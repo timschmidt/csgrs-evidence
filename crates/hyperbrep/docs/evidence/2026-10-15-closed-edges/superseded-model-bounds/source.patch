@@ -1,0 +1,237 @@
+diff --git a/crates/hyperbrep/Cargo.toml b/crates/hyperbrep/Cargo.toml
+index 59f4291c7..1a7ce8749 100644
+--- a/crates/hyperbrep/Cargo.toml
++++ b/crates/hyperbrep/Cargo.toml
+@@ -67,3 +67,7 @@ harness = false
+ [[bench]]
+ name = "periodic_cylinder"
+ harness = false
++
++[[bench]]
++name = "closed_edges"
++harness = false
+diff --git a/crates/hyperbrep/src/boolean_kernel/sets.rs b/crates/hyperbrep/src/boolean_kernel/sets.rs
+index 7744c7790..53655a42a 100644
+--- a/crates/hyperbrep/src/boolean_kernel/sets.rs
++++ b/crates/hyperbrep/src/boolean_kernel/sets.rs
+@@ -150,7 +150,10 @@ fn normalize(components: Vec<Component>) -> Result<Vec<Component>, BooleanError>
+     Ok(separate)
+ }
+ 
+-/// Conservative bounds for this solid alone, never the other selected bodies.
++/// Prefer bounds for this solid alone. When an unbounded surface carrier has
++/// no face bounds, the complete model's bounds still enclose this selection.
++/// That fallback may include unselected bodies and miss a rejection; it cannot
++/// reject a real overlap. It uses the same bound as the single-solid path.
+ pub(super) fn solid_bounds(
+     model: &ArenaModel,
+     solid: SolidId,
+@@ -161,7 +164,7 @@ pub(super) fn solid_bounds(
+     let mut bounds = None;
+     for face in solid_faces(model, solid)? {
+         let Some(face_bounds) = certified_face_bounds(model, face)? else {
+-            return Ok(None);
++            return Ok(model.bounds()?);
+         };
+         bounds = Some(match bounds {
+             None => face_bounds,
+diff --git a/crates/hyperbrep/src/ownership/references.rs b/crates/hyperbrep/src/ownership/references.rs
+index 51457ff4f..c8111fb30 100644
+--- a/crates/hyperbrep/src/ownership/references.rs
++++ b/crates/hyperbrep/src/ownership/references.rs
+@@ -97,7 +97,8 @@ impl<'a> VertexRef<'a> {
+             .point()
+     }
+ 
+-    /// Iterates over incident edges in insertion order.
++    /// Iterates over distinct incident edges in insertion order. A closed edge
++    /// appears once even though this vertex is both of its endpoints.
+     pub fn edges(self) -> impl ExactSizeIterator<Item = EdgeRef<'a>> {
+         self.model
+             .inner
+diff --git a/crates/hyperbrep/src/ownership/staging.rs b/crates/hyperbrep/src/ownership/staging.rs
+index 59eb05518..ad7d10788 100644
+--- a/crates/hyperbrep/src/ownership/staging.rs
++++ b/crates/hyperbrep/src/ownership/staging.rs
+@@ -108,6 +108,10 @@ impl ModelBuilder {
+         })
+     }
+     /// Adds an edge after checking all key owners and exact endpoints.
++    ///
++    /// A circle or ellipse spanning exactly one period may use the same vertex
++    /// at both endpoints. Other closed curve families require a future
++    /// regularity certificate and return [`BuildError::UnsupportedClosedEdge`].
+     pub fn edge(
+         &mut self,
+         start: &VertexKey,
+diff --git a/crates/hyperbrep/src/topology/builder.rs b/crates/hyperbrep/src/topology/builder.rs
+index 6d80d30d1..7c3da526d 100644
+--- a/crates/hyperbrep/src/topology/builder.rs
++++ b/crates/hyperbrep/src/topology/builder.rs
+@@ -70,12 +70,27 @@ impl ArenaModelBuilder {
+         domain: ParameterRange,
+         endpoint_certificate: bool,
+     ) -> Result<EdgeId, BuildError> {
+-        if start == end {
+-            return Err(BuildError::DegenerateEdge);
+-        }
+         let start_point = self.vertex_ref(start)?.point();
+         let end_point = self.vertex_ref(end)?.point();
+         let curve_ref = self.curve_ref(curve)?;
++        if start == end {
++            // A shared endpoint is valid topology for one complete, regular
++            // periodic curve. Restrict admission to carriers whose positive
++            // radii and independent axes already prove regularity and whose
++            // exact parameter period is known. Endpoint agreement alone would
++            // also admit constant or self-intersecting spline carriers.
++            if !matches!(
++                curve_ref.kind(),
++                Curve3Kind::CircleArc | Curve3Kind::EllipseArc
++            ) {
++                return Err(BuildError::UnsupportedClosedEdge(curve_ref.kind()));
++            }
++            require_real_equal(
++                &(domain.represented_end()? - domain.represented_start()?),
++                &Real::tau(),
++                BuildError::ClosedEdgePeriodMismatch,
++            )?;
++        }
+         if !endpoint_certificate {
+             require_curve_point_at_parameter(
+                 curve_ref,
+@@ -105,7 +120,9 @@ impl ArenaModelBuilder {
+             endpoint_certificate,
+         });
+         self.vertex_edges[start.index()].push(id);
+-        self.vertex_edges[end.index()].push(id);
++        if end != start {
++            self.vertex_edges[end.index()].push(id);
++        }
+         self.edge_uses_by_edge.push(Vec::new());
+         Ok(id)
+     }
+diff --git a/crates/hyperbrep/src/topology/error.rs b/crates/hyperbrep/src/topology/error.rs
+index 4242aa1fa..50f10ddb2 100644
+--- a/crates/hyperbrep/src/topology/error.rs
++++ b/crates/hyperbrep/src/topology/error.rs
+@@ -376,8 +376,10 @@ pub enum BuildError {
+     },
+     /// Exact geometry construction or evaluation failed.
+     Geometry(GeometryError),
+-    /// An edge references the same topological vertex twice.
+-    DegenerateEdge,
++    /// This curve family lacks a certificate for a regular closed edge.
++    UnsupportedClosedEdge(Curve3Kind),
++    /// A closed circular/elliptic edge does not span exactly one period.
++    ClosedEdgePeriodMismatch,
+     /// A curve/domain endpoint does not agree with the edge's vertex point.
+     EdgeEndpointMismatch {
+         /// Mismatched endpoint.
+diff --git a/crates/hypercurve/src/curve_string.rs b/crates/hypercurve/src/curve_string.rs
+index f2a4b509b..0c859cb08 100644
+--- a/crates/hypercurve/src/curve_string.rs
++++ b/crates/hypercurve/src/curve_string.rs
+@@ -82,6 +82,12 @@ impl CurveString2 {
+         }
+ 
+         for segment in &segments {
++            // Equal arc endpoints denote a full circle, not a zero-length
++            // chord. CircularArc2 owns radius/incidence validation; only line
++            // segments need this extra check for public unchecked construction.
++            let Segment2::Line(segment) = segment else {
++                continue;
++            };
+             if segment.start() == segment.end() {
+                 return Err(CurveError::ZeroLengthLine);
+             }
+diff --git a/crates/hypercurve/tests/hypercurve_curve_string.rs b/crates/hypercurve/tests/hypercurve_curve_string.rs
+index b58745fb8..e06d9bd6a 100644
+--- a/crates/hypercurve/tests/hypercurve_curve_string.rs
++++ b/crates/hypercurve/tests/hypercurve_curve_string.rs
+@@ -80,6 +80,86 @@ fn curve_string_and_contour_reject_forged_zero_length_segments() {
+     );
+ }
+ 
++#[test]
++fn full_circle_segments_retain_area_moment_and_winding_in_native_contours() {
++    for clockwise in [false, true] {
++        let arc = CircularArc2::try_from_center(p(5, -2), p(5, -2), p(3, -2), clockwise).unwrap();
++        let segment = Segment2::Arc(arc);
++        let path =
++            CurveString2::try_new(vec![segment.clone(), line_segment(5, -2, 7, -2)]).unwrap();
++        assert_eq!(path.len(), 2);
++        let contour = Contour2::try_new(vec![segment]).unwrap();
++        assert_eq!(contour.len(), 1);
++        let sign = if clockwise { -1 } else { 1 };
++        assert_eq!(
++            contour.signed_area().unwrap(),
++            Some(Real::from(sign * 4) * Real::pi())
++        );
++        assert_eq!(
++            contour.signed_x_first_moment().unwrap(),
++            Some(Real::from(sign * 12) * Real::pi())
++        );
++        assert_eq!(
++            crate::support::under_classified_result(&policy(), || contour
++                .winding_number(&p(3, -2)))
++            .unwrap(),
++            Classification::Decided(sign)
++        );
++        assert_eq!(
++            crate::support::under_classified_result(&policy(), || contour
++                .winding_number(&p(6, -2)))
++            .unwrap(),
++            Classification::Decided(0)
++        );
++    }
++}
++
++#[test]
++fn full_circle_native_regions_boolean_offset_and_repeat_exactly() {
++    let contour = Contour2::try_new(vec![Segment2::Arc(
++        CircularArc2::try_from_center(p(2, 0), p(2, 0), p(0, 0), false).unwrap(),
++    )])
++    .unwrap();
++    let region = crate::support::under(&policy(), || {
++        CurveRegion2::try_from_native_material_contours(vec![contour])
++    })
++    .unwrap()
++    .into_value();
++    let area = |region: &CurveRegion2| {
++        crate::support::under(&policy(), || region.signed_area())
++            .unwrap()
++            .into_value()
++    };
++    assert_eq!(area(&region), Some(Real::from(4) * Real::pi()));
++    for op in [
++        hypercurve::BooleanOp::Union,
++        hypercurve::BooleanOp::Intersection,
++    ] {
++        let same = crate::support::under(&policy(), || region.boolean_region(&region, op))
++            .unwrap()
++            .into_value();
++        assert_eq!(area(&same), Some(Real::from(4) * Real::pi()));
++    }
++    let offset = crate::support::under(&policy(), || {
++        region.offset(Real::one(), &hypercurve::OffsetCornerStyle2::Round)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&offset), Some(Real::from(9) * Real::pi()));
++    let ring = crate::support::under(&policy(), || {
++        offset.boolean_region(&region, hypercurve::BooleanOp::Difference)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&ring), Some(Real::from(5) * Real::pi()));
++    let back = crate::support::under(&policy(), || {
++        offset.offset(-Real::one(), &hypercurve::OffsetCornerStyle2::Round)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&back), Some(Real::from(4) * Real::pi()));
++}
++
+ #[test]
+ fn curve_string_endpoint_connection_classifies_exactly() {
+     let first = CurveString2::try_new(vec![line_segment(0, 0, 1, 0)]).unwrap();
