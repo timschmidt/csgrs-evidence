@@ -1,0 +1,65 @@
+--- a/crates/hyperbrep/src/topology/correspondence.rs
++++ b/crates/hyperbrep/src/topology/correspondence.rs
+@@ -75,9 +75,6 @@
+         pcurve_parameter: &Parameter,
+     ) -> Result<Parameter, GeometryError> {
+         if let Self::Affine { scale, offset } = self {
+-            if let Some(value) = pcurve_parameter.try_real() {
+-                return Ok(Parameter::from_real(scale * value + offset));
+-            }
+             return pcurve_parameter.affine_image(scale, offset);
+         }
+         let (directed_start, directed_end) = match direction {
+@@ -121,11 +118,6 @@
+         edge_parameter: &Parameter,
+     ) -> Result<Parameter, GeometryError> {
+         if let Self::Affine { scale, offset } = self {
+-            if let Some(value) = edge_parameter.try_real() {
+-                return ((value - offset) / scale)
+-                    .map(Parameter::from_real)
+-                    .map_err(GeometryError::Numeric);
+-            }
+             let inverse = (Real::one() / scale).map_err(GeometryError::Numeric)?;
+             return edge_parameter.affine_image(&inverse, &(-offset * &inverse));
+         }
+--- a/crates/hyperbrep/src/topology/helpers.rs
++++ b/crates/hyperbrep/src/topology/helpers.rs
+@@ -1620,20 +1620,6 @@
+                 Direction::Forward => (edge_domain.start(), edge_domain.end()),
+                 Direction::Reversed => (edge_domain.end(), edge_domain.start()),
+             };
+-            let (local_start, local_end) = pcurve.curve().parameter_endpoints();
+-            if let (Some(edge_start), Some(edge_end), Some(local_start), Some(local_end)) = (
+-                edge_start.try_real(),
+-                edge_end.try_real(),
+-                local_start.scalar(),
+-                local_end.scalar(),
+-            ) {
+-                // Native subdivisions can reparameterize their pieces. Keep
+-                // the existing scalar formula and avoid preparing root maps.
+-                let scale = ((edge_end - edge_start) / (local_end - local_start))
+-                    .map_err(GeometryError::Numeric)?;
+-                let offset = edge_start - &scale * local_start;
+-                return ParameterCorrespondence::affine(scale, offset);
+-            }
+             let pcurve_start = pcurve.domain_start()?;
+             let pcurve_end = pcurve.domain_end()?;
+             if pcurve_start
+@@ -1644,7 +1630,16 @@
+             {
+                 return Ok(source.clone());
+             }
+-            Err(GeometryError::UnrepresentableParameter.into())
++            let edge_start = edge_start
++                .try_real()
++                .ok_or(GeometryError::UnrepresentableParameter)?;
++            let edge_end = edge_end
++                .try_real()
++                .ok_or(GeometryError::UnrepresentableParameter)?;
++            let pcurve_width = pcurve.represented_end()? - pcurve.represented_start()?;
++            let scale = ((edge_end - edge_start) / pcurve_width).map_err(GeometryError::Numeric)?;
++            let offset = edge_start - &scale * pcurve.represented_start()?;
++            Ok(ParameterCorrespondence::affine(scale, offset)?)
+         }
+     }
+ }
