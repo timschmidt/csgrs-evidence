@@ -1,0 +1,238 @@
+--- a/crates/hyperbrep-io/src/part21/lexer.rs
++++ b/crates/hyperbrep-io/src/part21/lexer.rs
+@@ -16,8 +16,6 @@
+     Equal,
+     Omitted,
+     Derived,
+-    BeginExchange,
+-    EndExchange,
+     End,
+ }
+ #[derive(Clone, Copy, Debug)]
+@@ -151,17 +149,6 @@
+                 if self.byte() != Some(b'"') || (payload == self.cursor && padding != b'0') {
+                     return Err(self.syntax("invalid binary token"));
+                 }
+-                if payload < self.cursor {
+-                    let byte = self.source.as_bytes()[payload];
+-                    let first = if byte.is_ascii_digit() {
+-                        byte - b'0'
+-                    } else {
+-                        byte - b'A' + 10
+-                    };
+-                    if first >= (16u8 >> (padding - b'0')) {
+-                        return Err(self.syntax("binary padding bits must be zero"));
+-                    }
+-                }
+                 self.cursor += 1;
+                 Kind::Binary
+             }
+@@ -178,12 +165,6 @@
+                 let id = self.source[digits..self.cursor]
+                     .parse::<u64>()
+                     .map_err(|_| Error::new(start, ErrorKind::Syntax("entity ID exceeds u64")))?;
+-                if id == 0 {
+-                    return Err(Error::new(
+-                        start,
+-                        ErrorKind::Syntax("entity ID must be nonzero"),
+-                    ));
+-                }
+                 Kind::Reference(id)
+             }
+             b'@' => {
+@@ -241,10 +222,8 @@
+             b'A'..=b'Z' | b'_' | b'!' => {
+                 if self.source[start..].starts_with("ISO-10303-21") {
+                     self.cursor += "ISO-10303-21".len();
+-                    Kind::BeginExchange
+                 } else if self.source[start..].starts_with("END-ISO-10303-21") {
+                     self.cursor += "END-ISO-10303-21".len();
+-                    Kind::EndExchange
+                 } else {
+                     if byte == b'!' {
+                         self.cursor += 1;
+@@ -256,8 +235,8 @@
+                         return Err(self.syntax("expected keyword"));
+                     }
+                     self.word();
+-                    Kind::Word(&self.source[start..self.cursor])
+-                }
++                }
++                Kind::Word(&self.source[start..self.cursor])
+             }
+             _ => return Err(self.syntax("unexpected character")),
+         };
+--- a/crates/hyperbrep-io/src/part21/parser.rs
++++ b/crates/hyperbrep-io/src/part21/parser.rs
+@@ -7,7 +7,6 @@
+     pending: Option<Token<'a>>,
+     limits: &'l ReadLimits,
+     exchange: Exchange<'a>,
+-    frames: Vec<Frame>,
+ }
+ struct Frame {
+     index: usize,
+@@ -20,7 +19,6 @@
+         lexer: Lexer::new(source, limits),
+         pending: None,
+         limits,
+-        frames: Vec::new(),
+         exchange: Exchange {
+             source,
+             nodes: Vec::new(),
+@@ -31,7 +29,7 @@
+             index: Vec::new(),
+         },
+     };
+-    parser.expect(Kind::BeginExchange)?;
++    parser.word("ISO-10303-21")?;
+     parser.expect(Kind::Semicolon)?;
+     parser.word("HEADER")?;
+     parser.expect(Kind::Semicolon)?;
+@@ -76,7 +74,7 @@
+     if parser.exchange.sections.is_empty() {
+         return Err(parser.syntax("expected at least one DATA section")?);
+     }
+-    parser.expect(Kind::EndExchange)?;
++    parser.word("END-ISO-10303-21")?;
+     parser.expect(Kind::Semicolon)?;
+     parser.reject_extended_section()?;
+     parser.expect(Kind::End)?;
+@@ -212,15 +210,15 @@
+         )?;
+         Ok(index)
+     }
+-    fn frame(&mut self, index: usize, offset: usize) -> Result<(), Error> {
++    fn frame(&self, frames: &mut Vec<Frame>, index: usize, offset: usize) -> Result<(), Error> {
+         check(
+             Resource::NestingDepth,
+-            self.frames.len() + 1,
++            frames.len() + 1,
+             self.limits.nesting_depth,
+             offset,
+         )?;
+         push(
+-            &mut self.frames,
++            frames,
+             Frame {
+                 index,
+                 count: 0,
+@@ -232,22 +230,22 @@
+     fn list(&mut self) -> Result<usize, Error> {
+         let open = self.expect(Kind::Open)?;
+         let root = self.node(ValueKind::Aggregate, open.start, open.end)?;
+-        debug_assert!(self.frames.is_empty());
+-        self.frame(root, open.start)?;
++        let mut frames = Vec::new();
++        self.frame(&mut frames, root, open.start)?;
+         loop {
+             let token = self.peek()?;
+-            let frame = self.frames.last().expect("root frame or unfinished child");
++            let frame = frames.last().expect("root frame or unfinished child");
+             let typed = matches!(self.exchange.nodes[frame.index].kind, ValueKind::Typed(_));
+             if token.kind == Kind::Close && (!frame.expect_value || frame.count == 0) {
+                 if typed && frame.count != 1 {
+                     return Err(self.syntax("typed parameter requires one value")?);
+                 }
+                 self.take()?;
+-                let frame = self.frames.pop().expect("checked nonempty frame stack");
++                let frame = frames.pop().expect("checked nonempty frame stack");
+                 let end = self.exchange.nodes.len();
+                 self.exchange.nodes[frame.index].end = end;
+                 self.exchange.nodes[frame.index].span.end = token.end;
+-                if self.frames.is_empty() {
++                if frames.is_empty() {
+                     return Ok(root);
+                 }
+             } else if !frame.expect_value {
+@@ -255,10 +253,7 @@
+                     return Err(self.syntax("typed parameter requires one value")?);
+                 }
+                 self.expect(Kind::Comma)?;
+-                self.frames
+-                    .last_mut()
+-                    .expect("nonempty parent")
+-                    .expect_value = true;
++                frames.last_mut().expect("nonempty parent").expect_value = true;
+                 continue;
+             } else {
+                 let token = self.take()?;
+@@ -293,11 +288,11 @@
+                 };
+                 let index = self.node(kind, token.start, token.end)?;
+                 if matches!(kind, ValueKind::Aggregate | ValueKind::Typed(_)) {
+-                    self.frame(index, token.start)?;
++                    self.frame(&mut frames, index, token.start)?;
+                     continue;
+                 }
+             }
+-            let parent = self.frames.last_mut().expect("root not yet finished");
++            let parent = frames.last_mut().expect("root not yet finished");
+             parent.count += 1;
+             parent.expect_value = false;
+         }
+--- a/crates/hyperbrep-io/src/part21/writer.rs
++++ b/crates/hyperbrep-io/src/part21/writer.rs
+@@ -4,7 +4,6 @@
+ struct Output {
+     text: String,
+     limit: usize,
+-    frames: Vec<(usize, bool)>,
+ }
+ impl Output {
+     fn add(&mut self, text: &str) -> Result<(), Error> {
+@@ -20,22 +19,22 @@
+ 
+ fn value(exchange: &Exchange<'_>, index: usize, out: &mut Output) -> Result<(), Error> {
+     let mut index = index;
+-    debug_assert!(out.frames.is_empty());
++    let mut frames: Vec<(usize, bool)> = Vec::new();
+     loop {
+-        if let Some(&(end, _)) = out.frames.last() {
++        if let Some(&(end, _)) = frames.last() {
+             if index == end {
+                 out.add(")")?;
+-                out.frames.pop();
+-                if out.frames.is_empty() {
++                frames.pop();
++                if frames.is_empty() {
+                     break;
+                 }
+                 continue;
+             }
+-            let parent = out.frames.last_mut().expect("nonempty frame stack");
+-            let comma = std::mem::replace(&mut parent.1, true);
+-            if comma {
++            let parent = frames.last_mut().expect("nonempty frame stack");
++            if parent.1 {
+                 out.add(",")?;
+             }
++            parent.1 = true;
+         }
+         let node = &exchange.nodes[index];
+         match node.kind {
+@@ -44,14 +43,14 @@
+                     out.add(name)?;
+                 }
+                 out.add("(")?;
+-                push(&mut out.frames, (node.end, false), node.span.start)?;
++                push(&mut frames, (node.end, false), node.span.start)?;
+             }
+             _ => {
+                 out.add(&exchange.source[node.span.clone()])?;
+             }
+         }
+         index += 1;
+-        if out.frames.is_empty() {
++        if frames.is_empty() {
+             break;
+         }
+     }
+@@ -65,7 +64,6 @@
+     let mut out = Output {
+         text: String::new(),
+         limit,
+-        frames: Vec::new(),
+     };
+     out.add("ISO-10303-21;\nHEADER;\n")?;
+     for item in &exchange.records[exchange.header.clone()] {
