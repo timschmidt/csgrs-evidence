@@ -1,0 +1,33 @@
+use hyperbrep::{builder, boolean, BodySet, Point3, BooleanOperation, FaceSelectionAction};
+fn p(x:i32,y:i32,z:i32)->Point3 {Point3::new(x.into(),y.into(),z.into())}
+fn examine(name:&str, source:BodySet, cutter:&BodySet){
+ let graph=boolean::intersection_graph(source.model().solids().next().unwrap(),cutter.model().solids().next().unwrap()).unwrap();
+ println!("{name}: intersections={} traces={} unresolved={}",graph.exact_intersection_pairs(),graph.trimmed_curve_fragments(),graph.unresolved_trim_pairs());
+ for (which,selection,partition) in [("first",graph.select_first_faces(BooleanOperation::Intersection),graph.partition_first_faces()),("second",graph.select_second_faces(BooleanOperation::Intersection),graph.partition_second_faces())] {
+  let partition=partition.unwrap();
+  std::fs::write(format!("/tmp/{name}-{which}-partition.json"),partition.model().to_json().unwrap()).unwrap();
+  match selection {
+   Err(error)=>println!("{which}: {error:?}"),
+   Ok(selection)=>{
+    let model=selection.partitioned().model();
+    std::fs::write(format!("/tmp/{name}-{which}-selection.json"),model.to_json().unwrap()).unwrap();
+    for f in selection.faces(){
+     let face=f.face();
+     println!("{which} face={} kind={:?} action={:?} witness={:?}",face.index(),face.surface().kind(),f.action(),f.witness());
+     if f.action()==FaceSelectionAction::Discard {continue;}
+     for wire in face.outer().into_iter().chain(face.inner()) {
+      for use_ in wire.edge_uses(){let e=use_.edge(); println!("edge={} direction={:?} kind={:?} domain={:?} from={:?} to={:?}",e.index(),use_.direction(),e.curve().kind(),e.domain(),e.start().point(),e.end().point());}
+     }
+    }
+   }
+  }
+ }
+ println!("stitch: {:?}",graph.stitch_selected_faces(BooleanOperation::Intersection).map(|m|m.bodies().len()));
+}
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod acceptance;
+fn main(){
+ let (source,cutter,_,_)=acceptance::fixture(0);
+ let map=acceptance::similarity(&acceptance::ratio(1,1000),true);
+ examine("torus-reflected-axial",source.transformed(&map).unwrap(),&cutter.transformed(&map).unwrap());
+}

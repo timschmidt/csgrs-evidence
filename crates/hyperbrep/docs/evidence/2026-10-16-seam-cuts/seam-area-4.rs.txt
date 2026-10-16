@@ -1,0 +1,36 @@
+use hyperbrep::{Real, boolean, STRICT_PREDICATES};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod acceptance;
+fn main(){
+ for reflected in [false,true] {
+  let (source,cutter,_,_)=acceptance::fixture(0);
+  let map=acceptance::similarity(&Real::from(2).sqrt().unwrap(),reflected);
+  let cut=boolean::intersection(&source.transformed(&map).unwrap(),&cutter.transformed(&map).unwrap()).unwrap();
+  let loaded=acceptance::reload(cut.model());
+  let e=loaded.edges().next().unwrap();
+  let m=((e.domain().start().try_real().unwrap()+e.domain().end().try_real().unwrap())/Real::from(2)).unwrap();
+  let split=e.split(m.into()).unwrap();
+  let replay=acceptance::reload(split.model());
+  let transformed=replay.transformed(&acceptance::similarity(&acceptance::ratio(1,1000),true)).unwrap();
+  let moved=acceptance::reload(&transformed);
+  for (a,b) in replay.faces().zip(moved.faces()) {
+   let expected=a.area().unwrap()*acceptance::ratio(1,1_000_000);
+   let actual=b.area().unwrap();
+   let order=hyperlimit::compare_reals(&actual,&expected,STRICT_PREDICATES);
+   let compact=actual.compact_pi_laurent();
+   println!("reflect={reflected} face={} {:?} equality={:?} compact={:?}",b.index(),b.surface().kind(),order,compact.as_ref().map(|v|hyperlimit::compare_reals(v,&expected,STRICT_PREDICATES)));
+   if order.value()!=Some(std::cmp::Ordering::Equal) {
+    let surf=b.surface(); let (u,v)=surf.plane_directions().unwrap();
+    let squared=u.cross(v).norm_squared();
+    println!("normal2 rational={:?} compact={:?} sqrt={:?}",squared.exact_rational_ref(),squared.compact_pi_laurent(),squared.sqrt());
+    for (i,wire) in b.outer().into_iter().chain(b.inner()).enumerate(){
+     let path=hypercurve::CurvePath2::try_new(wire.edge_uses().map(|e|e.pcurve().curve().clone()).collect()).unwrap();
+     let area=path.boundary_loop().unwrap().signed_area();
+     std::fs::write(format!("/tmp/seam-wire-{reflected}-{i}.txt"),format!("{area:?}")).unwrap();
+    }
+
+    std::fs::write(format!("/tmp/seam-area-{reflected}-{}.txt",b.index()),format!("expected={expected:?}\nactual={actual:?}\ncompact={compact:?}")).unwrap();
+   }
+  }
+ }
+}

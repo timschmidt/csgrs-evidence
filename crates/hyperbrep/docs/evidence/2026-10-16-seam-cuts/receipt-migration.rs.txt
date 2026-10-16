@@ -1,0 +1,70 @@
+use hyperbrep::{ArchiveLimits, RawModel, Real, builder};
+use serde_json::{Value, json};
+#[allow(dead_code)]
+#[path = "/mnt/development/csgrs/crates/hyperbrep/tests/support/similarity.rs"]
+mod acceptance;
+
+fn digest(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn compare(a: &Value, b: &Value, path: &str, changed: &mut Vec<Value>) {
+    if a == b { return; }
+    if a.get("rational").is_some() && b.get("rational").is_some() {
+        let left: Real = serde_json::from_value(a.clone()).unwrap();
+        let right: Real = serde_json::from_value(b.clone()).unwrap();
+        acceptance::equal(&left, &right);
+        changed.push(json!({"path":path,"proof":"strict native exact scalar equality"}));
+        return;
+    }
+    match (a, b) {
+        (Value::Object(a), Value::Object(b)) => {
+            assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "{path}");
+            for (key, value) in a { compare(value, &b[key], &format!("{path}/{key}"), changed); }
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            assert_eq!(a.len(), b.len(), "{path}");
+            for (index, (a, b)) in a.iter().zip(b).enumerate() {
+                compare(a, b, &format!("{path}/{index}"), changed);
+            }
+        }
+        _ => panic!("non-scalar artifact change at {path}: {a} versus {b}"),
+    }
+}
+
+fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    if args[1] == "emit" {
+        let source = builder::cylinder(5.into(), 7.into()).unwrap();
+        let scale = Real::from(2).sqrt().unwrap();
+        let moved = source.transformed(&acceptance::similarity(&scale, false)).unwrap();
+        let replay = acceptance::reload(moved.model());
+        acceptance::equal(&replay.solids().next().unwrap().volume().unwrap(),
+                          &(Real::from(175) * Real::pi() * &scale * &scale * &scale));
+        acceptance::check_images(&replay);
+        let data = replay.to_json().unwrap();
+        println!("{}", json!({"bytes":data.len(),"receipt":digest(data.as_bytes())}));
+        std::fs::write(&args[2], data).unwrap();
+    } else {
+        assert_eq!(args[1], "compare");
+        let a = std::fs::read_to_string(&args[2]).unwrap();
+        let b = std::fs::read_to_string(&args[3]).unwrap();
+        let left = RawModel::from_json(&a, &ArchiveLimits::default()).unwrap().validate().unwrap();
+        let right = RawModel::from_json(&b, &ArchiveLimits::default()).unwrap().validate().unwrap();
+        assert_eq!(left.counts(), right.counts());
+        acceptance::equal(&left.solids().next().unwrap().volume().unwrap(),
+                          &right.solids().next().unwrap().volume().unwrap());
+        let mut changed = Vec::new();
+        compare(&serde_json::from_str(&a).unwrap(), &serde_json::from_str(&b).unwrap(), "", &mut changed);
+        assert!(!changed.is_empty());
+        let report = json!({"baseline_bytes":a.len(),"candidate_bytes":b.len(),
+            "baseline_receipt":digest(a.as_bytes()),"candidate_receipt":digest(b.as_bytes()),
+            "changed_exact_scalars":changed,"non_scalar_changes":0,
+            "both_archives_strictly_validate":true,
+            "scope":"Complete recursive archive comparison. Every non-scalar field, including topology, carrier family, domain and source mapping structure, is identical; every changed exact scalar proves equal under strict native predicates. Both complete archives independently validate. No checksum exception for other cases."});
+        std::fs::write(&args[4], serde_json::to_string_pretty(&report).unwrap()+"\n").unwrap();
+        println!("{report}");
+    }
+}
