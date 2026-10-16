@@ -1,0 +1,50 @@
+use hyperbrep::{BodySet, Matrix4, Model, Point3, RawModel, ArchiveLimits, Real, boolean, builder};
+fn p(x: i32, y: i32, z: i32) -> Point3 { Point3::new(x.into(),y.into(),z.into()) }
+fn q(x:i32,y:i32)->Real { (Real::from(x)/Real::from(y)).unwrap() }
+fn report(name:&str, result:Result<BodySet,hyperbrep::boolean::BooleanError>)->Option<BodySet>{
+ match result {
+  Err(error)=>{println!("{name}: error={error:?}");None},
+  Ok(value)=>{
+   println!("{name}: bodies={}",value.len());
+   for body in value.bodies() { println!("{name}: volume={:?}",body.volume()); }
+   let json=value.model().to_json().unwrap();
+   let replay=RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate();
+   println!("{name}: replay={:?}",replay.as_ref().map(Model::counts));
+   Some(value)
+  }
+ }
+}
+fn main(){
+ let args:Vec<_>=std::env::args().collect();
+ let family=&args[1];let rotation=&args[2];
+ let source=match family.as_str(){
+  "torus"=>builder::torus(5.into(),2.into()),
+  "cone"=>builder::cone_frustum(5.into(),2.into(),6.into()),
+  "cylinder"=>builder::cylinder(5.into(),6.into()),
+  _=>panic!("unknown family")
+ }.unwrap();
+ let (c,s)=match rotation.as_str(){
+  "identity"=>(Real::one(),Real::zero()),
+  "diagonal"=>{let r=(Real::from(2).sqrt().unwrap()/Real::from(2)).unwrap();(r.clone(),r)},
+  "rational"=>(q(3,5),q(4,5)),
+  _=>panic!("unknown rotation")
+ };
+ let map=Matrix4::from_row_major([c.clone(),-&s,0.into(),0.into(),s,c,0.into(),0.into(),0.into(),0.into(),1.into(),0.into(),0.into(),0.into(),0.into(),1.into()]);
+ let cutter=builder::cuboid(p(0,-20,-20),p(20,20,20)).unwrap().transformed(&map).unwrap();
+ println!("fixture={family}/{rotation}");
+ let half=report("intersection",boolean::intersection(&source,&cutter));
+ report("swapped",boolean::intersection(&cutter,&source));
+ let other=report("difference",boolean::difference(&source,&cutter));
+ if let Some(half)=&half{
+  report("recut",boolean::intersection(half,&cutter));
+  report("clear",boolean::difference(half,&cutter));
+  let axial=builder::cuboid(p(-20,-20,1),p(20,20,20)).unwrap();
+  report("band",boolean::intersection(half,&axial));
+  let cross=builder::cuboid(p(-20,0,-20),p(20,20,20)).unwrap();
+  report("sector",boolean::intersection(half,&cross));
+  if let Some(other)=&other{
+   report("restore",boolean::union(half,other));
+   report("restore-swapped",boolean::union(other,half));
+  }
+ }
+}
