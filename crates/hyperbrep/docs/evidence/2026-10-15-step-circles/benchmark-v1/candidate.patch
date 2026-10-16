@@ -1,0 +1,811 @@
+diff --git a/crates/hyperbrep-io/Cargo.toml b/crates/hyperbrep-io/Cargo.toml
+index 8c97b70b8..649410e7c 100644
+--- a/crates/hyperbrep-io/Cargo.toml
++++ b/crates/hyperbrep-io/Cargo.toml
+@@ -32,3 +32,7 @@ harness = false
+ [[bench]]
+ name = "advanced"
+ harness = false
++
++[[bench]]
++name = "circles"
++harness = false
+diff --git a/crates/hyperbrep-io/README.md b/crates/hyperbrep-io/README.md
+index 2e97d2ba4..eac3a4db3 100644
+--- a/crates/hyperbrep-io/README.md
++++ b/crates/hyperbrep-io/README.md
+@@ -6,9 +6,10 @@ HyperBRep and exact scalar arithmetic belongs to Hyperreal.
+ 
+ The crate reads and writes bounded Part 21 syntax, imports an explicitly
+ selected faceted or supported advanced representation into strictly validated
+-native HyperBRep solids, and exports selected planar, straight-edged solids to STEP. Coordinates and
+-authored unit conversions remain exact. Whole-document/product traversal,
+-curved analytic/spline exchange and approximate export remain unfinished.
++native HyperBRep solids, and exports selected planar, straight-edged solids to STEP.
++Advanced import includes direct circular edges on planes and cylinders. Coordinates
++and authored unit conversions remain exact. Whole-document/product traversal,
++other analytic/spline mappings, curved export and approximate export remain unfinished.
+ 
+ The syntax layer retains numeric lexemes without binary floating-point conversion, unknown
+ entity records, complex instances, forward references, multiple DATA sections,
+@@ -70,6 +71,13 @@ orientation and edge sense remain distinct; winding identifies finite outer
+ bounds even when the file only contains `FACE_BOUND` records. `VertexSource` and
+ `EdgeUseSource` distinguish implicit polygons from explicit topology.
+ 
++Direct `CIRCLE` edges retain the source angular frame, traversal and parameter
++map, including a closed edge with one vertex and distinct seam uses. Cylinder
++charts use native radians and metres; source angle units are converted exactly
++and independently of length units. Native validation proves the complete
++edge/pcurve image. Supplied curved `SURFACE_CURVE` and `SEAM_CURVE` records remain
++unsupported until every representation can be checked.
++
+ ```rust
+ use hyperbrep::{OperationContext, WorkBudget};
+ use hyperbrep_io::step::{ImportLimits, StepFile, StepReadOptions};
+@@ -130,6 +138,10 @@ construction recipes for independent readers. The
+ STEP bodies, splits and reflects a holed solid, exports faceted STEP, and
+ checks exact native reimport. This changes the exchange encoding while retaining
+ the planar line geometry; it is not curved-face tessellation.
++The [circular import example](examples/circular_step.rs) imports an exact
++non-cardinal cylinder, splits a circular edge and validates native archive replay.
++Its exact volume and unchanged boundary are checked independently of STEP output;
++the faceted writer rejects its curved carriers.
+ 
+ ANCHOR, REFERENCE,
+ SIGNATURE sections, scoped/value/constant references return explicit blockers.
+diff --git a/crates/hyperbrep-io/docs/STEP_MAPPING.md b/crates/hyperbrep-io/docs/STEP_MAPPING.md
+index 488acab5b..dd8df3db1 100644
+--- a/crates/hyperbrep-io/docs/STEP_MAPPING.md
++++ b/crates/hyperbrep-io/docs/STEP_MAPPING.md
+@@ -18,7 +18,7 @@ completeness and performance retain that priority order under
+ | `ImportedRepresentation::bodies()` | Owned native `Model` values, in representation item order, with model-bound solid/face/vertex/wire/edge-use views. |
+ | `interpreted_entities()` / `retained_entities()` | Sorted distinct interpreted IDs and source-order raw-retained IDs; disjoint and together covering every DATA instance. |
+ | `ImportedBody::edge_uses()` | Bound/loop IDs, typed polygon-segment or oriented-edge source, directed source endpoint identities and native edge-use reference. |
+-| `ImportedBody::explicit_edges()` | Explicit EDGE_CURVE identity, source geometry/master IDs, exact parameter maps for every representation and native edge reference. |
++| `ImportedBody::explicit_edges()` | Explicit EDGE_CURVE identity, source geometry/master IDs, exact directed parameter maps for every supplied supported representation and native edge reference. |
+ | `write_faceted(bodies, options, context)` | All explicitly selected supported native solid occurrences as one AP214 common faceted representation/product, or a typed failure. |
+ | `FacetedStep::bodies()` | Borrowed model-bound source-to-output mappings for every vertex, face, wire and directed edge use. |
+ 
+@@ -96,8 +96,9 @@ authored vector magnitude and parameter. Length conversion scales both origin
+ and velocity. Each endpoint must lie exactly on that support. The parameter
+ order must agree with `EDGE_CURVE.same_sense`. Native edges use their authored
+ topological start/end with canonical unit parameterization; `SourceCurveParameters`
+-reports `source_parameter = start + (end - start) * native_parameter`, including
+-negative maps. `ORIENTED_EDGE.orientation` and `FACE_BOUND.orientation` act
++reports `source_parameter = start + (end - start) * s`, where `s` is the
++normalized directed edge fraction (the native parameter for unit-domain lines),
++including negative maps. `ORIENTED_EDGE.orientation` and `FACE_BOUND.orientation` act
+ independently; reversing a bound reverses order and every edge use.
+ 
+ Each associated `PCURVE` has a plane basis and a one-item
+@@ -123,10 +124,56 @@ domain. General unbounded or disconnected planar face domains remain unsupported
+ The API is now `import_representation`; direct callers use the typed source enums.
+ There is no legacy import alias or parallel geometry carrier. Full EXPRESS/AP
+ conformance, native arbitrary-shell completeness, global arithmetic/work/heap
+-admission and curved/periodic STEP exchange remain unfinished. Independent OCCT
++admission and general curved/periodic STEP exchange remain unfinished. Independent OCCT
+ inputs and the exact/rejection/composition evidence are recorded in the
+ [advanced mapping qualification](../../hyperbrep/docs/evidence/2026-10-15-step-advanced/README.md).
+ 
++## Direct circular edges and cylindrical faces
++
++Advanced bodies additionally accept direct spatial `CIRCLE` curves and
++`CYLINDRICAL_SURFACE` supports through the same explicit topology and native
++builder. A circle's placement and positive radius define its exact support;
++native point location must certify both endpoints. A full circular edge uses
++the same explicit vertex at both endpoints and traverses exactly one period.
++Different vertex IDs at equal positions remain distinct and are rejected for
++this closed-circle encoding. There is no welding, synthetic seam vertex or
++implicit repair. Partial arcs retain both authored vertex IDs.
++
++The source parameter interval starts at the first endpoint's native canonical
++angle in `[0, tau]`, with the native locator selecting the first seam parameter.
++Its end is unwrapped in the direction of `EDGE_CURVE.same_sense`; a full edge's
++directed span is `+tau` or `-tau`. Both endpoints are divided by the context's
++exact radians-per-angle-unit scale. Thus the numeric source period need not be
++`tau`. Native circles retain their source frame and an increasing radian domain;
++native reversal supplies negative traversal. For native parameter `t`, the map
++fraction is `s = (t-domain.start)/(domain.end-domain.start)`. The source/master ID
++is the direct `CIRCLE` ID. Maps refer to the immutable imported revision.
++
++Plane faces use native circular pcurves and angular-sweep correspondence.
++Cylinder faces use continuous local UV charts in radians and metres, with a
++separate use for each side of the periodic seam. The first point uses native
++circle parameter location; subsequent segments continue the preceding lift only
++after explicit vertex continuity is checked. Native whole-image validation
++certifies every generated pcurve and its affine edge correspondence. The
++currently admitted cylindrical boundaries are constant-height circles and axial
++lines, within the existing native face/shell validation domain. This mapping
++does not add arbitrary cylinder trimming or general shell validation.
++
++Angular mapping requires a declared plane-angle unit, even when no angular
++number appears in the spatial circle record. Length and angle scales remain
++independent. A conversion named `degree` uses its authored exact decimal factor;
++it never substitutes symbolic `pi/180`. Uncertainty metadata cannot make an
++off-carrier decimal vertex incident.
++
++Curved `SURFACE_CURVE`, `SEAM_CURVE`, ellipses, other analytic surfaces and spline
++exchange remain typed unsupported. The planar line/supplied-pcurve mapping above
++is unchanged. Every selected body must finish admission before any result is
++published; all source entities remain interpreted or raw-retained. The exact
++faceted writer rejects these curved models. Native archive replay is a separate
++lossless operation, not a curved STEP round trip. See the
++[circular mapping evidence](../../hyperbrep/docs/evidence/2026-10-15-step-circles/README.md)
++and [runnable example](../examples/circular_step.rs).
++
+ ## Units and text
+ 
+ Published coordinates use **metres**. Unit categories remain length, plane angle
+diff --git a/crates/hyperbrep-io/src/step/advanced/curves.rs b/crates/hyperbrep-io/src/step/advanced/curves.rs
+index b94a54245..65d08c59d 100644
+--- a/crates/hyperbrep-io/src/step/advanced/curves.rs
++++ b/crates/hyperbrep-io/src/step/advanced/curves.rs
+@@ -226,6 +226,9 @@ impl Builder {
+         if entity.is_complex() {
+             return Err(geometry_site.error(ErrorKind::Unsupported("complex edge geometry")));
+         }
++        if record.name() == "CIRCLE" {
++            return self.circular_edge(resolver, id, geometry, start, end, same_sense, scale);
++        }
+         let mut parameters = Vec::new();
+         let master;
+         if record.name() == "SURFACE_CURVE" {
+@@ -318,6 +321,7 @@ impl Builder {
+             key: key.clone(),
+             start,
+             end,
++            circle: None,
+         };
+         cache(&mut self.by_edge, id, edge.clone(), site)?;
+         push(
+diff --git a/crates/hyperbrep-io/src/step/advanced/faces.rs b/crates/hyperbrep-io/src/step/advanced/faces.rs
+index 87b31d114..ab6a58da9 100644
+--- a/crates/hyperbrep-io/src/step/advanced/faces.rs
++++ b/crates/hyperbrep-io/src/step/advanced/faces.rs
+@@ -12,7 +12,7 @@ impl Builder {
+         let site = args.site;
+         resolver.text(args.next()?, site)?;
+         let bounds = args.list()?;
+-        let plane = self.plane(resolver, args.reference()?, scale)?;
++        let surface = self.surface(resolver, args.reference()?, scale)?;
+         let forward = args.boolean()?;
+         args.finish()?;
+         let orientation = if forward {
+@@ -40,17 +40,11 @@ impl Builder {
+             let loop_id = args.reference()?;
+             let bound_forward = args.boolean()?;
+             args.finish()?;
+-            let (wire, area) = self.edge_loop(
+-                resolver,
+-                bound_id,
+-                loop_id,
+-                bound_forward,
+-                &plane.geometry,
+-                scale,
+-            )?;
++            let (wire, area) =
++                self.edge_loop(resolver, bound_id, loop_id, bound_forward, &surface, scale)?;
+             let sign = order(bound_site, &area, &Real::zero())?;
+             if sign == Ordering::Equal {
+-                return Err(bound_site.invalid("zero-area planar bound"));
++                return Err(bound_site.invalid("zero-area parameter-space bound"));
+             }
+             let is_outer = sign
+                 == if forward {
+@@ -71,10 +65,13 @@ impl Builder {
+                 push(&mut holes, wire).map_err(|kind| site.error(kind))?;
+             }
+         }
+-        let outer = outer
+-            .ok_or_else(|| site.error(ErrorKind::Expected("one finite planar outer bound")))?;
++        let outer = outer.ok_or_else(|| {
++            site.error(ErrorKind::Expected(
++                "one finite parameter-space outer bound",
++            ))
++        })?;
+         self.model
+-            .face(&plane.key, orientation, &outer, &holes)
++            .face(&surface.key, orientation, &outer, &holes)
+             .map_err(|e| site.error(ErrorKind::Build(e)))
+     }
+     fn edge_loop(
+@@ -83,7 +80,7 @@ impl Builder {
+         bound: u64,
+         id: u64,
+         forward: bool,
+-        plane: &Plane,
++        surface: &FaceSurface,
+         scale: &Real,
+     ) -> Result<(WireKey, Real), Error> {
+         let mut args = resolver.simple(id, "EDGE_LOOP")?;
+@@ -117,6 +114,8 @@ impl Builder {
+         }
+         let mut uses = Vec::new();
+         let mut segments = Vec::new();
++        let mut previous_vertex = None;
++        let mut previous_parameter = None;
+         for (oriented, edge_id, forward) in ordered {
+             let edge = self.edge(resolver, edge_id, scale)?;
+             let (from, to) = if forward {
+@@ -124,25 +123,31 @@ impl Builder {
+             } else {
+                 (edge.end, edge.start)
+             };
+-            let uv = |id| {
+-                let point = &self.by_vertex[&id].point;
+-                let delta = point - &plane.origin;
+-                Point2::new(delta.dot(&plane.x), delta.dot(&plane.y))
++            if previous_vertex.is_some_and(|id| id != from) {
++                return Err(site.invalid("edge loop has disconnected vertex identities"));
++            }
++            let (segment, correspondence) = surface.boundary_segment(
++                &edge,
++                &self.by_vertex[&from].point,
++                &self.by_vertex[&to].point,
++                forward,
++                previous_parameter.as_ref(),
++                site,
++            )?;
++            previous_vertex = Some(to);
++            previous_parameter = Some(segment.end().clone());
++            let curve = match &segment {
++                Segment2::Line(line) => Curve2::from(line.clone()),
++                Segment2::Arc(arc) => Curve2::from(arc.clone()),
+             };
+-            let line = LineSeg2::try_new(uv(from), uv(to))
+-                .map_err(|e| site.error(ErrorKind::Geometry(e.into())))?;
+             let pcurve = self
+                 .model
+-                .pcurve(Pcurve::new(Curve2::from(line.clone())))
++                .pcurve(Pcurve::new(curve))
+                 .map_err(|e| site.error(ErrorKind::Build(e)))?;
+-            let (direction, correspondence) = if forward {
+-                (Direction::Forward, ParameterCorrespondence::identity())
++            let direction = if forward {
++                Direction::Forward
+             } else {
+-                (
+-                    Direction::Reversed,
+-                    ParameterCorrespondence::affine(-Real::one(), Real::one())
+-                        .map_err(|e| site.error(ErrorKind::Build(e)))?,
+-                )
++                Direction::Reversed
+             };
+             let key = self
+                 .model
+@@ -164,7 +169,7 @@ impl Builder {
+             )
+             .map_err(|kind| site.error(kind))?;
+             push(&mut uses, key).map_err(|kind| site.error(kind))?;
+-            push(&mut segments, Segment2::Line(line)).map_err(|kind| site.error(kind))?;
++            push(&mut segments, segment).map_err(|kind| site.error(kind))?;
+         }
+         let wire = self
+             .model
+diff --git a/crates/hyperbrep-io/src/step/advanced/mod.rs b/crates/hyperbrep-io/src/step/advanced/mod.rs
+index a7f09b2e1..b40ec92e1 100644
+--- a/crates/hyperbrep-io/src/step/advanced/mod.rs
++++ b/crates/hyperbrep-io/src/step/advanced/mod.rs
+@@ -1,9 +1,11 @@
+ //! Explicit STEP topology, with exact curve evidence admitted before publication.
++mod circles;
+ mod curves;
+ mod faces;
++mod surfaces;
+ 
+ use super::{
+-    Error, ErrorKind,
++    ContextUnits, Error, ErrorKind,
+     decode::{Args, Resolver, Site, reference},
+     error::{insert, push},
+     geometry::Plane,
+@@ -60,17 +62,20 @@ struct Edge {
+     key: EdgeKey,
+     start: u64,
+     end: u64,
++    circle: Option<circles::CircleEdge>,
+ }
+ #[derive(Clone)]
+-struct FacePlane {
++struct FaceSurface {
+     geometry: Plane,
+     key: SurfaceKey,
++    cylinder: Option<surfaces::Cylinder>,
+ }
+ struct Builder {
+     model: ModelBuilder,
+     by_vertex: HashMap<u64, Vertex>,
+     by_edge: HashMap<u64, Edge>,
+-    by_plane: HashMap<u64, FacePlane>,
++    by_surface: HashMap<u64, FaceSurface>,
++    angle_scale: Option<Real>,
+     vertices: Vec<(VertexSource, VertexKey)>,
+     edges: Vec<EdgeSource>,
+     faces: Vec<(u64, FaceKey)>,
+@@ -80,8 +85,9 @@ struct Builder {
+ pub(super) fn body(
+     resolver: &mut Resolver<'_, '_, '_>,
+     id: u64,
+-    scale: &Real,
++    units: &ContextUnits,
+ ) -> Result<ImportedBody, Error> {
++    let scale = &units.length.scale_to_si;
+     let mut args = resolver.simple(id, "MANIFOLD_SOLID_BREP")?;
+     let body_site = args.site;
+     let name = resolver.text(args.next()?, body_site)?;
+@@ -96,7 +102,11 @@ pub(super) fn body(
+         model: ModelBuilder::new(),
+         by_vertex: HashMap::new(),
+         by_edge: HashMap::new(),
+-        by_plane: HashMap::new(),
++        by_surface: HashMap::new(),
++        angle_scale: units
++            .plane_angle
++            .as_ref()
++            .map(|unit| unit.scale_to_si.clone()),
+         vertices: Vec::new(),
+         edges: Vec::new(),
+         faces: Vec::new(),
+@@ -180,32 +190,4 @@ impl Builder {
+         .map_err(|kind| site.error(kind))?;
+         Ok(vertex)
+     }
+-    fn plane(
+-        &mut self,
+-        resolver: &mut Resolver<'_, '_, '_>,
+-        id: u64,
+-        scale: &Real,
+-    ) -> Result<FacePlane, Error> {
+-        let entity = resolver.entity(id)?;
+-        let site = Site::entity(entity);
+-        let record = entity.components().next().expect("syntax component");
+-        if entity.is_complex() || record.name() != "PLANE" {
+-            return Err(site.error(ErrorKind::Unsupported("advanced support surface")));
+-        }
+-        if let Some(plane) = self.by_plane.get(&id) {
+-            return Ok(plane.clone());
+-        }
+-        let mut args = Args::new(record, site);
+-        resolver.text(args.next()?, site)?;
+-        let placement = args.reference()?;
+-        args.finish()?;
+-        let geometry = resolver.placement(placement, scale)?;
+-        let key = self
+-            .model
+-            .surface(geometry.surface.clone())
+-            .map_err(|e| site.error(ErrorKind::Build(e)))?;
+-        let plane = FacePlane { geometry, key };
+-        cache(&mut self.by_plane, id, plane.clone(), site)?;
+-        Ok(plane)
+-    }
+ }
+diff --git a/crates/hyperbrep-io/src/step/imported.rs b/crates/hyperbrep-io/src/step/imported.rs
+index 19c15e151..31eea37c9 100644
+--- a/crates/hyperbrep-io/src/step/imported.rs
++++ b/crates/hyperbrep-io/src/step/imported.rs
+@@ -79,15 +79,18 @@ pub(super) struct UseSource {
+     pub(super) source: EdgeUseSource,
+     pub(super) key: EdgeUseKey,
+ }
+-/// Exact affine map from the imported edge's canonical parameter `s` in `[0,1]`
+-/// to a source curve parameter: `start + (end - start) * s`.
++/// Exact affine map from the directed edge fraction `s` in `[0,1]` to a source
++/// curve parameter: `start + (end - start) * s`. For native parameter `t`,
++/// `s = (t - edge.domain.start) / (edge.domain.end - edge.domain.start)`.
++/// Native lines use `[0,1]`; native circles use an increasing angular interval.
+ #[derive(Clone, Debug)]
+ pub struct SourceCurveParameters {
+-    /// Source LINE, PCURVE or SURFACE_CURVE ID.
++    /// Source LINE, CIRCLE, PCURVE or SURFACE_CURVE ID.
+     pub curve: u64,
+-    /// Parameter at the original EDGE_CURVE start vertex.
++    /// Parameter at the original EDGE_CURVE start vertex, in source units.
+     pub start: Real,
+     /// Parameter at the original EDGE_CURVE end vertex; may be less than start.
++    /// A closed circle retains a distinct endpoint one exact source period away.
+     pub end: Real,
+ }
+ /// An explicit source EDGE_CURVE and its independently checked representations.
+diff --git a/crates/hyperbrep-io/src/step/representation.rs b/crates/hyperbrep-io/src/step/representation.rs
+index 9aec241ab..77c9e9966 100644
+--- a/crates/hyperbrep-io/src/step/representation.rs
++++ b/crates/hyperbrep-io/src/step/representation.rs
+@@ -66,8 +66,7 @@ pub(super) fn import(
+                 push(&mut bodies, body).map_err(|kind| site.error(kind))?;
+             }
+             "MANIFOLD_SOLID_BREP" if advanced => {
+-                let body =
+-                    super::advanced::body(&mut resolver, item_id, &units.length.scale_to_si)?;
++                let body = super::advanced::body(&mut resolver, item_id, &units)?;
+                 push(&mut bodies, body).map_err(|kind| site.error(kind))?;
+             }
+             "AXIS2_PLACEMENT_3D" => {
+diff --git a/crates/hyperreal/src/computable/node/algebra.rs b/crates/hyperreal/src/computable/node/algebra.rs
+index 986ccec10..3a5bc0d01 100644
+--- a/crates/hyperreal/src/computable/node/algebra.rs
++++ b/crates/hyperreal/src/computable/node/algebra.rs
+@@ -6,6 +6,128 @@ struct PiAtanLinearForm {
+     argument: Option<Computable>,
+ }
+ 
++#[cfg(test)]
++mod quarter_turn_atan_tests {
++    use super::*;
++
++    fn raw(approximation: Approximation) -> Computable {
++        Computable {
++            internal: Arc::new(Node::new(
++                approximation,
++                BoundCache::Invalid,
++                ExactSignCache::Unknown,
++            )),
++            signal: None,
++        }
++    }
++
++    #[test]
++    fn reconstructed_periodic_interpolation_retains_exact_trigonometry() {
++        // Splitting and replaying a periodic pcurve retains this expression:
++        // q = (pi - 2*pi)/(2*pi), a*(1+q) - (a-2*pi)*q = a-pi.
++        // Build its uncached representation, without constructor reduction.
++        let a = Computable::rational(Rational::fraction(4, 3).unwrap()).atan();
++        let pi = Computable::pi();
++        let q = raw(Approximation::Multiply(
++            raw(Approximation::Add(pi.clone(), pi.clone().shift_left(1).negate())),
++            Computable::pi_inverse_constant().shift_right(1),
++        ));
++        assert!(q.exact_rational().is_none());
++        let angle = raw(Approximation::Add(
++            raw(Approximation::Multiply(
++                a.clone(),
++                raw(Approximation::Add(Computable::one(), q.clone())),
++            )),
++            raw(Approximation::Multiply(
++                raw(Approximation::Add(a, pi.shift_left(1).negate())),
++                q.clone(),
++            )).negate(),
++        ));
++        assert!(angle.cached().is_none());
++        assert_eq!(angle.clone().sin().exact_rational(), Some(Rational::fraction(-4, 5).unwrap()));
++        assert_eq!(angle.clone().cos().exact_rational(), Some(Rational::fraction(-3, 5).unwrap()));
++        assert!(angle.cached().is_none());
++        assert!(q.cached().is_none());
++        #[cfg(feature = "serde")]
++        {
++            let serialized = serde_json::to_string(&angle).unwrap();
++            let replay: Computable = serde_json::from_str(&serialized).unwrap();
++            assert_eq!(replay.clone().sin().exact_rational(), Some(Rational::fraction(-4, 5).unwrap()));
++            assert_eq!(replay.clone().cos().exact_rational(), Some(Rational::fraction(-3, 5).unwrap()));
++            assert!(replay.cached().is_none());
++        }
++    }
++
++    #[test]
++    fn direct_computable_quarter_turns_keep_exact_rational_coordinates() {
++        for numerator in [-4, 4] {
++            let argument = Computable::rational(Rational::fraction(numerator, 3).unwrap());
++            for turns in -9_i64..=9 {
++                let angle = argument.clone().atan().add(
++                    Computable::pi().multiply_rational(Rational::fraction(turns, 2).unwrap()),
++                );
++                let s = Rational::fraction(numerator, 5).unwrap();
++                let c = Rational::fraction(3, 5).unwrap();
++                let (s, c) = match turns.rem_euclid(4) {
++                    0 => (s, c),
++                    1 => (c, -s),
++                    2 => (-s, -c),
++                    _ => (-c, s),
++                };
++                assert!(angle.cached().is_none());
++                assert_eq!(angle.clone().sin().exact_rational(), Some(s));
++                assert_eq!(angle.clone().cos().exact_rational(), Some(c));
++                assert!(angle.cached().is_none());
++            }
++        }
++    }
++
++    #[test]
++    fn quarter_turn_recognizer_does_not_admit_other_angles_or_discard_offsets() {
++        let atan = Computable::rational(Rational::fraction(4, 3).unwrap()).atan();
++        let quarter = atan.clone().add(Computable::pi().shift_right(1));
++        for value in [
++            atan.clone().add(Computable::pi().multiply_rational(Rational::fraction(1, 3).unwrap())),
++            quarter.clone().add(Computable::rational(Rational::fraction(1, 1_000_000_000_000).unwrap())),
++            quarter.shift_left(1),
++            raw(Approximation::Multiply(atan.clone(), Computable::sqrt_rational(Rational::new(2)))),
++            atan.add(Computable::rational(Rational::fraction(5, 12).unwrap()).atan()),
++        ] {
++            assert!(value.cached().is_none());
++            assert!(value.quarter_turn_plus_or_minus_atan_argument().is_none());
++            assert!(value.cached().is_none());
++        }
++    }
++
++    #[test]
++    fn unrecognized_or_exhausted_coefficients_do_not_invent_quarter_turns() {
++        let atan = Computable::rational(Rational::fraction(4, 3).unwrap()).atan();
++        let ratio = raw(Approximation::Multiply(
++            Computable::pi(),
++            Computable::pi_inverse_constant().shift_right(1),
++        ));
++        let tiny = Computable::rational(Rational::fraction(1, 1_000_000_000_000).unwrap());
++        let off_quarter = raw(Approximation::Add(
++            atan.clone(),
++            raw(Approximation::Multiply(
++                raw(Approximation::Add(ratio.clone(), tiny)),
++                Computable::pi(),
++            )),
++        ));
++        assert!(off_quarter.quarter_turn_plus_or_minus_atan_argument().is_none());
++        assert!(off_quarter.cached().is_none());
++        let quarter = raw(Approximation::Add(
++            atan,
++            raw(Approximation::Multiply(ratio, Computable::pi())),
++        ));
++        assert!(quarter.pi_atan_linear_form(0).is_none());
++        assert!(quarter.pi_atan_linear_form(1).is_none());
++        // A smaller unsuccessful search must not poison the later certificate.
++        assert!(quarter.quarter_turn_plus_or_minus_atan_argument().is_some());
++        assert!(quarter.cached().is_none());
++    }
++}
++
+ #[cfg(test)]
+ mod pi_laurent_compaction_node_tests {
+     use super::*;
+@@ -692,6 +814,16 @@ impl Computable {
+                 if let Some(scale) = right.exact_rational() {
+                     return Some(left.pi_atan_linear_form(budget - 1)?.scaled(scale));
+                 }
++                // A reconstructed parameter map can retain a rational scale
++                // as a Laurent expression in pi, e.g. (pi-2*pi)/(2*pi).
++                // Reuse its bounded exact certificate after the leaf fast
++                // paths; do not refine or broaden leaf-only exact_rational.
++                if let Some(scale) = left.bounded_laurent_rational(budget - 1) {
++                    return Some(right.pi_atan_linear_form(budget - 1)?.scaled(scale));
++                }
++                if let Some(scale) = right.bounded_laurent_rational(budget - 1) {
++                    return Some(left.pi_atan_linear_form(budget - 1)?.scaled(scale));
++                }
+                 None
+             }
+             _ => None,
+@@ -714,16 +846,35 @@ impl Computable {
+         (argument.exact_sign()? == orientation).then_some((orientation, argument))
+     }
+ 
+-    pub(crate) fn integer_pi_plus_or_minus_atan_argument(
++    pub(crate) fn quarter_turn_plus_or_minus_atan_argument(
+         &self,
+-    ) -> Option<(Sign, Sign, Computable)> {
++    ) -> Option<(bool, Sign, Sign, Computable)> {
+         let form = self.pi_atan_linear_form(64)?;
+         if form.constant.sign() != Sign::NoSign
+             || (!form.atan.is_one() && !form.atan.is_minus_one())
+         {
+             return None;
+         }
+-        let multiple = form.pi.integer_magnitude()?;
++        // Keep the integer-pi path free of a new rational scaling step. Odd multiples
++        // of pi/2 exchange the sine and cosine numerators; their signs follow
++        // the exact quarter-turn rotation, without refining either angle.
++        let Some(multiple) = form.pi.integer_magnitude() else {
++            let doubled = &form.pi * Rational::new(2);
++            let quarter_turns = doubled.integer_magnitude()?;
++            let sine_sign = if quarter_turns.bit(1) ^ (form.pi.sign() == Sign::Minus) {
++                Sign::Minus
++            } else {
++                Sign::Plus
++            };
++            let cosine_sign = if form.atan.is_minus_one() {
++                sine_sign
++            } else if sine_sign == Sign::Plus {
++                Sign::Minus
++            } else {
++                Sign::Plus
++            };
++            return Some((true, sine_sign, cosine_sign, form.argument?));
++        };
+         let cosine_sign = if multiple.bit(0) {
+             Sign::Minus
+         } else {
+@@ -738,7 +889,7 @@ impl Computable {
+         } else {
+             cosine_sign
+         };
+-        Some((sine_sign, cosine_sign, form.argument?))
++        Some((false, sine_sign, cosine_sign, form.argument?))
+     }
+ 
+     fn pi_acos_linear_form(&self, budget: usize) -> Option<PiAcosLinearForm> {
+diff --git a/crates/hyperreal/src/computable/node/exp_trig.rs b/crates/hyperreal/src/computable/node/exp_trig.rs
+index c0e4d28f1..41933c9a7 100644
+--- a/crates/hyperreal/src/computable/node/exp_trig.rs
++++ b/crates/hyperreal/src/computable/node/exp_trig.rs
+@@ -421,7 +421,7 @@ impl Computable {
+         let quadrant =
+             ((&multiplier % signed::FOUR.deref()) + signed::FOUR.deref()) % signed::FOUR.deref();
+ 
+-        if let Some((sine, cosine)) = reduced.integer_pi_atan_sin_cos() {
++        if let Some((sine, cosine)) = reduced.quarter_turn_atan_sin_cos() {
+             crate::trace_dispatch!("computable", "cos", "reduced-integer-pi-atan-rewrite");
+             return if quadrant.is_zero() {
+                 cosine
+@@ -452,7 +452,7 @@ impl Computable {
+         let quadrant =
+             ((&multiplier % signed::FOUR.deref()) + signed::FOUR.deref()) % signed::FOUR.deref();
+ 
+-        if let Some((sine, cosine)) = reduced.integer_pi_atan_sin_cos() {
++        if let Some((sine, cosine)) = reduced.quarter_turn_atan_sin_cos() {
+             crate::trace_dispatch!("computable", "sin", "reduced-integer-pi-atan-rewrite");
+             return if quadrant.is_zero() {
+                 sine
+@@ -536,11 +536,16 @@ impl Computable {
+             .sqrt()
+     }
+ 
+-    fn integer_pi_atan_sin_cos(&self) -> Option<(Computable, Computable)> {
+-        let (sine_sign, cosine_sign, argument) =
+-            self.integer_pi_plus_or_minus_atan_argument()?;
++    fn quarter_turn_atan_sin_cos(&self) -> Option<(Computable, Computable)> {
++        let (swap, sine_sign, cosine_sign, argument) =
++            self.quarter_turn_plus_or_minus_atan_argument()?;
+         let inverse_hypotenuse = Self::unit_hypotenuse(&argument).inverse();
+         let sine = argument.multiply(inverse_hypotenuse.clone());
++        let (sine, cosine) = if swap {
++            (inverse_hypotenuse, sine)
++        } else {
++            (sine, inverse_hypotenuse)
++        };
+         Some((
+             if sine_sign == Sign::Minus {
+                 sine.negate()
+@@ -548,9 +553,9 @@ impl Computable {
+                 sine
+             },
+             if cosine_sign == Sign::Minus {
+-                inverse_hypotenuse.negate()
++                cosine.negate()
+             } else {
+-                inverse_hypotenuse
++                cosine
+             },
+         ))
+     }
+@@ -569,8 +574,8 @@ impl Computable {
+             crate::trace_dispatch!("computable", "cos", "atan-inverse-rewrite");
+             return Self::unit_hypotenuse(&argument).inverse();
+         }
+-        if let Some((_, cosine)) = self.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "cos", "integer-pi-atan-rewrite");
++        if let Some((_, cosine)) = self.quarter_turn_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "cos", "quarter-turn-atan-rewrite");
+             return cosine;
+         }
+         if let Some(argument) = self.asin_argument() {
+@@ -670,8 +675,8 @@ impl Computable {
+                 .clone()
+                 .multiply(Self::unit_hypotenuse(&argument).inverse());
+         }
+-        if let Some((sine, _)) = self.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "sin", "integer-pi-atan-rewrite");
++        if let Some((sine, _)) = self.quarter_turn_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "sin", "quarter-turn-atan-rewrite");
+             return sine;
+         }
+         if let Some(argument) = self.asin_argument() {
+diff --git a/crates/hyperreal/src/computable/node/tests.rs b/crates/hyperreal/src/computable/node/tests.rs
+index 2cb83c5da..6086f5c43 100644
+--- a/crates/hyperreal/src/computable/node/tests.rs
++++ b/crates/hyperreal/src/computable/node/tests.rs
+@@ -3693,18 +3693,20 @@ fn inverse_atan_linear_sign_includes_the_argument_sign() {
+         );
+         let atan = argument.clone().atan();
+         let angle = atan.negate().add(Computable::pi());
+-        let (_, _, retained) = angle
+-            .integer_pi_plus_or_minus_atan_argument()
++        let (swap, _, _, retained) = angle
++            .quarter_turn_plus_or_minus_atan_argument()
+             .expect("pi minus atan must retain its inverse-trig argument");
++        assert!(!swap);
+         assert!(Computable::internal_structural_eq(&retained, &argument));
+ 
+         let half_pi = Computable::pi().shift_right(1);
+         let reduced = angle
+             .add(half_pi.clone().negate())
+             .add(half_pi.negate());
+-        let (_, _, retained) = reduced
+-            .integer_pi_plus_or_minus_atan_argument()
++        let (swap, _, _, retained) = reduced
++            .quarter_turn_plus_or_minus_atan_argument()
+             .expect("nested half-pi cancellation must retain its inverse-trig argument");
++        assert!(!swap);
+         assert!(Computable::internal_structural_eq(&retained, &argument));
+         assert!(Computable::internal_structural_eq(
+             &reduced.clone().sin(),
+diff --git a/crates/hyperreal/src/real/arithmetic/elementary_functions.rs b/crates/hyperreal/src/real/arithmetic/elementary_functions.rs
+index 5dd715128..65608b8e3 100644
+--- a/crates/hyperreal/src/real/arithmetic/elementary_functions.rs
++++ b/crates/hyperreal/src/real/arithmetic/elementary_functions.rs
+@@ -2321,12 +2321,12 @@ impl Real {
+         })
+     }
+ 
+-    fn retained_integer_pi_plus_or_minus_atan_argument(
++    fn retained_quarter_turn_plus_or_minus_atan_argument(
+         &self,
+-    ) -> Option<(Sign, Sign, Real)> {
+-        let (sine_sign, cosine_sign, argument) = self
++    ) -> Option<(bool, Sign, Sign, Real)> {
++        let (swap, sine_sign, cosine_sign, argument) = self
+             .fold_ref()
+-            .integer_pi_plus_or_minus_atan_argument()?;
++            .quarter_turn_plus_or_minus_atan_argument()?;
+         let argument = if let Some(rational) = argument.exact_rational() {
+             Self::new(rational)
+         } else if let Some((scale, radicand)) = argument.exact_pure_quadratic_surd() {
+@@ -2337,7 +2337,7 @@ impl Real {
+         } else {
+             Self::irrational_from_computable(argument)
+         };
+-        Some((sine_sign, cosine_sign, argument))
++        Some((swap, sine_sign, cosine_sign, argument))
+     }
+ 
+     fn retained_signed_half_pi_minus_atan_argument(&self) -> Option<(Sign, Real)> {
+@@ -2388,14 +2388,15 @@ impl Real {
+             return (&argument / denominator)
+                 .expect("positive inverse-trig normalization is nonzero");
+         }
+-        if let Some((sine_sign, _, argument)) =
+-            self.retained_integer_pi_plus_or_minus_atan_argument()
++        if let Some((swap, sine_sign, _, argument)) =
++            self.retained_quarter_turn_plus_or_minus_atan_argument()
+         {
+-            crate::trace_dispatch!("real", "sin", "integer-pi-atan-rewrite");
++            crate::trace_dispatch!("real", "sin", "quarter-turn-atan-rewrite");
+             let denominator = (Self::one() + &argument * &argument)
+                 .sqrt()
+                 .expect("one plus an exact atan argument square is positive");
+-            let value = (&argument / denominator)
++            let numerator = if swap { Self::one() } else { argument };
++            let value = (numerator / denominator)
+                 .expect("positive inverse-trig normalization is nonzero");
+             return if sine_sign == Sign::Minus {
+                 -value
+@@ -2486,14 +2487,15 @@ impl Real {
+             return (Self::one() / denominator)
+                 .expect("positive inverse-trig normalization is nonzero");
+         }
+-        if let Some((_, cosine_sign, argument)) =
+-            self.retained_integer_pi_plus_or_minus_atan_argument()
++        if let Some((swap, _, cosine_sign, argument)) =
++            self.retained_quarter_turn_plus_or_minus_atan_argument()
+         {
+-            crate::trace_dispatch!("real", "cos", "integer-pi-atan-rewrite");
++            crate::trace_dispatch!("real", "cos", "quarter-turn-atan-rewrite");
+             let denominator = (Self::one() + &argument * &argument)
+                 .sqrt()
+                 .expect("one plus an exact atan argument square is positive");
+-            let value = (Self::one() / denominator)
++            let numerator = if swap { argument } else { Self::one() };
++            let value = (numerator / denominator)
+                 .expect("positive inverse-trig normalization is nonzero");
+             return if cosine_sign == Sign::Minus {
+                 -value
+@@ -2736,11 +2738,11 @@ impl Real {
+             crate::trace_dispatch!("real", "cot", "half-pi-minus-atan-rewrite");
+             return Ok(argument);
+         }
+-        if let Some((sine_sign, cosine_sign, argument)) =
+-            self.retained_integer_pi_plus_or_minus_atan_argument()
++        if let Some((swap, sine_sign, cosine_sign, argument)) =
++            self.retained_quarter_turn_plus_or_minus_atan_argument()
+         {
+-            crate::trace_dispatch!("real", "cot", "integer-pi-atan-rewrite");
+-            let inverse = argument.inverse()?;
++            crate::trace_dispatch!("real", "cot", "quarter-turn-atan-rewrite");
++            let inverse = if swap { argument } else { argument.inverse()? };
+             return Ok(if sine_sign == cosine_sign {
+                 inverse
+             } else {
