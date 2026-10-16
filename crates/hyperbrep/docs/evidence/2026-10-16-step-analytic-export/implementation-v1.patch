@@ -1,0 +1,1426 @@
+diff --git a/crates/hyperbrep-io/README.md b/crates/hyperbrep-io/README.md
+index 6e9ef7d60..c2ee612df 100644
+--- a/crates/hyperbrep-io/README.md
++++ b/crates/hyperbrep-io/README.md
+@@ -118,13 +118,13 @@ exactly from directed boundaries; original pcurves/history require a native arch
+ 
+ ```rust
+ use hyperbrep::{builder, OperationContext, Point3, Real, WorkBudget};
+-use hyperbrep_io::step::{FacetedBody, StepWriteOptions, write_faceted};
++use hyperbrep_io::step::{StepBody, StepWriteOptions, write_faceted};
+ 
+ // Native exchange coordinates are metres. An eighth is exactly decimal-representable.
+ let eighth = (Real::one() / Real::from(8))?;
+ let bodies = builder::cuboid(Point3::origin(),
+     Point3::new(eighth, Real::one(), Real::one()))?;
+-let input = FacetedBody { solid: bodies.bodies().next().unwrap(), name: "Block" };
++let input = StepBody { solid: bodies.bodies().next().unwrap(), name: "Block" };
+ let context = OperationContext::strict(WorkBudget { refinements: 0, promotions: 0 });
+ let options = StepWriteOptions::new("block.step", "2026-10-15T00:00:00");
+ let artifact = write_faceted(&[input], &options, &context).result??;
+diff --git a/crates/hyperbrep-io/benches/export.rs b/crates/hyperbrep-io/benches/export.rs
+index dab786227..a0bb73346 100644
+--- a/crates/hyperbrep-io/benches/export.rs
++++ b/crates/hyperbrep-io/benches/export.rs
+@@ -1,5 +1,5 @@
+ use hyperbrep::{OperationContext, Point2, Point3, Real, WorkBudget, builder};
+-use hyperbrep_io::step::{FacetedBody, StepWriteOptions, WriteErrorKind, write_faceted};
++use hyperbrep_io::step::{StepBody, StepWriteOptions, WriteErrorKind, write_faceted};
+ use std::alloc::{GlobalAlloc, Layout, System};
+ use std::hint::black_box;
+ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+@@ -67,7 +67,7 @@ fn digest(bytes: &[u8]) -> u64 {
+ }
+ fn export(
+     name: &str,
+-    inputs: &[FacetedBody<'_>],
++    inputs: &[StepBody<'_>],
+     expected: (usize, usize, usize, usize),
+     iterations: usize,
+ ) {
+@@ -114,7 +114,7 @@ fn main() {
+     .unwrap();
+     let solid = box_body.bodies().next().unwrap();
+     assert_eq!(solid.volume().unwrap(), ratio(24, 1_000_000_000));
+-    let input = FacetedBody { solid, name: "box" };
++    let input = StepBody { solid, name: "box" };
+     export("export/box:", &[input], (8, 6, 6, 24), 1000);
+     let profile = |points: &[(i32, i32)]| {
+         points
+@@ -133,7 +133,7 @@ fn main() {
+     assert_eq!(solid.volume().unwrap(), ratio(20, 1_000_000_000));
+     export(
+         "export/hole:",
+-        &[FacetedBody {
++        &[StepBody {
+             solid,
+             name: "hole",
+         }],
+@@ -150,7 +150,7 @@ fn main() {
+     assert_eq!(solid.volume().unwrap(), ratio(10, 1_000_000_000));
+     export(
+         "export/concave:",
+-        &[FacetedBody {
++        &[StepBody {
+             solid,
+             name: "concave",
+         }],
+@@ -166,7 +166,7 @@ fn main() {
+         .unwrap();
+     export(
+         "export/split:",
+-        &[FacetedBody {
++        &[StepBody {
+             solid: split.model().solids().next().unwrap(),
+             name: "split",
+         }],
+@@ -179,7 +179,7 @@ fn main() {
+         Point3::new(ratio(1, 3), Real::one(), Real::one()),
+     )
+     .unwrap();
+-    let inputs = [FacetedBody {
++    let inputs = [StepBody {
+         solid: third.bodies().next().unwrap(),
+         name: "third",
+     }];
+diff --git a/crates/hyperbrep-io/docs/STEP_MAPPING.md b/crates/hyperbrep-io/docs/STEP_MAPPING.md
+index f3c02c490..3b22769b0 100644
+--- a/crates/hyperbrep-io/docs/STEP_MAPPING.md
++++ b/crates/hyperbrep-io/docs/STEP_MAPPING.md
+@@ -293,7 +293,7 @@ in an actual WASM runtime; this is not an arbitrary-hostile-input safety proof.
+ 
+ ## Exact native faceted export
+ 
+-`FacetedBody` explicitly selects a validated native `SolidRef` and output name.
++`StepBody` explicitly selects a validated native `SolidRef` and output name.
+ Native coordinates are interpreted as metres. `StepWriteOptions` supplies a
+ positive rational metres-per-output-unit factor, unit name, file/product metadata,
+ caller-authored timestamp and `WriteLimits`. The writer emits `AUTOMOTIVE_DESIGN`
+diff --git a/crates/hyperbrep-io/examples/advanced_step.rs b/crates/hyperbrep-io/examples/advanced_step.rs
+index 5645ccd6a..e96f92433 100644
+--- a/crates/hyperbrep-io/examples/advanced_step.rs
++++ b/crates/hyperbrep-io/examples/advanced_step.rs
+@@ -3,7 +3,7 @@
+ //! these planar line boundaries retain their geometry without tessellation.
+ use hyperbrep::{Matrix4, OperationContext, Real, SolidRef, WorkBudget};
+ use hyperbrep_io::step::{
+-    FacetedBody, ImportLimits, StepFile, StepReadOptions, StepWriteOptions, WriteLengthUnit,
++    ImportLimits, StepBody, StepFile, StepReadOptions, StepWriteOptions, WriteLengthUnit,
+     write_faceted,
+ };
+ use std::{error::Error, path::Path};
+@@ -22,7 +22,7 @@ fn save(directory: &Path, name: &str, solid: SolidRef<'_>) -> Result<(), Box<dyn
+         metres_per_unit: (Real::one() / Real::from(1000))?,
+     };
+     options.representation_name = name;
+-    let output = write_faceted(&[FacetedBody { solid, name }], &options, &context())
++    let output = write_faceted(&[StepBody { solid, name }], &options, &context())
+         .result
+         .map_err(|error| format!("solver budget: {error:?}"))??;
+     let file = StepFile::read(output.text().as_bytes(), &StepReadOptions::default())?;
+diff --git a/crates/hyperbrep-io/examples/faceted_step.rs b/crates/hyperbrep-io/examples/faceted_step.rs
+index 068e93d31..c36af3c12 100644
+--- a/crates/hyperbrep-io/examples/faceted_step.rs
++++ b/crates/hyperbrep-io/examples/faceted_step.rs
+@@ -1,7 +1,7 @@
+ //! Write native-authored, edited and transformed geometry for independent readers.
+ //! Run with an output directory; every coordinate is authored in exact metres.
+ use hyperbrep::{Matrix4, OperationContext, Point2, Point3, Real, SolidRef, WorkBudget, builder};
+-use hyperbrep_io::step::{FacetedBody, StepWriteOptions, WriteLengthUnit, write_faceted};
++use hyperbrep_io::step::{StepBody, StepWriteOptions, WriteLengthUnit, write_faceted};
+ use std::{error::Error, path::Path};
+ 
+ fn ratio(n: i32, d: i32) -> Real {
+@@ -34,7 +34,7 @@ fn save(
+     options.representation_name = name;
+     let inputs = solids
+         .iter()
+-        .map(|&solid| FacetedBody { solid, name })
++        .map(|&solid| StepBody { solid, name })
+         .collect::<Vec<_>>();
+     let output = write_faceted(&inputs, &options, &context)
+         .result
+diff --git a/crates/hyperbrep-io/src/step/mod.rs b/crates/hyperbrep-io/src/step/mod.rs
+index e9ac1efc8..3ca94fb30 100644
+--- a/crates/hyperbrep-io/src/step/mod.rs
++++ b/crates/hyperbrep-io/src/step/mod.rs
+@@ -25,9 +25,11 @@ pub use imported::{
+ };
+ pub use units::{ContextUnits, Uncertainty, Unit, UnitKind};
+ pub use write::{
+-    FacetedBody, FacetedStep, StepWriteOptions, WriteError, WriteErrorKind, WriteLengthUnit,
+-    WriteLimits, WriteResource, WrittenBody, WrittenEdgeUse, WrittenFace, WrittenVertex,
+-    WrittenWire, write_faceted,
++    AdvancedStep, FacetedStep, StepBody, StepWriteOptions, WriteError, WriteErrorKind,
++    WriteLengthUnit, WriteLimits, WriteResource, WrittenAdvancedBody, WrittenAdvancedEdge,
++    WrittenAdvancedEdgeUse, WrittenAdvancedFace, WrittenAdvancedVertex, WrittenAdvancedWire,
++    WrittenBody, WrittenEdgeUse, WrittenFace, WrittenSurfaceParameters, WrittenVertex, WrittenWire,
++    write_advanced, write_faceted,
+ };
+ 
+ use crate::part21::{self, Exchange, NumberLimits, ReadLimits};
+diff --git a/crates/hyperbrep-io/src/step/write/error.rs b/crates/hyperbrep-io/src/step/write/error.rs
+index f727f6818..c72fcfa85 100644
+--- a/crates/hyperbrep-io/src/step/write/error.rs
++++ b/crates/hyperbrep-io/src/step/write/error.rs
+@@ -1,7 +1,7 @@
+ use hyperbrep::{Curve3Kind, EntityKind, SurfaceKind};
+ use std::fmt;
+ 
+-/// Resource charged by exact faceted STEP writing.
++/// Resource charged by exact selected STEP writing.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum WriteResource {
+     /// Complete emitted UTF-8/ASCII bytes.
+@@ -29,11 +29,11 @@ pub enum WriteErrorKind {
+     NonTerminatingDecimal,
+     /// A vertex has a retained selected image without materialized coordinates.
+     UnmaterializedPoint,
+-    /// The source surface is outside this faceted writer's exact mapping.
++    /// The source surface is outside the selected writer's exact mapping.
+     UnsupportedSurface(SurfaceKind),
+-    /// The spatial edge is outside the finite straight-line mapping.
++    /// The spatial edge is outside the selected writer's exact mapping.
+     UnsupportedCurve(Curve3Kind),
+-    /// Faceted solids with cavity shells require a separate STEP entity mapping.
++    /// Solids with cavity shells require a separate STEP entity mapping.
+     VoidShells,
+     /// Invalid selection, unit declaration or boundary invariant.
+     Invalid(&'static str),
+@@ -50,6 +50,8 @@ pub enum WriteErrorKind {
+     Allocation,
+     /// Exact scalar arithmetic failed.
+     Numeric(hyperreal::Problem),
++    /// Exact native geometry evaluation or a strict predicate was unresolved.
++    Geometry(hyperbrep::GeometryError),
+ }
+ 
+ /// Error scoped to the caller's selected body and its native model.
+diff --git a/crates/hyperbrep-io/src/step/write/faceted.rs b/crates/hyperbrep-io/src/step/write/faceted.rs
+index 7d28705f8..e45daae08 100644
+--- a/crates/hyperbrep-io/src/step/write/faceted.rs
++++ b/crates/hyperbrep-io/src/step/write/faceted.rs
+@@ -1,5 +1,5 @@
+ use super::{
+-    FacetedBody, FacetedStep, StepWriteOptions, WriteError, WriteErrorKind, WrittenBody,
++    FacetedStep, StepBody, StepWriteOptions, WriteError, WriteErrorKind, WrittenBody,
+     WrittenEdgeUse, WrittenFace, WrittenVertex, WrittenWire,
+     error::{Site, push},
+     metadata, number,
+@@ -12,7 +12,7 @@ use hyperbrep::{
+ use std::collections::HashMap;
+ 
+ pub(super) fn write<'a>(
+-    sources: &[FacetedBody<'a>],
++    sources: &[StepBody<'a>],
+     options: &StepWriteOptions<'_>,
+ ) -> Result<FacetedStep<'a>, WriteError> {
+     let mut out = Output::new(options.limits);
+@@ -21,7 +21,7 @@ pub(super) fn write<'a>(
+             .site
+             .error(WriteErrorKind::Invalid("empty solid selection")));
+     }
+-    metadata::header(&mut out, options)?;
++    metadata::header(&mut out, options, "Exact selected faceted geometry")?;
+     let context = metadata::context(&mut out, options)?;
+     let mut bodies = Vec::new();
+     let mut items = Vec::new();
+@@ -61,7 +61,7 @@ struct Body<'a> {
+ }
+ fn body<'a>(
+     out: &mut Output,
+-    source: FacetedBody<'a>,
++    source: StepBody<'a>,
+     index: usize,
+     scale: &Real,
+ ) -> Result<WrittenBody<'a>, WriteError> {
+diff --git a/crates/hyperbrep-io/src/step/write/metadata.rs b/crates/hyperbrep-io/src/step/write/metadata.rs
+index 19798b061..d9ef34a27 100644
+--- a/crates/hyperbrep-io/src/step/write/metadata.rs
++++ b/crates/hyperbrep-io/src/step/write/metadata.rs
+@@ -1,7 +1,13 @@
+ use super::{StepWriteOptions, WriteError, WriteErrorKind, number, output::Output};
+ 
+-pub(super) fn header(out: &mut Output, options: &StepWriteOptions<'_>) -> Result<(), WriteError> {
+-    out.put("ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('Exact selected faceted geometry'),'2;1');\nFILE_NAME(")?;
++pub(super) fn header(
++    out: &mut Output,
++    options: &StepWriteOptions<'_>,
++    description: &str,
++) -> Result<(), WriteError> {
++    out.put("ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((")?;
++    out.string(description)?;
++    out.put("),'2;1');\nFILE_NAME(")?;
+     out.string(options.file_name)?;
+     out.put(",")?;
+     out.string(options.timestamp)?;
+diff --git a/crates/hyperbrep-io/src/step/write/mod.rs b/crates/hyperbrep-io/src/step/write/mod.rs
+index 192f49ebc..c55148563 100644
+--- a/crates/hyperbrep-io/src/step/write/mod.rs
++++ b/crates/hyperbrep-io/src/step/write/mod.rs
+@@ -1,4 +1,5 @@
+-//! Exact faceted STEP output; no implicit decimal rounding or geometry fitting.
++//! Exact selected STEP output; no implicit decimal rounding or geometry fitting.
++mod advanced;
+ mod error;
+ mod faceted;
+ mod metadata;
+@@ -7,10 +8,14 @@ mod output;
+ mod types;
+ 
+ use crate::part21::NumberLimits;
++pub use advanced::{
++    AdvancedStep, WrittenAdvancedBody, WrittenAdvancedEdge, WrittenAdvancedEdgeUse,
++    WrittenAdvancedFace, WrittenAdvancedVertex, WrittenAdvancedWire, WrittenSurfaceParameters,
++};
+ pub use error::{WriteError, WriteErrorKind, WriteResource};
+ use hyperbrep::{BudgetOutcome, OperationContext, Real};
+ pub use types::{
+-    FacetedBody, FacetedStep, WrittenBody, WrittenEdgeUse, WrittenFace, WrittenVertex, WrittenWire,
++    FacetedStep, StepBody, WrittenBody, WrittenEdgeUse, WrittenFace, WrittenVertex, WrittenWire,
+ };
+ 
+ /// Output units with an explicit exact scale; the name never overrides the scale.
+@@ -48,7 +53,7 @@ impl Default for WriteLimits {
+         }
+     }
+ }
+-/// Metadata, units and allowances for the AP214 common faceted subset.
++/// Metadata, units and allowances for the selected AP214 common geometry encodings.
+ ///
+ /// The timestamp is caller-supplied text; no current time or process identity
+ /// enters deterministic output. Calendar validity is not inferred.
+@@ -95,9 +100,24 @@ impl<'a> StepWriteOptions<'a> {
+ /// original model-bound sources. Cavity shells and curved families remain typed
+ /// blockers. No partial artifact escapes an error or exhausted solver scope.
+ pub fn write_faceted<'a>(
+-    bodies: &[FacetedBody<'a>],
++    bodies: &[StepBody<'a>],
+     options: &StepWriteOptions<'_>,
+     context: &OperationContext,
+ ) -> BudgetOutcome<Result<FacetedStep<'a>, WriteError>> {
+     context.evaluate(|| faceted::write(bodies, options))
+ }
++
++/// Writes selected planar/cylindrical solids with explicit line/circle topology.
++///
++/// Every emitted scalar is exact. Other carriers, cavity shells and values
++/// without an admitted finite decimal encoding fail with source diagnostics.
++/// Native curve and surface parameters map to the output through the returned
++/// report; face-local pcurves, unused geometry and history remain native data.
++/// No partial artifact escapes a failure or exhausted solver scope.
++pub fn write_advanced<'a>(
++    bodies: &[StepBody<'a>],
++    options: &StepWriteOptions<'_>,
++    context: &OperationContext,
++) -> BudgetOutcome<Result<AdvancedStep<'a>, WriteError>> {
++    context.evaluate(|| advanced::write(bodies, options))
++}
+diff --git a/crates/hyperbrep-io/src/step/write/types.rs b/crates/hyperbrep-io/src/step/write/types.rs
+index 070cb260a..0f6662af5 100644
+--- a/crates/hyperbrep-io/src/step/write/types.rs
++++ b/crates/hyperbrep-io/src/step/write/types.rs
+@@ -2,10 +2,10 @@ use hyperbrep::{EdgeUseRef, FaceRef, SolidRef, VertexRef, WireRef};
+ 
+ /// One explicitly selected native solid occurrence, with its output name.
+ #[derive(Clone, Copy, Debug)]
+-pub struct FacetedBody<'a> {
++pub struct StepBody<'a> {
+     /// Source body; coordinates are interpreted as metres.
+     pub solid: SolidRef<'a>,
+-    /// Name encoded in the output FACETED_BREP entity.
++    /// Name encoded in the selected output solid entity.
+     pub name: &'a str,
+ }
+ /// A native vertex and its exact CARTESIAN_POINT encoding.
+diff --git a/crates/hyperbrep-io/tests/step_write.rs b/crates/hyperbrep-io/tests/step_write.rs
+index c175f2d83..c511f9357 100644
+--- a/crates/hyperbrep-io/tests/step_write.rs
++++ b/crates/hyperbrep-io/tests/step_write.rs
+@@ -1,6 +1,6 @@
+ use hyperbrep::{OperationContext, Point3, Real, WorkBudget, builder};
+ use hyperbrep_io::step::{
+-    FacetedBody, ImportLimits, StepFile, StepReadOptions, StepWriteOptions, WriteErrorKind,
++    ImportLimits, StepBody, StepFile, StepReadOptions, StepWriteOptions, WriteErrorKind,
+     WriteLengthUnit, WriteLimits, WriteResource, write_faceted,
+ };
+ 
+@@ -31,7 +31,7 @@ fn native_faceted_solids_export_every_body_hole_and_source_use_exactly() {
+         let inputs = imported
+             .bodies()
+             .iter()
+-            .map(|body| FacetedBody {
++            .map(|body| StepBody {
+                 solid: body.solid(),
+                 name: body.name(),
+             })
+@@ -113,7 +113,7 @@ fn strict_writer_diagnoses_nonrepresentable_coordinates_units_and_limits() {
+         Point3::new(ratio(1, 3), Real::one(), Real::one()),
+     )
+     .unwrap();
+-    let inputs = [FacetedBody {
++    let inputs = [StepBody {
+         solid: models.bodies().next().unwrap(),
+         name: "third",
+     }];
+@@ -130,7 +130,7 @@ fn strict_writer_diagnoses_nonrepresentable_coordinates_units_and_limits() {
+         Point3::new(Real::one(), Real::one(), Real::one()),
+     )
+     .unwrap();
+-    let inputs = [FacetedBody {
++    let inputs = [StepBody {
+         solid: models.bodies().next().unwrap(),
+         name: "unit",
+     }];
+@@ -200,7 +200,7 @@ fn exact_file_metadata_and_repeated_occurrences_remain_explicit() {
+     )
+     .unwrap();
+     let solid = models.bodies().next().unwrap();
+-    let input = FacetedBody {
++    let input = StepBody {
+         solid,
+         name: "same 'body' \\ Ω🙂\n",
+     };
+diff --git a/crates/hyperbrep-io/tests/step_write_geometry.rs b/crates/hyperbrep-io/tests/step_write_geometry.rs
+index 9e4c39649..ad2f79f9c 100644
+--- a/crates/hyperbrep-io/tests/step_write_geometry.rs
++++ b/crates/hyperbrep-io/tests/step_write_geometry.rs
+@@ -5,7 +5,7 @@ use hyperbrep::{
+ use hyperbrep_io::{
+     part21::{NumberLimits, Value, ValueKind},
+     step::{
+-        FacetedBody, FacetedStep, ImportLimits, StepFile, StepReadOptions, StepWriteOptions,
++        FacetedStep, ImportLimits, StepBody, StepFile, StepReadOptions, StepWriteOptions,
+         WriteErrorKind, WriteLengthUnit, write_faceted,
+     },
+ };
+@@ -112,7 +112,7 @@ fn check_graph(output: &FacetedStep<'_>, scale: &Real) {
+ }
+ fn check_solid(solid: SolidRef<'_>) {
+     let output = write_faceted(
+-        &[FacetedBody {
++        &[StepBody {
+             solid,
+             name: "authored",
+         }],
+@@ -188,11 +188,11 @@ fn exact_output_units_preserve_inch_grid_and_nearby_distinct_bodies() {
+     let options = StepWriteOptions::new("gap.step", "2026-10-15T00:00:00");
+     let output = write_faceted(
+         &[
+-            FacetedBody {
++            StepBody {
+                 solid: first.bodies().next().unwrap(),
+                 name: "a",
+             },
+-            FacetedBody {
++            StepBody {
+                 solid: second.bodies().next().unwrap(),
+                 name: "b",
+             },
+@@ -218,7 +218,7 @@ fn exact_output_units_preserve_inch_grid_and_nearby_distinct_bodies() {
+         metres_per_unit: inch.clone(),
+     };
+     let output = write_faceted(
+-        &[FacetedBody {
++        &[StepBody {
+             solid: inches.bodies().next().unwrap(),
+             name: "inch cube",
+         }],
+@@ -231,7 +231,7 @@ fn exact_output_units_preserve_inch_grid_and_nearby_distinct_bodies() {
+     check_graph(&output, &inch);
+     // A one-metre coordinate is 5000/127 inches; choosing inches cannot license rounding.
+     let error = write_faceted(
+-        &[FacetedBody {
++        &[StepBody {
+             solid: first.bodies().next().unwrap(),
+             name: "metre cube",
+         }],
+@@ -259,7 +259,7 @@ fn unsupported_curves_cavities_and_selected_images_fail_with_source_sites() {
+     .unwrap();
+     for (bodies, expected) in [(&sphere, 0), (&cylinder, 1), (&cavity, 2)] {
+         let error = write_faceted(
+-            &[FacetedBody {
++            &[StepBody {
+                 solid: bodies.bodies().next().unwrap(),
+                 name: "unsupported",
+             }],
+@@ -305,11 +305,11 @@ fn unsupported_curves_cavities_and_selected_images_fail_with_source_sites() {
+         .unwrap();
+     let error = write_faceted(
+         &[
+-            FacetedBody {
++            StepBody {
+                 solid: source.bodies().next().unwrap(),
+                 name: "supported first",
+             },
+-            FacetedBody {
++            StepBody {
+                 solid: split.model().solids().next().unwrap(),
+                 name: "selected image",
+             },
+diff --git a/crates/hyperbrep-io/tests/step_write_limits.rs b/crates/hyperbrep-io/tests/step_write_limits.rs
+index 01213654f..b2e42a249 100644
+--- a/crates/hyperbrep-io/tests/step_write_limits.rs
++++ b/crates/hyperbrep-io/tests/step_write_limits.rs
+@@ -2,7 +2,7 @@ use hyperbrep::{OperationContext, Point3, Real, WorkBudget, builder};
+ use hyperbrep_io::{
+     part21::NumberLimits,
+     step::{
+-        FacetedBody, StepFile, StepReadOptions, StepWriteOptions, WriteErrorKind, WriteResource,
++        StepBody, StepFile, StepReadOptions, StepWriteOptions, WriteErrorKind, WriteResource,
+         write_faceted,
+     },
+ };
+@@ -16,7 +16,7 @@ fn context() -> OperationContext {
+ fn output_counts_are_inclusive_and_rejections_can_be_retried() {
+     let bodies =
+         builder::cuboid(Point3::origin(), Point3::new(1.into(), 1.into(), 1.into())).unwrap();
+-    let inputs = [FacetedBody {
++    let inputs = [StepBody {
+         solid: bodies.bodies().next().unwrap(),
+         name: "unit",
+     }];
+@@ -86,7 +86,7 @@ fn decimal_significand_exponent_and_integer_storage_have_separate_limits() {
+         let mut options = StepWriteOptions::new("numbers.step", "2026-10-15T00:00:00");
+         options.limits.number = NumberLimits { digits, exponent };
+         let output = write_faceted(
+-            &[FacetedBody {
++            &[StepBody {
+                 solid: bodies.bodies().next().unwrap(),
+                 name: "number",
+             }],
+@@ -112,7 +112,7 @@ fn decimal_significand_exponent_and_integer_storage_have_separate_limits() {
+     options.limits.number_bits = 8;
+     assert!(matches!(
+         write_faceted(
+-            &[FacetedBody {
++            &[StepBody {
+                 solid: bodies.bodies().next().unwrap(),
+                 name: "binary"
+             }],
+@@ -134,7 +134,7 @@ fn decimal_significand_exponent_and_integer_storage_have_separate_limits() {
+ fn escaped_string_expansion_obeys_the_physical_step_limit() {
+     let bodies =
+         builder::cuboid(Point3::origin(), Point3::new(1.into(), 1.into(), 1.into())).unwrap();
+-    let inputs = [FacetedBody {
++    let inputs = [StepBody {
+         solid: bodies.bodies().next().unwrap(),
+         name: "unit",
+     }];
+diff --git a/crates/hyperbrep-io/tests/support/analytic_cylinder.rs b/crates/hyperbrep-io/tests/support/analytic_cylinder.rs
+index d27a3d049..2846e5f72 100644
+--- a/crates/hyperbrep-io/tests/support/analytic_cylinder.rs
++++ b/crates/hyperbrep-io/tests/support/analytic_cylinder.rs
+@@ -1,7 +1,7 @@
+ //! Exact assertions shared by native tests and an actual WASM consumer.
+ use hyperbrep::*;
+ use hyperbrep_io::step::{
+-    Error, ErrorKind, FacetedBody, ImportLimits, ImportedRepresentation, Resource, StepFile,
++    Error, ErrorKind, ImportLimits, ImportedRepresentation, Resource, StepBody, StepFile,
+     StepReadOptions, StepWriteOptions, WriteErrorKind, write_faceted,
+ };
+ use hyperlimit::{PredicateOutcome, compare_reals};
+@@ -564,7 +564,7 @@ pub fn composition() {
+     check(&replay(boolean::union(&empty, &a).unwrap().model()));
+     assert_eq!(model.to_json().unwrap(), original);
+     let artifact = write_faceted(
+-        &[FacetedBody {
++        &[StepBody {
+             solid: model.solids().next().unwrap(),
+             name: "curved",
+         }],
+diff --git a/crates/hyperbrep/src/geometry.rs b/crates/hyperbrep/src/geometry.rs
+index 9fd5864aa..cff9e8e10 100644
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -13,8 +13,10 @@ use hyperlimit::{PredicateOutcome, compare_reals, point3_equal};
+ use crate::Parameter;
+ use crate::error::{GeometryError, GeometryResult};
+ 
++mod analytic;
+ mod location;
+ mod point;
++pub use analytic::{CircularArcGeometry, CylinderGeometry};
+ use location::{
+     locate_ellipse_arc_parameters, locate_line_parameter, locate_nurbs_parameters,
+     locate_rational_bezier_parameters,
+diff --git a/crates/hyperbrep/src/lib.rs b/crates/hyperbrep/src/lib.rs
+index 989589204..7ed37ba61 100644
+--- a/crates/hyperbrep/src/lib.rs
++++ b/crates/hyperbrep/src/lib.rs
+@@ -46,13 +46,14 @@ pub use construction::{ConstructionError, LoftSection, RationalBezierSweepFrame,
+ pub use context::OperationContext;
+ pub use error::{GeometryError, GeometryResult};
+ pub use geometry::{
+-    Axis, Curve3, Curve3Kind, CurveDerivative3, CurveParameterLocation, CurveSurfaceIntersection,
+-    CurveSurfacePoint, GeometricPoint3, IntersectionMultiplicity, MaterializedSurfacePcurve,
+-    ParameterDomain, Pcurve, Surface, SurfaceBounds, SurfaceDomain, SurfaceIntersectionComponents,
+-    SurfaceIntersectionCurve, SurfaceIntersectionLine, SurfaceIntersectionOperand,
+-    SurfaceIntersectionParameterRay, SurfaceIntersectionPcurve, SurfaceIntersectionRay,
+-    SurfaceIsoAxis, SurfaceKind, SurfaceParameterDomain, SurfacePartials,
+-    SurfacePcurveCorrespondence, SurfaceSurfaceIntersection,
++    Axis, CircularArcGeometry, Curve3, Curve3Kind, CurveDerivative3, CurveParameterLocation,
++    CurveSurfaceIntersection, CurveSurfacePoint, CylinderGeometry, GeometricPoint3,
++    IntersectionMultiplicity, MaterializedSurfacePcurve, ParameterDomain, Pcurve, Surface,
++    SurfaceBounds, SurfaceDomain, SurfaceIntersectionComponents, SurfaceIntersectionCurve,
++    SurfaceIntersectionLine, SurfaceIntersectionOperand, SurfaceIntersectionParameterRay,
++    SurfaceIntersectionPcurve, SurfaceIntersectionRay, SurfaceIsoAxis, SurfaceKind,
++    SurfaceParameterDomain, SurfacePartials, SurfacePcurveCorrespondence,
++    SurfaceSurfaceIntersection,
+ };
+ pub use hyperlattice::{Aabb, Matrix4, Point2, Point3, Real, Vector2, Vector3};
+ pub use hypersolve::work_budget::{BudgetExceeded, BudgetOutcome, WorkBudget, WorkKind, WorkUsage};
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/analytic.rs
+@@ -0,0 +1,80 @@
++//! Borrowed exact carrier data for inspection and exchange.
++use super::{Curve3, CurveGeometry3, Point3, Real, Surface, SurfaceGeometry, Vector3};
++
++/// A borrowed circular carrier and its exact angular parameterization.
++///
++/// The axes are orthonormal. For a curve parameter `t`, its angle is
++/// `angle_at_start +/- (t - curve.domain().start())`, with the sign given by
++/// `increasing_angle`. A topological edge may use a subinterval of that domain.
++/// This is immutable inspection data, not a second curve or a construction proof.
++#[derive(Clone, Copy, Debug)]
++pub struct CircularArcGeometry<'a> {
++    /// Circle center.
++    pub center: &'a Point3,
++    /// Unit direction at angle zero.
++    pub x: &'a Vector3,
++    /// Unit direction at angle pi/2.
++    pub y: &'a Vector3,
++    /// Strictly positive radius.
++    pub radius: &'a Real,
++    /// Angle corresponding to the spatial curve domain's start.
++    pub angle_at_start: &'a Real,
++    /// Whether angle increases with the spatial curve parameter.
++    pub increasing_angle: bool,
++}
++
++/// A borrowed exact cylinder frame and radius.
++///
++/// The right-handed axes are orthonormal. Surface parameters `(u,v)` evaluate
++/// as `origin + radius*(x*cos(u) + y*sin(u)) + axis*v`. The finite source chart
++/// remains available through [`Surface::domain`].
++#[derive(Clone, Copy, Debug)]
++pub struct CylinderGeometry<'a> {
++    /// Origin of the axial coordinate.
++    pub origin: &'a Point3,
++    /// Unit radial direction at angle zero.
++    pub x: &'a Vector3,
++    /// Unit radial direction at angle pi/2.
++    pub y: &'a Vector3,
++    /// Unit axial direction.
++    pub axis: &'a Vector3,
++    /// Strictly positive radius.
++    pub radius: &'a Real,
++}
++
++impl Curve3 {
++    /// Borrows the exact carrier and angular map of a native circular arc.
++    ///
++    /// Other curve families return `None`; this does not fit, canonicalize or
++    /// sample them. Reversal and subdivision retain their actual angular maps.
++    pub fn circular_geometry(&self) -> Option<CircularArcGeometry<'_>> {
++        let CurveGeometry3::CircleArc(arc) = &self.data.geometry else {
++            return None;
++        };
++        Some(CircularArcGeometry {
++            center: &arc.center,
++            x: &arc.x,
++            y: &arc.y,
++            radius: &arc.x_radius,
++            angle_at_start: &arc.angle_at_start,
++            increasing_angle: arc.direction > 0,
++        })
++    }
++}
++
++impl Surface {
++    /// Borrows the exact cylinder carrier without changing its chart or frame.
++    /// Other surface families return `None`.
++    pub fn cylindrical_geometry(&self) -> Option<CylinderGeometry<'_>> {
++        let SurfaceGeometry::Cylinder(cylinder) = &self.data.geometry else {
++            return None;
++        };
++        Some(CylinderGeometry {
++            origin: &cylinder.origin,
++            x: &cylinder.frame.x,
++            y: &cylinder.frame.y,
++            axis: &cylinder.frame.z,
++            radius: &cylinder.radius,
++        })
++    }
++}
+--- /dev/null
++++ b/crates/hyperbrep-io/src/step/write/advanced/geometry.rs
+@@ -0,0 +1,194 @@
++use super::super::{WriteError, WriteErrorKind, error::Site, number, output::Output};
++use super::WrittenSurfaceParameters;
++use hyperbrep::{GeometryError, Point3, Real, Surface, SurfaceKind, Vector2, Vector3};
++use hyperlimit::{PredicateOutcome, compare_reals};
++use std::cmp::Ordering;
++
++fn order(a: &Real, b: &Real, site: Site) -> Result<Ordering, WriteError> {
++    match compare_reals(a, b, hyperbrep::STRICT_PREDICATES) {
++        PredicateOutcome::Decided { value, .. } => Ok(value),
++        PredicateOutcome::Unknown { needed, stage } => Err(site.error(WriteErrorKind::Geometry(
++            GeometryError::PredicateUnresolved { needed, stage },
++        ))),
++    }
++}
++
++/// The scalar layer owns this value certificate. Materialization here selects
++/// an exact STEP encoding; it never substitutes a nearby rational.
++fn rational(value: &Real, out: &Output) -> Result<Real, WriteError> {
++    let value = if value.exact_rational_ref().is_some() {
++        value.clone()
++    } else {
++        Real::new(
++            value
++                .exact_rational_normal_form()
++                .ok_or_else(|| out.site.error(WriteErrorKind::NonRational))?,
++        )
++    };
++    number::exact(&value, &out.limits, out.site)?;
++    Ok(value)
++}
++
++pub(super) fn length(value: &Real, scale: &Real, out: &Output) -> Result<Real, WriteError> {
++    let value = rational(value, out)?;
++    let value =
++        (&value / scale).map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))?;
++    rational(&value, out)
++}
++
++pub(super) fn converted(point: &Point3, scale: &Real, out: &Output) -> Result<Point3, WriteError> {
++    Ok(Point3::new(
++        length(&point.x, scale, out)?,
++        length(&point.y, scale, out)?,
++        length(&point.z, scale, out)?,
++    ))
++}
++
++/// Emits already converted coordinates.
++pub(super) fn point(out: &mut Output, point: &Point3) -> Result<u64, WriteError> {
++    out.entity("CARTESIAN_POINT", |out| {
++        out.put("'',(")?;
++        out.number(&point.x)?;
++        out.put(",")?;
++        out.number(&point.y)?;
++        out.put(",")?;
++        out.number(&point.z)?;
++        out.put(")")
++    })
++}
++
++fn direction(out: &mut Output, vector: &Vector3) -> Result<u64, WriteError> {
++    // Check every directly retained rational component before any projective
++    // division. Normalized rational directions may share an irrational factor.
++    for i in 0..3 {
++        if vector[i].exact_rational_ref().is_some() {
++            number::exact(&vector[i], &out.limits, out.site)?;
++        }
++    }
++    let ratios = match number::primitive_direction(vector, &out.limits, out.site) {
++        Ok(value) => value,
++        Err(WriteError {
++            kind: WriteErrorKind::NonRational,
++            ..
++        }) => {
++            let mut pivot = None;
++            for i in 0..3 {
++                if order(&vector[i], &Real::zero(), out.site)? != Ordering::Equal {
++                    pivot = Some(vector[i].abs());
++                    break;
++                }
++            }
++            let pivot =
++                pivot.ok_or_else(|| out.site.error(WriteErrorKind::Invalid("zero direction")))?;
++            let mut ratios = [Real::zero(), Real::zero(), Real::zero()];
++            for i in 0..3 {
++                ratios[i] = rational(
++                    &(&vector[i] / &pivot)
++                        .map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))?,
++                    out,
++                )?;
++            }
++            number::primitive_direction(&Vector3::new(ratios), &out.limits, out.site)?
++        }
++        Err(error) => return Err(error),
++    };
++    out.entity("DIRECTION", |out| {
++        out.put("'',(")?;
++        out.number(&ratios[0])?;
++        out.put(",")?;
++        out.number(&ratios[1])?;
++        out.put(",")?;
++        out.number(&ratios[2])?;
++        out.put(")")
++    })
++}
++
++pub(super) fn placement(
++    out: &mut Output,
++    origin: &Point3,
++    axis: &Vector3,
++    x: &Vector3,
++    scale: &Real,
++) -> Result<u64, WriteError> {
++    let origin = converted(origin, scale, out)?;
++    let origin = point(out, &origin)?;
++    let axis = direction(out, axis)?;
++    let x = direction(out, x)?;
++    out.entity("AXIS2_PLACEMENT_3D", |out| {
++        out.put("'',")?;
++        out.reference(origin)?;
++        out.put(",")?;
++        out.reference(axis)?;
++        out.put(",")?;
++        out.reference(x)
++    })
++}
++
++pub(super) fn surface(
++    out: &mut Output,
++    source: &Surface,
++    scale: &Real,
++) -> Result<(u64, WrittenSurfaceParameters), WriteError> {
++    let divide = |value: Real| {
++        (value / scale).map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))
++    };
++    match source.kind() {
++        SurfaceKind::Plane => {
++            let origin = source.plane_origin().expect("plane origin");
++            let (u, v) = source.plane_directions().expect("plane directions");
++            let normal = u.cross(v);
++            let x = u
++                .normalize_checked()
++                .map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))?;
++            let axis = normal
++                .normalize_checked()
++                .map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))?;
++            let y = axis
++                .cross(&x)
++                .normalize_checked()
++                .map_err(|problem| out.site.error(WriteErrorKind::Numeric(problem)))?;
++            let parameters = WrittenSurfaceParameters {
++                u: Vector2::new([divide(u.dot(&x))?, divide(u.dot(&y))?]),
++                v: Vector2::new([divide(v.dot(&x))?, divide(v.dot(&y))?]),
++            };
++            let placement = placement(out, origin, &normal, u, scale)?;
++            let id = out.entity("PLANE", |out| {
++                out.put("'',")?;
++                out.reference(placement)
++            })?;
++            Ok((id, parameters))
++        }
++        SurfaceKind::Cylinder => {
++            let cylinder = source.cylindrical_geometry().expect("cylinder data");
++            let parameters = WrittenSurfaceParameters {
++                u: Vector2::new([Real::one(), Real::zero()]),
++                v: Vector2::new([Real::zero(), divide(Real::one())?]),
++            };
++            let radius = length(cylinder.radius, scale, out)?;
++            let placement = placement(out, cylinder.origin, cylinder.axis, cylinder.x, scale)?;
++            let id = out.entity("CYLINDRICAL_SURFACE", |out| {
++                out.put("'',")?;
++                out.reference(placement)?;
++                out.put(",")?;
++                out.number(&radius)
++            })?;
++            Ok((id, parameters))
++        }
++        kind => Err(out.site.error(WriteErrorKind::UnsupportedSurface(kind))),
++    }
++}
++
++pub(super) fn line(out: &mut Output, origin: u64, velocity: &Vector3) -> Result<u64, WriteError> {
++    let direction = direction(out, velocity)?;
++    let vector = out.entity("VECTOR", |out| {
++        out.put("'',")?;
++        out.reference(direction)?;
++        out.put(",1.")
++    })?;
++    out.entity("LINE", |out| {
++        out.put("'',")?;
++        out.reference(origin)?;
++        out.put(",")?;
++        out.reference(vector)
++    })
++}
+--- /dev/null
++++ b/crates/hyperbrep-io/src/step/write/advanced/mod.rs
+@@ -0,0 +1,363 @@
++//! Explicit native topology over the selected exact analytic STEP carriers.
++mod geometry;
++mod types;
++
++use super::{
++    StepBody, StepWriteOptions, WriteError, WriteErrorKind,
++    error::{Site, push},
++    metadata,
++    output::Output,
++};
++use hyperbrep::{
++    Curve3Kind, Direction, EdgeRef, EntityKind, FaceRef, GeometryError, Orientation, Point3, Real,
++    SurfaceRef, VertexRef, WireRef,
++};
++use std::collections::HashMap;
++pub use types::*;
++
++pub(super) fn write<'a>(
++    sources: &[StepBody<'a>],
++    options: &StepWriteOptions<'_>,
++) -> Result<AdvancedStep<'a>, WriteError> {
++    let mut out = Output::new(options.limits);
++    if sources.is_empty() {
++        return Err(out
++            .site
++            .error(WriteErrorKind::Invalid("empty solid selection")));
++    }
++    metadata::header(&mut out, options, "Exact selected analytic geometry")?;
++    let context = metadata::context(&mut out, options)?;
++    let mut bodies = Vec::new();
++    let mut items = Vec::new();
++    for (index, source) in sources.iter().enumerate() {
++        let body = body(
++            &mut out,
++            *source,
++            index,
++            &options.length_unit.metres_per_unit,
++        )?;
++        push(&mut items, body.entity, out.site)?;
++        push(&mut bodies, body, out.site)?;
++    }
++    out.site = Site::default();
++    let representation = out.entity("ADVANCED_BREP_SHAPE_REPRESENTATION", |out| {
++        out.string(options.representation_name)?;
++        out.put(",")?;
++        out.references(&items)?;
++        out.put(",")?;
++        out.reference(context)
++    })?;
++    metadata::product(&mut out, options.representation_name, representation)?;
++    out.put("ENDSEC;\nEND-ISO-10303-21;\n")?;
++    Ok(AdvancedStep {
++        text: out.text,
++        representation,
++        bodies,
++    })
++}
++
++#[derive(Default)]
++struct Body<'a> {
++    points: HashMap<VertexRef<'a>, (usize, Point3)>,
++    edge_ids: HashMap<EdgeRef<'a>, u64>,
++    supports: HashMap<SurfaceRef<'a>, (u64, WrittenSurfaceParameters)>,
++    vertices: Vec<WrittenAdvancedVertex<'a>>,
++    edges: Vec<WrittenAdvancedEdge<'a>>,
++    faces: Vec<WrittenAdvancedFace<'a>>,
++    wires: Vec<WrittenAdvancedWire<'a>>,
++    edge_uses: Vec<WrittenAdvancedEdgeUse<'a>>,
++}
++
++fn body<'a>(
++    out: &mut Output,
++    source: StepBody<'a>,
++    index: usize,
++    scale: &Real,
++) -> Result<WrittenAdvancedBody<'a>, WriteError> {
++    let site = Site {
++        body: Some(index),
++        entity: Some((EntityKind::Solid, source.solid.index())),
++    };
++    out.site = site;
++    if source.solid.voids().len() != 0 {
++        return Err(site.error(WriteErrorKind::VoidShells));
++    }
++    let mut body = Body::default();
++    let mut faces = Vec::new();
++    for face in source.solid.outer().faces() {
++        let id = body.face(out, face, scale)?;
++        push(&mut faces, id, out.site)?;
++    }
++    out.site.entity = Some((EntityKind::Shell, source.solid.outer().index()));
++    let shell = out.entity("CLOSED_SHELL", |out| {
++        out.put("'',")?;
++        out.references(&faces)
++    })?;
++    out.site = site;
++    let entity = out.entity("MANIFOLD_SOLID_BREP", |out| {
++        out.string(source.name)?;
++        out.put(",")?;
++        out.reference(shell)
++    })?;
++    Ok(WrittenAdvancedBody {
++        source: source.solid,
++        entity,
++        shell,
++        vertices: body.vertices,
++        edges: body.edges,
++        faces: body.faces,
++        wires: body.wires,
++        edge_uses: body.edge_uses,
++    })
++}
++
++impl<'a> Body<'a> {
++    fn vertex(
++        &mut self,
++        out: &mut Output,
++        source: VertexRef<'a>,
++        scale: &Real,
++    ) -> Result<WrittenAdvancedVertex<'a>, WriteError> {
++        if let Some((index, _)) = self.points.get(&source) {
++            return Ok(self.vertices[*index]);
++        }
++        out.site.entity = Some((EntityKind::Vertex, source.index()));
++        let coordinates = source
++            .point()
++            .try_coordinates()
++            .ok_or_else(|| out.site.error(WriteErrorKind::UnmaterializedPoint))?;
++        let coordinates = geometry::converted(coordinates, scale, out)?;
++        let point = geometry::point(out, &coordinates)?;
++        let entity = out.entity("VERTEX_POINT", |out| {
++            out.put("'',")?;
++            out.reference(point)
++        })?;
++        let vertex = WrittenAdvancedVertex {
++            source,
++            entity,
++            point,
++        };
++        self.points
++            .try_reserve(1)
++            .map_err(|_| out.site.error(WriteErrorKind::Allocation))?;
++        self.points
++            .insert(source, (self.vertices.len(), coordinates));
++        push(&mut self.vertices, vertex, out.site)?;
++        Ok(vertex)
++    }
++
++    fn edge(
++        &mut self,
++        out: &mut Output,
++        source: EdgeRef<'a>,
++        scale: &Real,
++    ) -> Result<u64, WriteError> {
++        if let Some(id) = self.edge_ids.get(&source) {
++            return Ok(*id);
++        }
++        let site = Site {
++            body: out.site.body,
++            entity: Some((EntityKind::Edge, source.index())),
++        };
++        out.site = site;
++        let curve = source.curve();
++        if !matches!(curve.kind(), Curve3Kind::Line | Curve3Kind::CircleArc) {
++            return Err(site.error(WriteErrorKind::UnsupportedCurve(curve.kind())));
++        }
++        let start = self.vertex(out, source.start(), scale)?;
++        let end = self.vertex(out, source.end(), scale)?;
++        out.site = site;
++        let (geometry, parameter_start, parameter_end, same_sense) = match curve.kind() {
++            Curve3Kind::Line => {
++                let velocity = &self.points[&source.end()].1 - &self.points[&source.start()].1;
++                let length = velocity
++                    .norm()
++                    .map_err(|problem| site.error(WriteErrorKind::Numeric(problem)))?;
++                (
++                    geometry::line(out, start.point, &velocity)?,
++                    Real::zero(),
++                    length,
++                    true,
++                )
++            }
++            Curve3Kind::CircleArc => {
++                let circle = curve.circular_geometry().expect("circular carrier");
++                let radius = geometry::length(circle.radius, scale, out)?;
++                let placement = geometry::placement(
++                    out,
++                    circle.center,
++                    &circle.x.cross(circle.y),
++                    circle.x,
++                    scale,
++                )?;
++                let id = out.entity("CIRCLE", |out| {
++                    out.put("'',")?;
++                    out.reference(placement)?;
++                    out.put(",")?;
++                    out.number(&radius)
++                })?;
++                let (a, b) = source.domain().try_real_endpoints().ok_or_else(|| {
++                    site.error(WriteErrorKind::Geometry(
++                        GeometryError::UnrepresentableParameter,
++                    ))
++                })?;
++                let angle = |parameter: &Real| {
++                    let delta = parameter - curve.domain().start();
++                    if circle.increasing_angle {
++                        circle.angle_at_start + delta
++                    } else {
++                        circle.angle_at_start - delta
++                    }
++                };
++                (id, angle(a), angle(b), circle.increasing_angle)
++            }
++            _ => unreachable!("checked carrier"),
++        };
++        let entity = out.entity("EDGE_CURVE", |out| {
++            out.put("'',")?;
++            out.reference(start.entity)?;
++            out.put(",")?;
++            out.reference(end.entity)?;
++            out.put(",")?;
++            out.reference(geometry)?;
++            out.put(if same_sense { ",.T." } else { ",.F." })
++        })?;
++        self.edge_ids
++            .try_reserve(1)
++            .map_err(|_| site.error(WriteErrorKind::Allocation))?;
++        self.edge_ids.insert(source, entity);
++        push(
++            &mut self.edges,
++            WrittenAdvancedEdge {
++                source,
++                entity,
++                geometry,
++                parameter_start,
++                parameter_end,
++            },
++            site,
++        )?;
++        Ok(entity)
++    }
++
++    fn wire(
++        &mut self,
++        out: &mut Output,
++        source: WireRef<'a>,
++        scale: &Real,
++        outer: bool,
++    ) -> Result<u64, WriteError> {
++        let site = Site {
++            body: out.site.body,
++            entity: Some((EntityKind::Wire, source.index())),
++        };
++        let mut uses = Vec::new();
++        for source in source.edge_uses() {
++            let use_site = Site {
++                body: site.body,
++                entity: Some((EntityKind::EdgeUse, source.index())),
++            };
++            out.site = use_site;
++            out.segment()?;
++            let edge = self.edge(out, source.edge(), scale)?;
++            out.site = use_site;
++            let entity = out.entity("ORIENTED_EDGE", |out| {
++                out.put("'',*,*,")?;
++                out.reference(edge)?;
++                out.put(match source.direction() {
++                    Direction::Forward => ",.T.",
++                    Direction::Reversed => ",.F.",
++                })
++            })?;
++            push(
++                &mut self.edge_uses,
++                WrittenAdvancedEdgeUse { source, entity },
++                use_site,
++            )?;
++            push(&mut uses, entity, use_site)?;
++        }
++        out.site = site;
++        let entity = out.entity("EDGE_LOOP", |out| {
++            out.put("'',")?;
++            out.references(&uses)
++        })?;
++        let bound = out.entity(
++            if outer {
++                "FACE_OUTER_BOUND"
++            } else {
++                "FACE_BOUND"
++            },
++            |out| {
++                out.put("'',")?;
++                out.reference(entity)?;
++                out.put(",.T.")
++            },
++        )?;
++        push(
++            &mut self.wires,
++            WrittenAdvancedWire {
++                source,
++                entity,
++                bound,
++            },
++            site,
++        )?;
++        Ok(bound)
++    }
++
++    fn face(
++        &mut self,
++        out: &mut Output,
++        source: FaceRef<'a>,
++        scale: &Real,
++    ) -> Result<u64, WriteError> {
++        let site = Site {
++            body: out.site.body,
++            entity: Some((EntityKind::Face, source.index())),
++        };
++        out.site = site;
++        let support = source.surface();
++        let (surface, parameters) = if let Some(value) = self.supports.get(&support) {
++            value.clone()
++        } else {
++            let value = geometry::surface(out, &support, scale)?;
++            self.supports
++                .try_reserve(1)
++                .map_err(|_| site.error(WriteErrorKind::Allocation))?;
++            self.supports.insert(support, value.clone());
++            value
++        };
++        let outer = source.outer().ok_or_else(|| {
++            site.error(WriteErrorKind::Invalid("advanced face needs an outer wire"))
++        })?;
++        let mut bounds = Vec::new();
++        let bound = self.wire(out, outer, scale, true)?;
++        push(&mut bounds, bound, site)?;
++        for wire in source.inner() {
++            let bound = self.wire(out, wire, scale, false)?;
++            push(&mut bounds, bound, site)?;
++        }
++        out.site = site;
++        let entity = out.entity("ADVANCED_FACE", |out| {
++            out.put("'',")?;
++            out.references(&bounds)?;
++            out.put(",")?;
++            out.reference(surface)?;
++            out.put(match source.orientation() {
++                Orientation::Forward => ",.T.",
++                Orientation::Reversed => ",.F.",
++            })
++        })?;
++        push(
++            &mut self.faces,
++            WrittenAdvancedFace {
++                source,
++                entity,
++                surface,
++                parameters,
++            },
++            site,
++        )?;
++        Ok(entity)
++    }
++}
+--- /dev/null
++++ b/crates/hyperbrep-io/src/step/write/advanced/types.rs
+@@ -0,0 +1,160 @@
++use hyperbrep::{
++    EdgeRef, EdgeUseRef, FaceRef, Point2, Real, SolidRef, Vector2, VertexRef, WireRef,
++};
++
++/// A native vertex with its distinct topological and coordinate STEP entities.
++#[derive(Clone, Copy, Debug)]
++pub struct WrittenAdvancedVertex<'a> {
++    /// Original model-bound identity.
++    pub source: VertexRef<'a>,
++    /// Output VERTEX_POINT ID.
++    pub entity: u64,
++    /// Output CARTESIAN_POINT ID.
++    pub point: u64,
++}
++
++/// A native edge and the exact parameterization of its emitted LINE or CIRCLE.
++#[derive(Clone, Debug)]
++pub struct WrittenAdvancedEdge<'a> {
++    /// Original model-bound edge, with its retained native parameter interval.
++    pub source: EdgeRef<'a>,
++    /// Output EDGE_CURVE ID.
++    pub entity: u64,
++    /// Output LINE or CIRCLE ID.
++    pub geometry: u64,
++    /// Emitted curve parameter at the native edge's start vertex.
++    pub parameter_start: Real,
++    /// Emitted curve parameter at the native edge's end vertex.
++    /// Interpolation uses the normalized native edge fraction. Negative traversal
++    /// decreases this parameter; a full circle retains a complete unwrapped turn.
++    pub parameter_end: Real,
++}
++
++/// Exact linear map from an authored native surface chart to the output chart.
++///
++/// Origins coincide physically; the two vectors are the columns of the map.
++/// Plane output coordinates are in the selected length unit; cylinder U is in
++/// radians and V is in that length unit. This is encoding metadata, not a surface.
++#[derive(Clone, Debug)]
++pub struct WrittenSurfaceParameters {
++    /// Output UV change for one native U unit.
++    pub u: Vector2,
++    /// Output UV change for one native V unit.
++    pub v: Vector2,
++}
++impl WrittenSurfaceParameters {
++    /// Maps a native parameter without converting through floating point.
++    pub fn map(&self, point: &Point2) -> Point2 {
++        Point2::origin() + self.u.clone() * point.x() + self.v.clone() * point.y()
++    }
++}
++
++/// An authored face and its emitted analytic support and chart map.
++#[derive(Clone, Debug)]
++pub struct WrittenAdvancedFace<'a> {
++    /// Original model-bound face, including its orientation and pcurves.
++    pub source: FaceRef<'a>,
++    /// Output ADVANCED_FACE ID.
++    pub entity: u64,
++    /// Output PLANE or CYLINDRICAL_SURFACE ID.
++    pub surface: u64,
++    /// Native-to-output surface parameter map.
++    pub parameters: WrittenSurfaceParameters,
++}
++
++/// An authored outer/inner wire and its explicit directed edge loop.
++#[derive(Clone, Copy, Debug)]
++pub struct WrittenAdvancedWire<'a> {
++    /// Original model-bound wire.
++    pub source: WireRef<'a>,
++    /// Output EDGE_LOOP ID.
++    pub entity: u64,
++    /// Output FACE_OUTER_BOUND or FACE_BOUND ID.
++    pub bound: u64,
++}
++
++/// One directed use of a shared edge, including repeated uses on a seam.
++#[derive(Clone, Copy, Debug)]
++pub struct WrittenAdvancedEdgeUse<'a> {
++    /// Original use and its native pcurve/correspondence.
++    pub source: EdgeUseRef<'a>,
++    /// Output ORIENTED_EDGE ID; source direction is preserved.
++    pub entity: u64,
++}
++
++/// Complete encoding report for one explicitly selected solid occurrence.
++#[derive(Debug)]
++pub struct WrittenAdvancedBody<'a> {
++    pub(super) source: SolidRef<'a>,
++    pub(super) entity: u64,
++    pub(super) shell: u64,
++    pub(super) vertices: Vec<WrittenAdvancedVertex<'a>>,
++    pub(super) edges: Vec<WrittenAdvancedEdge<'a>>,
++    pub(super) faces: Vec<WrittenAdvancedFace<'a>>,
++    pub(super) wires: Vec<WrittenAdvancedWire<'a>>,
++    pub(super) edge_uses: Vec<WrittenAdvancedEdgeUse<'a>>,
++}
++impl<'a> WrittenAdvancedBody<'a> {
++    /// Original source solid in its immutable model.
++    pub fn source(&self) -> SolidRef<'a> {
++        self.source
++    }
++    /// Output MANIFOLD_SOLID_BREP ID.
++    pub fn entity(&self) -> u64 {
++        self.entity
++    }
++    /// Output CLOSED_SHELL ID.
++    pub fn shell(&self) -> u64 {
++        self.shell
++    }
++    /// Every used native vertex, in first-use order; coordinates do not weld IDs.
++    pub fn vertices(&self) -> &[WrittenAdvancedVertex<'a>] {
++        &self.vertices
++    }
++    /// Every used native edge and emitted carrier map, in first-use order.
++    pub fn edges(&self) -> &[WrittenAdvancedEdge<'a>] {
++        &self.edges
++    }
++    /// Every face in native shell order.
++    pub fn faces(&self) -> &[WrittenAdvancedFace<'a>] {
++        &self.faces
++    }
++    /// Every outer and inner wire in face traversal order.
++    pub fn wires(&self) -> &[WrittenAdvancedWire<'a>] {
++        &self.wires
++    }
++    /// Every directed use, including both sides of a shared edge or seam.
++    pub fn edge_uses(&self) -> &[WrittenAdvancedEdgeUse<'a>] {
++        &self.edge_uses
++    }
++}
++
++/// Exact selected advanced geometry with source-to-output topology/parameter maps.
++///
++/// Direct spatial curves encode the boundary; native pcurves, unused geometry,
++/// history and document records are not serialized. Keep a native archive when
++/// those representations must survive. Each input occurrence remains distinct.
++#[derive(Debug)]
++pub struct AdvancedStep<'a> {
++    pub(super) text: String,
++    pub(super) representation: u64,
++    pub(super) bodies: Vec<WrittenAdvancedBody<'a>>,
++}
++impl<'a> AdvancedStep<'a> {
++    /// Complete deterministic Part 21 exchange.
++    pub fn text(&self) -> &str {
++        &self.text
++    }
++    /// Releases the independent text and drops borrowed source accounting.
++    pub fn into_text(self) -> String {
++        self.text
++    }
++    /// Output ADVANCED_BREP_SHAPE_REPRESENTATION ID for selected re-import.
++    pub fn representation(&self) -> u64 {
++        self.representation
++    }
++    /// Body encoding reports, in selected occurrence order.
++    pub fn bodies(&self) -> &[WrittenAdvancedBody<'a>] {
++        &self.bodies
++    }
++}
+--- /dev/null
++++ b/crates/hyperbrep-io/tests/step_write_advanced.rs
+@@ -0,0 +1,42 @@
++use hyperbrep::{OperationContext, Real, WorkBudget, builder};
++use hyperbrep_io::step::{
++    ImportLimits, StepBody, StepFile, StepReadOptions, StepWriteOptions, write_advanced,
++};
++
++#[test]
++fn exact_cylinder_exports_reimports_and_remains_consumable() {
++    let context = OperationContext::strict(WorkBudget {
++        refinements: 10_000,
++        promotions: 1000,
++    });
++    let source = builder::cylinder(Real::from(5), Real::from(7)).unwrap();
++    let output = write_advanced(
++        &[StepBody {
++            solid: source.bodies().next().unwrap(),
++            name: "native cylinder",
++        }],
++        &StepWriteOptions::new("cylinder.step", "2026-10-16T00:00:00"),
++        &context,
++    )
++    .result
++    .unwrap()
++    .unwrap();
++    let file = StepFile::read(output.text().as_bytes(), &StepReadOptions::default()).unwrap();
++    let imported = file
++        .import_representation(output.representation(), &ImportLimits::default(), &context)
++        .result
++        .unwrap()
++        .unwrap();
++    assert_eq!(imported.bodies().len(), 1);
++    assert_eq!(
++        (imported.bodies()[0].solid().volume().unwrap() - Real::from(175) * Real::pi())
++            .exact_rational_normal_form(),
++        Some(hyperreal::Rational::zero())
++    );
++    let native = imported.bodies()[0].model().to_json().unwrap();
++    let replay = hyperbrep::RawModel::from_json(&native, &hyperbrep::ArchiveLimits::default())
++        .unwrap()
++        .validate()
++        .unwrap();
++    assert_eq!(replay.to_json().unwrap(), native);
++}
