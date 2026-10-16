@@ -1,0 +1,25 @@
+use hyperbrep::{Real, boolean::{self,BooleanOperation}};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/sectors.rs"] mod sector;
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod seam;
+fn main() {
+ for reflected in [false,true] {
+  let scale=Real::from(2).sqrt().unwrap();
+  let map=seam::similarity(&scale,reflected);
+  let (a,b,_,_)=sector::fixture(3);
+  let a=a.transformed(&map).unwrap();let b=b.transformed(&map).unwrap();
+  println!("kind=3 sqrt2 reflected={reflected}");
+  for (label,model) in [("first",a.model()),("second",b.model())] {
+   std::fs::write(format!("/tmp/hyperbrep-sector-sqrt2-{reflected}-{label}.json"),model.to_json().unwrap()).unwrap();
+  }
+  let graph=boolean::intersection_graph(a.bodies().next().unwrap(),b.bodies().next().unwrap());
+  println!("graph={:?}",graph.as_ref().map(|_|()));
+  let Ok(graph)=graph else {continue};
+  println!("partition_first={:?}",graph.partition_first_faces().map(|p|p.model().counts()));
+  println!("partition_second={:?}",graph.partition_second_faces().map(|p|p.model().counts()));
+  println!("select_first={:?}",graph.select_first_faces(BooleanOperation::Intersection).map(|_|()));
+  println!("select_second={:?}",graph.select_second_faces(BooleanOperation::Intersection).map(|_|()));
+  println!("stitch={:?}",graph.stitch_selected_faces(BooleanOperation::Intersection).map(|p|p.len()));
+ }
+}

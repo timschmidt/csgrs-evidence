@@ -1,0 +1,37 @@
+use hyperbrep::{ArchiveLimits,RawModel,Real,boolean};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/sectors.rs"] mod sector;
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod seam;
+fn main() {
+ let q=seam::ratio; let scale=q(1,1000);
+ let (half,cutter,_,_)=sector::fixture(3);
+ let map=seam::similarity(&scale,true);
+ let half=half.transformed(&map).unwrap(); let cutter=cutter.transformed(&map).unwrap();
+ let pi=Real::pi(); let root=Real::from(3).sqrt().unwrap();
+ for (name,body,expected) in [
+  ("intersection",boolean::intersection(&half,&cutter).unwrap(), q(20,3)*&pi*&pi+Real::from(10)*&pi*&root+q(8,3)*&pi-Real::from(2)*&root),
+  ("difference",boolean::difference(&half,&cutter).unwrap(), q(40,3)*&pi*&pi+Real::from(10)*&pi*&root+q(16,3)*&pi+Real::from(2)*&root),
+ ] {
+  let original=body.model().clone();
+  let replay=RawModel::from_json(&original.to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().unwrap();
+  let edge=replay.edges().next().unwrap();
+  let middle=((edge.domain().start().try_real().unwrap()+edge.domain().end().try_real().unwrap())/Real::from(2)).unwrap();
+  let split=edge.split(middle.into()).unwrap();
+  let split=RawModel::from_json(&split.model().to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().unwrap();
+  let transformed=split.transformed(&map).unwrap();
+  let transformed=RawModel::from_json(&transformed.to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().unwrap();
+  for (stage,model,factor) in [("original",original,q(1,1_000_000)),("replay",replay,q(1,1_000_000)),("split",split,q(1,1_000_000)),("transformed",transformed,q(1,1_000_000)*q(1,1_000_000))] {
+   let mut total=Real::zero(); let mut rows=Vec::new();
+   for face in model.faces() {
+    let area=face.area().unwrap();
+    println!("{name} {stage} face={} {:?} area={:?} compact={}",face.index(),face.surface().geometry().kind(),area.to_f64_lossy(),area.compact_pi_laurent().is_some());
+    rows.push(serde_json::json!({"face":face.index(),"area":area})); total+=area;
+   }
+   let wanted=&expected*&factor;
+   println!("{name} {stage} total={:?} wanted={:?} equality={:?} compact={}",total.to_f64_lossy(),wanted.to_f64_lossy(),hyperlimit::compare_reals(&total,&wanted,hyperbrep::STRICT_PREDICATES).value(),total.compact_pi_laurent().is_some());
+   std::fs::write(format!("/tmp/hyperbrep-sector-matrix-{name}-{stage}-areas.json"),serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+   std::fs::write(format!("/tmp/hyperbrep-sector-matrix-{name}-{stage}.json"),model.to_json().unwrap()).unwrap();
+  }
+ }
+}

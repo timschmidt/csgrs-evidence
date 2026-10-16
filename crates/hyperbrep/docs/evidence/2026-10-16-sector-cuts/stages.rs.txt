@@ -1,0 +1,35 @@
+use hyperbrep::{boolean::{self,BooleanOperation,FacePairTrim},builder,Point3};
+fn p(x:i32,y:i32,z:i32)->Point3 {Point3::new(x.into(),y.into(),z.into())}
+fn main() {
+ for kind in 0..5 {
+  let a=if kind==2 || kind==4 {builder::cone_frustum(5.into(),2.into(),6.into()).unwrap()} else {builder::torus(5.into(),2.into()).unwrap()};
+  let first=if kind==0 {builder::cuboid(p(-20,-20,0),p(20,20,20)).unwrap()} else {builder::cuboid(p(0,-20,-20),p(20,20,20)).unwrap()};
+  let a=boolean::intersection(&a,&first).unwrap();
+  let b=if kind<3 {builder::cuboid(p(-20,0,-20),p(20,20,20)).unwrap()} else {builder::cuboid(p(-20,-20,1),p(20,20,20)).unwrap()};
+  let graph=boolean::intersection_graph(a.bodies().next().unwrap(),b.bodies().next().unwrap()).unwrap();
+  println!("kind={kind}");
+  for pair in graph.intersections() {
+   let summary=match pair.trim() {
+    FacePairTrim::CurveFragments(c)=>format!("curves={}",c.len()),
+    FacePairTrim::SurfaceCurveFragments(c)=>format!("surface_curves={}",c.len()),
+    FacePairTrim::CoincidentFaces{first_traces,second_traces}=>format!("coincident={}/{}",first_traces.len(),second_traces.len()),
+    _=>continue,
+   };
+   println!("  face {}/{}: {summary}",pair.first_face().index(),pair.second_face().index());
+  }
+  println!("partition_first={:?}",graph.partition_first_faces().map(|p|p.model().counts()));
+  println!("partition_second={:?}",graph.partition_second_faces().map(|p|p.model().counts()));
+  println!("select_first={:?}",graph.select_first_faces(BooleanOperation::Intersection).map(|_|()));
+  println!("select_second={:?}",graph.select_second_faces(BooleanOperation::Intersection).map(|_|()));
+  for (name, operation) in [("intersection",BooleanOperation::Intersection),("difference",BooleanOperation::Difference)] {
+   let result=graph.stitch_selected_faces(operation);
+   println!("{name}={:?}",result.as_ref().map(|p|p.len()));
+   if let Ok(result)=result {
+    let json=result.model().to_json().unwrap();
+    let file=format!("/tmp/hyperbrep-sector-{kind}-{name}.json");
+    std::fs::write(&file,&json).unwrap();
+    println!("replay={:?}, file={file}",hyperbrep::RawModel::from_json(&json,&hyperbrep::ArchiveLimits::default()).unwrap().validate().map(|m|m.counts()));
+   }
+  }
+ }
+}

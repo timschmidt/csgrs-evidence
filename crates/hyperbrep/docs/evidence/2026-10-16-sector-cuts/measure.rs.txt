@@ -1,0 +1,32 @@
+use hyperbrep::{ArchiveLimits,RawModel,Real};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod support;
+fn main() {
+ for kind in [0,3] { for name in ["intersection","difference"] {
+  let json=std::fs::read_to_string(format!("/tmp/hyperbrep-sector-{kind}-{name}.json")).unwrap();
+  let source=RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate().unwrap();
+  let edge=source.edges().next().unwrap();
+  let midpoint=((edge.domain().start().try_real().unwrap()+edge.domain().end().try_real().unwrap())/Real::from(2)).unwrap();
+  let split=edge.split(midpoint.into()).unwrap();
+  let split=RawModel::from_json(&split.model().to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().unwrap();
+  let scaled=split.transformed(&support::similarity(&support::ratio(1,1000),true)).unwrap();
+  let scaled=RawModel::from_json(&scaled.to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().unwrap();
+  let mut original=Real::zero(); let mut actual=Real::zero(); let mut rows=Vec::new();
+  for (a,b) in source.faces().zip(scaled.faces()) {
+   let before=a.area().unwrap(); let after=b.area().unwrap();
+   let expected=&before*support::ratio(1,1_000_000);
+   println!("kind={kind} {name} face={} {:?}: before={:?}, after={:?}, equality={:?}",a.index(),a.surface().geometry().kind(),before.to_f64_lossy(),after.to_f64_lossy(),hyperlimit::compare_reals(&after,&expected,hyperbrep::STRICT_PREDICATES).value());
+   rows.push(serde_json::json!({"face":a.index(),"before":before,"after":after}));
+   original+=before; actual+=after;
+  }
+  let pi=Real::pi(); let root=Real::from(3).sqrt().unwrap();
+  let expected=if kind==0 {Real::from(10)*&pi*&pi+Real::from(24)*&pi} else if name=="intersection" {
+   support::ratio(20,3)*&pi*&pi+Real::from(10)*&pi*&root+support::ratio(8,3)*&pi-Real::from(2)*&root
+  } else {
+   support::ratio(40,3)*&pi*&pi+Real::from(10)*&pi*&root+support::ratio(16,3)*&pi+Real::from(2)*&root
+  };
+  println!("independent original={:?}, transformed={:?}",hyperlimit::compare_reals(&original,&expected,hyperbrep::STRICT_PREDICATES).value(),hyperlimit::compare_reals(&actual,&(&expected*support::ratio(1,1_000_000)),hyperbrep::STRICT_PREDICATES).value());
+  println!("sum before={:?}, after={:?}, equal={:?}",original.to_f64_lossy(),actual.to_f64_lossy(),hyperlimit::compare_reals(&actual,&(&original*support::ratio(1,1_000_000)),hyperbrep::STRICT_PREDICATES).value());
+  std::fs::write(format!("/tmp/hyperbrep-sector-measures-{kind}-{name}.json"),serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+ }}
+}
