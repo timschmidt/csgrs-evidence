@@ -1,0 +1,26 @@
+use hyperbrep::{builder,boolean,BodySet,Point3};
+fn p(x:i32,y:i32,z:i32)->Point3 {Point3::new(x.into(),y.into(),z.into())}
+fn main(){
+ let axial=builder::cuboid(p(-20,-20,0),p(20,20,20)).unwrap();
+ let long=builder::cuboid(p(0,-20,-20),p(20,20,20)).unwrap();
+ let cross=builder::cuboid(p(-20,0,-20),p(20,20,20)).unwrap();
+ let band=builder::cuboid(p(-20,-20,1),p(20,20,20)).unwrap();
+ for (name,a,cutter) in [
+  ("torus-axial",builder::torus(5.into(),2.into()).unwrap(),&axial),
+  ("torus-long",builder::torus(5.into(),2.into()).unwrap(),&long),
+  ("cone-long",builder::cone_frustum(5.into(),2.into(),6.into()).unwrap(),&long),
+ ] {
+  let half=boolean::intersection(&a,cutter).unwrap();
+  let other=boolean::difference(&a,cutter).unwrap();
+  for (op,result) in [
+   ("recut",boolean::intersection(&half,cutter)),
+   ("clear",boolean::difference(&half,cutter)),
+   ("restore",boolean::union(&half,&other)),
+   ("quarter",boolean::intersection(&half,&cross)),
+   ("band",boolean::intersection(&half,&band)),
+  ]{
+   let result:Result<usize,_>=result.map(|b:BodySet|b.len());
+   println!("{name} {op}: {result:?}");
+  }
+ }
+}
