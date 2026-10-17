@@ -1,0 +1,77 @@
+"""Sequential final-source qualification; every attempt remains source-bound."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from check import OUT, ROOT, hashes, run
+
+C = ['--offline', '--locked']
+CORE = ['-p', 'hyperbrep', '-p', 'hyperbrep-io']
+DEPS = ['-p', 'hyperreal', '-p', 'hyperlimit', '-p', 'hypersolve', '-p', 'hypercurve']
+WASM = Path('/tmp/hyperbrep-cone-exchange-wasm-probe')
+COMMANDS = [
+    ('native-debug', ['cargo', 'test', *C, *CORE, '--all-features', '--no-fail-fast'], {}, 1800),
+    ('native-release', ['cargo', 'test', *C, *CORE, '--all-features', '--release', '--no-fail-fast'], {}, 1800),
+    ('native-minimal', ['cargo', 'test', *C, *CORE, '--no-default-features', '--release', '--no-fail-fast'], {}, 1800),
+    ('dependency-libraries', ['cargo', 'test', *C, *DEPS, '--all-features', '--release', '--lib', '--no-fail-fast'], {}, 1800),
+    ('inherited-zero-factor-default', ['cargo', 'test', *C, '-p', 'hyperreal', '--test', 'determinant_product_cancellation', 'other_arities_keep_their_mathematical_values', '--', '--exact'], {}, 900),
+    ('inherited-zero-factor-all-features', ['cargo', 'test', *C, '-p', 'hyperreal', '--all-features', '--test', 'determinant_product_cancellation', 'other_arities_keep_their_mathematical_values', '--', '--exact'], {}, 900),
+    ('native-clippy', ['cargo', 'clippy', *C, *CORE, '--all-features', '--all-targets', '--', '-D', 'warnings'], {}, 900),
+    ('native-minimal-clippy', ['cargo', 'clippy', *C, *CORE, '--no-default-features', '--all-targets', '--', '-D', 'warnings'], {}, 900),
+    ('dependency-clippy', ['cargo', 'clippy', *C, *DEPS, '--all-features', '--all-targets', '--', '-D', 'warnings'], {}, 900),
+    ('dependency-minimal-clippy', ['cargo', 'clippy', *C, *DEPS, '--no-default-features', '--all-targets', '--', '-D', 'warnings'], {}, 900),
+    ('rustdoc', ['cargo', 'doc', *C, *CORE, *DEPS, '--all-features', '--no-deps'], {'RUSTDOCFLAGS': '-D warnings'}, 900),
+]
+COMMANDS.append(('dependency-minimal-libraries', ['cargo', 'test', *C, *DEPS, '--no-default-features', '--release', '--lib', '--no-fail-fast'], {}, 1800))
+for label, example, folder in [
+    ('analytic', 'analytic_step', 'exports'), ('faceted', 'faceted_step', 'faceted-exports'),
+    ('advanced', 'advanced_step', 'advanced-exports'), ('supplied', 'supplied_step', None),
+    ('circular', 'circular_step', None), ('similarity', 'analytic_similarity', 'scaled-exports'),
+    ('torus', 'torus_step', 'torus-exports'), ('cone', 'cone_step', 'cone-exports'),
+]:
+    command = ['cargo', 'run', *C, '-p', 'hyperbrep-io', '--example', example, '--release']
+    if folder:
+        command += ['--', str(OUT / folder)]
+    COMMANDS.append((label + '-example', command, {}, 900))
+COMMANDS += [
+    ('cone-occt', ['python3', str(OUT / 'analysis-recipes/occt_cones.py'), 'cone-exports'], {}, 300),
+    ('torus-occt', ['python3', str(OUT / 'torus_occt.py')], {}, 300),
+    ('occt-reader', ['python3', str(OUT / 'occt_read.py')], {}, 300),
+    ('fuzz-check', ['cargo', 'check', *C, '--manifest-path', 'crates/hyperbrep/fuzz/Cargo.toml', '--bins'], {}, 900),
+    ('wasm-build', ['cargo', 'build', *C, '--manifest-path', str(WASM / 'Cargo.toml'), '--target', 'wasm32-unknown-unknown', '--release'], {'RUSTFLAGS': '-D warnings'}, 900),
+    ('wasm-runtime', ['python3', str(WASM / 'run.py')], {}, 1800),
+    ('fmt', ['cargo', 'fmt', '--all', '--', '--check'], {}, 300),
+    ('diff-check', ['git', 'diff', '--check'], {}, 300),
+]
+parser = argparse.ArgumentParser()
+parser.add_argument('--only', nargs='+', choices=[row[0] for row in COMMANDS])
+args = parser.parse_args()
+recipe = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+source = hashes()
+wasm_paths = [(OUT/'wasm-probe'/name, WASM/name) for name in ['Cargo.toml','Cargo.lock','run.py']]
+wasm_paths += [(OUT/'wasm-probe'/name, WASM/'src'/name) for name in ['lib.rs','faceted.rs']]
+for retained, actual in wasm_paths:
+    assert retained.read_bytes()==actual.read_bytes(), actual
+wasm_inputs = {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for pair in wasm_paths for p in pair}
+(OUT/'wasm-source-binding.json').write_text(json.dumps(wasm_inputs,indent=2)+'\n')
+failures = []
+executed = []
+for label, command, env, seconds in COMMANDS:
+    if args.only and label not in args.only:
+        continue
+    executed.append(label)
+    if run(label, command, seconds, env):
+        failures.append(label)
+    assert source == hashes()
+    assert all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==digest for p,digest in wasm_inputs.items())
+assert hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == recipe
+path = OUT / 'qualification-drivers.json'
+rows = json.loads(path.read_text()) if path.exists() else []
+rows.append(dict(recipe=str(Path(__file__).relative_to(ROOT)), sha256=recipe,
+                 executed=executed, failures=failures, source_unchanged=True))
+path.write_text(json.dumps(rows, indent=2) + '\n')
+print('failed checks:', failures, flush=True)
+raise SystemExit(bool(failures))
