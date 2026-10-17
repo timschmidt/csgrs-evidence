@@ -1,0 +1,26 @@
+use hyperbrep::Real;
+use serde_json::Value;
+fn real(v: &Value) -> Real { serde_json::from_value(v.clone()).unwrap() }
+fn main() {
+ let args: Vec<_> = std::env::args().collect();
+ let raw: Value = serde_json::from_str(&std::fs::read_to_string(&args[1]).unwrap()).unwrap();
+ let curve = &raw["curves"][1]["EllipseArc"];
+ let edge = &raw["edges"][1];
+ let mut pairs = Vec::new();
+ for (endpoint, vertex) in [(0,1),(1,2)] {
+  let parameter = real(&edge["domain"][endpoint]["Scalar"]);
+  let delta = parameter - real(&curve["domain"][0]);
+  let angle = real(&curve["angle_at_start"]) + delta * Real::from(curve["direction"].as_i64().unwrap());
+  let cosine = angle.clone().cos(); let sine = angle.sin();
+  for axis in 0..2 {
+   let value = real(&curve["center"][axis]) + real(&curve["x"][axis])*real(&curve["x_radius"])*&cosine + real(&curve["y"][axis])*real(&curve["y_radius"])*&sine;
+   let point = real(&raw["vertices"][vertex]["Coordinates"][axis]);
+   let pair = vec![value,point];
+   let encoded=serde_json::to_string(&pair).unwrap();
+   let cold:Vec<Real>=serde_json::from_str(&encoded).unwrap();
+   println!("endpoint={endpoint} axis={axis} equal={:?} normal={:?}", hyperlimit::compare_reals(&cold[0],&cold[1],hyperbrep::STRICT_PREDICATES), (&cold[0]-&cold[1]).exact_rational_normal_form());
+   pairs.push(pair);
+  }
+ }
+ std::fs::write(&args[2],serde_json::to_string(&pairs).unwrap()).unwrap();
+}
