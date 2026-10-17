@@ -1,0 +1,21 @@
+use hypercurve::{CircularArc2, Curve2, Point2, RationalBezier2};
+use hyperbrep::Real;
+fn main() {
+    let text = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let point = |name: &str| {
+        let [x,y]: [Real;2] = serde_json::from_value(raw[name].clone()).unwrap();
+        Point2::new(x,y)
+    };
+    let arc = || CircularArc2::try_from_center(point("start"),point("end"),point("center"),raw["clockwise"].as_bool().unwrap()).unwrap();
+    println!("locations {:?}",Curve2::from(arc()).point_locations(&point("point").into()));
+    println!("native {:?}",arc().contains_point(&point("point")));
+    let arc = arc();
+    for (i,span) in arc.rational_bezier_decomposition().unwrap().spans().iter().enumerate() {
+        let curve = RationalBezier2::from(span.curve().clone());
+        println!("span {i} {:?}",curve.contains_point(&point("point")));
+        for (name,p) in [("start",curve.start()),("end",curve.end())] {
+            println!("span {i} {name} {}",serde_json::json!([p.x(),p.y()]));
+        }
+    }
+}
