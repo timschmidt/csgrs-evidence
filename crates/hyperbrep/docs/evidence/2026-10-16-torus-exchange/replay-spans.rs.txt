@@ -1,0 +1,25 @@
+use hyperbrep::*;
+fn eq(a:&Real,b:&Real)->GeometryResult<std::cmp::Ordering>{Parameter::from(a.clone()).compare(&Parameter::from(b.clone()))}
+fn probe(name:&str,model:&Model){
+ println!("{name}: replay={:?}",RawModel::from_json(&model.to_json().unwrap(),&ArchiveLimits::default()).unwrap().validate().as_ref().map(|_|()));
+ for f in model.faces(){
+  if f.surface().kind()!=SurfaceKind::Torus {continue}
+  for u in f.outer().unwrap().edge_uses(){
+   let edge=u.edge();let p=u.pcurve();let start=p.curve().start();let end=p.curve().end();
+   let a=start.coordinates().unwrap();let b=end.coordinates().unwrap();
+   let d=if eq(a.y(),b.y())==Ok(std::cmp::Ordering::Equal){b.x()-a.x()}else{b.y()-a.y()};
+   let d=if u.direction()==Direction::Forward{d}else{-d};
+   let span=edge.domain().end().try_real().unwrap()-edge.domain().start().try_real().unwrap();
+   let result=eq(&d,&span);
+   if result.is_err(){
+    if name=="partitioned torus" && u.index()==67 { println!("d={d:?} span={span:?} a={a:?} b={b:?} curve={:?}",edge.curve().circular_geometry()); }
+    println!("face={} use={} span equality={result:?}; sin={:?} cos={:?} low={:?} high={:?}",f.index(),u.index(),eq(&d.clone().sin(),&span.clone().sin()),eq(&d.clone().cos(),&span.clone().cos()),eq(&(&d-&span),&-Real::tau()),eq(&(&d-&span),&Real::tau()));
+   }
+  }
+ }
+}
+fn p(x:i32,y:i32,z:i32)->Point3{Point3::new(x.into(),y.into(),z.into())}
+fn main(){
+ let torus=builder::torus(10.into(),5.into()).unwrap();let cutter=builder::cuboid(p(-40,-40,3),p(40,40,40)).unwrap();let band=boolean::intersection(&torus,&cutter).unwrap();probe("band",band.bodies().next().unwrap().model());
+ let s=builder::sphere(3.into()).unwrap();let t=builder::torus(3.into(),1.into()).unwrap();let graph=boolean::intersection_graph(s.bodies().next().unwrap(),t.bodies().next().unwrap()).unwrap();let sphere=graph.partition_first_faces().unwrap();let torus=graph.partition_second_faces().unwrap();probe("partitioned sphere",sphere.model());probe("partitioned torus",torus.model());
+}
