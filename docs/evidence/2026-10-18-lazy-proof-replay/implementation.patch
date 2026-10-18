@@ -1,0 +1,621 @@
+--- a/crates/hyperlimit/tests/lazy_scalar_certificates.rs
++++ b/crates/hyperlimit/tests/lazy_scalar_certificates.rs
+@@ -0,0 +1,33 @@
++#![cfg(feature = "serde")]
++
++use hyperlimit::{Point2, PredicatePolicy, Sign, classify_real_sign, orient2};
++use hyperreal::Real;
++
++#[test]
++fn lazy_scalar_certificates_reach_strict_geometric_predicates() {
++    for value in [
++        Real::pi(),
++        Real::from(2).sqrt().unwrap(),
++        Real::from(3).ln().unwrap(),
++    ] {
++        let mut wire = serde_json::to_value(value).unwrap();
++        wire.as_object_mut().unwrap().remove("computable");
++        let value = Real::from_json(&wire.to_string()).unwrap();
++        assert_eq!(
++            classify_real_sign(&value, PredicatePolicy::STRICT).value(),
++            Some(Sign::Positive)
++        );
++        // The determinant of (1, 0) and (0, value) equals value > 0.
++        let a = Point2::new(Real::zero(), Real::zero());
++        let b = Point2::new(Real::one(), Real::zero());
++        let c = Point2::new(Real::zero(), value);
++        assert_eq!(
++            orient2(&a, &b, &c, PredicatePolicy::STRICT).value(),
++            Some(Sign::Positive)
++        );
++        assert_eq!(
++            orient2(&a, &c, &b, PredicatePolicy::STRICT).value(),
++            Some(Sign::Negative)
++        );
++    }
++}
+--- a/crates/hyperreal/src/computable/node.rs
++++ b/crates/hyperreal/src/computable/node.rs
+@@ -54,3 +54,4 @@
+ include!("node/magnitude_boundary_tests.rs");
+ include!("node/certified_planning_tests.rs");
+ include!("node/exact_sign_cache_tests.rs");
++include!("node/trig_range_proof_tests.rs");
+--- a/crates/hyperreal/src/computable/node/primitive_constructors.rs
++++ b/crates/hyperreal/src/computable/node/primitive_constructors.rs
+@@ -403,8 +403,10 @@
+             };
+         }
+         crate::trace_dispatch!("computable", "constructor", "prescaled-sin");
+-        Self {
+-            internal: Arc::new(Node::new(Approximation::PrescaledSin(value), BoundCache::Invalid, ExactSignCache::Invalid)),
++        let sign = value.reduced_pi_multiple_sign()
++            .map_or(ExactSignCache::Invalid, ExactSignCache::Valid);
++        Self {
++            internal: Arc::new(Node::new(Approximation::PrescaledSin(value), BoundCache::Invalid, sign)),
+             signal: None,
+         }
+     }
+@@ -568,8 +570,10 @@
+         // Same reduced-argument contract as prescaled_sin; tangent additionally
+         // relies on the public constructor to handle near-pole complements.
+         crate::trace_dispatch!("computable", "constructor", "prescaled-tan");
+-        Self {
+-            internal: Arc::new(Node::new(Approximation::PrescaledTan(value), BoundCache::Invalid, ExactSignCache::Invalid)),
++        let sign = value.reduced_pi_multiple_sign()
++            .map_or(ExactSignCache::Invalid, ExactSignCache::Valid);
++        Self {
++            internal: Arc::new(Node::new(Approximation::PrescaledTan(value), BoundCache::Invalid, sign)),
+             signal: None,
+         }
+     }
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -16,7 +16,7 @@
+ /// Keeping these in one allocation makes a `Computable` clone one pointer and
+ /// one atomic reference-count update instead of two of each.
+ #[derive(Debug)]
+-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
++#[cfg_attr(feature = "serde", derive(Serialize), serde(transparent))]
+ #[cfg(not(verus_keep_ghost))]
+ pub(super) struct Node {
+     #[cfg_attr(feature = "serde", serde(skip, default))]
+@@ -24,6 +24,31 @@
+     approximation: Approximation,
+     #[cfg_attr(feature = "serde", serde(skip, default))]
+     cache: EvaluationCache,
++}
++
++#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
++impl<'de> Deserialize<'de> for Node {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: serde::Deserializer<'de>,
++    {
++        // Preserve the transparent wire representation and default cache state.
++        // Replay this bounded proof from the expression itself so a subsequent
++        // bounded reducer can consume it without first warming a numeric cache.
++        let approximation = Approximation::deserialize(deserializer)?;
++        let facts = AtomicFacts::default();
++        if let Approximation::PrescaledSin(argument) | Approximation::PrescaledTan(argument) =
++            &approximation
++            && let Some(sign) = argument.reduced_pi_multiple_sign()
++        {
++            facts.replace_exact_sign(ExactSignCache::Valid(sign));
++        }
++        Ok(Self {
++            facts,
++            approximation,
++            cache: EvaluationCache::default(),
++        })
++    }
+ }
+ 
+ #[cfg(not(verus_keep_ghost))]
+--- a/crates/hyperreal/src/computable/node/structural_analysis.rs
++++ b/crates/hyperreal/src/computable/node/structural_analysis.rs
+@@ -1013,6 +1013,57 @@
+         }
+     }
+ 
++    /// Sign of a retained nonzero q*pi with |q| < 1/2.
++    ///
++    /// Inspect at most 32 nodes, accepting one exact rational factor, binary
++    /// shifts and negations. Native rational magnitude metadata avoids building
++    /// a large shifted coefficient. This bounds graph inspection, not the size
++    /// of an input rational. Other forms and overflowing shifts stay unknown.
++    fn reduced_pi_multiple_sign(&self) -> Option<Sign> {
++        let mut remaining = 32_usize;
++        let mut node = self;
++        let mut factor = None;
++        let mut shift = 0_i32;
++        let mut negative = false;
++        loop {
++            remaining = remaining.checked_sub(1)?;
++            match &node.internal.approximation {
++                Approximation::Constant(SharedConstant::Pi) => {
++                    let factor = factor.unwrap_or_else(Rational::one);
++                    if factor.msd_exact_with_offset(shift)?.0 >= -1 {
++                        return None;
++                    }
++                    return Some(if negative {
++                        negate_sign(factor.sign())
++                    } else {
++                        factor.sign()
++                    });
++                }
++                Approximation::Negate(child) => {
++                    negative = !negative;
++                    node = child;
++                }
++                Approximation::Offset(child, offset) => {
++                    shift = shift.checked_add(*offset)?;
++                    node = child;
++                }
++                Approximation::Multiply(left, right) if factor.is_none() => {
++                    // Charge both leaf inspections, including the unsuccessful
++                    // one when the rational is on the right.
++                    remaining = remaining.checked_sub(2)?;
++                    if let Some(rational) = left.exact_rational() {
++                        factor = Some(rational);
++                        node = right;
++                    } else {
++                        factor = Some(right.exact_rational()?);
++                        node = left;
++                    }
++                }
++                _ => return None,
++            }
++        }
++    }
++
+     fn exact_sign(&self) -> Option<Sign> {
+         // `exact_sign` is stronger than "current approximation sign": it means
+         // the expression shape or a separated cached approximation proves the
+@@ -1098,6 +1149,12 @@
+                 }
+                 Approximation::PrescaledSinRational(r) | Approximation::PrescaledTanRational(r) => {
+                     Some(Some(r.sign()))
++                }
++                // Sine and tangent share the argument's sign on (-pi/2, pi/2).
++                // Recover the witness from the graph after lazy reconstruction
++                // or import; serialized class tags and cache hints are not proof.
++                Approximation::PrescaledSin(argument) | Approximation::PrescaledTan(argument) => {
++                    Some(argument.reduced_pi_multiple_sign())
+                 }
+                 Approximation::PrescaledCosRational(_)
+                 | Approximation::SincSmall(_)
+--- a/crates/hyperreal/src/computable/node/trig_range_proof_tests.rs
++++ b/crates/hyperreal/src/computable/node/trig_range_proof_tests.rs
+@@ -0,0 +1,145 @@
++#[cfg(all(test, feature = "serde"))]
++mod trig_range_proof_tests {
++    use super::*;
++    use serde_json::{Value, json};
++
++    fn raw_trig(kind: &str, argument: Value) -> Computable {
++        serde_json::from_value(json!({"internal": {kind: argument}})).unwrap()
++    }
++
++    fn pi_multiple(q: Rational) -> Value {
++        serde_json::to_value(Computable::pi().multiply(Computable::rational(q))).unwrap()
++    }
++
++    fn assert_unwarmed_sign(kind: &str, argument: Value, expected: RealSign) {
++        let value = raw_trig(kind, argument);
++        let wire = serde_json::to_value(&value).unwrap();
++        assert!(value.cached().is_none());
++        assert_eq!(
++            value.immediate_sign(),
++            Some(expected),
++            "proof replay on import"
++        );
++        for _ in 0..2 {
++            assert_eq!(
++                value.structural_facts().sign,
++                Some(expected),
++                "{kind}: {wire}"
++            );
++            assert!(
++                value.cached().is_none(),
++                "sign inspection must not approximate"
++            );
++        }
++        assert_eq!(serde_json::to_value(value).unwrap(), wire);
++    }
++
++    #[test]
++    fn reduced_pi_graphs_prove_sign_without_approximation_after_import() {
++        // Sine and tangent have the sign of q for -1/2 < q < 1/2.
++        // Reimported graphs have no serialized cache facts or Real class tag.
++        for kind in ["PrescaledSin", "PrescaledTan"] {
++            for (q, sign) in [
++                (Rational::fraction(1, 5).unwrap(), RealSign::Positive),
++                (Rational::fraction(-1, 5).unwrap(), RealSign::Negative),
++                (Rational::fraction(49, 100).unwrap(), RealSign::Positive),
++                (Rational::fraction(-49, 100).unwrap(), RealSign::Negative),
++            ] {
++                assert_unwarmed_sign(kind, pi_multiple(q), sign);
++            }
++            // The shifted graph denotes pi*2^(-160); prove sign without building
++            // or refining a number whose absolute size is used as a tolerance.
++            let pi = serde_json::to_value(Computable::pi()).unwrap();
++            let tiny = json!({"internal": {"Offset": [pi, -160]}});
++            assert_unwarmed_sign(kind, tiny, RealSign::Positive);
++        }
++    }
++
++    #[test]
++    fn range_proofs_do_not_certify_poles_or_wrong_quadrants() {
++        for kind in ["PrescaledSin", "PrescaledTan"] {
++            for (q, sine, tangent) in [
++                (Rational::zero(), Some(RealSign::Zero), Some(RealSign::Zero)),
++                (
++                    Rational::fraction(1, 2).unwrap(),
++                    Some(RealSign::Positive),
++                    None,
++                ),
++                (
++                    Rational::fraction(3, 4).unwrap(),
++                    Some(RealSign::Positive),
++                    Some(RealSign::Negative),
++                ),
++                (Rational::one(), Some(RealSign::Zero), Some(RealSign::Zero)),
++                (
++                    Rational::fraction(3, 2).unwrap(),
++                    Some(RealSign::Negative),
++                    None,
++                ),
++            ] {
++                let value = raw_trig(kind, pi_multiple(q));
++                let expected = if kind == "PrescaledSin" {
++                    sine
++                } else {
++                    tangent
++                };
++                if let Some(sign) = value.structural_facts().sign {
++                    assert_eq!(Some(sign), expected, "{kind}");
++                }
++                assert!(value.cached().is_none());
++            }
++        }
++    }
++
++    #[test]
++    fn extreme_shifts_and_unsupported_graphs_do_not_expand_coefficients() {
++        fn raw(approximation: Approximation) -> Computable {
++            Computable {
++                internal: Arc::new(Node::new(
++                    approximation,
++                    BoundCache::Invalid,
++                    ExactSignCache::Invalid,
++                )),
++                signal: None,
++            }
++        }
++        let tiny = raw(Approximation::Offset(Computable::pi(), i32::MIN));
++        let negative_tiny = raw(Approximation::Negate(tiny.clone()));
++        for (argument, sign) in [(tiny, Sign::Plus), (negative_tiny, Sign::Minus)] {
++            for approximation in [
++                Approximation::PrescaledSin(argument.clone()),
++                Approximation::PrescaledTan(argument.clone()),
++            ] {
++                let value = raw(approximation);
++                assert_eq!(value.exact_sign(), Some(sign));
++                assert!(value.cached().is_none());
++                assert!(argument.cached().is_none());
++            }
++        }
++
++        let mut deep = raw(Approximation::Offset(Computable::pi(), -160));
++        for _ in 0..33 {
++            deep = raw(Approximation::Negate(deep));
++        }
++        let overflowing_shift = raw(Approximation::Offset(
++            raw(Approximation::Offset(Computable::pi(), i32::MAX)),
++            2,
++        ));
++        // A matching-looking pi factor cannot cancel an undefined operand.
++        let undefined = raw(Approximation::Multiply(
++            raw(Approximation::Inverse(Computable::zero())),
++            Computable::pi(),
++        ));
++        for argument in [deep, overflowing_shift, undefined] {
++            for approximation in [
++                Approximation::PrescaledSin(argument.clone()),
++                Approximation::PrescaledTan(argument.clone()),
++            ] {
++                let value = raw(approximation);
++                assert_eq!(value.exact_sign(), None);
++                assert!(value.cached().is_none());
++                assert!(argument.cached().is_none());
++            }
++        }
++    }
++}
+--- a/crates/hyperreal/src/real/arithmetic/quadratic_tower_sign.rs
++++ b/crates/hyperreal/src/real/arithmetic/quadratic_tower_sign.rs
+@@ -41,7 +41,7 @@
+             // sign, so transfer the proof to its payload with that correction.
+             compact
+                 .computable_ref()
+-                .retain_sign_of_scaled_tower_source(self.computable_ref(), compact.rational.sign());
++                .retain_sign_of_scaled_tower_source(&self.computable_ref(), compact.rational.sign());
+         }
+         compact *= Self::new(self.rational.clone());
+         if let Some(signal) = self.abort_signal() {
+@@ -57,7 +57,7 @@
+         if self.rational.sign() == Sign::NoSign {
+             return Computable::zero();
+         }
+-        let payload = self.computable_ref().clone();
++        let payload = self.computable_clone();
+         if self.rational.is_one() {
+             payload
+         } else {
+--- a/crates/hyperreal/src/real/arithmetic/representation.rs
++++ b/crates/hyperreal/src/real/arithmetic/representation.rs
+@@ -1,3 +1,4 @@
++use std::borrow::Cow;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
+ 
+@@ -172,10 +173,14 @@
+         }
+     }
+ 
+-    fn computable_ref(&self) -> &Computable {
+-        self.computable
+-            .as_ref()
+-            .expect("non-rational Real classes carry a computable payload")
++    fn computable_ref(&self) -> Cow<'_, Computable> {
++        // A named certificate may retain its recipe without a materialized
++        // payload. Borrow existing graphs so their proofs and signals survive;
++        // only reconstruct when the graph is absent.
++        match &self.computable {
++            Some(computable) => Cow::Borrowed(computable),
++            None => Cow::Owned(self.class.computable_certificate()),
++        }
+     }
+ 
+     pub(super) fn computable_clone(&self) -> Computable {
+--- a/crates/hyperreal/tests/serde_lazy_certificates.rs
++++ b/crates/hyperreal/tests/serde_lazy_certificates.rs
+@@ -0,0 +1,183 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Rational, Real, RealSign, ZeroKnowledge};
++use serde_json::Value;
++
++fn fraction(numerator: i64, denominator: u64) -> Real {
++    Real::from(Rational::fraction(numerator, denominator).unwrap())
++}
++
++// Every named certificate, constructed through the public API. Bounds follow
++// from 3 < pi < 22/7, 8/3 < e < 11/4, 7/5 < sqrt(2) < 3/2,
++// monotonicity, and the defining power/logarithm identities.
++fn certificates() -> Vec<(&'static str, Real, i64, i64)> {
++    let pi = Real::pi();
++    let e = Real::e();
++    let pi_squared = &pi * &pi;
++    let sqrt_two = Real::from(2).sqrt().unwrap();
++    let ln_two = Real::from(2).ln().unwrap();
++    let ln_three = Real::from(3).ln().unwrap();
++    vec![
++        ("One", fraction(3, 2), 1, 2),
++        ("Pi", pi.clone(), 3, 4),
++        ("PiPow", pi_squared.clone(), 9, 10),
++        ("PiInv", pi.clone().inverse().unwrap(), 0, 1),
++        ("PiExp", &pi * &e, 8, 9),
++        ("PiInvExp", (&e / &pi).unwrap(), 0, 1),
++        ("PiSqrt", &pi * &sqrt_two, 4, 5),
++        ("ConstProduct", &pi_squared * &e, 24, 28),
++        ("ConstOffset", &pi - Real::from(3), 0, 1),
++        ("ConstProductSqrt", &(&pi_squared * &e) * &sqrt_two, 33, 42),
++        ("Sqrt", sqrt_two, 1, 2),
++        ("Exp", Real::from(2).exp().unwrap(), 7, 8),
++        ("Ln", ln_three.clone(), 1, 2),
++        ("LnAffine", (Real::from(2) * &e).ln().unwrap(), 1, 2),
++        ("LnProduct", &ln_two * &ln_three, 0, 2),
++        ("Log10", Real::from(2).log10().unwrap(), 0, 1),
++        ("Log2", Real::from(3).log2().unwrap(), 1, 2),
++        ("Pow10", fraction(1, 3).exp10().unwrap(), 2, 3),
++        ("Pow2", fraction(1, 3).exp2().unwrap(), 1, 2),
++        ("SinPi", fraction(1, 5).sin_pi(), 0, 1),
++        ("TanPi", fraction(1, 5).tan_pi().unwrap(), 0, 1),
++    ]
++}
++
++fn assert_tag(wire: &Value, expected: &str) {
++    let tag = &wire["class"];
++    assert!(
++        tag == expected
++            || tag
++                .as_object()
++                .is_some_and(|map| map.contains_key(expected))
++    );
++}
++
++fn query_and_compose(value: &Real, scale: i64, lower: i64, upper: i64) {
++    let sign = match scale.cmp(&0) {
++        std::cmp::Ordering::Less => RealSign::Negative,
++        std::cmp::Ordering::Equal => RealSign::Zero,
++        std::cmp::Ordering::Greater => RealSign::Positive,
++    };
++    let json = value.to_json();
++    let bytes = value.to_bytes();
++    for precision in [0, -128, 0] {
++        assert_eq!(value.structural_facts().sign, Some(sign));
++        let _ = value.detailed_facts();
++        let _ = value.domain_facts();
++        assert_eq!(value.certified_sign_until(precision).sign(), Some(sign));
++        assert_eq!(
++            value.zero_status(),
++            if scale == 0 {
++                ZeroKnowledge::Zero
++            } else {
++                ZeroKnowledge::NonZero
++            }
++        );
++    }
++    let (lower, upper) = if scale < 0 {
++        (upper * scale, lower * scale)
++    } else {
++        (lower * scale, upper * scale)
++    };
++    let [lo, hi] = value.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::from(lower) && hi <= Rational::from(upper));
++    let translated = value + Real::one();
++    let [lo, hi] = translated.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::from(lower + 1) && hi <= Rational::from(upper + 1));
++    if scale != 0 {
++        let inverse = value.inverse_ref().unwrap();
++        let product = value * inverse;
++        // Request the existing exact reduction explicitly. Automatic equality
++        // refinement alone does not currently decide every reciprocal product.
++        assert_eq!(
++            product.exact_rational_normal_form(),
++            Some(Rational::one()),
++            "{json}"
++        );
++    }
++    if scale > 0 {
++        let root = value.clone().sqrt().unwrap();
++        let [lo, hi] = root.certified_rational_interval(-32).unwrap();
++        assert!(lo >= Rational::zero() && hi <= Rational::from(7));
++    }
++    assert_eq!(value.to_json(), json);
++    assert_eq!(value.to_bytes(), bytes);
++}
++
++fn lazy_certificate_matrix(decode: impl Fn(&Value) -> Real) {
++    for (name, value, lower, upper) in certificates() {
++        let original = serde_json::to_value(&value).unwrap();
++        assert_tag(&original, name);
++        for scale in [0, 1, -3] {
++            for omit in [false, true] {
++                let mut wire = original.clone();
++                let original_scale: Rational =
++                    serde_json::from_value(wire["rational"].clone()).unwrap();
++                wire["rational"] =
++                    serde_json::to_value(original_scale * Rational::from(scale)).unwrap();
++                if omit {
++                    wire.as_object_mut().unwrap().remove("computable");
++                } else {
++                    wire["computable"] = Value::Null;
++                }
++                let decoded = decode(&wire);
++                query_and_compose(&decoded, scale, lower, upper);
++                assert!(serde_json::to_value(&decoded).unwrap()["computable"].is_null());
++            }
++        }
++    }
++}
++
++#[test]
++fn json_lazy_certificates_support_queries_and_composition() {
++    lazy_certificate_matrix(|wire| Real::from_json(&wire.to_string()).unwrap());
++}
++
++#[test]
++fn cbor_lazy_certificates_support_queries_and_composition() {
++    lazy_certificate_matrix(|wire| {
++        let mut bytes = Vec::new();
++        ciborium::ser::into_writer(wire, &mut bytes).unwrap();
++        Real::from_bytes(&bytes).unwrap()
++    });
++}
++
++#[test]
++fn materialized_certificates_keep_the_same_semantics() {
++    for (name, value, lower, upper) in certificates() {
++        assert_tag(&serde_json::to_value(&value).unwrap(), name);
++        query_and_compose(&value, 1, lower, upper);
++    }
++}
++
++#[test]
++fn lazy_quadratic_certificate_supports_normal_forms_and_towers() {
++    let value = Real::from(-3) * Real::from(2).sqrt().unwrap();
++    let mut wire = serde_json::to_value(value).unwrap();
++    assert_tag(&wire, "Sqrt");
++    wire["computable"] = Value::Null;
++    let value = Real::from_json(&wire.to_string()).unwrap();
++    let expected = (Rational::zero(), Rational::from(-3), Rational::from(2));
++    assert_eq!(value.exact_rational_normal_form(), None);
++    assert_eq!(value.exact_quadratic_normal_form(), Some(expected.clone()));
++    assert_eq!(value.quadratic_tower_sign(), Some(RealSign::Negative));
++    assert_eq!(value.radical_tower_sign(), Some(RealSign::Negative));
++    let compact = value.compact_quadratic_tower().unwrap();
++    assert_eq!(compact.exact_quadratic_normal_form(), Some(expected));
++    let polynomial = value.quadratic_tower_annihilating_polynomial().unwrap();
++    // This value is -3 sqrt(2), hence x^2 = 18. Independently reduce every
++    // coefficient into its rational and sqrt(2) parts.
++    let mut even = Rational::zero();
++    let mut odd = Rational::zero();
++    let mut power = Rational::one();
++    for (index, coefficient) in polynomial.into_iter().enumerate() {
++        if index % 2 == 0 {
++            even = even + coefficient * &power;
++        } else {
++            odd = odd + coefficient * &power;
++            power *= Rational::from(18);
++        }
++    }
++    assert_eq!((even, odd), (Rational::zero(), Rational::zero()));
++    assert!(serde_json::to_value(&value).unwrap()["computable"].is_null());
++}
+--- a/crates/hyperreal/tests/trig_certificate_composition.rs
++++ b/crates/hyperreal/tests/trig_certificate_composition.rs
+@@ -0,0 +1,51 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Rational, Real};
++use serde_json::Value;
++
++fn reciprocal(value: &Real) {
++    assert_eq!(
++        (value * value.inverse_ref().unwrap()).exact_rational_normal_form(),
++        Some(Rational::one()),
++        "{}",
++        value.to_json(),
++    );
++}
++
++#[test]
++fn cold_and_reimported_trig_certificates_compose_through_scaling() {
++    for value in [
++        Real::from(Rational::fraction(1, 5).unwrap()).sin_pi(),
++        Real::from(Rational::fraction(1, 5).unwrap())
++            .tan_pi()
++            .unwrap(),
++    ] {
++        let wire = serde_json::to_value(&value).unwrap();
++        for lazy in [false, true] {
++            let mut wire = wire.clone();
++            if lazy {
++                wire["computable"] = Value::Null;
++            }
++            let value = Real::from_json(&wire.to_string()).unwrap();
++            let before = value.to_json();
++            for warm in [false, true] {
++                if warm {
++                    value.certified_rational_interval(-128).unwrap();
++                }
++                reciprocal(&value);
++                for result in [
++                    &value * Real::from(2),
++                    &value * Real::from(-3),
++                    (&value / Real::from(2)).unwrap(),
++                    &value + &value,
++                ] {
++                    reciprocal(&result);
++                    // A fresh import must be able to recover its proof from
++                    // the represented graph or certificate, without cache bits.
++                    reciprocal(&Real::from_bytes(&result.to_bytes()).unwrap());
++                }
++            }
++            assert_eq!(value.to_json(), before);
++        }
++    }
++}

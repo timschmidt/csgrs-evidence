@@ -1,0 +1,79 @@
+--- algebra_explicit_v1-baseline
++++ algebra_explicit_v1-candidate
+@@ -1656,31 +1656,43 @@
+         Some((base, coefficient * &scale, offset * scale))
+     }
+ 
++    // Prove only cancellation of the symbolic terms. Ordinary sums retain
++    // their shared operands and approximation caches. The zero-only caller
++    // keeps addition's early offset check before comparing symbolic bases.
++    pub(crate) fn rational_affine_difference(
++        &self,
++        other: &Self,
++        zero_only: bool,
++    ) -> Option<Rational> {
++        let left_parts = self.rational_offset_parts(&mut 8);
++        let right_parts = other.rational_offset_parts(&mut 8);
++        let (left, left_scale, left_offset, right, right_scale, right_offset) =
++            match (left_parts, right_parts) {
++                (Some((left, scale, offset)), Some((right, other_scale, other_offset))) =>
++                    (left, scale, offset, right, other_scale, other_offset),
++                (Some((base, scale, offset)), None) =>
++                    (base, scale, offset, other, Rational::one(), Rational::zero()),
++                (None, Some((base, scale, offset))) =>
++                    (self, Rational::one(), Rational::zero(), base, scale, offset),
++                (None, None) => return None,
++            };
++        if zero_only && left_offset != right_offset {
++            return None;
++        }
++        let same_term = if left_scale == right_scale {
++            Self::internal_structural_eq(left, right)
++        } else {
++            Self::internal_structural_eq(
++                &left.clone().multiply_rational(left_scale),
++                &right.clone().multiply_rational(right_scale),
++            )
++        };
++        same_term.then(|| left_offset - right_offset)
++    }
++
+     /// Add some other number to this number.
+     #[allow(clippy::should_implement_trait)]
+     pub fn add(self, other: Computable) -> Computable {
+-        fn affine_offset_eq(left: &Computable, right: &Computable) -> bool {
+-            let left_parts = left.rational_offset_parts(&mut 8);
+-            let right_parts = right.rational_offset_parts(&mut 8);
+-            let (left, left_scale, right, right_scale) = match (left_parts, right_parts) {
+-                (Some((left, left_scale, left_offset)), Some((right, right_scale, right_offset)))
+-                    if left_offset == right_offset => (left, left_scale, right, right_scale),
+-                (Some((base, scale, offset)), None) if offset.sign() == Sign::NoSign =>
+-                    (base, scale, right, Rational::one()),
+-                (None, Some((base, scale, offset))) if offset.sign() == Sign::NoSign =>
+-                    (left, Rational::one(), base, scale),
+-                _ => return false,
+-            };
+-            if left_scale == right_scale {
+-                Computable::internal_structural_eq(left, right)
+-            } else {
+-                Computable::internal_structural_eq(
+-                    &left.clone().multiply_rational(left_scale),
+-                    &right.clone().multiply_rational(right_scale),
+-                )
+-            }
+-        }
+-
+         fn commuted_add_pair_eq(left: &Computable, right: &Computable) -> bool {
+             matches!(
+                 (&left.internal.approximation, &right.internal.approximation),
+@@ -1762,7 +1774,9 @@
+             (Approximation::Negate(cancelled), _) => Some((&other, cancelled)),
+             _ => None,
+         };
+-        if cancelled_pair.is_some_and(|(left, right)| affine_offset_eq(left, right)) {
++        if cancelled_pair.is_some_and(|(left, right)| {
++            left.rational_affine_difference(right, true).is_some()
++        }) {
+             crate::trace_dispatch!("computable", "add", "affine-offset-cancellation");
+             return Self::zero();
+         }

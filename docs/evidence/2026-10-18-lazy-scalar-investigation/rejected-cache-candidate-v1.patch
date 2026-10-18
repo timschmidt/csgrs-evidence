@@ -1,0 +1,1926 @@
+--- a/crates/hyperlimit/tests/lazy_scalar_certificates.rs
++++ b/crates/hyperlimit/tests/lazy_scalar_certificates.rs
+@@ -0,0 +1,33 @@
++#![cfg(feature = "serde")]
++
++use hyperlimit::{Point2, PredicatePolicy, Sign, classify_real_sign, orient2};
++use hyperreal::Real;
++
++#[test]
++fn lazy_scalar_certificates_reach_strict_geometric_predicates() {
++    for value in [
++        Real::pi(),
++        Real::from(2).sqrt().unwrap(),
++        Real::from(3).ln().unwrap(),
++    ] {
++        let mut wire = serde_json::to_value(value).unwrap();
++        wire.as_object_mut().unwrap().remove("computable");
++        let value = Real::from_json(&wire.to_string()).unwrap();
++        assert_eq!(
++            classify_real_sign(&value, PredicatePolicy::STRICT).value(),
++            Some(Sign::Positive)
++        );
++        // The determinant of (1, 0) and (0, value) equals value > 0.
++        let a = Point2::new(Real::zero(), Real::zero());
++        let b = Point2::new(Real::one(), Real::zero());
++        let c = Point2::new(Real::zero(), value);
++        assert_eq!(
++            orient2(&a, &b, &c, PredicatePolicy::STRICT).value(),
++            Some(Sign::Positive)
++        );
++        assert_eq!(
++            orient2(&a, &c, &b, PredicatePolicy::STRICT).value(),
++            Some(Sign::Negative)
++        );
++    }
++}
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -309,8 +309,16 @@
+ Serialization records expression structure, not transient caches or abort
+ signals. An opaque scalar without its required computable payload is rejected
+ by Serde and returns `Problem::ParseError` through the convenience readers.
++Valid named symbolic certificates may omit their lazy payload; fact queries,
++normal forms, and subsequent arithmetic reconstruct it from the certificate
++without changing the serialized expression. Existing payloads retain their
++proofs and caches. Each value retains at most one reconstructed graph until
++the value is dropped; its size follows the certificate and is not bounded by
++a byte limit. Primitive caching or reconstruction allocates one private cache
++record on first use; an unused cache occupies one inline atomic pointer.
+ Validation of mathematical domains inside present expression graphs remains
+-incomplete.
++incomplete, as does validation of arbitrary supplied certificates against their
++payloads.
+ 
+ ## Guarantees and boundaries
+ 
+--- a/crates/hyperreal/src/real/arithmetic/add_sub.rs
++++ b/crates/hyperreal/src/real/arithmetic/add_sub.rs
+@@ -27,7 +27,7 @@
+                 rational,
+                 class: left.class.clone(),
+                 computable: left.computable.clone(),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             };
+@@ -83,7 +83,7 @@
+             rational: term.rational.clone(),
+             class,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ }
+@@ -108,7 +108,7 @@
+                 rational,
+                 class: self.class.clone(),
+                 computable: self.computable.clone(),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             };
+         }
+         if self.has_zero_scale() {
+@@ -163,7 +163,7 @@
+             rational: Rational::one(),
+             class: Irrational,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ }
+@@ -359,7 +359,7 @@
+                 rational: -&self.rational,
+                 class: One,
+                 computable: None,
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             };
+@@ -390,7 +390,7 @@
+                 rational,
+                 class: self.class.clone(),
+                 computable: self.computable.clone(),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             };
+         }
+         if self.class == Pi
+@@ -458,7 +458,7 @@
+             rational: Rational::one(),
+             class: Irrational,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ }
+@@ -532,7 +532,7 @@
+                 rational: x.clone(),
+                 class: One,
+                 computable: None,
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             }
+         } else if matches!(
+             (x.to_integer_i64(), y.to_integer_i64()),
+@@ -547,7 +547,7 @@
+                 rational: Rational::one(),
+                 class: Sqrt(rationals::SIX.clone()),
+                 computable: Some(Computable::sqrt_rational(rationals::SIX.clone())),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             }
+         } else {
+             let product = x * y;
+@@ -556,7 +556,7 @@
+                     rational: product,
+                     class: One,
+                     computable: None,
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 };
+             }
+             let (a, b) = product.extract_square_reduced();
+@@ -567,15 +567,15 @@
+                     rational: a,
+                     class: One,
+                     computable: None,
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 };
+             }
+             Self {
+                 rational: a,
+                 class: Sqrt(b.clone()),
+                 computable: Some(Computable::sqrt_squarefree_rational(b)),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
+-            }
+-        }
+-    }
+-}
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
++            }
++        }
++    }
++}
+--- a/crates/hyperreal/src/real/arithmetic/canonical_constants.rs
++++ b/crates/hyperreal/src/real/arithmetic/canonical_constants.rs
+@@ -26,7 +26,7 @@
+ 
+ mod constants {
+     use super::{
+-        AtomicPrimitiveApproxCache, Class, ConstOffsetClass, LnAffineClass,
++        RealCaches, Class, ConstOffsetClass, LnAffineClass,
+         PrimitiveApproxCache,
+     };
+     use crate::{Computable, Rational, Real};
+@@ -39,68 +39,68 @@
+             rational: Rational::one(),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static TAU: Real = Real {
+             rational: Rational::new(2),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_OVER_TWO: Real = Real {
+             rational: Rational::fraction(1, 2).unwrap(),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_OVER_THREE: Real = Real {
+             rational: Rational::fraction(1, 3).unwrap(),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_OVER_FOUR: Real = Real {
+             rational: Rational::fraction(1, 4).unwrap(),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_OVER_SIX: Real = Real {
+             rational: Rational::fraction(1, 6).unwrap(),
+             class: Class::Pi,
+             computable: Some(Computable::pi()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static HALF: Real = Real::new(Rational::fraction(1, 2).unwrap());
+         static SQRT_TWO_OVER_TWO: Real = Real {
+             rational: Rational::fraction(1, 2).unwrap(),
+             class: Class::Sqrt(Rational::new(2)),
+             computable: Some(Computable::sqrt_constant(2).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static SQRT_THREE_OVER_TWO: Real = Real {
+             rational: Rational::fraction(1, 2).unwrap(),
+             class: Class::Sqrt(Rational::new(3)),
+             computable: Some(Computable::sqrt_constant(3).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static SQRT_THREE: Real = Real {
+             rational: Rational::one(),
+             class: Class::Sqrt(Rational::new(3)),
+             computable: Some(Computable::sqrt_constant(3).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static SQRT_THREE_OVER_THREE: Real = Real {
+             rational: Rational::fraction(1, 3).unwrap(),
+             class: Class::Sqrt(Rational::new(3)),
+             computable: Some(Computable::sqrt_constant(3).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static SQRT_SIX_OVER_THREE: Real = Real {
+             rational: Rational::fraction(1, 3).unwrap(),
+             class: Class::Sqrt(Rational::new(6)),
+             computable: Some(Computable::sqrt_rational(Rational::new(6))),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_SQRT_TWO: Real = Real {
+             rational: Rational::one(),
+@@ -109,49 +109,49 @@
+                 Computable::pi(),
+                 Computable::sqrt_constant(2).unwrap(),
+             )),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN2: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(2)),
+             computable: Some(Computable::ln_constant(2).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN3: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(3)),
+             computable: Some(Computable::ln_constant(3).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static HALF_LN3: Real = Real {
+             rational: Rational::fraction(1, 2).unwrap(),
+             class: Class::Ln(Rational::new(3)),
+             computable: Some(Computable::ln_constant(3).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN5: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(5)),
+             computable: Some(Computable::ln_constant(5).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN6: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(6)),
+             computable: Some(Computable::ln_constant(6).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN7: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(7)),
+             computable: Some(Computable::ln_constant(7).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static LN10: Real = Real {
+             rational: Rational::one(),
+             class: Class::Ln(Rational::new(10)),
+             computable: Some(Computable::ln_constant(10).unwrap()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static PI_MINUS_THREE: Real = Real {
+             rational: Rational::one(),
+@@ -164,7 +164,7 @@
+                 Computable::pi(),
+                 Computable::rational(Rational::new(-3)),
+             )),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static ONE_PLUS_LN2: Real = Real {
+             rational: Rational::one(),
+@@ -176,13 +176,13 @@
+                 Computable::one(),
+                 Computable::ln_constant(2).unwrap(),
+             )),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+         static E: Real = Real {
+             rational: Rational::one(),
+             class: Class::Exp(Rational::one()),
+             computable: Some(Computable::e_constant()),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         };
+     }
+ 
+@@ -249,7 +249,7 @@
+                 rational: Rational::one(),
+                 class: Class::Sqrt(Rational::new(2)),
+                 computable: Some(Computable::sqrt_constant(2).unwrap()),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             }),
+             3 => Some(sqrt_three()),
+             _ => None,
+--- a/crates/hyperreal/src/real/arithmetic/classification.rs
++++ b/crates/hyperreal/src/real/arithmetic/classification.rs
+@@ -78,8 +78,8 @@
+     Log2(Rational),                 // Rational > 1 and never a power of two
+     Pow10(Rational), // Exactly 10**Rational for a noninteger exponent not represented as a sqrt
+     Pow2(Rational),  // Exactly 2**Rational for a noninteger exponent not represented as a sqrt
+-    SinPi(Rational),                // 0 < Rational < 1/2 also never 1/6 or 1/4 or 1/3
+-    TanPi(Rational),                // 0 < Rational < 1/2 also never 1/6 or 1/4 or 1/3
++    SinPi(Rational), // 0 < Rational < 1/2 also never 1/6 or 1/4 or 1/3
++    TanPi(Rational), // 0 < Rational < 1/2 also never 1/6 or 1/4 or 1/3
+     Irrational,
+ }
+ 
+@@ -93,15 +93,22 @@
+     F64(Option<f64>),
+ }
+ 
+-/// Lock-free cache for lossy primitive conversions.
++/// Per-value caches for primitive conversions and a lazily reconstructed graph.
+ ///
+ /// Exact-real values never convert to NaN, so reserved quiet-NaN bit patterns
+-/// can represent the empty and overflow states without increasing `Real`'s
+-/// layout. A tagged negative-NaN range carries cached finite `f32` values;
++/// can represent the primitive empty and overflow states in one atomic word.
++/// A tagged negative-NaN range carries cached finite `f32` values;
+ /// every other finite bit pattern is a cached `f64`.
+-pub(super) struct AtomicPrimitiveApproxCache(std::sync::atomic::AtomicU64);
+-
+-impl AtomicPrimitiveApproxCache {
++pub(super) struct RealCaches(std::sync::atomic::AtomicPtr<RealCacheData>);
++
++struct RealCacheData {
++    primitive: std::sync::atomic::AtomicU64,
++    // Preserve evidence between queries without changing the optional wire
++    // payload. Ordinary materialized values never initialize this cell.
++    computable: std::sync::OnceLock<Computable>,
++}
++
++impl RealCaches {
+     const EMPTY: u64 = 0x7ff8_0000_0000_0001;
+     #[cfg(feature = "cached-f32-approx")]
+     const F32_NONE: u64 = 0x7ff8_0000_0000_0002;
+@@ -110,27 +117,82 @@
+     const F32_TAG: u64 = 0xffff_ffff_0000_0000;
+ 
+     pub(super) fn new(value: PrimitiveApproxCache) -> Self {
+-        Self(std::sync::atomic::AtomicU64::new(Self::encode(value)))
++        let cache = Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
++        if !matches!(value, PrimitiveApproxCache::Empty) {
++            cache.set(value);
++        }
++        cache
++    }
++
++    fn data(&self) -> Option<&RealCacheData> {
++        let pointer = self.0.load(std::sync::atomic::Ordering::Acquire);
++        if pointer.is_null() {
++            None
++        } else {
++            // SAFETY: the installed allocation is immutable in identity and
++            // lives until this cache is exclusively dropped.
++            Some(unsafe { &*pointer })
++        }
++    }
++
++    fn data_or_init(&self) -> &RealCacheData {
++        if let Some(data) = self.data() {
++            return data;
++        }
++        let allocated = Box::into_raw(Box::new(RealCacheData {
++            primitive: std::sync::atomic::AtomicU64::new(Self::EMPTY),
++            computable: std::sync::OnceLock::new(),
++        }));
++        let pointer = match self.0.compare_exchange(
++            std::ptr::null_mut(),
++            allocated,
++            std::sync::atomic::Ordering::AcqRel,
++            std::sync::atomic::Ordering::Acquire,
++        ) {
++            Ok(_) => allocated,
++            Err(installed) => {
++                // SAFETY: this unpublished allocation lost initialization.
++                unsafe { drop(Box::from_raw(allocated)) };
++                installed
++            }
++        };
++        // SAFETY: the winning allocation remains installed until Drop.
++        unsafe { &*pointer }
++    }
++
++    fn cached_computable(&self) -> Option<&Computable> {
++        self.data()?.computable.get()
++    }
++
++    fn computable(&self, class: &Class) -> &Computable {
++        self.data_or_init()
++            .computable
++            .get_or_init(|| class.computable_certificate())
+     }
+ 
+     #[inline]
+     pub(super) fn get(&self) -> PrimitiveApproxCache {
+-        Self::decode(self.0.load(std::sync::atomic::Ordering::Relaxed))
++        self.data().map_or(PrimitiveApproxCache::Empty, |data| {
++            Self::decode(data.primitive.load(std::sync::atomic::Ordering::Relaxed))
++        })
+     }
+ 
+     pub(super) fn set(&self, value: PrimitiveApproxCache) {
+         let encoded = Self::encode(value);
+         if matches!(value, PrimitiveApproxCache::Empty) {
+-            self.0
+-                .store(encoded, std::sync::atomic::Ordering::Relaxed);
++            if let Some(data) = self.data() {
++                data.primitive
++                    .store(encoded, std::sync::atomic::Ordering::Relaxed);
++            }
+             return;
+         }
+ 
+         // Keep a concurrently-computed f64 in preference to f32. Conversion
+         // caches are accelerators only, so relaxed ordering is sufficient.
+-        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
++        let primitive = &self.data_or_init().primitive;
++        let mut current = primitive.load(std::sync::atomic::Ordering::Relaxed);
+         while Self::rank(current) <= Self::rank(encoded) {
+-            match self.0.compare_exchange_weak(
++            match primitive.compare_exchange_weak(
+                 current,
+                 encoded,
+                 std::sync::atomic::Ordering::Relaxed,
+@@ -183,13 +245,36 @@
+     }
+ }
+ 
+-impl Default for AtomicPrimitiveApproxCache {
++impl Default for RealCaches {
+     fn default() -> Self {
+         Self::new(PrimitiveApproxCache::Empty)
+     }
+ }
+ 
+-impl std::fmt::Debug for AtomicPrimitiveApproxCache {
++impl Clone for RealCaches {
++    fn clone(&self) -> Self {
++        let cloned = Self::new(self.get());
++        if let Some(computable) = self.cached_computable() {
++            // The destination is new. Share the graph's proofs while keeping
++            // the original serialized optional payload unchanged.
++            let _ = cloned.data_or_init().computable.set(computable.clone());
++        }
++        cloned
++    }
++}
++
++impl Drop for RealCaches {
++    fn drop(&mut self) {
++        let pointer = *self.0.get_mut();
++        if !pointer.is_null() {
++            // SAFETY: Drop has exclusive access, so all borrowed cache data
++            // have expired. This is the unique owner of the allocation.
++            unsafe { drop(Box::from_raw(pointer)) };
++        }
++    }
++}
++
++impl std::fmt::Debug for RealCaches {
+     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         self.get().fmt(formatter)
+     }
+@@ -643,8 +728,7 @@
+             }
+             Sqrt(radicand) => Computable::sqrt_squarefree_rational(radicand.clone()),
+             PiSqrt(radicand) => {
+-                Computable::pi()
+-                    .multiply(Computable::sqrt_squarefree_rational(radicand.clone()))
++                Computable::pi().multiply(Computable::sqrt_squarefree_rational(radicand.clone()))
+             }
+             ConstProductSqrt(product) => {
+                 let constant =
+--- a/crates/hyperreal/src/real/arithmetic/elementary_functions.rs
++++ b/crates/hyperreal/src/real/arithmetic/elementary_functions.rs
+@@ -164,7 +164,7 @@
+                         rational: square,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 } else if !square.is_one()
+                     && let Some(shared) = rest.to_integer_i64().and_then(constants::sqrt_constant)
+@@ -179,7 +179,7 @@
+                         rational: square,
+                         class: shared.class,
+                         computable: shared.computable,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 } else {
+                     crate::trace_dispatch!("real", "sqrt", "rational-sqrt-special-form");
+@@ -187,7 +187,7 @@
+                         rational: square,
+                         class: Sqrt(rest.clone()),
+                         computable: Some(Computable::sqrt_squarefree_rational(rest)),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+             }
+@@ -202,7 +202,7 @@
+                         rational: square,
+                         class: Irrational,
+                         computable: Some(Computable::sqrt(self.into_computable())),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+             }
+@@ -218,7 +218,7 @@
+                         rational: square,
+                         class: Exp(exp.clone()),
+                         computable: Some(Computable::exp_rational(exp)),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+             }
+@@ -345,7 +345,7 @@
+                         rational: Rational::one(),
+                         class: Irrational,
+                         computable: Some(Computable::nth_root(self.fold(), n)),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -373,7 +373,7 @@
+                     rational: Rational::one(),
+                     class: Exp(self.rational.clone()),
+                     computable: Some(Computable::exp_rational(self.rational)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             Ln(ln) => {
+@@ -384,7 +384,7 @@
+                         rational: ln.clone().powi(int)?,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+                 if self.rational.denominator() == unsigned::TWO.deref() {
+@@ -432,7 +432,7 @@
+                 rational: Rational::one(),
+                 class: Pow2(exponent),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             });
+@@ -457,7 +457,7 @@
+                 rational: Rational::one(),
+                 class: Pow10(exponent),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             });
+@@ -520,7 +520,7 @@
+             rational: Rational::one(),
+             class: Log10(r),
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ 
+@@ -587,7 +587,7 @@
+             rational: Rational::one(),
+             class: Log2(r),
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ 
+@@ -722,7 +722,7 @@
+                     rational: Rational::new(-1),
+                     class: Ln(inv),
+                     computable: Some(Computable::ln(new)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 })
+             }
+             std::cmp::Ordering::Equal => {
+@@ -741,7 +741,7 @@
+                     rational: Rational::one(),
+                     class: Ln(r),
+                     computable: Some(Computable::ln(new)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 })
+             }
+         }
+@@ -769,7 +769,7 @@
+             rational: term.rational.clone(),
+             class,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ 
+@@ -823,7 +823,7 @@
+                         rational: exp.clone(),
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+                 if exp == &*rationals::ONE && self.rational == *rationals::TWO {
+@@ -2699,14 +2699,14 @@
+                 rational: Rational::new(-1),
+                 class: TanPi(n),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             }
+         } else {
+             Self {
+                 rational: Rational::one(),
+                 class: TanPi(n),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             }
+         })
+     }
+@@ -3845,7 +3845,7 @@
+                     rational: Rational::one(),
+                     class: Irrational,
+                     computable: Some(value.ln().multiply(exp).exp()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 })
+             }
+             Some(Sign::Minus) => {
+@@ -3859,14 +3859,14 @@
+                         rational: Rational::one(),
+                         class: Irrational,
+                         computable: Some(value.ln().multiply(exp).exp().negate()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     })
+                 } else {
+                     Ok(Self {
+                         rational: Rational::one(),
+                         class: Irrational,
+                         computable: Some(value.ln().multiply(exp).exp()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     })
+                 }
+             }
+@@ -3916,7 +3916,7 @@
+                         rational,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -3973,7 +3973,7 @@
+                         rational,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+                 Sqrt(sqrt) => 'quick: {
+@@ -3989,7 +3989,7 @@
+                             rational: product,
+                             class: Sqrt(sqrt.clone()),
+                             computable: self.computable,
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         };
+                         crate::trace_dispatch!("real", "powi", "sqrt-odd-special-form");
+                         return Ok(n);
+@@ -4009,7 +4009,7 @@
+                             rational,
+                             class: Irrational,
+                             computable: Some(computable),
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         });
+                     }
+                 }
+@@ -4059,7 +4059,7 @@
+                     rational: Rational::one(),
+                     class: Irrational,
+                     computable: Some(value.ln().multiply(exp).exp()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 })
+             }
+         }
+--- a/crates/hyperreal/src/real/arithmetic/facts.rs
++++ b/crates/hyperreal/src/real/arithmetic/facts.rs
+@@ -276,7 +276,7 @@
+             rational,
+             class: self.class.clone(),
+             computable: self.computable.clone(),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ 
+--- a/crates/hyperreal/src/real/arithmetic/format_parse.rs
++++ b/crates/hyperreal/src/real/arithmetic/format_parse.rs
+@@ -111,7 +111,7 @@
+                 rational,
+                 class: One,
+                 computable: None,
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             }),
+--- a/crates/hyperreal/src/real/arithmetic/inversion.rs
++++ b/crates/hyperreal/src/real/arithmetic/inversion.rs
+@@ -120,7 +120,7 @@
+             rational: Rational::one(),
+             class: Irrational,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ 
+@@ -129,7 +129,7 @@
+             rational: Rational::one(),
+             class: Irrational,
+             computable: Some(computable),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ 
+@@ -220,7 +220,7 @@
+                 rational: Rational::new(-1),
+                 class: SinPi(reduced),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             }
+@@ -229,7 +229,7 @@
+                 rational: Rational::one(),
+                 class: SinPi(reduced),
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             }
+@@ -328,7 +328,7 @@
+             },
+             class: SinPi(reduced),
+             computable: Some(Computable::prescaled_sin(argument)),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ 
+@@ -351,7 +351,7 @@
+                         rational: self.rational.inverse()?,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -362,7 +362,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class: PiInv,
+                         computable: Some(Computable::pi_inverse_constant()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -373,7 +373,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class: Pi,
+                         computable: Some(Computable::pi()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -389,7 +389,7 @@
+                         rational,
+                         class: self.class,
+                         computable: self.computable,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -411,7 +411,7 @@
+                         rational,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -428,7 +428,7 @@
+                     rational: self.rational.inverse()?,
+                     class: One,
+                     computable: None,
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -452,7 +452,7 @@
+                         rational,
+                         class: self.class,
+                         computable: self.computable,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -466,7 +466,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiInv,
+                     computable: Some(Computable::pi_inverse_constant()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -479,7 +479,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Pi,
+                     computable: Some(Computable::pi()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -492,7 +492,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Exp(exp.clone()),
+                     computable: Some(Computable::exp_rational(exp)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -505,7 +505,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiInvExp(exp.clone().neg()),
+                     computable: Some(self.computable_clone().inverse()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -517,7 +517,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiExp(exp.clone().neg()),
+                     computable: Some(self.computable_clone().inverse()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 });
+@@ -544,7 +544,7 @@
+                 rational,
+                 class,
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             });
+@@ -559,7 +559,7 @@
+                 rational: self.rational.inverse()?,
+                 class,
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             });
+@@ -569,7 +569,7 @@
+             rational: self.rational.clone().inverse()?,
+             class: Irrational,
+             computable: Some(Computable::inverse(self.computable_clone())),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ 
+@@ -583,7 +583,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class: One,
+                         computable: None,
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -594,7 +594,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class: PiInv,
+                         computable: Some(Computable::pi_inverse_constant()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -605,7 +605,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class: Pi,
+                         computable: Some(Computable::pi()),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -625,7 +625,7 @@
+                         rational,
+                         class: self.class.clone(),
+                         computable: self.computable.clone(),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -647,7 +647,7 @@
+                         rational,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -681,7 +681,7 @@
+                         rational,
+                         class: self.class.clone(),
+                         computable: self.computable.clone(),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -691,7 +691,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Irrational,
+                     computable: Some(Computable::inverse(self.computable_clone())),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -704,7 +704,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiInv,
+                     computable: Some(Computable::pi_inverse_constant()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -715,7 +715,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Pi,
+                     computable: Some(Computable::pi()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -729,7 +729,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Exp(exp.clone()),
+                     computable: Some(Computable::exp_rational(exp)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -740,7 +740,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiInvExp(exp.clone().neg()),
+                     computable: Some(self.computable_clone().inverse()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -751,7 +751,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: PiExp(exp.clone().neg()),
+                     computable: Some(self.computable_clone().inverse()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -776,7 +776,7 @@
+                         rational,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -790,7 +790,7 @@
+                         rational: self.rational.clone().inverse()?,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                        primitive_approx_cache: RealCaches::new(
+                             PrimitiveApproxCache::Empty,
+                         ),
+                     });
+@@ -800,7 +800,7 @@
+                     rational: self.rational.clone().inverse()?,
+                     class: Irrational,
+                     computable: Some(Computable::inverse(self.computable_clone())),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                    primitive_approx_cache: RealCaches::new(
+                         PrimitiveApproxCache::Empty,
+                     ),
+                 })
+@@ -832,7 +832,7 @@
+             rational: self.rational.clone().inverse()?,
+             class: Irrational,
+             computable: Some(Computable::inverse(self.computable_clone())),
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         })
+     }
+ }
+--- a/crates/hyperreal/src/real/arithmetic/linear_algebra.rs
++++ b/crates/hyperreal/src/real/arithmetic/linear_algebra.rs
+@@ -2584,7 +2584,7 @@
+                     coefficients,
+                     values,
+                 )),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(
++                primitive_approx_cache: RealCaches::new(
+                     PrimitiveApproxCache::Empty,
+                 ),
+             };
+--- a/crates/hyperreal/src/real/arithmetic/mul_div.rs
++++ b/crates/hyperreal/src/real/arithmetic/mul_div.rs
+@@ -39,7 +39,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (Pi, Pi) => {
+@@ -51,7 +51,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiPow(power), Pi) | (Pi, PiPow(power)) => {
+@@ -66,7 +66,7 @@
+                             self.computable_clone(),
+                             other.computable_clone(),
+                         )),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 };
+                 let (class, computable) = Class::make_pi_power(power);
+@@ -75,7 +75,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiPow(left), PiPow(right)) => {
+@@ -90,7 +90,7 @@
+                             self.computable_clone(),
+                             other.computable_clone(),
+                         )),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 };
+                 let (class, computable) = Class::make_pi_power(power);
+@@ -99,7 +99,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (Pi, Exp(r)) | (Exp(r), Pi) => {
+@@ -111,7 +111,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiPow(power), Exp(exp)) | (Exp(exp), PiPow(power)) => {
+@@ -123,7 +123,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiExp(r), Exp(s)) | (Exp(s), PiExp(r)) => {
+@@ -135,7 +135,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (ConstProduct(product), Exp(exp)) | (Exp(exp), ConstProduct(product)) => {
+@@ -147,7 +147,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (ConstProduct(product), Pi) | (Pi, ConstProduct(product)) => {
+@@ -162,7 +162,7 @@
+                             self.computable_clone(),
+                             other.computable_clone(),
+                         )),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 };
+                 let (class, computable) =
+@@ -172,7 +172,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (ConstProduct(product), PiPow(power)) | (PiPow(power), ConstProduct(product)) => {
+@@ -187,7 +187,7 @@
+                             self.computable_clone(),
+                             other.computable_clone(),
+                         )),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 };
+                 let (class, computable) =
+@@ -197,7 +197,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (ConstProduct(left), ConstProduct(right)) => {
+@@ -212,7 +212,7 @@
+                             self.computable_clone(),
+                             other.computable_clone(),
+                         )),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 };
+                 let (class, computable) =
+@@ -222,7 +222,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (Pi, Sqrt(r)) | (Sqrt(r), Pi) => {
+@@ -234,7 +234,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (Exp(exp), Sqrt(r)) | (Sqrt(r), Exp(exp)) => {
+@@ -246,7 +246,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiExp(exp), Sqrt(r)) | (Sqrt(r), PiExp(exp)) => {
+@@ -259,7 +259,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiInvExp(exp), Sqrt(r)) | (Sqrt(r), PiInvExp(exp)) => {
+@@ -272,7 +272,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (ConstProduct(product), Sqrt(r)) | (Sqrt(r), ConstProduct(product)) => {
+@@ -288,7 +288,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (PiSqrt(r), Sqrt(s)) | (Sqrt(s), PiSqrt(r)) if r == s => {
+@@ -299,7 +299,7 @@
+                     rational,
+                     class: Pi,
+                     computable: Some(Computable::pi()),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             (Ln(r), Ln(s)) => {
+@@ -311,7 +311,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+             _ => {
+@@ -337,7 +337,7 @@
+                                     rational,
+                                     class,
+                                     computable: Some(computable),
+-                                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                                 };
+                             }
+                             Sqrt(radicand) => {
+@@ -347,7 +347,7 @@
+                                     rational,
+                                     class,
+                                     computable: Some(computable),
+-                                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                                 };
+                             }
+                             _ => unreachable!(),
+@@ -370,7 +370,7 @@
+                             rational,
+                             class,
+                             computable: Some(computable),
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         };
+                     }
+                     if let (Some((product_pi, product_exp)), Some((sqrt_pi, sqrt_exp, radicand))) = (
+@@ -388,7 +388,7 @@
+                             rational,
+                             class,
+                             computable: Some(computable),
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         };
+                     }
+                 }
+@@ -402,7 +402,7 @@
+                         rational,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     };
+                 }
+                 let rational = &self.rational * &other.rational;
+@@ -413,7 +413,7 @@
+                         self.computable_clone(),
+                         other.computable_clone(),
+                     )),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 }
+             }
+         }
+@@ -565,7 +565,7 @@
+                 rational,
+                 class: self.class.clone(),
+                 computable: self.computable.clone(),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             });
+         }
+         if self.class == One {
+@@ -576,7 +576,7 @@
+                     rational: &self.rational / &other.rational,
+                     class: Exp(exp.clone()),
+                     computable: Some(Computable::exp_rational(exp)),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             crate::trace_dispatch!("real", "div", "lhs-rational-symbolic-inverse");
+@@ -598,7 +598,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (ConstProduct(product), Exp(exp)) => {
+@@ -609,7 +609,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (ConstProduct(product), Pi) if product.pi_power > 0 => {
+@@ -620,7 +620,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (PiExp(exp), Exp(divisor_exp)) => {
+@@ -630,7 +630,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (PiExp(exp), Pi) => {
+@@ -640,7 +640,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (Exp(exp), Pi) => {
+@@ -651,7 +651,7 @@
+                     rational: &self.rational / &other.rational,
+                     class: PiInvExp(exp.clone()),
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (Pi, Exp(exp)) => {
+@@ -661,7 +661,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             (ConstProductSqrt(product), Exp(exp)) => {
+@@ -685,7 +685,7 @@
+                     rational: &self.rational / &other.rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+             _ => {}
+@@ -748,7 +748,7 @@
+                             rational,
+                             class,
+                             computable: Some(computable),
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         }
+                     }
+                     Sqrt(radicand) => {
+@@ -758,7 +758,7 @@
+                             rational,
+                             class,
+                             computable: Some(computable),
+-                            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                         }
+                     }
+                     _ => unreachable!(),
+@@ -788,7 +788,7 @@
+                         rational: &self.rational / &other.rational,
+                         class,
+                         computable: Some(computable),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+             }
+@@ -814,7 +814,7 @@
+                     rational,
+                     class,
+                     computable: Some(computable),
+-                    primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                    primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                 });
+             }
+         }
+@@ -827,7 +827,7 @@
+                 rational: &self.rational / &other.rational,
+                 class,
+                 computable: Some(computable),
+-                primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+             });
+         }
+         // Simplify ln(x) / ln(10) to just log10(x)
+@@ -866,7 +866,7 @@
+                         rational,
+                         class: Log2(r.clone()),
+                         computable: Some(self.inherit_abort(computable)),
+-                        primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++                        primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+                     });
+                 }
+             } else {
+--- a/crates/hyperreal/src/real/arithmetic/quadratic_tower_sign.rs
++++ b/crates/hyperreal/src/real/arithmetic/quadratic_tower_sign.rs
+@@ -57,7 +57,7 @@
+         if self.rational.sign() == Sign::NoSign {
+             return Computable::zero();
+         }
+-        let payload = self.computable_ref().clone();
++        let payload = self.computable_clone();
+         if self.rational.is_one() {
+             payload
+         } else {
+--- a/crates/hyperreal/src/real/arithmetic/representation.rs
++++ b/crates/hyperreal/src/real/arithmetic/representation.rs
+@@ -52,7 +52,7 @@
+     // the rational leaf only when a generic approximation kernel actually needs it.
+     pub(super) computable: Option<Computable>,
+     #[cfg_attr(feature = "serde", serde(skip, default))]
+-    pub(super) primitive_approx_cache: AtomicPrimitiveApproxCache,
++    pub(super) primitive_approx_cache: RealCaches,
+ }
+ 
+ #[cfg(feature = "serde")]
+@@ -82,7 +82,7 @@
+             rational: wire.rational,
+             class: wire.class,
+             computable: wire.computable,
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::default(),
++            primitive_approx_cache: RealCaches::default(),
+         })
+     }
+ }
+@@ -100,19 +100,13 @@
+                 class: One,
+                 computable: None,
+                 primitive_approx_cache: {
+-                    #[cfg(any(
+-                        feature = "cached-f32-approx",
+-                        feature = "cached-f64-approx"
+-                    ))]
++                    #[cfg(any(feature = "cached-f32-approx", feature = "cached-f64-approx"))]
+                     {
+-                        AtomicPrimitiveApproxCache::new(self.primitive_approx_cache.get())
++                        RealCaches::new(self.primitive_approx_cache.get())
+                     }
+-                    #[cfg(not(any(
+-                        feature = "cached-f32-approx",
+-                        feature = "cached-f64-approx"
+-                    )))]
++                    #[cfg(not(any(feature = "cached-f32-approx", feature = "cached-f64-approx")))]
+                     {
+-                        AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty)
++                        RealCaches::new(PrimitiveApproxCache::Empty)
+                     }
+                 },
+             };
+@@ -137,9 +131,7 @@
+             rational: self.rational.clone(),
+             class: self.class.clone(),
+             computable,
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(
+-                self.primitive_approx_cache.get(),
+-            ),
++            primitive_approx_cache: self.primitive_approx_cache.clone(),
+         }
+     }
+ }
+@@ -158,7 +150,7 @@
+             rational,
+             class: One,
+             computable: None,
+-            primitive_approx_cache: AtomicPrimitiveApproxCache::new(PrimitiveApproxCache::Empty),
++            primitive_approx_cache: RealCaches::new(PrimitiveApproxCache::Empty),
+         }
+     }
+ 
+@@ -173,20 +165,25 @@
+     }
+ 
+     fn computable_ref(&self) -> &Computable {
++        // Named certificates may omit their lazily materialized graph. Share
++        // the same reconstruction used by owned access, while borrowing an
++        // existing payload so its retained proofs and caches stay available.
+         self.computable
+             .as_ref()
+-            .expect("non-rational Real classes carry a computable payload")
++            .unwrap_or_else(|| self.primitive_approx_cache.computable(&self.class))
+     }
+ 
+     pub(super) fn computable_clone(&self) -> Computable {
+-        self.computable
+-            .clone()
+-            .unwrap_or_else(|| self.class.computable_certificate())
++        self.computable_ref().clone()
+     }
+ 
+     pub(super) fn into_computable(self) -> Computable {
+-        self.computable
+-            .unwrap_or_else(|| self.class.computable_certificate())
++        self.computable.unwrap_or_else(|| {
++            self.primitive_approx_cache
++                .cached_computable()
++                .cloned()
++                .unwrap_or_else(|| self.class.computable_certificate())
++        })
+     }
+ 
+     /// Provide an atomic flag to signal early abort of calculations.
+@@ -194,9 +191,10 @@
+     /// Aborted calculations may have incorrect results.
+     pub fn abort(&mut self, s: Signal) {
+         self.primitive_approx_cache.set(PrimitiveApproxCache::Empty);
+-        let computable = self
+-            .computable
+-            .get_or_insert_with(|| self.class.computable_certificate());
++        if self.computable.is_none() {
++            self.computable = Some(self.computable_clone());
++        }
++        let computable = self.computable.as_mut().unwrap();
+         computable.abort(s);
+     }
+ 
+@@ -461,10 +459,8 @@
+     /// Certified Euclidean remainder for positive modulus.
+     pub fn rem_euclid_certified(&self, modulus: &Real) -> Result<Real, Problem> {
+         crate::trace_dispatch!("real", "integer-rounding", "rem-euclid-certified");
+-        match modulus.certified_cmp_until(
+-            &Self::zero(),
+-            Self::CERTIFIED_INTEGER_COMPARE_TOLERANCE,
+-        ) {
++        match modulus.certified_cmp_until(&Self::zero(), Self::CERTIFIED_INTEGER_COMPARE_TOLERANCE)
++        {
+             CertifiedRealOrdering::Known {
+                 ordering: Ordering::Greater,
+                 ..
+@@ -622,3 +618,58 @@
+     }
+     r.shifted_big_integer(0).bit(0)
+ }
++
++#[cfg(test)]
++mod computable_access_tests {
++    use super::*;
++
++    #[test]
++    fn shared_access_borrows_retained_payload_and_reconstructs_only_missing_payload() {
++        let mut value = Real::pi();
++        let retained = value.computable.as_ref().unwrap();
++        assert!(std::ptr::eq(value.computable_ref(), retained));
++        assert!(value.primitive_approx_cache.cached_computable().is_none());
++
++        value.computable = None;
++        let reconstructed = value.computable_ref();
++        assert!(std::ptr::eq(value.computable_ref(), reconstructed));
++        assert!(value.computable.is_none());
++        assert_eq!(
++            value.certified_sign_until(0).sign(),
++            Some(RealSign::Positive)
++        );
++        assert!(value.computable.is_none());
++    }
++
++    #[test]
++    fn concurrent_lazy_queries_share_one_reconstructed_payload() {
++        let mut value = Real::pi() - Real::from(3);
++        value.computable = None;
++        let barrier = std::sync::Barrier::new(8);
++        std::thread::scope(|scope| {
++            let handles: Vec<_> = (0..8)
++                .map(|_| {
++                    let value = &value;
++                    let barrier = &barrier;
++                    scope.spawn(move || {
++                        barrier.wait();
++                        let payload = value.computable_ref();
++                        assert_eq!(payload.sign_until(-128), Some(RealSign::Positive));
++                        payload as *const Computable as usize
++                    })
++                })
++                .collect();
++            let expected = value.computable_ref() as *const Computable as usize;
++            for handle in handles {
++                assert_eq!(handle.join().unwrap(), expected);
++            }
++        });
++        assert!(value.computable.is_none());
++        let clone = value.clone();
++        assert!(clone.computable.is_none());
++        assert_eq!(
++            clone.computable_ref().immediate_sign(),
++            Some(RealSign::Positive)
++        );
++    }
++}
+--- a/crates/hyperreal/src/real/arithmetic/tests.rs
++++ b/crates/hyperreal/src/real/arithmetic/tests.rs
+@@ -223,9 +223,9 @@
+             size_of::<Class>()
+         );
+         assert!(
+-            size_of::<AtomicPrimitiveApproxCache>() <= 8,
++            size_of::<RealCaches>() <= 8,
+             "atomic primitive cache grew to {} bytes",
+-            size_of::<AtomicPrimitiveApproxCache>()
++            size_of::<RealCaches>()
+         );
+         assert!(
+             size_of::<PrimitiveApproxCache>() <= 16,
+--- a/crates/hyperreal/tests/serde_lazy_certificates.rs
++++ b/crates/hyperreal/tests/serde_lazy_certificates.rs
+@@ -0,0 +1,183 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Rational, Real, RealSign, ZeroKnowledge};
++use serde_json::Value;
++
++fn fraction(numerator: i64, denominator: u64) -> Real {
++    Real::from(Rational::fraction(numerator, denominator).unwrap())
++}
++
++// Every named certificate, constructed through the public API. Bounds follow
++// from 3 < pi < 22/7, 8/3 < e < 11/4, 7/5 < sqrt(2) < 3/2,
++// monotonicity, and the defining power/logarithm identities.
++fn certificates() -> Vec<(&'static str, Real, i64, i64)> {
++    let pi = Real::pi();
++    let e = Real::e();
++    let pi_squared = &pi * &pi;
++    let sqrt_two = Real::from(2).sqrt().unwrap();
++    let ln_two = Real::from(2).ln().unwrap();
++    let ln_three = Real::from(3).ln().unwrap();
++    vec![
++        ("One", fraction(3, 2), 1, 2),
++        ("Pi", pi.clone(), 3, 4),
++        ("PiPow", pi_squared.clone(), 9, 10),
++        ("PiInv", pi.clone().inverse().unwrap(), 0, 1),
++        ("PiExp", &pi * &e, 8, 9),
++        ("PiInvExp", (&e / &pi).unwrap(), 0, 1),
++        ("PiSqrt", &pi * &sqrt_two, 4, 5),
++        ("ConstProduct", &pi_squared * &e, 24, 28),
++        ("ConstOffset", &pi - Real::from(3), 0, 1),
++        ("ConstProductSqrt", &(&pi_squared * &e) * &sqrt_two, 33, 42),
++        ("Sqrt", sqrt_two, 1, 2),
++        ("Exp", Real::from(2).exp().unwrap(), 7, 8),
++        ("Ln", ln_three.clone(), 1, 2),
++        ("LnAffine", (Real::from(2) * &e).ln().unwrap(), 1, 2),
++        ("LnProduct", &ln_two * &ln_three, 0, 2),
++        ("Log10", Real::from(2).log10().unwrap(), 0, 1),
++        ("Log2", Real::from(3).log2().unwrap(), 1, 2),
++        ("Pow10", fraction(1, 3).exp10().unwrap(), 2, 3),
++        ("Pow2", fraction(1, 3).exp2().unwrap(), 1, 2),
++        ("SinPi", fraction(1, 5).sin_pi(), 0, 1),
++        ("TanPi", fraction(1, 5).tan_pi().unwrap(), 0, 1),
++    ]
++}
++
++fn assert_tag(wire: &Value, expected: &str) {
++    let tag = &wire["class"];
++    assert!(
++        tag == expected
++            || tag
++                .as_object()
++                .is_some_and(|map| map.contains_key(expected))
++    );
++}
++
++fn query_and_compose(value: &Real, scale: i64, lower: i64, upper: i64) {
++    let sign = match scale.cmp(&0) {
++        std::cmp::Ordering::Less => RealSign::Negative,
++        std::cmp::Ordering::Equal => RealSign::Zero,
++        std::cmp::Ordering::Greater => RealSign::Positive,
++    };
++    let json = value.to_json();
++    let bytes = value.to_bytes();
++    for precision in [0, -128, 0] {
++        assert_eq!(value.structural_facts().sign, Some(sign));
++        let _ = value.detailed_facts();
++        let _ = value.domain_facts();
++        assert_eq!(value.certified_sign_until(precision).sign(), Some(sign));
++        assert_eq!(
++            value.zero_status(),
++            if scale == 0 {
++                ZeroKnowledge::Zero
++            } else {
++                ZeroKnowledge::NonZero
++            }
++        );
++    }
++    let (lower, upper) = if scale < 0 {
++        (upper * scale, lower * scale)
++    } else {
++        (lower * scale, upper * scale)
++    };
++    let [lo, hi] = value.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::from(lower) && hi <= Rational::from(upper));
++    let translated = value + Real::one();
++    let [lo, hi] = translated.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::from(lower + 1) && hi <= Rational::from(upper + 1));
++    if scale != 0 {
++        let inverse = value.inverse_ref().unwrap();
++        let product = value * inverse;
++        // Request the existing exact reduction explicitly. Automatic equality
++        // refinement alone does not currently decide every reciprocal product.
++        assert_eq!(
++            product.exact_rational_normal_form(),
++            Some(Rational::one()),
++            "{json}"
++        );
++    }
++    if scale > 0 {
++        let root = value.clone().sqrt().unwrap();
++        let [lo, hi] = root.certified_rational_interval(-32).unwrap();
++        assert!(lo >= Rational::zero() && hi <= Rational::from(7));
++    }
++    assert_eq!(value.to_json(), json);
++    assert_eq!(value.to_bytes(), bytes);
++}
++
++fn lazy_certificate_matrix(decode: impl Fn(&Value) -> Real) {
++    for (name, value, lower, upper) in certificates() {
++        let original = serde_json::to_value(&value).unwrap();
++        assert_tag(&original, name);
++        for scale in [0, 1, -3] {
++            for omit in [false, true] {
++                let mut wire = original.clone();
++                let original_scale: Rational =
++                    serde_json::from_value(wire["rational"].clone()).unwrap();
++                wire["rational"] =
++                    serde_json::to_value(original_scale * Rational::from(scale)).unwrap();
++                if omit {
++                    wire.as_object_mut().unwrap().remove("computable");
++                } else {
++                    wire["computable"] = Value::Null;
++                }
++                let decoded = decode(&wire);
++                query_and_compose(&decoded, scale, lower, upper);
++                assert!(serde_json::to_value(&decoded).unwrap()["computable"].is_null());
++            }
++        }
++    }
++}
++
++#[test]
++fn json_lazy_certificates_support_queries_and_composition() {
++    lazy_certificate_matrix(|wire| Real::from_json(&wire.to_string()).unwrap());
++}
++
++#[test]
++fn cbor_lazy_certificates_support_queries_and_composition() {
++    lazy_certificate_matrix(|wire| {
++        let mut bytes = Vec::new();
++        ciborium::ser::into_writer(wire, &mut bytes).unwrap();
++        Real::from_bytes(&bytes).unwrap()
++    });
++}
++
++#[test]
++fn materialized_certificates_keep_the_same_semantics() {
++    for (name, value, lower, upper) in certificates() {
++        assert_tag(&serde_json::to_value(&value).unwrap(), name);
++        query_and_compose(&value, 1, lower, upper);
++    }
++}
++
++#[test]
++fn lazy_quadratic_certificate_supports_normal_forms_and_towers() {
++    let value = Real::from(-3) * Real::from(2).sqrt().unwrap();
++    let mut wire = serde_json::to_value(value).unwrap();
++    assert_tag(&wire, "Sqrt");
++    wire["computable"] = Value::Null;
++    let value = Real::from_json(&wire.to_string()).unwrap();
++    let expected = (Rational::zero(), Rational::from(-3), Rational::from(2));
++    assert_eq!(value.exact_rational_normal_form(), None);
++    assert_eq!(value.exact_quadratic_normal_form(), Some(expected.clone()));
++    assert_eq!(value.quadratic_tower_sign(), Some(RealSign::Negative));
++    assert_eq!(value.radical_tower_sign(), Some(RealSign::Negative));
++    let compact = value.compact_quadratic_tower().unwrap();
++    assert_eq!(compact.exact_quadratic_normal_form(), Some(expected));
++    let polynomial = value.quadratic_tower_annihilating_polynomial().unwrap();
++    // This value is -3 sqrt(2), hence x^2 = 18. Independently reduce every
++    // coefficient into its rational and sqrt(2) parts.
++    let mut even = Rational::zero();
++    let mut odd = Rational::zero();
++    let mut power = Rational::one();
++    for (index, coefficient) in polynomial.into_iter().enumerate() {
++        if index % 2 == 0 {
++            even = even + coefficient * &power;
++        } else {
++            odd = odd + coefficient * &power;
++            power *= Rational::from(18);
++        }
++    }
++    assert_eq!((even, odd), (Rational::zero(), Rational::zero()));
++    assert!(serde_json::to_value(&value).unwrap()["computable"].is_null());
++}
