@@ -1,0 +1,295 @@
+--- a/crates/hypercircuit/tests/curved_outline.rs
++++ b/crates/hypercircuit/tests/curved_outline.rs
+@@ -4,11 +4,14 @@
+ use hypercircuit::Design;
+ use hypercircuit::{
+     AdapterKind, BoardContour, BoardContourSegment, BoardId, BoardOutline, Circuit, CircuitId,
+-    FabricationExportOptions, FabricationFileKind, FabricationPackage, KiCadExportOmission,
+-    KiCadExportOptions, KiCadImportOptions, KiCadImportReport, MaterializationOptions,
+-    MaterializationProjection, NegotiatedRoutePolicy, NegotiatedRouteStatus, PcbDesignRules,
+-    PcbLayout, PcbStackup, PlacementSolvePolicy, Real, SemanticDocument, StackupLayer,
+-    StackupLayerKind, TransientPolicy,
++    KiCadExportOmission, KiCadExportOptions, KiCadImportOptions, KiCadImportReport,
++    NegotiatedRoutePolicy, NegotiatedRouteStatus, PcbDesignRules, PcbLayout, PcbStackup,
++    PlacementSolvePolicy, Real, SemanticDocument, StackupLayer, StackupLayerKind, TransientPolicy,
++};
++#[cfg(feature = "geometry")]
++use hypercircuit::{
++    FabricationExportOptions, FabricationFileKind, FabricationPackage, MaterializationOptions,
++    MaterializationProjection,
+ };
+ use hypercurve::{Classification, RegionPointLocation};
+ use hyperlattice::Point2;
+@@ -69,6 +72,7 @@
+     ])
+ }
+ 
++#[cfg(feature = "geometry")]
+ fn cubic_exterior() -> BoardContour {
+     BoardContour::from_segments(vec![
+         LinePathSegment::new(p(0, 0), p(10, 0), hyperlimit::PredicatePolicy::STRICT)
+--- a/crates/hypercurve/tests/svg_scalar_failures.rs
++++ b/crates/hypercurve/tests/svg_scalar_failures.rs
+@@ -0,0 +1,33 @@
++#![cfg(feature = "svg")]
++
++use hypercurve::{Real, SvgError, import_svg_document};
++use std::fmt::Write;
++
++#[test]
++fn exact_svg_rejects_a_coordinate_without_its_required_scalar_payload() {
++    // CBOR for rational=1, class=Irrational, computable=null. The map is
++    // syntactically valid but cannot describe an opaque real value.
++    let invalid = b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
++        \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\xf6";
++    let zero = Real::zero().to_bytes();
++    let one = Real::one().to_bytes();
++    // HCP3, one line, then its two points: (invalid, 0) to (1, 0).
++    let mut bytes = b"HCP3\x00\x00\x00\x01\x00".to_vec();
++    for coordinate in [invalid.as_slice(), &zero, &one, &zero] {
++        bytes.extend_from_slice(&u32::try_from(coordinate.len()).unwrap().to_be_bytes());
++        bytes.extend_from_slice(coordinate);
++    }
++    let mut extension = String::from("3:");
++    for byte in bytes {
++        write!(&mut extension, "{byte:02x}").unwrap();
++    }
++    let document = format!(
++        r#"<svg xmlns="http://www.w3.org/2000/svg"><path fill="none" stroke="black" data-hypercurve-path="{extension}" d="M0 0 L1 0"/></svg>"#
++    );
++    let error = import_svg_document(&document).unwrap_err();
++    assert!(
++        matches!(error, SvgError::MalformedInput(ref detail)
++            if detail.contains("invalid exact coordinate") && detail.contains("ParseError")),
++        "{error:?}",
++    );
++}
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -305,9 +305,12 @@
+ cargo run --features simple -- "(sqrt (/ 49 64))"
+ ```
+ 
+-With `serde`, use `serde::to_json`, `from_json`, `to_bytes`, and `from_bytes`.
++With `serde`, use `Real::to_json`, `from_json`, `to_bytes`, and `from_bytes`.
+ Serialization records expression structure, not transient caches or abort
+-signals.
++signals. An opaque scalar without its required computable payload is rejected
++by Serde and returns `Problem::ParseError` through the convenience readers.
++Validation of mathematical domains inside present expression graphs remains
++incomplete.
+ 
+ ## Guarantees and boundaries
+ 
+--- a/crates/hyperreal/src/real/arithmetic/representation.rs
++++ b/crates/hyperreal/src/real/arithmetic/representation.rs
+@@ -42,7 +42,7 @@
+ /// assert_eq!(answer, three);
+ /// ```
+ #[derive(Debug)]
+-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
++#[cfg_attr(feature = "serde", derive(Serialize))]
+ pub struct Real {
+     pub(super) rational: Rational,
+     pub(super) class: Class,
+@@ -53,6 +53,38 @@
+     pub(super) computable: Option<Computable>,
+     #[cfg_attr(feature = "serde", serde(skip, default))]
+     pub(super) primitive_approx_cache: AtomicPrimitiveApproxCache,
++}
++
++#[cfg(feature = "serde")]
++impl<'de> Deserialize<'de> for Real {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: serde::Deserializer<'de>,
++    {
++        #[derive(Deserialize)]
++        #[serde(rename = "Real")]
++        struct RealWire {
++            rational: Rational,
++            class: Class,
++            computable: Option<Computable>,
++        }
++
++        let wire = RealWire::deserialize(deserializer)?;
++        // Symbolic classes can reconstruct a missing lazy payload from their
++        // certificate. An opaque class has no such fallback, including when
++        // the outer scale happens to be zero.
++        if matches!(wire.class, Irrational) && wire.computable.is_none() {
++            return Err(serde::de::Error::custom(
++                "Real Irrational class requires a Computable payload",
++            ));
++        }
++        Ok(Self {
++            rational: wire.rational,
++            class: wire.class,
++            computable: wire.computable,
++            primitive_approx_cache: AtomicPrimitiveApproxCache::default(),
++        })
++    }
+ }
+ 
+ impl Clone for Real {
+--- a/crates/hyperreal/src/serde.rs
++++ b/crates/hyperreal/src/serde.rs
+@@ -14,6 +14,10 @@
+     }
+ 
+     /// Deserializes a Real from a JSON string.
++    ///
++    /// An opaque value without its required computable payload returns
++    /// [`Problem::ParseError`]. Present expression graphs are not yet fully
++    /// validated for mathematical domain errors at this boundary.
+     pub fn from_json(json: &str) -> Result<Self, Problem> {
+         serde_json::from_str(json).map_err(|_| Problem::ParseError)
+     }
+@@ -37,6 +41,9 @@
+     }
+ 
+     /// Deserializes a Real from a CBOR byte slice.
++    ///
++    /// Uses the same representation checks and remaining mathematical-domain
++    /// limitations as [`Real::from_json`].
+     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Problem> {
+         de::from_reader(bytes).map_err(|_| Problem::ParseError)
+     }
+--- a/crates/hyperreal/tests/serde_payload.rs
++++ b/crates/hyperreal/tests/serde_payload.rs
+@@ -0,0 +1,136 @@
++#![cfg(feature = "serde")]
++
++use ciborium::Value;
++use hyperreal::{Problem, Rational, Real};
++use serde_json::json;
++
++fn missing_payloads() -> Vec<serde_json::Value> {
++    // A zero outer scale must not conceal an invalid inner representation.
++    [0, 1, -3]
++        .into_iter()
++        .flat_map(|scale| {
++            let mut wire = json!({
++                "rational": Rational::new(scale),
++                "class": "Irrational",
++                "computable": null,
++            });
++            let explicit_null = wire.clone();
++            wire.as_object_mut().unwrap().remove("computable");
++            [explicit_null, wire]
++        })
++        .collect()
++}
++
++fn cbor_bytes(value: &impl serde::Serialize) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++#[test]
++fn json_deserializer_rejects_missing_opaque_payload() {
++    for wire in missing_payloads() {
++        let error = serde_json::from_value::<Real>(wire).unwrap_err();
++        assert!(error.to_string().contains("Computable payload"));
++    }
++}
++
++#[test]
++fn json_wrapper_preserves_missing_payload_failure() {
++    for wire in missing_payloads() {
++        assert_eq!(Real::from_json(&wire.to_string()), Err(Problem::ParseError));
++    }
++}
++
++#[test]
++fn cbor_deserializer_rejects_missing_opaque_payload() {
++    for wire in missing_payloads() {
++        let bytes = cbor_bytes(&wire);
++        let error = ciborium::de::from_reader::<Real, _>(bytes.as_slice()).unwrap_err();
++        assert!(error.to_string().contains("Computable payload"));
++    }
++}
++
++#[test]
++fn cbor_wrapper_preserves_missing_payload_failure() {
++    for wire in missing_payloads() {
++        assert_eq!(
++            Real::from_bytes(&cbor_bytes(&wire)),
++            Err(Problem::ParseError)
++        );
++    }
++}
++
++#[test]
++fn cbor_value_conversion_preserves_missing_payload_failure() {
++    for wire in missing_payloads() {
++        let value = Value::serialized(&wire).unwrap();
++        assert_eq!(Real::try_from(&value), Err(Problem::ParseError));
++        assert_eq!(Real::try_from(value), Err(Problem::ParseError));
++    }
++}
++
++#[test]
++fn enclosing_collections_cannot_publish_missing_payloads() {
++    for wire in missing_payloads() {
++        let json = json!([Real::one(), wire]);
++        assert!(serde_json::from_value::<Vec<Real>>(json.clone()).is_err());
++        assert!(ciborium::de::from_reader::<Vec<Real>, _>(cbor_bytes(&json).as_slice()).is_err());
++    }
++}
++
++fn valid_values() -> Vec<(Real, i64, i64)> {
++    vec![
++        (Real::zero(), 0, 0),
++        (Real::new(Rational::fraction(-3, 7).unwrap()), -1, 0),
++        (Real::pi(), 3, 4),
++        (Real::e(), 2, 3),
++        (Real::from(2).sqrt().unwrap(), 1, 2),
++        // 3 < pi < 22/7 and 8/3 < e < 11/4 imply 5 < pi + e < 6.
++        (Real::pi() + Real::e(), 5, 6),
++    ]
++}
++
++fn check_bounds(value: &Real, lower: i64, upper: i64) {
++    let [lo, hi] = value.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::new(lower) && hi <= Rational::new(upper));
++    let translated = value + Real::one();
++    let [lo, hi] = translated.certified_rational_interval(-32).unwrap();
++    assert!(lo >= Rational::new(lower + 1) && hi <= Rational::new(upper + 1));
++}
++
++#[test]
++fn valid_payloads_preserve_values_and_serialized_bytes() {
++    let values = valid_values();
++    assert_eq!(
++        serde_json::to_value(&values.last().unwrap().0).unwrap()["class"],
++        "Irrational"
++    );
++    for (value, lower, upper) in values {
++        let json = value.to_json();
++        let bytes = value.to_bytes();
++        for decoded in [
++            Real::from_json(&json).unwrap(),
++            Real::from_bytes(&bytes).unwrap(),
++        ] {
++            check_bounds(&decoded, lower, upper);
++            assert_eq!(decoded.to_json(), json);
++            assert_eq!(decoded.to_bytes(), bytes);
++        }
++    }
++}
++
++#[test]
++fn symbolic_certificates_remain_valid_without_materialized_payloads() {
++    for (value, lower, upper) in valid_values().into_iter().take(5) {
++        let mut wire = serde_json::to_value(value).unwrap();
++        assert_ne!(wire["class"], "Irrational");
++        wire.as_object_mut().unwrap().remove("computable");
++        for decoded in [
++            Real::from_json(&wire.to_string()).unwrap(),
++            Real::from_bytes(&cbor_bytes(&wire)).unwrap(),
++        ] {
++            check_bounds(&decoded, lower, upper);
++        }
++    }
++}
