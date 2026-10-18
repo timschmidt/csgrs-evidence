@@ -1,0 +1,705 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index 5eb7f8b54..f9cf401a0 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -372,6 +372,24 @@ These limits do **not** bound total decoding work, parameter sizes or graph
+ construction. General opaque-graph domain validation and comprehensive import
+ resource limits remain incomplete; externally contain hostile-input workloads.
+ 
++Private trigonometric wire variants retain reduced parameters. The dedicated
++`PrescaledCosRational`, `PrescaledSinRational` and `PrescaledTanRational` kernels
++require `|r| < 1`; their half-pi-complement variants require `1 <= r < 3/2`.
++Imports outside those stored parameter ranges return `ParseError`, including
++when a zero outer factor would hide the invalid child. Small-angle `sinc` and
++`cosc` nodes reject exact rational inputs outside `|x| <= 3/4` and shared
++constants whose certified magnitude proves they exceed that bound. This
++tightens earlier unchecked private representations; the public trigonometric
++constructors retain their wider input domains through argument reduction.
++General non-leaf kernel ranges and quantile seed admission remain incomplete.
++Inverse-cosine endpoint facts distinguish `acos(1) = acosh(1) = 0`; an imported
++`acosh` node needs evidence about its argument before claiming a positive sign.
++The native rational reader recognizes these exact endpoints so later arithmetic
++can consume them without numerical refinement. For `acosh`, the shared bounded
++quotient evaluator requires rational leaves and checks every denominator before
++discarding zero terms; an arbitrary cached zero is insufficient. Imported
++non-rational `acosh` arguments may remain undecided until new evidence is found.
++
+ Hypercurve's exact SVG import exposes undecided scalar admission as
+ `SvgError::Scalar(Problem::UnknownCertificate)` with the scalar error as its
+ source. Consumers matching every `SvgError` variant must handle the new
+diff --git a/crates/hyperreal/src/computable/node/representation.rs b/crates/hyperreal/src/computable/node/representation.rs
+index 335dd0d48..7aa66089e 100644
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -5,9 +5,10 @@
+ /// approximations and exact reductions proven for that node.
+ ///
+ /// With `serde`, decoding rejects out-of-domain exact rational arguments to
+-/// partial functions. This check does not prove that an arbitrary expression
+-/// is defined: non-leaf domain obligations and private kernel range requirements
+-/// still apply. Deserialization does not refine an operand to decide its domain.
++/// partial functions and known violations of stored kernel parameter ranges.
++/// This check does not prove that an arbitrary expression is defined: general
++/// non-leaf domain/range obligations and quantile seed proofs still apply.
++/// Deserialization does not refine an operand to decide its domain.
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ #[cfg(not(verus_keep_ghost))]
+@@ -42,6 +43,8 @@ impl<'de> Deserialize<'de> for Node {
+         // bounded reducer can consume it without first warming a numeric cache.
+         let approximation = Approximation::deserialize(deserializer)?;
+         Self::check_serialized_rational_domain(&approximation).map_err(serde::de::Error::custom)?;
++        Self::check_serialized_kernel_parameters(&approximation)
++            .map_err(serde::de::Error::custom)?;
+         let facts = AtomicFacts::default();
+         if let Approximation::PrescaledSin(argument) | Approximation::PrescaledTan(argument) =
+             &approximation
+@@ -59,6 +62,50 @@ impl<'de> Deserialize<'de> for Node {
+ 
+ #[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+ impl Node {
++    fn check_serialized_kernel_parameters(
++        approximation: &Approximation,
++    ) -> Result<(), &'static str> {
++        // These variants store a reduced argument, not an arbitrary argument
++        // to the corresponding total trigonometric function. Reuse the native
++        // constructor's classification before accepting its range-dependent
++        // sign facts and approximation bounds. Preserve the supplied graph.
++        let invalid = match approximation {
++            Approximation::PrescaledCosRational(r)
++            | Approximation::PrescaledSinRational(r)
++            | Approximation::PrescaledTanRational(r) => r.msd_exact().is_some_and(|msd| msd >= 0),
++            Approximation::PrescaledCosHalfPiMinusRational(r)
++            | Approximation::PrescaledSinHalfPiMinusRational(r)
++            | Approximation::PrescaledCotHalfPiMinusRational(r) => {
++                r.sign() != Sign::Plus
++                    || Computable::exact_rational_half_pi_shortcut_magnitude(r).is_none()
++            }
++            Approximation::SincSmall(argument) | Approximation::CoscSmall(argument) => {
++                if let Some(rational) = argument.exact_rational() {
++                    let limit = Rational::fraction(3, 4).expect("nonzero constant denominator");
++                    rational.compare_magnitude(&limit) == Ordering::Greater
++                } else if let Approximation::Constant(constant) = &argument.internal.approximation {
++                    // A certified MSD >= 0 proves |x| >= 1 > 3/4. Inspect only
++                    // these trusted constants; do not refine an untrusted
++                    // expression or mistake a planning estimate for a proof.
++                    constant
++                        .bound_info()
++                        .known_msd()
++                        .flatten()
++                        .is_some_and(|msd| msd >= 0)
++                } else {
++                    // General non-leaf domain/range admission remains open.
++                    false
++                }
++            }
++            _ => false,
++        };
++        if invalid {
++            Err("Computable argument violates its stored kernel range")
++        } else {
++            Ok(())
++        }
++    }
++
+     fn check_serialized_rational_domain(approximation: &Approximation) -> Result<(), &'static str> {
+         // Children have already passed the same check while decoding. Reject
+         // an undefined child before a parent can hide it with multiplication
+diff --git a/crates/hyperreal/src/computable/node/ring_polynomial.rs b/crates/hyperreal/src/computable/node/ring_polynomial.rs
+index b9406fd36..0d199d151 100644
+--- a/crates/hyperreal/src/computable/node/ring_polynomial.rs
++++ b/crates/hyperreal/src/computable/node/ring_polynomial.rs
+@@ -21,6 +21,8 @@ struct RingRecognition<'a> {
+     // Earlier polynomial/quotient attempts keep their original arithmetic.
+     root_squares: bool,
+     root_square_used: bool,
++    // Imported endpoint proofs cannot assume opaque atoms denote valid reals.
++    rational_only: bool,
+ }
+ 
+ impl<'a> RingRecognition<'a> {
+@@ -41,6 +43,7 @@ impl<'a> RingRecognition<'a> {
+             signal: &value.signal,
+             root_squares: false,
+             root_square_used: false,
++            rational_only: false,
+         }
+     }
+ 
+@@ -193,6 +196,9 @@ impl<'a> RingRecognition<'a> {
+     }
+ 
+     fn atom(&mut self, value: &'a Computable) -> Option<RingPolynomial> {
++        if self.rational_only {
++            return None;
++        }
+         for index in 0..self.atoms.len() {
+             self.charge()?;
+             if Computable::internal_structural_eq(self.atoms[index], value) {
+diff --git a/crates/hyperreal/src/computable/node/ring_quotient.rs b/crates/hyperreal/src/computable/node/ring_quotient.rs
+index 12fe9b15b..cdacd5dc3 100644
+--- a/crates/hyperreal/src/computable/node/ring_quotient.rs
++++ b/crates/hyperreal/src/computable/node/ring_quotient.rs
+@@ -249,16 +249,28 @@ impl<'a> RingRecognition<'a> {
+ 
+ impl Computable {
+     pub(crate) fn bounded_quotient_rational(&self) -> Option<Rational> {
+-        self.bounded_quotient_projection(false)
++        self.bounded_quotient_projection(false, false)
+     }
+ 
+     pub(crate) fn bounded_root_square_rational(&self) -> Option<Rational> {
+-        self.bounded_quotient_projection(true)
++        self.bounded_quotient_projection(true, false)
+     }
+ 
+-    fn bounded_quotient_projection(&self, root_squares: bool) -> Option<Rational> {
++    // Reuse the quotient evaluator and its existing limits, but require every
++    // leaf to be rational and every inverse to have a nonzero denominator.
++    // Both children are checked before multiplication can erase a zero term.
++    fn bounded_defined_rational(&self) -> Option<Rational> {
++        self.bounded_quotient_projection(false, true)
++    }
++
++    fn bounded_quotient_projection(
++        &self,
++        root_squares: bool,
++        rational_only: bool,
++    ) -> Option<Rational> {
+         let mut recognition = RingRecognition::new(self);
+         recognition.root_squares = root_squares;
++        recognition.rational_only = rational_only;
+         let quotient = recognition.expand_quotient(self, RingRecognition::MAX_DEPTH)?;
+         let rational = recognition.project_quotient(&quotient)?;
+         if should_stop(&self.signal) || (root_squares && !recognition.root_square_used) {
+diff --git a/crates/hyperreal/src/computable/node/structural_analysis.rs b/crates/hyperreal/src/computable/node/structural_analysis.rs
+index eedff1fe8..f88faea53 100644
+--- a/crates/hyperreal/src/computable/node/structural_analysis.rs
++++ b/crates/hyperreal/src/computable/node/structural_analysis.rs
+@@ -76,15 +76,9 @@ impl AlgebraicSeparation {
+     fn rational_root(root: &Computable) -> Option<(u32, Rational)> {
+         match &root.internal.approximation {
+             Approximation::Sqrt(child) => Some((2, child.exact_rational()?)),
+-            Approximation::NthRoot(child, degree) => {
+-                Some((*degree, child.exact_rational()?))
+-            }
+-            Approximation::Constant(SharedConstant::Sqrt2) => {
+-                Some((2, Rational::new(2)))
+-            }
+-            Approximation::Constant(SharedConstant::Sqrt3) => {
+-                Some((2, Rational::new(3)))
+-            }
++            Approximation::NthRoot(child, degree) => Some((*degree, child.exact_rational()?)),
++            Approximation::Constant(SharedConstant::Sqrt2) => Some((2, Rational::new(2))),
++            Approximation::Constant(SharedConstant::Sqrt3) => Some((2, Rational::new(3))),
+             _ => None,
+         }
+     }
+@@ -173,18 +167,14 @@ impl AlgebraicSeparation {
+             .checked_add(self.conjugate_log2)?
+             .max(self.denominator_log2.checked_add(other.conjugate_log2)?)
+             .checked_add(1)?;
+-        self.denominator_log2 = self
+-            .denominator_log2
+-            .checked_add(other.denominator_log2)?;
++        self.denominator_log2 = self.denominator_log2.checked_add(other.denominator_log2)?;
+         self.conjugate_log2 = conjugate_log2;
+         self.merge_generators(other)?;
+         self.within_limits().then_some(self)
+     }
+ 
+     fn multiply(mut self, other: Self) -> Option<Self> {
+-        self.denominator_log2 = self
+-            .denominator_log2
+-            .checked_add(other.denominator_log2)?;
++        self.denominator_log2 = self.denominator_log2.checked_add(other.denominator_log2)?;
+         self.conjugate_log2 = self.conjugate_log2.checked_add(other.conjugate_log2)?;
+         self.merge_generators(other)?;
+         self.within_limits().then_some(self)
+@@ -213,9 +203,7 @@ impl AlgebraicSeparation {
+             .denominator_log2
+             .checked_mul(degree_u64.checked_sub(1)?)?
+             .checked_add(self.conjugate_log2)?;
+-        self.conjugate_log2 = numerator
+-            .checked_add(degree_u64.checked_sub(1)?)?
+-            / degree_u64;
++        self.conjugate_log2 = numerator.checked_add(degree_u64.checked_sub(1)?)? / degree_u64;
+         self.insert_generator(root, degree)?;
+         self.within_limits().then_some(self)
+     }
+@@ -273,9 +261,7 @@ impl Binary64Interval {
+         let numerator = num::ToPrimitive::to_u64(value.numerator())?;
+         let denominator = num::ToPrimitive::to_u64(value.denominator())?;
+         const MAX_EXACT_BINARY64_INTEGER: u64 = 1_u64 << 53;
+-        if numerator > MAX_EXACT_BINARY64_INTEGER
+-            || denominator > MAX_EXACT_BINARY64_INTEGER
+-        {
++        if numerator > MAX_EXACT_BINARY64_INTEGER || denominator > MAX_EXACT_BINARY64_INTEGER {
+             return None;
+         }
+         // Both integer-to-binary64 conversions are exact. Division is the only
+@@ -324,10 +310,7 @@ impl Binary64Interval {
+         if self.lower <= 0.0 && self.upper >= 0.0 {
+             return None;
+         }
+-        Self::new(
+-            (1.0 / self.upper).next_down(),
+-            (1.0 / self.lower).next_up(),
+-        )
++        Self::new((1.0 / self.upper).next_down(), (1.0 / self.lower).next_up())
+     }
+ 
+     fn square(self) -> Option<Self> {
+@@ -382,9 +365,9 @@ impl Computable {
+             *remaining = remaining.checked_sub(1)?;
+             let result = match &node.internal.approximation {
+                 Approximation::One => AlgebraicSeparation::rational(&Rational::one()),
+-                Approximation::Int(value) => AlgebraicSeparation::rational(
+-                    &Rational::from_bigint(value.clone()),
+-                ),
++                Approximation::Int(value) => {
++                    AlgebraicSeparation::rational(&Rational::from_bigint(value.clone()))
++                }
+                 Approximation::Ratio(value) => AlgebraicSeparation::rational(value),
+                 Approximation::Constant(SharedConstant::Sqrt2)
+                 | Approximation::Constant(SharedConstant::Sqrt3) => {
+@@ -393,28 +376,25 @@ impl Computable {
+                         Approximation::Constant(SharedConstant::Sqrt3) => 3,
+                         _ => unreachable!(),
+                     };
+-                    AlgebraicSeparation::rational(&Rational::new(radicand))?
+-                        .root(node.clone(), 2)
++                    AlgebraicSeparation::rational(&Rational::new(radicand))?.root(node.clone(), 2)
+                 }
+                 Approximation::Negate(child) => parse(child, remaining, memo),
+                 Approximation::Offset(child, shift) => {
+                     parse(child, remaining, memo)?.offset(*shift)
+                 }
+-                Approximation::Add(left, right) => parse(left, remaining, memo)?
+-                    .add(parse(right, remaining, memo)?),
+-                Approximation::Multiply(left, right) => parse(left, remaining, memo)?
+-                    .multiply(parse(right, remaining, memo)?),
++                Approximation::Add(left, right) => {
++                    parse(left, remaining, memo)?.add(parse(right, remaining, memo)?)
++                }
++                Approximation::Multiply(left, right) => {
++                    parse(left, remaining, memo)?.multiply(parse(right, remaining, memo)?)
++                }
+                 Approximation::Inverse(child)
+-                    if child
+-                        .exact_sign()
+-                        .is_some_and(|sign| sign != Sign::NoSign) =>
++                    if child.exact_sign().is_some_and(|sign| sign != Sign::NoSign) =>
+                 {
+                     parse(child, remaining, memo)?.inverse()
+                 }
+                 Approximation::Square(child) => parse(child, remaining, memo)?.square(),
+-                Approximation::Sqrt(child) => {
+-                    parse(child, remaining, memo)?.root(node.clone(), 2)
+-                }
++                Approximation::Sqrt(child) => parse(child, remaining, memo)?.root(node.clone(), 2),
+                 Approximation::NthRoot(child, degree) => {
+                     parse(child, remaining, memo)?.root(node.clone(), *degree)
+                 }
+@@ -573,9 +553,9 @@ impl Computable {
+             return Some(cached);
+         }
+         if constant == SharedConstant::Tau
+-                && let Some(pi_precision) = p.checked_sub(1)
+-                && let Some(cached) =
+-                    Self::cached_shared_constant_at_precision(SharedConstant::Pi, pi_precision)
++            && let Some(pi_precision) = p.checked_sub(1)
++            && let Some(cached) =
++                Self::cached_shared_constant_at_precision(SharedConstant::Pi, pi_precision)
+         {
+             // tau is exactly 2*pi, so a pi approximation at precision p-1
+             // is already a tau approximation at precision p. Populate the
+@@ -585,9 +565,9 @@ impl Computable {
+             return Some(cached);
+         }
+         if constant == SharedConstant::Pi
+-                && let Some(tau_precision) = p.checked_add(1)
+-                && let Some(cached) =
+-                    Self::cached_shared_constant_at_precision(SharedConstant::Tau, tau_precision)
++            && let Some(tau_precision) = p.checked_add(1)
++            && let Some(cached) =
++                Self::cached_shared_constant_at_precision(SharedConstant::Tau, tau_precision)
+         {
+             // The same identity works in reverse: a tau approximation at
+             // precision p+1 is already a pi approximation at precision p.
+@@ -690,7 +670,15 @@ impl Computable {
+             Approximation::Int(n) => Some(if n.sign() == Sign::NoSign {
+                 BoundInfo::Zero
+             } else {
+-                BoundInfo::with_sign(n.sign(), crate::verified::word::checked_bit_length_msd(n.magnitude().bits(), 1, false, 0))
++                BoundInfo::with_sign(
++                    n.sign(),
++                    crate::verified::word::checked_bit_length_msd(
++                        n.magnitude().bits(),
++                        1,
++                        false,
++                        0,
++                    ),
++                )
+             }),
+             Approximation::Constant(constant) => Some(constant.bound_info()),
+             Approximation::Ratio(r) => Some(BoundInfo::from_rational(r)),
+@@ -783,7 +771,15 @@ impl Computable {
+                 Approximation::Int(n) => Some(if n.sign() == Sign::NoSign {
+                     BoundInfo::Zero
+                 } else {
+-                    BoundInfo::with_sign(n.sign(), crate::verified::word::checked_bit_length_msd(n.magnitude().bits(), 1, false, 0))
++                    BoundInfo::with_sign(
++                        n.sign(),
++                        crate::verified::word::checked_bit_length_msd(
++                            n.magnitude().bits(),
++                            1,
++                            false,
++                            0,
++                        ),
++                    )
+                 }),
+                 Approximation::Constant(constant) => Some(constant.bound_info()),
+                 Approximation::Ratio(r) => Some(BoundInfo::from_rational(r)),
+@@ -970,9 +966,7 @@ impl Computable {
+                     .binary64_filter_interval(remaining)?
+                     .multiply(Binary64Interval::exact(scale)?)
+             }
+-            Approximation::Inverse(child) => {
+-                child.binary64_filter_interval(remaining)?.inverse()
+-            }
++            Approximation::Inverse(child) => child.binary64_filter_interval(remaining)?.inverse(),
+             Approximation::Square(child) => child.binary64_filter_interval(remaining)?.square(),
+             Approximation::Add(left, right) => left
+                 .binary64_filter_interval(remaining)?
+@@ -1113,7 +1107,9 @@ impl Computable {
+                         && appr.abs() > BigInt::one()
+                     {
+                         let sign = appr.sign();
+-                        node.internal.facts.replace_exact_sign(ExactSignCache::Valid(sign));
++                        node.internal
++                            .facts
++                            .replace_exact_sign(ExactSignCache::Valid(sign));
+                         Some(Some(sign))
+                     } else {
+                         Some(None)
+@@ -1162,10 +1158,24 @@ impl Computable {
+                 Approximation::PrescaledCosHalfPiMinusRational(_)
+                 | Approximation::PrescaledSinHalfPiMinusRational(_)
+                 | Approximation::PrescaledCotHalfPiMinusRational(_) => Some(Some(Sign::Plus)),
+-                Approximation::AcosPositiveRational(_)
+-                | Approximation::AcosNegativeRational(_)
+-                | Approximation::AcoshNearOne(_)
+-                | Approximation::AcoshDirect(_)
++                Approximation::AcosPositiveRational(r) => {
++                    Some(Some(if r.is_one() { Sign::NoSign } else { Sign::Plus }))
++                }
++                Approximation::AcoshNearOne(argument) | Approximation::AcoshDirect(argument) => {
++                    // The representation alone does not prove x>1. A checked
++                    // rational expression proves the endpoint and its domain;
++                    // a cached sign alone could hide an undefined child.
++                    Some(argument.bounded_defined_rational().and_then(|r| {
++                        if r.is_one() {
++                            Some(Sign::NoSign)
++                        } else if r > Rational::one() {
++                            Some(Sign::Plus)
++                        } else {
++                            None
++                        }
++                    }))
++                }
++                Approximation::AcosNegativeRational(_)
+                 | Approximation::Erfc(_)
+                 | Approximation::NormalSf(_) => Some(Some(Sign::Plus)),
+                 Approximation::AcosPositive(_) | Approximation::NormalInterval { .. } => Some(None),
+@@ -1302,7 +1312,8 @@ impl Computable {
+                         (Some(Sign::Plus), Some(Sign::Plus)) => Some(Sign::Plus),
+                         (Some(Sign::Minus), Some(Sign::Minus)) => Some(Sign::Minus),
+                         _ => None,
+-                    }.or_else(|| node.exact_positive_exp_difference_sign());
++                    }
++                    .or_else(|| node.exact_positive_exp_difference_sign());
+                     store_exact_sign(node, result);
+                     values.push(result);
+                 }
+@@ -1343,14 +1354,16 @@ impl Computable {
+         }
+         let rational_square = &rational * &rational;
+         let radical_square = &scale * &scale * radicand?;
+-        Some(match rational_square
+-            .partial_cmp(&radical_square)
+-            .expect("finite exact rationals are totally ordered")
+-        {
+-            Ordering::Less => scale.sign(),
+-            Ordering::Equal => Sign::NoSign,
+-            Ordering::Greater => rational.sign(),
+-        })
++        Some(
++            match rational_square
++                .partial_cmp(&radical_square)
++                .expect("finite exact rationals are totally ordered")
++            {
++                Ordering::Less => scale.sign(),
++                Ordering::Equal => Sign::NoSign,
++                Ordering::Greater => rational.sign(),
++            },
++        )
+     }
+ 
+     pub(crate) fn exact_pure_quadratic_surd(&self) -> Option<(Rational, Rational)> {
+@@ -1405,15 +1418,21 @@ impl Computable {
+     }
+ 
+     pub(crate) fn exact_rational(&self) -> Option<Rational> {
+-        // Only exact leaf nodes are exposed here. Keeping this narrow prevents
+-        // constructor shortcuts from accidentally forcing approximation of a
+-        // composite just to discover that it is not rational.
++        // Read exact leaves and defined inverse-cosine endpoints. Do not turn
++        // an arbitrary cached zero into a rational: imported graphs may still
++        // contain unresolved domain obligations beneath that sign fact.
+         match &self.internal.approximation {
+             Approximation::One => Some(Rational::one()),
+             Approximation::Int(n) => Some(Rational::from_bigint(n.clone())),
+             Approximation::Ratio(r) => Some(r.clone()),
++            Approximation::AcosPositiveRational(r) if r.is_one() => Some(Rational::zero()),
++            Approximation::AcoshNearOne(argument) | Approximation::AcoshDirect(argument) => {
++                argument
++                    .bounded_defined_rational()?
++                    .is_one()
++                    .then(Rational::zero)
++            }
+             _ => None,
+         }
+     }
+-
+ }
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_kernel_invariants.rs
+@@ -0,0 +1,227 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real, RealSign, ZeroKnowledge};
++use serde_json::{Value, json};
++
++fn q(n: i64, d: u64) -> Value {
++    serde_json::to_value(Rational::fraction(n, d).unwrap()).unwrap()
++}
++
++fn leaf(n: i64, d: u64) -> Value {
++    json!({"internal": {"Ratio": q(n, d)}})
++}
++
++fn node(kind: &str, argument: Value) -> Value {
++    json!({"internal": {kind: argument}})
++}
++
++fn cbor(value: &Value) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++#[test]
++fn imported_private_trig_kernels_require_their_stored_parameter_ranges() {
++    let mut invalid = Vec::new();
++    // These dedicated rational kernels store |r| < 1; public constructors
++    // route larger values through residual or general argument reduction.
++    for kind in [
++        "PrescaledCosRational",
++        "PrescaledSinRational",
++        "PrescaledTanRational",
++    ] {
++        for n in [-4, -2, -1, 1, 2, 4] {
++            invalid.push(node(kind, q(n, 1)));
++        }
++    }
++    // Complement kernels store a positive magnitude 1 <= r < 3/2.
++    for kind in [
++        "PrescaledCosHalfPiMinusRational",
++        "PrescaledSinHalfPiMinusRational",
++        "PrescaledCotHalfPiMinusRational",
++    ] {
++        for (n, d) in [(-4, 1), (-1, 1), (0, 1), (1, 2), (3, 2), (2, 1), (4, 1)] {
++            invalid.push(node(kind, q(n, d)));
++        }
++    }
++    // Small-angle continuations carry the separate |x| <= 3/4 contract.
++    for kind in ["SincSmall", "CoscSmall"] {
++        for n in [-4, -1, 1, 4] {
++            invalid.push(node(kind, leaf(n, 1)));
++        }
++        for constant in ["Pi", "Tau", "Sqrt2"] {
++            invalid.push(node(kind, json!({"internal": {"Constant": constant}})));
++        }
++    }
++    let mut accepted = Vec::new();
++    for graph in invalid {
++        let direct_json = serde_json::from_value::<Computable>(graph.clone());
++        let direct_cbor = ciborium::de::from_reader::<Computable, _>(cbor(&graph).as_slice());
++        if direct_json.is_ok() || direct_cbor.is_ok() {
++            accepted.push(graph.clone());
++        }
++        for graph in [graph.clone(), node("Multiply", json!([leaf(0, 1), graph]))] {
++            for scale in [0, 1, -3] {
++                let wire = json!({"rational":q(scale, 1),"class":"Irrational","computable":graph});
++                let a = Real::from_json(&wire.to_string());
++                let b = Real::from_bytes(&cbor(&wire));
++                assert_eq!(a.is_err(), b.is_err());
++                if a != Err(Problem::ParseError) || b != Err(Problem::ParseError) {
++                    accepted.push(wire.clone());
++                }
++                let container = json!([Real::one(), wire]);
++                let a = serde_json::from_value::<Vec<Real>>(container.clone());
++                let b = ciborium::de::from_reader::<Vec<Real>, _>(cbor(&container).as_slice());
++                if a.is_ok() || b.is_ok() {
++                    accepted.push(container);
++                }
++            }
++        }
++    }
++    assert!(
++        accepted.is_empty(),
++        "{} unchecked private kernel inputs; first: {:?}",
++        accepted.len(),
++        accepted.first()
++    );
++}
++
++#[test]
++fn inverse_cosine_endpoints_preserve_zero_facts_and_downstream_failure() {
++    let one = leaf(1, 1);
++    let sum_one = node("Add", json!([leaf(2, 1), leaf(-1, 1)]));
++    let inverse_one = node("Inverse", one.clone());
++    let mut cases = vec![node("AcosPositiveRational", q(1, 1))];
++    for kind in ["AcoshNearOne", "AcoshDirect"] {
++        for argument in [one.clone(), sum_one.clone(), inverse_one.clone()] {
++            cases.push(node(kind, argument));
++        }
++    }
++    for graph in cases {
++        // acos(1)=acosh(1)=0, independent of the graph's spelling or cache.
++        let native: Computable = serde_json::from_value(graph.clone()).unwrap();
++        assert_eq!(
++            native.structural_facts().sign,
++            Some(RealSign::Zero),
++            "{graph}"
++        );
++        assert_eq!(native.structural_facts().zero, ZeroKnowledge::Zero);
++        let wire = json!({"rational":q(1, 1),"class":"Irrational","computable":graph});
++        for restored in [
++            Real::from_json(&wire.to_string()).unwrap(),
++            Real::from_bytes(&cbor(&wire)).unwrap(),
++        ] {
++            let json = restored.to_json();
++            let bytes = restored.to_bytes();
++            for precision in [0, -64, 0] {
++                assert_eq!(restored.refine_sign_until(precision), Some(RealSign::Zero));
++            }
++            assert_eq!(restored.to_json(), json);
++            assert_eq!(restored.to_bytes(), bytes);
++            assert_eq!(restored.inverse_ref(), Err(Problem::DivideByZero));
++            assert_eq!(
++                (Real::one() + &restored).exact_rational_normal_form(),
++                Some(Rational::one())
++            );
++            assert_eq!(
++                (restored + Real::one()).exact_rational_normal_form(),
++                Some(Rational::one())
++            );
++        }
++    }
++}
++
++#[test]
++fn endpoint_proofs_do_not_erase_unresolved_domain_obligations() {
++    let denominator = node("Add", json!([leaf(1, 1), leaf(-1, 1)]));
++    let invalid = node("Inverse", denominator);
++    let hidden = node("Multiply", json!([leaf(0, 1), invalid]));
++    let value: Computable = serde_json::from_value(hidden.clone()).unwrap();
++    // General graph admission still accepts this undefined expression. Its
++    // existing sign fact is not a domain proof and must not erase the inverse.
++    let _ = value.structural_facts();
++    let sum = value.add(Computable::one());
++    let wire = serde_json::to_value(&sum).unwrap();
++    assert_eq!(wire["internal"]["Add"][0], hidden);
++
++    let argument = node("Add", json!([hidden, leaf(1, 1)]));
++    for kind in ["AcoshNearOne", "AcoshDirect"] {
++        let graph = node(kind, argument.clone());
++        let native: Computable = serde_json::from_value(graph.clone()).unwrap();
++        assert_eq!(native.structural_facts().sign, None);
++        let sum = native.add(Computable::one());
++        let wire = serde_json::to_value(sum).unwrap();
++        assert_eq!(wire["internal"]["Add"][0], graph);
++    }
++}
++
++#[test]
++fn valid_private_parameters_and_public_trig_outputs_remain_consumable() {
++    let mut graphs = Vec::new();
++    for kind in [
++        "PrescaledCosRational",
++        "PrescaledSinRational",
++        "PrescaledTanRational",
++    ] {
++        for n in [-3, -2, 0, 2, 3] {
++            graphs.push(node(kind, q(n, 4)));
++        }
++    }
++    for kind in [
++        "PrescaledCosHalfPiMinusRational",
++        "PrescaledSinHalfPiMinusRational",
++        "PrescaledCotHalfPiMinusRational",
++    ] {
++        for (n, d) in [(1, 1), (7, 5), (149, 100)] {
++            graphs.push(node(kind, q(n, d)));
++        }
++    }
++    for kind in ["SincSmall", "CoscSmall"] {
++        for n in [-3, -1, 0, 1, 3] {
++            graphs.push(node(kind, leaf(n, 4)));
++        }
++    }
++    for graph in graphs {
++        let wire = json!({"rational":q(1, 1),"class":"Irrational","computable":graph});
++        let source = Real::from_json(&wire.to_string()).unwrap();
++        let bytes = source.to_bytes();
++        let restored = Real::from_bytes(&bytes).unwrap();
++        assert_eq!(restored.to_bytes(), bytes);
++        let [lo, hi] = restored.certified_rational_interval(-32).unwrap();
++        // |sin(x)|, |cos(x)| <= 1; |tan(x)| < 1 for |x| <= 3/4.
++        // For the medium cotangent, pi > 25/8 and tan(t)>t give cot(t)<16.
++        // The small-angle integral forms bound sinc by 1 and cosc by 1/2.
++        assert!(lo > Rational::new(-2) && hi < Rational::new(16));
++        assert!(
++            (restored + Real::one())
++                .certified_rational_interval(-32)
++                .is_some()
++        );
++    }
++    for n in [
++        -200, -150, -140, -100, -75, -1, 0, 1, 75, 100, 140, 150, 200,
++    ] {
++        let input = Real::from(Rational::fraction(n, 100).unwrap());
++        for value in [
++            input.clone().sin(),
++            input.clone().cos(),
++            input.tan().unwrap(),
++        ] {
++            let json = value.to_json();
++            let bytes = value.to_bytes();
++            for restored in [
++                Real::from_json(&json).unwrap(),
++                Real::from_bytes(&bytes).unwrap(),
++            ] {
++                assert_eq!(restored.to_json(), json);
++                assert_eq!(restored.to_bytes(), bytes);
++                assert!(
++                    (restored + Real::one())
++                        .certified_rational_interval(-32)
++                        .is_some()
++                );
++            }
++        }
++    }
++}
