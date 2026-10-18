@@ -1,0 +1,13 @@
+# Exact KiCad track ingress after flat native aggregation
+
+Target revision: 7abc7128c00ad1b4bbb10ddd24dc968c39dfdd8a. This is a new experiment, not reinstatement of E29, E36, E46, or E62.
+
+Owning layer: HyperDRC KiCad ingress bridges exact decimal source to Hypercurve line strokes. Hypercurve owns analytic stroke geometry, predicates, and resource costs. Properties P1, P6, P8-P9, P17-P20, P35-P39 apply.
+
+Domain: finite rational KiCad straight-segment endpoints and nonnegative width; a positive width denotes a closed round-capped stroke, coincident endpoints a disk, zero width the regularized empty set. Invalid fields, exact blockers, budget exhaustion, and finite-report failure remain typed. Native results must compose, retain exact area/bounds/membership and strict receipts, and remain authoritative when report conversion fails.
+
+First reproduce the unchanged archived 10 stroke and 12 aggregation tests on the current qualified libraries, and rerun the current 39 failure tests. These tests distinguish intended analytic geometry from the current ordinary rectangle adapter. Then isolate only the exact-track importer in a fresh source/target, retaining current flat aggregation and all other production code. Importer error-constructor changes are part of the isolated source change. Archive the original 39 test file unchanged; separately run E36's reviewed 39-test migration which replaces one obsolete finite-adapter-error assertion with stronger exact-range/area/bounds/handoff assertions. The six original extreme fixtures are unchanged. No cache proposal is included.
+
+The candidate is unadmitted until the existing original full-board worker-CPU 120-second, copper-neck body-wall 60-second, and Gerber gates pass without fixture or policy changes, correctness/report migrations are independently justified, and all affected checks complete. Measure current candidate before choosing any owning-layer performance repair. Rectangles versus capsules are different sets: their timings are diagnostic, never a performance-only comparison. A later retention would require a new readiness migration; this experiment retains readiness 22 and makes no distributable artifact claim.
+
+External containment: existing runner v3, 8 GiB address space, two build jobs, 1800-second command wall cap (60 seconds for focused probes), 16 GiB cumulative root consumption and 64 GiB cumulative Disk B consumption using their original baselines, 512 MiB reserve, 2 GiB available host memory, 64 MiB aggregate command logs. These are not internal operation work/memory bounds. Never overwrite closed sources, targets, helpers, or evidence; hash physical paths independently. Preserve failed results. Hypervoxel is out of scope and must not compile.
