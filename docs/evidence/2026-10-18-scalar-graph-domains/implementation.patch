@@ -1,0 +1,398 @@
+--- a/crates/hypercurve/tests/svg_scalar_failures.rs
++++ b/crates/hypercurve/tests/svg_scalar_failures.rs
+@@ -2,6 +2,24 @@
+ 
+ use hypercurve::{Real, SvgError, import_svg_document};
+ use std::fmt::Write;
++
++fn document_with_first_coordinate(invalid: &[u8]) -> String {
++    let zero = Real::zero().to_bytes();
++    let one = Real::one().to_bytes();
++    // HCP3, one line, then its two points: (invalid, 0) to (1, 0).
++    let mut bytes = b"HCP3\x00\x00\x00\x01\x00".to_vec();
++    for coordinate in [invalid, &zero, &one, &zero] {
++        bytes.extend_from_slice(&u32::try_from(coordinate.len()).unwrap().to_be_bytes());
++        bytes.extend_from_slice(coordinate);
++    }
++    let mut extension = String::from("3:");
++    for byte in bytes {
++        write!(&mut extension, "{byte:02x}").unwrap();
++    }
++    format!(
++        r#"<svg xmlns="http://www.w3.org/2000/svg"><path fill="none" stroke="black" data-hypercurve-path="{extension}" d="M0 0 L1 0"/></svg>"#
++    )
++}
+ 
+ #[test]
+ fn exact_svg_rejects_a_coordinate_without_its_required_scalar_payload() {
+@@ -9,21 +27,7 @@
+     // syntactically valid but cannot describe an opaque real value.
+     let invalid = b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
+         \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\xf6";
+-    let zero = Real::zero().to_bytes();
+-    let one = Real::one().to_bytes();
+-    // HCP3, one line, then its two points: (invalid, 0) to (1, 0).
+-    let mut bytes = b"HCP3\x00\x00\x00\x01\x00".to_vec();
+-    for coordinate in [invalid.as_slice(), &zero, &one, &zero] {
+-        bytes.extend_from_slice(&u32::try_from(coordinate.len()).unwrap().to_be_bytes());
+-        bytes.extend_from_slice(coordinate);
+-    }
+-    let mut extension = String::from("3:");
+-    for byte in bytes {
+-        write!(&mut extension, "{byte:02x}").unwrap();
+-    }
+-    let document = format!(
+-        r#"<svg xmlns="http://www.w3.org/2000/svg"><path fill="none" stroke="black" data-hypercurve-path="{extension}" d="M0 0 L1 0"/></svg>"#
+-    );
++    let document = document_with_first_coordinate(invalid);
+     let error = import_svg_document(&document).unwrap_err();
+     assert!(
+         matches!(error, SvgError::MalformedInput(ref detail)
+@@ -31,3 +35,27 @@
+         "{error:?}",
+     );
+ }
++
++#[test]
++fn exact_svg_rejects_undefined_scalar_graphs_before_publishing_a_path() {
++    // CBOR Real records with rational=1 and class=Irrational. The respective
++    // graphs are Sqrt(Int(-1)) and Inverse(Int(0)); neither denotes a real.
++    for invalid in [
++        b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
++            \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\
++            \xa1\x68internal\xa1\x64Sqrt\xa1\x68internal\xa1\x63Int\x82\x20\x81\x01"
++            .as_slice(),
++        b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
++            \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\
++            \xa1\x68internal\xa1\x67Inverse\xa1\x68internal\xa1\x63Int\x82\x00\x80"
++            .as_slice(),
++    ] {
++        let document = document_with_first_coordinate(invalid);
++        let error = import_svg_document(&document).unwrap_err();
++        assert!(
++            matches!(error, SvgError::MalformedInput(ref detail)
++                if detail.contains("invalid exact coordinate") && detail.contains("ParseError")),
++            "{error:?}",
++        );
++    }
++}
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -3,6 +3,11 @@
+ /// This is a demand-driven exact-real representation: every node can produce an
+ /// integer approximation at a requested binary precision, and caches store only
+ /// approximations and exact reductions proven for that node.
++///
++/// With `serde`, decoding rejects out-of-domain exact rational arguments to
++/// partial functions. This check does not prove that an arbitrary expression
++/// is defined: non-leaf domain obligations and private kernel range requirements
++/// still apply. Deserialization does not refine an operand to decide its domain.
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ #[cfg(not(verus_keep_ghost))]
+@@ -36,6 +41,7 @@
+         // Replay this bounded proof from the expression itself so a subsequent
+         // bounded reducer can consume it without first warming a numeric cache.
+         let approximation = Approximation::deserialize(deserializer)?;
++        Self::check_serialized_rational_domain(&approximation).map_err(serde::de::Error::custom)?;
+         let facts = AtomicFacts::default();
+         if let Approximation::PrescaledSin(argument) | Approximation::PrescaledTan(argument) =
+             &approximation
+@@ -48,6 +54,62 @@
+             approximation,
+             cache: EvaluationCache::default(),
+         })
++    }
++}
++
++#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
++impl Node {
++    fn check_serialized_rational_domain(approximation: &Approximation) -> Result<(), &'static str> {
++        // Children have already passed the same check while decoding. Reject
++        // an undefined child before a parent can hide it with multiplication
++        // by zero, cancellation, or an outer Real scale. Only inspect exact
++        // leaves; an inconclusive domain proof must not reject a valid graph.
++        let outside_closed_unit = |r: &Rational| r < &-Rational::one() || r > &Rational::one();
++        let outside_open_unit = |r: &Rational| r <= &-Rational::one() || r >= &Rational::one();
++        let outside_positive_unit = |r: &Rational| r.sign() == Sign::Minus || r > &Rational::one();
++        let invalid = match approximation {
++            Approximation::Inverse(value) | Approximation::PrescaledCot(value) => value
++                .exact_rational()
++                .is_some_and(|r| r.sign() == Sign::NoSign),
++            Approximation::Sqrt(value) | Approximation::NthRoot(value, _) => value
++                .exact_rational()
++                .is_some_and(|r| r.sign() == Sign::Minus),
++            Approximation::PrescaledLn(value) => value
++                .exact_rational()
++                .is_some_and(|r| r <= -Rational::one()),
++            // These variants store x for ln(1+x), not the logarithm's input.
++            Approximation::PrescaledLnRational(r)
++            | Approximation::BinaryScaledLnRational { residual: r, .. } => r <= &-Rational::one(),
++            Approximation::IntegralAtan(denominator) => denominator.is_zero(),
++            Approximation::AsinRational(r) => outside_closed_unit(r),
++            Approximation::PrescaledAsin(value) | Approximation::AsinDeferred(value) => value
++                .exact_rational()
++                .is_some_and(|r| outside_closed_unit(&r)),
++            // Both rational endpoint variants store an absolute argument.
++            Approximation::AcosPositiveRational(r) | Approximation::AcosNegativeRational(r) => {
++                outside_positive_unit(r)
++            }
++            Approximation::AcosPositive(value) => value
++                .exact_rational()
++                .is_some_and(|r| outside_positive_unit(&r)),
++            Approximation::AtanhRational(r) => outside_open_unit(r),
++            Approximation::PrescaledAtanh(value) | Approximation::AtanhDirect(value) => value
++                .exact_rational()
++                .is_some_and(|r| outside_open_unit(&r)),
++            Approximation::AcoshNearOne(value) | Approximation::AcoshDirect(value) => {
++                value.exact_rational().is_some_and(|r| r < Rational::one())
++            }
++            Approximation::NormalQuantile(data) => data
++                .p
++                .exact_rational()
++                .is_some_and(|r| r.sign() != Sign::Plus || r >= Rational::one()),
++            _ => false,
++        };
++        if invalid {
++            Err("Computable argument is outside its real-valued domain")
++        } else {
++            Ok(())
++        }
+     }
+ }
+ 
+--- a/crates/hyperreal/tests/serde_graph_domains.rs
++++ b/crates/hyperreal/tests/serde_graph_domains.rs
+@@ -0,0 +1,232 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real};
++use serde_json::{Value, json};
++
++fn rational(numerator: i64, denominator: u64) -> Value {
++    serde_json::to_value(Rational::fraction(numerator, denominator).unwrap()).unwrap()
++}
++
++fn leaf(numerator: i64, denominator: u64) -> Value {
++    json!({"internal": {"Ratio": rational(numerator, denominator)}})
++}
++
++fn node(kind: &str, argument: Value) -> Value {
++    json!({"internal": {kind: argument}})
++}
++
++fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++fn invalid_nodes() -> Vec<Value> {
++    let mut cases = vec![
++        node("Inverse", leaf(0, 1)),
++        node("PrescaledCot", leaf(0, 1)),
++        node("Sqrt", leaf(-1, 1)),
++        node("NthRoot", json!([leaf(-1, 1), 3])),
++        node("IntegralAtan", json!([0, []])),
++    ];
++    // The logarithm variants store x for ln(1+x), whose domain is x > -1.
++    for n in [-2, -1] {
++        cases.push(node("PrescaledLn", leaf(n, 1)));
++        cases.push(node("PrescaledLnRational", rational(n, 1)));
++        cases.push(node(
++            "BinaryScaledLnRational",
++            json!({"residual": rational(n, 1), "shift": 7}),
++        ));
++    }
++    for n in [-2, 2] {
++        cases.push(node("AsinRational", rational(n, 1)));
++        for kind in ["PrescaledAsin", "AsinDeferred"] {
++            cases.push(node(kind, leaf(n, 1)));
++        }
++    }
++    // The negative-endpoint acos variant stores |x|, not the signed x.
++    for n in [-1, 2] {
++        for kind in ["AcosPositiveRational", "AcosNegativeRational"] {
++            cases.push(node(kind, rational(n, 1)));
++        }
++        cases.push(node("AcosPositive", leaf(n, 1)));
++    }
++    for n in [-2, -1, 1, 2] {
++        cases.push(node("AtanhRational", rational(n, 1)));
++        for kind in ["PrescaledAtanh", "AtanhDirect"] {
++            cases.push(node(kind, leaf(n, 1)));
++        }
++    }
++    for kind in ["AcoshNearOne", "AcoshDirect"] {
++        cases.push(node(kind, leaf(1, 2)));
++    }
++    for n in [-1, 0, 1, 2] {
++        cases.push(node(
++            "NormalQuantile",
++            json!({"p": leaf(n, 1), "seed": [0, []], "seed_prec": -16}),
++        ));
++    }
++    // Int and One leaves share the same mathematical domain rules as Ratio.
++    cases.push(node("Inverse", json!({"internal": {"Int": [0, []]}})));
++    cases.push(node("Sqrt", json!({"internal": {"Int": [-1, [1]]}})));
++    cases.push(node("AtanhDirect", json!({"internal": "One"})));
++    cases
++}
++
++#[test]
++fn native_graph_import_rejects_exact_out_of_domain_arguments() {
++    let mut accepted = Vec::new();
++    for wire in invalid_nodes() {
++        let json = serde_json::from_value::<Computable>(wire.clone());
++        let binary = ciborium::de::from_reader::<Computable, _>(cbor(&wire).as_slice());
++        match (json, binary) {
++            (Err(json), Err(binary)) => {
++                assert!(json.to_string().contains("domain"));
++                assert!(binary.to_string().contains("domain"));
++            }
++            _ => accepted.push(wire),
++        }
++    }
++    assert!(
++        accepted.is_empty(),
++        "accepted undefined nodes: {accepted:?}"
++    );
++}
++
++#[test]
++fn undefined_children_cannot_be_hidden_by_outer_identities_or_collections() {
++    let mut accepted = Vec::new();
++    for invalid in invalid_nodes() {
++        for graph in [
++            invalid.clone(),
++            node("Multiply", json!([leaf(0, 1), invalid])),
++            node("Add", json!([invalid, leaf(1, 1)])),
++            node("Square", invalid.clone()),
++        ] {
++            for scale in [0, 1, -3] {
++                let wire = json!({
++                    "rational": rational(scale, 1),
++                    "class": "Irrational",
++                    "computable": graph,
++                });
++                let bytes = cbor(&wire);
++                if Real::from_json(&wire.to_string()) != Err(Problem::ParseError)
++                    || Real::from_bytes(&bytes) != Err(Problem::ParseError)
++                    || Real::try_from(ciborium::Value::serialized(&wire).unwrap())
++                        != Err(Problem::ParseError)
++                {
++                    accepted.push(wire.clone());
++                }
++                let collection = json!([Real::one(), wire]);
++                if serde_json::from_value::<Vec<Real>>(collection.clone()).is_ok()
++                    || ciborium::de::from_reader::<Vec<Real>, _>(cbor(&collection).as_slice())
++                        .is_ok()
++                {
++                    accepted.push(collection);
++                }
++            }
++        }
++    }
++    assert!(
++        accepted.is_empty(),
++        "undefined pipeline inputs: {accepted:?}"
++    );
++}
++
++#[test]
++fn valid_partial_functions_preserve_values_and_wire_representation() {
++    let mut values = vec![
++        (Real::zero().sqrt().unwrap(), 0, 0),
++        (Real::from(2).sqrt().unwrap(), 1, 2),
++        (Real::from(2).ln().unwrap(), 0, 1),
++        (Real::from(2).acosh().unwrap(), 1, 2),
++        (
++            Real::from(Rational::fraction(1, 2).unwrap())
++                .atanh()
++                .unwrap(),
++            0,
++            1,
++        ),
++        (Real::from(2).inverse().unwrap(), 0, 1),
++    ];
++    for n in [-1, 0, 1] {
++        values.push((Real::from(n).asin().unwrap(), -2, 2));
++        values.push((Real::from(n).acos().unwrap(), 0, 4));
++    }
++    // Keep the full negative and large log1p residuals from the native guard
++    // regression; their stored arguments must not be mistaken for ln inputs.
++    for (numerator, denominator, lower, upper) in
++        [(-255, 256, -6, -5), (-1, 2, -1, 0), (1000, 1, 6, 7)]
++    {
++        values.push((
++            Real::from(Rational::fraction(numerator, denominator).unwrap())
++                .ln_1p()
++                .unwrap(),
++            lower,
++            upper,
++        ));
++    }
++    // Defined opaque operands must not be rejected for lacking a leaf proof.
++    // 25/8 < pi < 22/7 implies 7 < 1/(pi - 3) < 8 and 1 < sqrt(pi) < 2.
++    values.push(((Real::pi() - Real::from(3)).inverse().unwrap(), 7, 8));
++    values.push((Real::pi().sqrt().unwrap(), 1, 2));
++    for (value, lower, upper) in values {
++        let json = value.to_json();
++        let bytes = value.to_bytes();
++        for restored in [
++            Real::from_json(&json).unwrap(),
++            Real::from_bytes(&bytes).unwrap(),
++        ] {
++            let [lo, hi] = restored.certified_rational_interval(-32).unwrap();
++            assert!(lo >= Rational::new(lower) && hi <= Rational::new(upper));
++            assert_eq!(restored.to_json(), json);
++            assert_eq!(restored.to_bytes(), bytes);
++            let [lo, hi] = (restored + Real::one())
++                .certified_rational_interval(-32)
++                .unwrap();
++            assert!(lo >= Rational::new(lower + 1) && hi <= Rational::new(upper + 1));
++        }
++    }
++}
++
++#[test]
++fn logarithm_residuals_preserve_zero_and_both_sides_of_one() {
++    // For |x| <= 1/4, |ln(1+x)| < 1/2. At x=0 the result is exactly zero.
++    // Exercise every stored logarithm residual representation directly.
++    for numerator in [-1, 0, 1] {
++        for graph in [
++            node("PrescaledLn", leaf(numerator, 4)),
++            node("PrescaledLnRational", rational(numerator, 4)),
++            node(
++                "BinaryScaledLnRational",
++                json!({"residual": rational(numerator, 4), "shift": 0}),
++            ),
++        ] {
++            let wire = json!({
++                "rational": rational(1, 1),
++                "class": "Irrational",
++                "computable": graph,
++            });
++            let bytes = cbor(&wire);
++            for value in [
++                Real::from_json(&wire.to_string()).unwrap(),
++                Real::from_bytes(&bytes).unwrap(),
++            ] {
++                let [lo, hi] = value.certified_rational_interval(-32).unwrap();
++                let half = Rational::fraction(1, 2).unwrap();
++                assert!(lo > -half.clone() && hi < half);
++                match numerator {
++                    -1 => assert!(hi < Rational::zero()),
++                    1 => assert!(lo > Rational::zero()),
++                    0 => {
++                        let unit = Rational::fraction(1, 1_u64 << 32).unwrap();
++                        assert!(lo <= Rational::zero() && hi >= Rational::zero());
++                        assert!(lo >= -unit.clone() && hi <= unit);
++                    }
++                    _ => unreachable!(),
++                }
++                assert_eq!(serde_json::to_value(&value).unwrap(), wire);
++            }
++        }
++    }
++}
