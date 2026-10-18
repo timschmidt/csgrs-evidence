@@ -1,0 +1,1008 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index f9cf401a0..8df59eccf 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -381,7 +381,7 @@ when a zero outer factor would hide the invalid child. Small-angle `sinc` and
+ constants whose certified magnitude proves they exceed that bound. This
+ tightens earlier unchecked private representations; the public trigonometric
+ constructors retain their wider input domains through argument reduction.
+-General non-leaf kernel ranges and quantile seed admission remain incomplete.
++General non-leaf kernel ranges remain incomplete.
+ Inverse-cosine endpoint facts distinguish `acos(1) = acosh(1) = 0`; an imported
+ `acosh` node needs evidence about its argument before claiming a positive sign.
+ The native rational reader recognizes these exact endpoints so later arithmetic
+@@ -390,6 +390,19 @@ quotient evaluator requires rational leaves and checks every denominator before
+ discarding zero terms; an arbitrary cached zero is insufficient. Imported
+ non-rational `acosh` arguments may remain undecided until new evidence is found.
+ 
++Normal-quantile seeds are evaluation hints, including in retained wire graphs.
++Recognizable CDF expressions of exact rational arguments retain their inverse
++without evaluating tiny tails: the shared scalar normalizer suggests an argument,
++and structural equality with the complete reconstructed CDF proves the identity.
++Seeds no longer supply certified values by themselves. Other results require
++CDF enclosures, with monotone search when a Newton step or seed is insufficient.
++The exact half-probability identity remains zero through import and downstream
++arithmetic. Valid stored graph bytes are preserved; a native constructor may
++canonicalize the exact half-probability case to zero and recognized rational
++CDF inverses to their exact values. The native quantile
++operation requires a defined probability strictly between zero and one;
++general expression-domain validation and total-work bounds remain incomplete.
++
+ Hypercurve's exact SVG import exposes undecided scalar admission as
+ `SvgError::Scalar(Problem::UnknownCertificate)` with the scalar error as its
+ source. Consumers matching every `SvgError` variant must handle the new
+diff --git a/crates/hyperreal/src/computable/approximation/statistics.rs b/crates/hyperreal/src/computable/approximation/statistics.rs
+index ba3817477..b828f7c06 100644
+--- a/crates/hyperreal/src/computable/approximation/statistics.rs
++++ b/crates/hyperreal/src/computable/approximation/statistics.rs
+@@ -61,7 +61,12 @@ fn normal_sf(signal: &Option<Signal>, op: &Computable, p: Precision) -> BigInt {
+     op.clone().negate().pnorm().approx_signal(signal, p)
+ }
+ 
+-fn normal_interval(signal: &Option<Signal>, lo: &Computable, hi: &Computable, p: Precision) -> BigInt {
++fn normal_interval(
++    signal: &Option<Signal>,
++    lo: &Computable,
++    hi: &Computable,
++    p: Precision,
++) -> BigInt {
+     hi.clone()
+         .pnorm()
+         .add(lo.clone().pnorm().negate())
+@@ -84,7 +89,92 @@ fn log_dnorm(signal: &Option<Signal>, op: &Computable, p: Precision) -> BigInt {
+         .approx_signal(signal, p)
+ }
+ 
+-const NORMAL_QUANTILE_RESULT_MSD_BOUND: Precision = 5;
++// Compare a dyadic trial point with the quantile, or certify an interval
++// around it. The seed and Newton step choose trial points; only CDF bounds
++// justify returning an approximation. Each approximation has error <= 1 ulp,
++// so a difference greater than two ulps proves the corresponding strict order.
++fn normal_quantile_probe(
++    signal: &Option<Signal>,
++    p: &Computable,
++    trial: &BigInt,
++    working_precision: Precision,
++) -> Option<std::cmp::Ordering> {
++    use std::cmp::Ordering;
++
++    let lower = Computable::integer(trial - 2)
++        .shift_left(working_precision)
++        .pnorm();
++    let upper = Computable::integer(trial + 2)
++        .shift_left(working_precision)
++        .pnorm();
++    let center = Computable::integer(trial.clone())
++        .shift_left(working_precision)
++        .pnorm();
++    // This is a planning hint only. Small tail densities need extra CDF bits;
++    // all decisions below still require disjoint numerical enclosures.
++    let magnitude = scale(trial.abs(), working_precision)
++        .to_u32()
++        .unwrap_or(64)
++        .min(64);
++    let guard = ((magnitude + 2).pow(2) + 8) as Precision;
++    let mut precision = working_precision.saturating_sub(guard).min(-16);
++    loop {
++        if should_stop(signal) {
++            return None;
++        }
++        let probability = p.approx_signal(signal, precision);
++        let lo = lower.approx_signal(signal, precision);
++        let hi = upper.approx_signal(signal, precision);
++        if should_stop(signal) {
++            return None;
++        }
++        if &probability - &lo > BigInt::from(2) && &hi - &probability > BigInt::from(2) {
++            return Some(Ordering::Equal);
++        }
++        if lo - &probability > BigInt::from(2) {
++            return Some(Ordering::Greater);
++        }
++        if &probability - hi > BigInt::from(2) {
++            return Some(Ordering::Less);
++        }
++        // If a bracket endpoint equals the root, its strict comparison cannot
++        // terminate. The center is then separated from the root instead.
++        let middle = center.approx_signal(signal, precision);
++        if should_stop(signal) {
++            return None;
++        }
++        if &middle - &probability > BigInt::from(2) {
++            return Some(Ordering::Greater);
++        }
++        if probability - middle > BigInt::from(2) {
++            return Some(Ordering::Less);
++        }
++        precision = precision.saturating_sub(16);
++    }
++}
++
++fn normal_quantile_bisect(
++    signal: &Option<Signal>,
++    p: &Computable,
++    mut lower: BigInt,
++    mut upper: BigInt,
++    working_precision: Precision,
++) -> BigInt {
++    use std::cmp::Ordering;
++
++    while &upper - &lower > BigInt::from(4) {
++        let trial = (&lower + &upper) >> 1;
++        match normal_quantile_probe(signal, p, &trial, working_precision) {
++            Some(Ordering::Less) => lower = trial,
++            Some(Ordering::Greater) => upper = trial,
++            Some(Ordering::Equal) => return scale(trial, -2),
++            None => return BigInt::zero(),
++        }
++    }
++    // The root lies in [lower, upper], whose width is at most one result ulp.
++    // Round its exact midpoint: half the width plus half an ulp is <= one ulp.
++    scale(lower + upper, -3)
++}
+ 
+ fn normal_quantile(
+     signal: &Option<Signal>,
+@@ -93,16 +183,76 @@ fn normal_quantile(
+     seed_prec: Precision,
+     prec: Precision,
+ ) -> BigInt {
+-    if prec >= seed_prec || should_stop(signal) {
+-        return scale(seed.clone(), seed_prec - prec);
++    use std::cmp::Ordering;
++
++    if should_stop(signal) {
++        return BigInt::zero();
++    }
++    if let Some(exact) = p.exact_normal_quantile() {
++        return Computable::rational(exact).approx_signal(signal, prec);
++    }
++    if prec > 0 {
++        return scale(normal_quantile(signal, p, seed, seed_prec, 0), -prec);
++    }
++    let working_precision = prec - 2;
++    if prec < -16 {
++        let previous_precision = prec / 2 - 6;
++        let previous = normal_quantile(signal, p, seed, seed_prec, previous_precision);
++        if should_stop(signal) {
++            return BigInt::zero();
++        }
++        let xn = Computable::integer(previous.clone()).shift_left(previous_precision);
++        let residual = xn.clone().pnorm().add(p.clone().negate());
++        let correction = residual.multiply(xn.clone().dnorm().inverse());
++        let trial = xn
++            .add(correction.negate())
++            .approx_signal(signal, working_precision);
++        let shift = previous_precision - working_precision;
++        let lower = (&previous - 1) << shift;
++        let upper = (&previous + 1) << shift;
++        // A previous certified approximation supplies a bracket even if a
++        // Newton proposal fails or leaves the interval. No convergence estimate
++        // or fixed bound on the quantile's magnitude is used as a certificate.
++        if trial >= lower
++            && trial <= upper
++            && normal_quantile_probe(signal, p, &trial, working_precision) == Some(Ordering::Equal)
++        {
++            return scale(trial, -2);
++        }
++        return normal_quantile_bisect(signal, p, lower, upper, working_precision);
+     }
+ 
+-    let appr_prec = (NORMAL_QUANTILE_RESULT_MSD_BOUND + prec) / 2 - 6;
+-    let xn_int = normal_quantile(signal, p, seed, seed_prec, appr_prec);
+-    let xn = Computable::integer(xn_int).shift_left(appr_prec);
+-    let fx = xn.clone().pnorm();
+-    let phi_xn = xn.clone().dnorm();
+-    let x_next = xn.add(fx.add(p.clone().negate()).multiply(phi_xn.inverse()).negate());
++    // Avoid materializing a huge untrusted seed. This only selects a starting
++    // point: every finite quantile remains reachable by the expanding search.
++    let trial = if seed.is_zero()
++        || i64::from(seed_prec) + i64::try_from(seed.bits()).unwrap_or(i64::MAX / 2) > 5
++    {
++        BigInt::zero()
++    } else {
++        scale(seed.clone(), seed_prec - working_precision)
++    };
++    if normal_quantile_probe(signal, p, &trial, working_precision) == Some(Ordering::Equal) {
++        return scale(trial, -2);
++    }
+ 
+-    (x_next.approx_signal(signal, prec - 2) + signed::TWO.deref()) >> 2
++    let unit = BigInt::one() << working_precision.unsigned_abs();
++    let mut lower = -&unit;
++    let mut upper = unit;
++    loop {
++        match normal_quantile_probe(signal, p, &lower, working_precision) {
++            Some(Ordering::Less) => break,
++            Some(Ordering::Greater) => lower <<= 1,
++            Some(Ordering::Equal) => return scale(lower, -2),
++            None => return BigInt::zero(),
++        }
++    }
++    loop {
++        match normal_quantile_probe(signal, p, &upper, working_precision) {
++            Some(Ordering::Greater) => break,
++            Some(Ordering::Less) => upper <<= 1,
++            Some(Ordering::Equal) => return scale(upper, -2),
++            None => return BigInt::zero(),
++        }
++    }
++    normal_quantile_bisect(signal, p, lower, upper, working_precision)
+ }
+diff --git a/crates/hyperreal/src/computable/node/algebra.rs b/crates/hyperreal/src/computable/node/algebra.rs
+index 986ccec10..ac9e44842 100644
+--- a/crates/hyperreal/src/computable/node/algebra.rs
++++ b/crates/hyperreal/src/computable/node/algebra.rs
+@@ -306,10 +306,7 @@ impl PiLaurentPolynomial {
+             return None;
+         }
+         let (power, coefficient) = self.terms.pop()?;
+-        Some(Self::monomial(
+-            power.checked_neg()?,
+-            coefficient.inverse()?,
+-        ))
++        Some(Self::monomial(power.checked_neg()?, coefficient.inverse()?))
+     }
+ }
+ 
+@@ -683,11 +680,7 @@ impl Computable {
+             ),
+             Approximation::Multiply(left, right) => {
+                 if let Some(scale) = left.exact_rational() {
+-                    return Some(
+-                        right
+-                            .pi_atan_linear_form(budget - 1)?
+-                            .scaled(scale),
+-                    );
++                    return Some(right.pi_atan_linear_form(budget - 1)?.scaled(scale));
+                 }
+                 if let Some(scale) = right.exact_rational() {
+                     return Some(left.pi_atan_linear_form(budget - 1)?.scaled(scale));
+@@ -778,8 +771,7 @@ impl Computable {
+                 };
+                 return Some(PiAcosLinearForm {
+                     constant: Rational::zero(),
+-                    pi: orientation.clone()
+-                        * Rational::fraction(1, 2).expect("two is nonzero"),
++                    pi: orientation.clone() * Rational::fraction(1, 2).expect("two is nonzero"),
+                     acos: -orientation,
+                     argument: Some(Self::rational(
+                         Rational::fraction(1, 6).expect("six is nonzero"),
+@@ -837,11 +829,7 @@ impl Computable {
+             ),
+             Approximation::Multiply(left, right) => {
+                 if let Some(scale) = left.exact_rational() {
+-                    return Some(
+-                        right
+-                            .pi_acos_linear_form(budget - 1)?
+-                            .scaled(scale),
+-                    );
++                    return Some(right.pi_acos_linear_form(budget - 1)?.scaled(scale));
+                 }
+                 if let Some(scale) = right.exact_rational() {
+                     return Some(left.pi_acos_linear_form(budget - 1)?.scaled(scale));
+@@ -921,29 +909,22 @@ impl Computable {
+         Some((orientation, form.argument?))
+     }
+ 
+-    fn collapsed_inverse_trig_linear_sum(
+-        &self,
+-        other: &Computable,
+-    ) -> Option<Rational> {
++    fn collapsed_inverse_trig_linear_sum(&self, other: &Computable) -> Option<Rational> {
+         if !self.internal.contains_inverse_trig_or_pi()
+             && !other.internal.contains_inverse_trig_or_pi()
+         {
+             return None;
+         }
+-        if let (Some(left), Some(right)) = (
+-            self.pi_atan_linear_form(32),
+-            other.pi_atan_linear_form(32),
+-        )
++        if let (Some(left), Some(right)) =
++            (self.pi_atan_linear_form(32), other.pi_atan_linear_form(32))
+             && let Some(form) = left.add(right)
+             && form.pi.sign() == Sign::NoSign
+             && form.atan.sign() == Sign::NoSign
+         {
+             return Some(form.constant);
+         }
+-        if let (Some(left), Some(right)) = (
+-            self.pi_acos_linear_form(32),
+-            other.pi_acos_linear_form(32),
+-        )
++        if let (Some(left), Some(right)) =
++            (self.pi_acos_linear_form(32), other.pi_acos_linear_form(32))
+             && let Some(form) = left.add(right)
+             && form.pi.sign() == Sign::NoSign
+             && form.acos.sign() == Sign::NoSign
+@@ -1026,10 +1007,7 @@ impl Computable {
+             && form.constant.sign() == Sign::NoSign
+         {
+             if form.pi.sign() == Sign::NoSign {
+-                return Some(product_sign(
+-                    form.atan.sign(),
+-                    form.argument?.exact_sign()?,
+-                ));
++                return Some(product_sign(form.atan.sign(), form.argument?.exact_sign()?));
+             }
+             if form.atan.sign() == Sign::NoSign {
+                 return Some(form.pi.sign());
+@@ -1121,9 +1099,7 @@ impl Computable {
+                     None
+                 }
+             }
+-            Approximation::Negate(child) => {
+-                Some(-child.retained_pi_rational_multiple(budget - 1)?)
+-            }
++            Approximation::Negate(child) => Some(-child.retained_pi_rational_multiple(budget - 1)?),
+             Approximation::Offset(child, shift) => Some(
+                 child.retained_pi_rational_multiple(budget - 1)?
+                     * Self::power_of_two_rational(*shift),
+@@ -1213,7 +1189,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Negate(self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Negate(self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1287,7 +1267,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Inverse(self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Inverse(self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1316,7 +1300,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Offset(self, n), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Offset(self, n),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1375,7 +1363,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Square(self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Square(self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1402,8 +1394,7 @@ impl Computable {
+                         return self.multiply(left.clone()).add(remainder);
+                     }
+                 }
+-                if let Some(remainder) = other.without_scaled_shared_factor(SharedConstant::InvPi)
+-                {
++                if let Some(remainder) = other.without_scaled_shared_factor(SharedConstant::InvPi) {
+                     return remainder;
+                 }
+             }
+@@ -1428,8 +1419,7 @@ impl Computable {
+                         return other.multiply(left.clone()).add(remainder);
+                     }
+                 }
+-                if let Some(remainder) = self.without_scaled_shared_factor(SharedConstant::InvPi)
+-                {
++                if let Some(remainder) = self.without_scaled_shared_factor(SharedConstant::InvPi) {
+                     return remainder;
+                 }
+             }
+@@ -1540,7 +1530,11 @@ impl Computable {
+             }
+         }
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Multiply(self, other), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Multiply(self, other),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1551,12 +1545,10 @@ impl Computable {
+     ) -> Computable {
+         Self {
+             internal: Arc::new(Node::new(
+-                Approximation::LinearCombination3(Box::new(
+-                    LinearCombination3 {
+-                        coefficients,
+-                        values,
+-                    },
+-                )),
++                Approximation::LinearCombination3(Box::new(LinearCombination3 {
++                    coefficients,
++                    values,
++                })),
+                 BoundCache::Invalid,
+                 ExactSignCache::Invalid,
+             )),
+@@ -1612,7 +1604,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Multiply(Self::rational(scale), self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Multiply(Self::rational(scale), self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1632,9 +1628,8 @@ impl Computable {
+                 }
+                 let (left, left_scale, left_offset) = left.rational_offset_parts(budget)?;
+                 let (right, right_scale, right_offset) = right.rational_offset_parts(budget)?;
+-                return Self::internal_structural_eq(left, right).then(|| {
+-                    (left, left_scale + right_scale, left_offset + right_offset)
+-                });
++                return Self::internal_structural_eq(left, right)
++                    .then(|| (left, left_scale + right_scale, left_offset + right_offset));
+             }
+             Approximation::Negate(child) => (child, Rational::new(-1)),
+             Approximation::Offset(child, shift) if shift.unsigned_abs() <= 4096 => {
+@@ -1663,12 +1658,16 @@ impl Computable {
+             let left_parts = left.rational_offset_parts(&mut 8);
+             let right_parts = right.rational_offset_parts(&mut 8);
+             let (left, left_scale, right, right_scale) = match (left_parts, right_parts) {
+-                (Some((left, left_scale, left_offset)), Some((right, right_scale, right_offset)))
+-                    if left_offset == right_offset => (left, left_scale, right, right_scale),
+-                (Some((base, scale, offset)), None) if offset.sign() == Sign::NoSign =>
+-                    (base, scale, right, Rational::one()),
+-                (None, Some((base, scale, offset))) if offset.sign() == Sign::NoSign =>
+-                    (left, Rational::one(), base, scale),
++                (
++                    Some((left, left_scale, left_offset)),
++                    Some((right, right_scale, right_offset)),
++                ) if left_offset == right_offset => (left, left_scale, right, right_scale),
++                (Some((base, scale, offset)), None) if offset.sign() == Sign::NoSign => {
++                    (base, scale, right, Rational::one())
++                }
++                (None, Some((base, scale, offset))) if offset.sign() == Sign::NoSign => {
++                    (left, Rational::one(), base, scale)
++                }
+                 _ => return false,
+             };
+             if left_scale == right_scale {
+@@ -1722,14 +1721,18 @@ impl Computable {
+             && let Some((base, scale, offset)) = self.rational_offset_parts(&mut 8)
+         {
+             crate::trace_dispatch!("computable", "add", "rational-offset-fold");
+-            return base.clone().multiply_rational(scale)
++            return base
++                .clone()
++                .multiply_rational(scale)
+                 .add(Self::rational(offset + rational));
+         }
+         if let Some(rational) = &left_exact
+             && let Some((base, scale, offset)) = other.rational_offset_parts(&mut 8)
+         {
+             crate::trace_dispatch!("computable", "add", "rational-offset-fold");
+-            return base.clone().multiply_rational(scale)
++            return base
++                .clone()
++                .multiply_rational(scale)
+                 .add(Self::rational(offset + rational));
+         }
+         if let Approximation::Add(left, right) = &self.internal.approximation
+@@ -1838,7 +1841,9 @@ impl Computable {
+                     .and_then(|rational| other.sin_pi_rational_sum_sign(rational))
+             });
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Add(self, other), if certified_bound == BoundInfo::Unknown {
++            internal: Arc::new(Node::new(
++                Approximation::Add(self, other),
++                if certified_bound == BoundInfo::Unknown {
+                     BoundCache::Invalid
+                 } else {
+                     BoundCache::Valid(certified_bound)
+@@ -1857,7 +1862,11 @@ impl Computable {
+             return Self::one();
+         }
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Int(n), BoundCache::Invalid, ExactSignCache::Invalid)),
++            internal: Arc::new(Node::new(
++                Approximation::Int(n),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
+             signal: None,
+         }
+     }
+@@ -1870,7 +1879,11 @@ impl Computable {
+             return Self::zero();
+         }
+         let series = Self {
+-            internal: Arc::new(Node::new(Approximation::ErfSeries(self.clone()), BoundCache::Invalid, ExactSignCache::Invalid)),
++            internal: Arc::new(Node::new(
++                Approximation::ErfSeries(self.clone()),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
+             signal: None,
+         };
+         let gaussian = self.square().negate().exp();
+@@ -1886,7 +1899,11 @@ impl Computable {
+             return Self::one();
+         }
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Erfc(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Plus))),
++            internal: Arc::new(Node::new(
++                Approximation::Erfc(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Plus),
++            )),
+             signal: None,
+         }
+     }
+@@ -1928,7 +1945,11 @@ impl Computable {
+             return Self::rational(HALF_RATIONAL.clone());
+         }
+         Self {
+-            internal: Arc::new(Node::new(Approximation::NormalSf(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Plus))),
++            internal: Arc::new(Node::new(
++                Approximation::NormalSf(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Plus),
++            )),
+             signal: None,
+         }
+     }
+@@ -1955,7 +1976,11 @@ impl Computable {
+             None => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::NormalInterval { lo, hi }, BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::NormalInterval { lo, hi },
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -1963,7 +1988,11 @@ impl Computable {
+     /// Natural logarithm of the standard normal CDF.
+     pub fn log_pnorm(self) -> Computable {
+         Self {
+-            internal: Arc::new(Node::new(Approximation::LogPnorm(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Minus))),
++            internal: Arc::new(Node::new(
++                Approximation::LogPnorm(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Minus),
++            )),
+             signal: None,
+         }
+     }
+@@ -1971,7 +2000,11 @@ impl Computable {
+     /// Natural logarithm of the standard normal upper-tail probability.
+     pub fn log_normal_sf(self) -> Computable {
+         Self {
+-            internal: Arc::new(Node::new(Approximation::LogNormalSf(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Minus))),
++            internal: Arc::new(Node::new(
++                Approximation::LogNormalSf(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Minus),
++            )),
+             signal: None,
+         }
+     }
+@@ -1979,20 +2012,28 @@ impl Computable {
+     /// Natural logarithm of the standard normal density.
+     pub fn log_dnorm(self) -> Computable {
+         Self {
+-            internal: Arc::new(Node::new(Approximation::LogDnorm(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Minus))),
++            internal: Arc::new(Node::new(
++                Approximation::LogDnorm(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Minus),
++            )),
+             signal: None,
+         }
+     }
+ 
+-    /// Standard normal quantile by Newton iteration with the analytic density.
++    /// Standard normal quantile for a defined probability strictly between zero and one.
++    ///
++    /// The seed is an evaluation hint. A retained CDF identity or numerical
++    /// enclosures certify the result; safeguarded Newton iteration and monotone
++    /// search repair inaccurate seeds.
+     pub fn normal_quantile(p: Computable, seed: BigInt, seed_prec: Precision) -> Computable {
++        if let Some(exact) = p.exact_normal_quantile() {
++            return Self::rational(exact);
++        }
+         Self {
+             internal: Arc::new(Node::new(
+-                Approximation::NormalQuantile(Box::new(NormalQuantileData {
+-                    p,
+-                    seed,
+-                    seed_prec,
+-                })), BoundCache::Invalid,
++                Approximation::NormalQuantile(Box::new(NormalQuantileData { p, seed, seed_prec })),
++                BoundCache::Invalid,
+                 ExactSignCache::Invalid,
+             )),
+             signal: None,
+@@ -2003,5 +2044,4 @@ impl Computable {
+     pub fn abort(&mut self, s: Signal) {
+         self.signal = Some(s);
+     }
+-
+ }
+diff --git a/crates/hyperreal/src/computable/node/structural_analysis.rs b/crates/hyperreal/src/computable/node/structural_analysis.rs
+index f88faea53..c380e5c61 100644
+--- a/crates/hyperreal/src/computable/node/structural_analysis.rs
++++ b/crates/hyperreal/src/computable/node/structural_analysis.rs
+@@ -1161,6 +1161,7 @@ impl Computable {
+                 Approximation::AcosPositiveRational(r) => {
+                     Some(Some(if r.is_one() { Sign::NoSign } else { Sign::Plus }))
+                 }
++                Approximation::NormalQuantile(_) => Some(node.exact_rational().map(|r| r.sign())),
+                 Approximation::AcoshNearOne(argument) | Approximation::AcoshDirect(argument) => {
+                     // The representation alone does not prove x>1. A checked
+                     // rational expression proves the endpoint and its domain;
+@@ -1417,8 +1418,33 @@ impl Computable {
+         self.cheap_bound().certified_sign_and_msd()
+     }
+ 
++    pub(crate) fn exact_normal_quantile(&self) -> Option<Rational> {
++        if self.exact_rational().as_ref() == Some(&*HALF_RATIONAL) {
++            return Some(Rational::zero());
++        }
++        // Native CDF construction retains erf's argument. It suggests an
++        // inverse, but only reconstructing the complete CDF proves the identity:
++        // a similar-looking expression or an untrusted seed is not a witness.
++        let Approximation::Offset(sum, -1) = &self.internal.approximation else {
++            return None;
++        };
++        let Approximation::Add(_, erf) = &sum.internal.approximation else {
++            return None;
++        };
++        let Approximation::Multiply(_, series) = &erf.internal.approximation else {
++            return None;
++        };
++        let Approximation::ErfSeries(argument) = &series.internal.approximation else {
++            return None;
++        };
++        let (scale, radicand) = argument.exact_pure_quadratic_surd()?;
++        let inverse = scale * (radicand * Rational::new(2)).perfect_nth_root(2)?;
++        let reconstructed = Self::rational(inverse.clone()).pnorm();
++        Self::internal_structural_eq(self, &reconstructed).then_some(inverse)
++    }
++
+     pub(crate) fn exact_rational(&self) -> Option<Rational> {
+-        // Read exact leaves and defined inverse-cosine endpoints. Do not turn
++        // Read exact leaves and defined inverse-cosine/quantile identities. Do not turn
+         // an arbitrary cached zero into a rational: imported graphs may still
+         // contain unresolved domain obligations beneath that sign fact.
+         match &self.internal.approximation {
+@@ -1426,6 +1452,7 @@ impl Computable {
+             Approximation::Int(n) => Some(Rational::from_bigint(n.clone())),
+             Approximation::Ratio(r) => Some(r.clone()),
+             Approximation::AcosPositiveRational(r) if r.is_one() => Some(Rational::zero()),
++            Approximation::NormalQuantile(data) => data.p.exact_normal_quantile(),
+             Approximation::AcoshNearOne(argument) | Approximation::AcoshDirect(argument) => {
+                 argument
+                     .bounded_defined_rational()?
+--- /dev/null
++++ b/crates/hyperreal/tests/normal_quantile_evidence.rs
+@@ -0,0 +1,294 @@
++use hyperreal::{Computable, Rational, RealSign, ZeroKnowledge};
++use num::{BigInt, One, Signed};
++use rug::Float;
++use std::sync::{
++    Arc,
++    atomic::{AtomicBool, Ordering},
++};
++
++fn probability(n: i64, d: u64) -> Computable {
++    Computable::rational(Rational::fraction(n, d).unwrap())
++}
++
++fn mpfr_cdf(mut x: Float) -> Float {
++    x /= Float::with_val(384, 2).sqrt();
++    (-x).erfc() / 2
++}
++
++fn check_quantile(value: &Computable, n: i64, d: u64, precision: i32) {
++    let actual = value.approx(precision);
++    let x = Float::with_val(384, Float::parse(actual.to_string()).unwrap());
++    let mut lower = Float::with_val(384, &x - 1);
++    let mut upper = Float::with_val(384, &x + 1);
++    lower <<= precision;
++    upper <<= precision;
++    let p = Float::with_val(384, n) / Float::with_val(384, d);
++    // MPFR's erfc is independent of Hyperreal's erf series and Newton step.
++    // The CDF is strictly increasing, so these enclose its unique inverse.
++    assert!(
++        mpfr_cdf(lower) <= p,
++        "lower bound: {n}/{d}, {precision}, {actual}"
++    );
++    assert!(
++        mpfr_cdf(upper) >= p,
++        "upper bound: {n}/{d}, {precision}, {actual}"
++    );
++}
++
++#[test]
++fn native_half_probability_is_exact_for_every_seed() {
++    for (seed, precision) in [
++        (0, -16),
++        (6_553_600, -16),
++        (-6_553_600, -16),
++        (1, i32::MIN),
++        (1, i32::MAX),
++    ] {
++        let value = Computable::normal_quantile(probability(1, 2), seed.into(), precision);
++        assert_eq!(value.structural_facts().zero, ZeroKnowledge::Zero);
++        for precision in [0, -96, 0] {
++            assert_eq!(value.approx(precision), BigInt::from(0));
++        }
++    }
++}
++
++#[test]
++fn bad_seeds_cannot_change_interior_or_tail_quantiles() {
++    for (n, d) in [
++        (1, 4),
++        (3, 4),
++        (1, 1_000),
++        (999, 1_000),
++        (1, 1_000_000_000_000_000_000),
++        (999_999_999_999_999_999, 1_000_000_000_000_000_000),
++    ] {
++        for (seed, seed_precision) in [
++            (6_553_600, -16),
++            (-6_553_600, -16),
++            (0, 0),
++            (1, i32::MIN),
++            (1, i32::MAX),
++        ] {
++            let value = Computable::normal_quantile(probability(n, d), seed.into(), seed_precision);
++            let values = {
++                #[cfg(feature = "serde")]
++                {
++                    let json = serde_json::to_string(&value).unwrap();
++                    let mut cbor = Vec::new();
++                    ciborium::ser::into_writer(&value, &mut cbor).unwrap();
++                    vec![
++                        value,
++                        serde_json::from_str(&json).unwrap(),
++                        ciborium::de::from_reader(cbor.as_slice()).unwrap(),
++                    ]
++                }
++                #[cfg(not(feature = "serde"))]
++                {
++                    vec![value]
++                }
++            };
++            for value in values {
++                #[cfg(feature = "serde")]
++                let wire = serde_json::to_vec(&value).unwrap();
++                let expected = if (n as u64) * 2 < d {
++                    RealSign::Negative
++                } else {
++                    RealSign::Positive
++                };
++                for precision in [0, -80, 0] {
++                    if let Some(sign) = value.structural_facts().sign {
++                        assert_eq!(sign, expected);
++                    }
++                    check_quantile(&value, n, d, precision);
++                }
++                assert_eq!(value.structural_facts().sign, Some(expected));
++                #[cfg(feature = "serde")]
++                assert_eq!(serde_json::to_vec(&value).unwrap(), wire);
++            }
++        }
++    }
++}
++
++#[test]
++fn concurrent_quantile_queries_reuse_only_certified_values() {
++    let value = Arc::new(Computable::normal_quantile(
++        probability(3, 4),
++        (-6_553_600).into(),
++        -16,
++    ));
++    let threads: Vec<_> = (0..4)
++        .map(|offset| {
++            let value = value.clone();
++            std::thread::spawn(move || {
++                let precisions = [0, -96, -16, 0];
++                for index in 0..precisions.len() {
++                    check_quantile(
++                        &value,
++                        3,
++                        4,
++                        precisions[(index + offset) % precisions.len()],
++                    );
++                }
++            })
++        })
++        .collect();
++    for thread in threads {
++        thread.join().unwrap();
++    }
++    assert_eq!(value.structural_facts().sign, Some(RealSign::Positive));
++}
++
++#[test]
++fn cancelled_quantile_work_does_not_publish_a_seed_or_poison_recovery() {
++    let stopped = Arc::new(AtomicBool::new(true));
++    let mut value = Computable::normal_quantile(probability(3, 4), 6_553_600.into(), -16);
++    value.abort(stopped.clone());
++    let _ = value.approx(-80);
++    assert_eq!(value.structural_facts().sign, None);
++    assert_eq!(value.structural_facts().zero, ZeroKnowledge::Unknown);
++    stopped.store(false, Ordering::Relaxed);
++    check_quantile(&value, 3, 4, -80);
++    assert!(value.approx(0).abs() <= BigInt::one());
++}
++
++#[test]
++fn rational_cdf_composition_preserves_exact_values_and_tail_completion() {
++    // Strict monotonicity gives inverse-CDF(CDF(x)) = x. The expected dyadic
++    // values below are exact; evaluating the tiny tail probability is unnecessary.
++    for (n, d) in [
++        (-1000, 1),
++        (1000, 1),
++        (-1001, 8),
++        (1001, 8),
++        (-3, 4),
++        (3, 4),
++    ] {
++        let p = probability(n, d).pnorm();
++        for seed in [-6_553_600_i64, 0, 6_553_600] {
++            let native = Computable::normal_quantile(p.clone(), seed.into(), -16);
++            let values = {
++                #[cfg(feature = "serde")]
++                {
++                    // Preserve an actual imported quantile node even when the
++                    // native constructor can now return the exact rational.
++                    let graph = serde_json::json!({"internal":{"NormalQuantile":{
++                        "p":p, "seed":BigInt::from(seed), "seed_prec":-16
++                    }}});
++                    let mut cbor = Vec::new();
++                    ciborium::ser::into_writer(&graph, &mut cbor).unwrap();
++                    vec![
++                        native,
++                        serde_json::from_value(graph).unwrap(),
++                        ciborium::de::from_reader(cbor.as_slice()).unwrap(),
++                    ]
++                }
++                #[cfg(not(feature = "serde"))]
++                {
++                    vec![native]
++                }
++            };
++            for value in values {
++                #[cfg(feature = "serde")]
++                let wire = serde_json::to_vec(&value).unwrap();
++                let sign = if n < 0 {
++                    RealSign::Negative
++                } else {
++                    RealSign::Positive
++                };
++                assert_eq!(value.structural_facts().sign, Some(sign));
++                for precision in [0_i32, -96, 0] {
++                    let actual = value.approx(precision);
++                    let expected_numerator = BigInt::from(n) << precision.unsigned_abs();
++                    let error = (actual * d - expected_numerator).abs();
++                    if precision < 0 {
++                        assert_eq!(error, BigInt::from(0));
++                    } else {
++                        assert!(error <= BigInt::from(d));
++                    }
++                }
++                #[cfg(feature = "serde")]
++                {
++                    assert_eq!(serde_json::to_vec(&value).unwrap(), wire);
++                    let wrapped = serde_json::json!({
++                        "rational":Rational::new(-3),
++                        "class":"Irrational", "computable":value
++                    });
++                    let restored = hyperreal::Real::from_json(&wrapped.to_string()).unwrap();
++                    assert_eq!(
++                        restored.exact_rational_normal_form(),
++                        Some(Rational::fraction(-3 * n, d).unwrap())
++                    );
++                    assert_eq!(
++                        restored.inverse_ref().unwrap().exact_rational_normal_form(),
++                        Some(Rational::fraction(-3 * n, d).unwrap().inverse().unwrap())
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn altered_cdf_graph_must_not_borrow_the_original_inverse() {
++    let mut graph = serde_json::to_value(probability(3, 4).pnorm()).unwrap();
++    let offset = graph
++        .pointer_mut("/internal/Offset/0/internal/Add/0")
++        .unwrap();
++    assert_eq!(*offset, serde_json::to_value(Computable::one()).unwrap());
++    // Change (1 + erf(x/sqrt(2)))/2 to (9/8 + erf(x/sqrt(2)))/2.
++    // The retained erf argument still suggests x, but it is no longer a proof.
++    *offset = serde_json::to_value(probability(9, 8)).unwrap();
++    let p: Computable = serde_json::from_value(graph).unwrap();
++    let value = Computable::normal_quantile(p, 3.into(), -2);
++    let actual = value.approx(-80);
++    assert_ne!(actual, BigInt::from(3) << 78);
++    let x = Float::with_val(384, Float::parse(actual.to_string()).unwrap());
++    let mut lower = Float::with_val(384, &x - 1);
++    let mut upper = Float::with_val(384, &x + 1);
++    lower <<= -80;
++    upper <<= -80;
++    let p = mpfr_cdf(Float::with_val(384, 3) / 4) + Float::with_val(384, 1) / 16;
++    assert!(mpfr_cdf(lower) <= p);
++    assert!(mpfr_cdf(upper) >= p);
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn imported_half_quantiles_preserve_graphs_and_downstream_zero() {
++    use hyperreal::{Problem, Real};
++    use serde_json::json;
++    for seed in [-6_553_600_i64, 0, 6_553_600] {
++        let half = serde_json::to_value(probability(1, 2)).unwrap();
++        let graph = json!({"internal":{"NormalQuantile":{
++            "p":half, "seed":BigInt::from(seed), "seed_prec":-16
++        }}});
++        let value: Computable = serde_json::from_value(graph.clone()).unwrap();
++        assert_eq!(value.structural_facts().zero, ZeroKnowledge::Zero);
++        assert_eq!(serde_json::to_value(&value).unwrap(), graph);
++        for scale in [1, -3] {
++            let wire =
++                json!({"rational":Rational::new(scale),"class":"Irrational","computable":graph});
++            let mut bytes = Vec::new();
++            ciborium::ser::into_writer(&wire, &mut bytes).unwrap();
++            for restored in [
++                Real::from_json(&wire.to_string()).unwrap(),
++                Real::from_bytes(&bytes).unwrap(),
++            ] {
++                let json = restored.to_json();
++                let cbor = restored.to_bytes();
++                for precision in [0, -96, 0] {
++                    assert_eq!(restored.structural_facts().zero, ZeroKnowledge::Zero);
++                    assert!(restored.certified_rational_interval(precision).is_some());
++                }
++                assert_eq!(restored.to_json(), json);
++                assert_eq!(restored.to_bytes(), cbor);
++                assert_eq!(restored.inverse_ref(), Err(Problem::DivideByZero));
++                assert_eq!(
++                    (Real::one() + restored).exact_rational_normal_form(),
++                    Some(Rational::one())
++                );
++            }
++        }
++    }
++}
