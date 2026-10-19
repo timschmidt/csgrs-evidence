@@ -1,0 +1,744 @@
+diff --git a/docs/admission.md b/docs/admission.md
+index a52466f69..87892a0d4 100644
+--- a/docs/admission.md
++++ b/docs/admission.md
+@@ -220,7 +220,10 @@ serialization; neither substitutes for the other contract.
+ 
+ Maintain a named corpus of ordinary workflows: drilled bodies, transformed
+ primitives, profile extrusion, holes, repeated cuts, touching and coplanar
+-surfaces, and supported symbolic representations. Record separately:
++surfaces, and supported symbolic representations. The
++[named modeling corpus](workflow-corpus.md) records fixtures, input domains
++and semantic equality criteria; admission records identify the revisions and
++configurations actually executed. Record separately:
+ 
+ ```text
+ certified completion
+diff --git a/docs/workflow-corpus.md b/docs/workflow-corpus.md
+new file mode 100644
+index 000000000..5f8d14e6f
+--- /dev/null
++++ b/docs/workflow-corpus.md
+@@ -0,0 +1,80 @@
++# Named modeling workflow corpus
++
++This catalog identifies regression gates and their finite input domains.
++The [admission protocol](admission.md) remains normative. Admission records in
++the [execution ledger](properties-status.json) identify the revision, commands,
++feature configurations and observed results; this catalog alone proves no
++implementation claim. Tests require the stated completion and preserve the
++original difficult fixtures.
++
++| Workflow | Domain and semantic evidence | Regression gate |
++| --- | --- | --- |
++| Transformed box Booleans | Nine configurations under five invertible affine maps; exact represented-set equality, separate PWN validity, subsequent composition | [strict_boolean_workflows.rs](../tests/strict_boolean_workflows.rs) |
++| Drilled bodies and removal chains | Inscribed polygonal drills with 8, 16, 24 and 32 angular samples; strict membership, certified manifoldness, independently derived volume enclosure, complete subtraction and reuse of empty | [strict_drilled_workflows.rs](../tests/strict_drilled_workflows.rs) |
++| Empty results | Valid-set identities, disconnected and symbolic operands, invalid operands paired with empty, subsequent operations | [empty_composition.rs](../tests/empty_composition.rs) |
++| Transformed primitives | Exact scaling, translation, rotation and reflection; volume and topology; finite projective transforms and typed unbounded/invalid/undecided outcomes | [transform_failures.rs](../tests/transform_failures.rs) |
++| Profile extrusion with a hole | Rational line profiles, including a translation beyond binary64 range; exact area and volume, manifoldness, native diagnostics | [exact_linear_modeling.rs](../tests/exact_linear_modeling.rs) |
++
++## Transformed box domain
++
++Each source box is an exact rational polyhedron. The named configurations are
++overlap, coplanar faces, face touching, edge touching, point touching,
++disconnected components, coincidence, strict nesting, and an overlap of exactly
++`1/10^12` next to a coplanar face. Each runs under `STRICT` with:
++
++- Identity.
++- Rational shear and translation, with determinant one.
++- Reflection and nonuniform scale, with determinant minus six.
++- A 45-degree rotation with exact `sqrt(2)/2` coefficients.
++- Translation by `pi`, `sqrt(2)` and `ln(2)` on the three axes.
++
++Each of the 45 pairs checks 21 outputs: both transformed inputs; union,
++intersection, difference and XOR before and after transformation; commuted
++union and intersection; reunion of difference and intersection; union and
++intersection idempotence; complete subtraction; and rebuilding from empty.
++Every completed operation must report `Certified`. Nonempty output must
++separately pass certified closed-PWN validation. Canonical empty is checked at
++the modeling boundary because the native PWN kernel requires nonempty input.
++Edge/point-touching and XOR outputs are not promised manifold by this gate.
++
++## Equality criterion and independent oracle
++
++The [oracle](../tests/support/strict_boolean_workflows/oracle.rs) uses explicitly
++specified inverse affine charts to recover exact rational coordinates. It
++never rounds coordinates and never calls native Boolean or containment code.
++Failure to prove a rational chart coordinate is an oracle limitation, not
++evidence that the geometry is incorrect.
++
++Every nondegenerate output triangle must lie on a source coordinate plane and
++inside source bounds. Those planes partition space into open cells without
++output boundary. Exact signed ray crossings establish winding at one
++nondegenerate point per cell; the winding is constant throughout that cell.
++The expected membership comes directly from the two box inequalities and the
++Boolean truth table. Equality on these open cells establishes equality of the
++regularized sets, including their closures. Signed tetrahedral volume is also
++checked against the independent sum of occupied-cell volumes.
++
++The ray samples follow a rational curve in each cell. Any projected triangle
++edge line intersects that curve at most twice, so `6*T+1` trials suffice for
++`T` triangles. Controls in every coordinate frame reject a disjoint box with
++the same volume. A hand-retriangulated face keeps the exact set while putting
++an internal vertex on the first sample ray, requiring the retry path.
++
++Semantic equality is independent of vertex order, triangle count and
++serialization. These tests establish facts about their exact polyhedral sets;
++they do not establish fidelity to an analytic surface or certify earlier
++approximate construction intent.
++
++## Scope and resource limits
++
++The strict success gates remain required successes. An undecided predicate,
++unsupported representation, invalid input, resource exhaustion or incorrect
++result is a separate outcome, never a substitute passing status. Approximate
++completion is not accepted by changing this corpus's policy. Existing typed
++failure tests remain separate from these valid-input success gates.
++
++Admission runs retain external time and address-space containment. That does
++not establish internal total-work, retained-heap or cancellation guarantees.
++These finite fixtures do not exhaust all meshes, transformations, symbolic
++expressions, cache histories or thread schedules. Full workflow coverage,
++end-to-end provenance and the clean shipped-user-path validation remain open.
+diff --git a/tests/strict_boolean_workflows.rs b/tests/strict_boolean_workflows.rs
+new file mode 100644
+index 000000000..07789b72c
+--- /dev/null
++++ b/tests/strict_boolean_workflows.rs
+@@ -0,0 +1,43 @@
++//! Exact regularized-set identities through ordinary transformed box workflows.
++//!
++//! See `docs/workflow-corpus.md` for the finite domain and equality criterion.
++//! The independent oracle checks each boundary-free open grid cell with exact
++//! rational winding; native PWN validation is a separate topology requirement.
++
++#[path = "support/strict_boolean_workflows/mod.rs"]
++mod corpus;
++
++macro_rules! frame_cases {
++    ($module:ident, $frame:literal) => {
++        mod $module {
++            macro_rules! fixture_case {
++                ($name:ident, $fixture:literal) => {
++                    #[test]
++                    fn $name() {
++                        crate::corpus::assert_workflow($fixture, $frame);
++                    }
++                };
++            }
++            fixture_case!(overlap, "overlap");
++            fixture_case!(coplanar, "coplanar");
++            fixture_case!(face_touch, "face-touch");
++            fixture_case!(edge_touch, "edge-touch");
++            fixture_case!(point_touch, "point-touch");
++            fixture_case!(disconnected, "disconnected");
++            fixture_case!(coincident, "coincident");
++            fixture_case!(nested, "nested");
++            fixture_case!(near_coplanar, "near-coplanar");
++
++            #[test]
++            fn oracle_rejects_wrong_sets_and_retries_degenerate_rays() {
++                crate::corpus::assert_oracle_controls($frame);
++            }
++        }
++    };
++}
++
++frame_cases!(identity, "identity");
++frame_cases!(shear, "shear");
++frame_cases!(reflection, "reflection");
++frame_cases!(root_rotation, "root-rotation");
++frame_cases!(symbolic_translation, "symbolic-translation");
+diff --git a/tests/support/strict_boolean_workflows/fixtures.rs b/tests/support/strict_boolean_workflows/fixtures.rs
+new file mode 100644
+index 000000000..e7aab07ec
+--- /dev/null
++++ b/tests/support/strict_boolean_workflows/fixtures.rs
+@@ -0,0 +1,153 @@
++// Exact source boxes and explicitly invertible affine coordinate charts.
++#[derive(Clone)]
++struct Box3 {
++    lo: [Q; 3],
++    hi: [Q; 3],
++}
++impl Box3 {
++    fn new(lo: [i64; 3], hi: [i64; 3]) -> Self {
++        Self {
++            lo: lo.map(q),
++            hi: hi.map(q),
++        }
++    }
++    fn contains(&self, p: &[Q; 3]) -> bool {
++        (0..3).all(|i| self.lo[i] < p[i] && p[i] < self.hi[i])
++    }
++    fn mesh(&self) -> TriangleMesh {
++        let size = sub(&self.hi, &self.lo).map(Real::from);
++        let mesh = solid::cuboid(size[0].clone(), size[1].clone(), size[2].clone()).unwrap();
++        mesh.translated(
++            Real::from(self.lo[0].clone()),
++            Real::from(self.lo[1].clone()),
++            Real::from(self.lo[2].clone()),
++        )
++        .unwrap()
++    }
++}
++
++fn fixture(name: &str) -> (Box3, Box3) {
++    let a = Box3::new([0, 0, 0], [2, 2, 2]);
++    let b = match name {
++        "overlap" => Box3::new([1, 1, 1], [3, 3, 3]),
++        "coplanar" => Box3::new([1, 0, 0], [3, 2, 2]),
++        "face-touch" => Box3::new([2, 0, 0], [4, 2, 2]),
++        "edge-touch" => Box3::new([2, 2, 0], [4, 4, 2]),
++        "point-touch" => Box3::new([2, 2, 2], [4, 4, 4]),
++        "disconnected" => Box3::new([3, 0, 0], [5, 2, 2]),
++        "coincident" => a.clone(),
++        "nested" => Box3 {
++            lo: [
++                Q::fraction(1, 2).unwrap(),
++                Q::fraction(1, 2).unwrap(),
++                Q::fraction(1, 2).unwrap(),
++            ],
++            hi: [
++                Q::fraction(3, 2).unwrap(),
++                Q::fraction(3, 2).unwrap(),
++                Q::fraction(3, 2).unwrap(),
++            ],
++        },
++        "near-coplanar" => {
++            let e = Q::fraction(1, 1_000_000_000_000_u64).unwrap();
++            Box3 {
++                lo: [q(2) - &e, q(0), q(0)],
++                hi: [q(4) - e, q(2), q(2)],
++            }
++        },
++        _ => panic!("unknown fixture {name}"),
++    };
++    (a, b)
++}
++
++struct Frame {
++    name: String,
++    c: Real,
++    shift: [Real; 3],
++}
++impl Frame {
++    fn new(name: &str) -> Self {
++        let shift = if name == "symbolic-translation" {
++            [
++                Real::pi(),
++                Real::from(2).sqrt().unwrap(),
++                Real::from(2).ln().unwrap(),
++            ]
++        } else {
++            [Real::zero(), Real::zero(), Real::zero()]
++        };
++        let c = if name == "root-rotation" {
++            (Real::from(2).sqrt().unwrap() / Real::from(2)).unwrap()
++        } else {
++            Real::zero()
++        };
++        Self {
++            name: name.into(),
++            c,
++            shift,
++        }
++    }
++    fn matrix(&self) -> Matrix4 {
++        let rows = match self.name.as_str() {
++            "identity" => return Matrix4::identity(),
++            "shear" => [1, 1, 0, 3, 0, 1, 1, -2, 0, 0, 1, 5, 0, 0, 0, 1].map(Real::from),
++            "reflection" => [-2, 0, 0, 7, 0, 3, 0, -5, 0, 0, 1, 2, 0, 0, 0, 1].map(Real::from),
++            "root-rotation" => [
++                self.c.clone(),
++                -self.c.clone(),
++                Real::zero(),
++                Real::zero(),
++                self.c.clone(),
++                self.c.clone(),
++                Real::zero(),
++                Real::zero(),
++                Real::zero(),
++                Real::zero(),
++                Real::one(),
++                Real::zero(),
++                Real::zero(),
++                Real::zero(),
++                Real::zero(),
++                Real::one(),
++            ],
++            "symbolic-translation" => return Matrix4::affine_translation(self.shift.clone()),
++            _ => panic!("unknown frame"),
++        };
++        Matrix4::from_row_major(rows)
++    }
++    fn chart(&self, p: &Point3) -> Result<[Q; 3], String> {
++        let [x, y, z] = [p.x.clone(), p.y.clone(), p.z.clone()];
++        let row = match self.name.as_str() {
++            "identity" => [x, y, z],
++            "shear" => {
++                let z = z - Real::from(5);
++                let y = y + Real::from(2) - &z;
++                [x - Real::from(3) - &y, y, z]
++            },
++            "reflection" => [
++                (Real::from(7) - x) / Real::from(2),
++                (y + Real::from(5)) / Real::from(3),
++                Ok(z - Real::from(2)),
++            ]
++            .map(Result::unwrap),
++            "root-rotation" => [&self.c * (&x + &y), &self.c * (&y - &x), z],
++            "symbolic-translation" => {
++                [x - &self.shift[0], y - &self.shift[1], z - &self.shift[2]]
++            },
++            _ => unreachable!(),
++        };
++        let mut out = Vec::new();
++        for value in row {
++            out.push(
++                value
++                    .exact_rational_normal_form()
++                    .ok_or("oracle-undecided: chart coordinate has no proved rational form")?,
++            );
++        }
++        Ok(out.try_into().unwrap())
++    }
++    fn apply(&self, mesh: &TriangleMesh) -> Result<GeometryOutcome<TriangleMesh>, String> {
++        solid::try_transform_with_context(mesh, &self.matrix(), &GeometryContext::STRICT)
++            .map_err(|e| format!("transform-error {:?}: {e}", e.kind()))
++    }
++}
+diff --git a/tests/support/strict_boolean_workflows/mod.rs b/tests/support/strict_boolean_workflows/mod.rs
+new file mode 100644
+index 000000000..069135576
+--- /dev/null
++++ b/tests/support/strict_boolean_workflows/mod.rs
+@@ -0,0 +1,263 @@
++//! Fixtures, independent oracle and workflow execution share one test module.
++use csgrs::solid::SolidExt;
++use csgrs::{GeometryCertainty, GeometryContext, GeometryOutcome, Real, TriangleMesh, solid};
++use hyperlattice::{Matrix4, Point3};
++use hypermesh::BooleanOp;
++use hyperreal::Rational as Q;
++
++include!("fixtures.rs");
++include!("oracle.rs");
++
++fn union(a: bool, b: bool) -> bool {
++    a || b
++}
++fn intersection(a: bool, b: bool) -> bool {
++    a && b
++}
++fn difference(a: bool, b: bool) -> bool {
++    a && !b
++}
++fn xor(a: bool, b: bool) -> bool {
++    a != b
++}
++fn left(a: bool, _: bool) -> bool {
++    a
++}
++fn right(_: bool, b: bool) -> bool {
++    b
++}
++fn empty(_: bool, _: bool) -> bool {
++    false
++}
++fn operation(
++    a: &TriangleMesh,
++    b: &TriangleMesh,
++    op: BooleanOp,
++) -> Result<GeometryOutcome<TriangleMesh>, String> {
++    solid::boolean_with_context(a, b, op, &GeometryContext::STRICT)
++        .map_err(|e| format!("boolean-error {e:?}"))
++}
++fn check(
++    label: &str,
++    outcome: GeometryOutcome<TriangleMesh>,
++    frame: &Frame,
++    a: &Box3,
++    b: &Box3,
++    expected: fn(bool, bool) -> bool,
++    total: &mut Counts,
++) -> Result<TriangleMesh, String> {
++    if outcome.certainty != GeometryCertainty::Certified {
++        return Err(format!("{label}: qualified-approximate-completion"));
++    }
++    let result =
++        audit(&outcome.value, frame, a, b, expected).map_err(|e| format!("{label}: {e}"))?;
++    // The native kernel requires nonempty PWN input; the public modeling
++    // layer owns canonical empty geometry, checked independently above.
++    if !outcome.value.triangles.is_empty() {
++        let topology = outcome
++            .value
++            .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++            .map_err(|e| format!("{label}: topology-error {e:?}"))?;
++        if topology.certainty != hypermesh::MeshCertainty::Certified {
++            return Err(format!("{label}: topology certainty is approximate"));
++        }
++    }
++    total.outputs += result.outputs;
++    total.cells += result.cells;
++    total.ray_trials += result.ray_trials;
++    println!(
++        "checked\t{label}\t{}\t{}\t{}",
++        result.cells,
++        outcome.value.positions.len(),
++        outcome.value.triangles.len()
++    );
++    Ok(outcome.value)
++}
++
++fn run(name: &str, frame_name: &str) -> Result<Counts, String> {
++    let (a, b) = fixture(name);
++    let ma = a.mesh();
++    let mb = b.mesh();
++    let frame = Frame::new(frame_name);
++    let base = Frame::new("identity");
++    let mut count = Counts::default();
++    let ta = check(
++        "transform-a",
++        frame.apply(&ma)?,
++        &frame,
++        &a,
++        &b,
++        left,
++        &mut count,
++    )?;
++    let tb = check(
++        "transform-b",
++        frame.apply(&mb)?,
++        &frame,
++        &a,
++        &b,
++        right,
++        &mut count,
++    )?;
++    let mut difference_result = None;
++    let mut intersection_result = None;
++    for (label, op, expected) in [
++        ("union", BooleanOp::Union, union as fn(bool, bool) -> bool),
++        ("intersection", BooleanOp::Intersection, intersection),
++        ("difference", BooleanOp::Difference, difference),
++        ("xor", BooleanOp::SymmetricDifference, xor),
++    ] {
++        let original = check(
++            &format!("base-{label}"),
++            operation(&ma, &mb, op)?,
++            &base,
++            &a,
++            &b,
++            expected,
++            &mut count,
++        )?;
++        check(
++            &format!("transform-after-{label}"),
++            frame.apply(&original)?,
++            &frame,
++            &a,
++            &b,
++            expected,
++            &mut count,
++        )?;
++        let composed = check(
++            &format!("{label}-after-transform"),
++            operation(&ta, &tb, op)?,
++            &frame,
++            &a,
++            &b,
++            expected,
++            &mut count,
++        )?;
++        if matches!(op, BooleanOp::Union | BooleanOp::Intersection) {
++            check(
++                &format!("commuted-{label}"),
++                operation(&tb, &ta, op)?,
++                &frame,
++                &a,
++                &b,
++                expected,
++                &mut count,
++            )?;
++        }
++        if op == BooleanOp::Difference {
++            difference_result = Some(composed.clone());
++        }
++        if op == BooleanOp::Intersection {
++            intersection_result = Some(composed);
++        }
++    }
++    let partition = check(
++        "partition-reunion",
++        operation(
++            &difference_result.unwrap(),
++            &intersection_result.unwrap(),
++            BooleanOp::Union,
++        )?,
++        &frame,
++        &a,
++        &b,
++        left,
++        &mut count,
++    )?;
++    for op in [BooleanOp::Union, BooleanOp::Intersection] {
++        check(
++            "idempotent",
++            operation(&ta, &ta, op)?,
++            &frame,
++            &a,
++            &b,
++            left,
++            &mut count,
++        )?;
++    }
++    let removed = check(
++        "complete-subtraction",
++        operation(&partition, &ta, BooleanOp::Difference)?,
++        &frame,
++        &a,
++        &b,
++        empty,
++        &mut count,
++    )?;
++    check(
++        "rebuild-from-empty",
++        operation(&removed, &tb, BooleanOp::Union)?,
++        &frame,
++        &a,
++        &b,
++        right,
++        &mut count,
++    )?;
++    Ok(count)
++}
++
++pub(super) fn assert_workflow(name: &str, frame: &str) {
++    let counts = run(name, frame).unwrap_or_else(|reason| panic!("{name}/{frame}: {reason}"));
++    assert_eq!(counts.outputs, 21);
++    assert!(counts.cells > 0);
++}
++
++pub(super) fn assert_oracle_controls(frame_name: &str) {
++    let (a, b) = fixture("disconnected");
++    let frame = Frame::new(frame_name);
++    let correct = frame.apply(&a.mesh()).unwrap();
++    let wrong = frame.apply(&b.mesh()).unwrap();
++    assert_eq!(correct.certainty, GeometryCertainty::Certified);
++    assert_eq!(wrong.certainty, GeometryCertainty::Certified);
++    assert!(audit(&correct.value, &frame, &a, &b, left).is_ok());
++    // Both boxes have exact volume eight and valid topology. Membership,
++    // independently of volume and the native kernel, must reject this swap.
++    let rejected = audit(&wrong.value, &frame, &a, &b, left).unwrap_err();
++    assert!(rejected.contains("cell winding"), "{rejected}");
++
++    // Retriangulate x=2 by an outward fan through (y,z)=(1,2/3).
++    // This lies on the first ray sample of the inside y/z grid cell, forcing
++    // the oracle to retry without changing the represented box or volume.
++    let original = a.mesh();
++    let mut triangles: Vec<_> = original
++        .triangles
++        .iter()
++        .copied()
++        .filter(|triangle| {
++            !triangle
++                .indices()
++                .iter()
++                .all(|&i| original.positions[i].x == Real::from(2))
++        })
++        .collect();
++    assert_eq!(triangles.len() + 2, original.triangles.len());
++    let mut positions = original.positions.to_vec();
++    let first = positions.len();
++    positions.extend([
++        Point3::new(2.into(), 0.into(), 0.into()),
++        Point3::new(2.into(), 2.into(), 0.into()),
++        Point3::new(2.into(), 2.into(), 2.into()),
++        Point3::new(2.into(), 0.into(), 2.into()),
++        Point3::new(2.into(), 1.into(), Real::from(Q::fraction(2, 3).unwrap())),
++    ]);
++    for i in 0..4 {
++        triangles.push(hypermesh::Triangle::new(
++            first + i,
++            first + (i + 1) % 4,
++            first + 4,
++        ));
++    }
++    let fan = frame.apply(&TriangleMesh::new(positions, triangles)).unwrap();
++    assert_eq!(fan.certainty, GeometryCertainty::Certified);
++    let proof = fan
++        .value
++        .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++        .unwrap();
++    assert_eq!(proof.certainty, hypermesh::MeshCertainty::Certified);
++    let retry = audit(&fan.value, &frame, &a, &b, left).unwrap();
++    assert!(
++        retry.ray_trials > retry.cells,
++        "the degenerate first ray was not exercised"
++    );
++}
+diff --git a/tests/support/strict_boolean_workflows/oracle.rs b/tests/support/strict_boolean_workflows/oracle.rs
+new file mode 100644
+index 000000000..05fb2c50c
+--- /dev/null
++++ b/tests/support/strict_boolean_workflows/oracle.rs
+@@ -0,0 +1,159 @@
++// Independent exact set oracle; no mesh Boolean or containment calls.
++fn q(n: i64) -> Q {
++    Q::new(n)
++}
++fn sub(a: &[Q; 3], b: &[Q; 3]) -> [Q; 3] {
++    std::array::from_fn(|i| &a[i] - &b[i])
++}
++fn cross(a: &[Q; 3], b: &[Q; 3]) -> [Q; 3] {
++    [
++        &a[1] * &b[2] - &a[2] * &b[1],
++        &a[2] * &b[0] - &a[0] * &b[2],
++        &a[0] * &b[1] - &a[1] * &b[0],
++    ]
++}
++fn dot(a: &[Q; 3], b: &[Q; 3]) -> Q {
++    (0..3).fold(q(0), |s, i| s + &a[i] * &b[i])
++}
++fn orient(a: &[Q; 3], b: &[Q; 3], p: &[Q; 3]) -> Q {
++    (&b[1] - &a[1]) * (&p[2] - &a[2]) - (&b[2] - &a[2]) * (&p[1] - &a[1])
++}
++
++#[derive(Default, Debug)]
++struct Counts {
++    outputs: usize,
++    cells: usize,
++    ray_trials: usize,
++}
++
++// All triangles must stay on the source coordinate planes in the inverse
++// affine chart. The open grid cells therefore contain no output boundary.
++// Exact signed ray crossings at one nondegenerate point per cell establish
++// its winding, and hence the entire regularized set. This oracle uses rational
++// arithmetic directly; it never calls Hypermesh containment or Boolean code.
++fn audit(
++    mesh: &TriangleMesh,
++    frame: &Frame,
++    a: &Box3,
++    b: &Box3,
++    expected: fn(bool, bool) -> bool,
++) -> Result<Counts, String> {
++    let planes: [Vec<Q>; 3] = std::array::from_fn(|i| {
++        let mut v = vec![
++            a.lo[i].clone(),
++            a.hi[i].clone(),
++            b.lo[i].clone(),
++            b.hi[i].clone(),
++        ];
++        v.sort_by(|x, y| x.partial_cmp(y).unwrap());
++        v.dedup();
++        v
++    });
++    let grid: [Vec<Q>; 3] = std::array::from_fn(|i| {
++        let mut v = planes[i].clone();
++        v.insert(0, &v[0] - q(1));
++        v.push(v.last().unwrap() + q(1));
++        v
++    });
++    let points: Vec<_> = mesh
++        .positions
++        .iter()
++        .map(|p| frame.chart(p))
++        .collect::<Result<_, _>>()?;
++    for p in &points {
++        if (0..3).any(|i| p[i] < planes[i][0] || p[i] > *planes[i].last().unwrap()) {
++            return Err("incorrect-result: output extends beyond source bounds".into());
++        }
++    }
++    let mut triangles = Vec::new();
++    let mut six_volume = q(0);
++    for triangle in mesh.triangles.iter() {
++        let mut ids = triangle.indices();
++        if ids.iter().any(|&i| i >= points.len()) {
++            return Err("incorrect-result: invalid output index".into());
++        }
++        if frame.name == "reflection" {
++            ids.swap(0, 2);
++        }
++        let t = ids.map(|i| points[i].clone());
++        if !(0..3)
++            .any(|i| t[0][i] == t[1][i] && t[0][i] == t[2][i] && planes[i].contains(&t[0][i]))
++        {
++            return Err("incorrect-result: output facet is not on a source plane".into());
++        }
++        if cross(&sub(&t[1], &t[0]), &sub(&t[2], &t[0])) == [q(0), q(0), q(0)] {
++            return Err("incorrect-result: degenerate output triangle".into());
++        }
++        six_volume = six_volume + dot(&t[0], &cross(&t[1], &t[2]));
++        triangles.push(t);
++    }
++    let mut count = Counts {
++        outputs: 1,
++        ..Counts::default()
++    };
++    let mut volume = q(0);
++    for xs in grid[0].windows(2) {
++        for ys in grid[1].windows(2) {
++            for zs in grid[2].windows(2) {
++                let size = [&xs[1] - &xs[0], &ys[1] - &ys[0], &zs[1] - &zs[0]];
++                let mut sampled = None;
++                // This rational curve intersects any projected edge line at most
++                // twice. 6*T+1 samples suffice for the at most 3*T edge lines.
++                for k in 0..=6 * triangles.len() {
++                    count.ray_trials += 1;
++                    let p = [
++                        (&xs[0] + &xs[1]) / q(2),
++                        &ys[0] + &size[1] / q(k as i64 + 2),
++                        &zs[0] + &size[2] / q(k as i64 + 3),
++                    ];
++                    let mut winding = 0_i64;
++                    let mut ambiguous = false;
++                    for t in &triangles {
++                        let area = orient(&t[0], &t[1], &t[2]);
++                        if area == q(0) || t[0][0] <= p[0] {
++                            continue;
++                        }
++                        let side = [
++                            orient(&t[0], &t[1], &p),
++                            orient(&t[1], &t[2], &p),
++                            orient(&t[2], &t[0], &p),
++                        ];
++                        if side.contains(&q(0)) {
++                            ambiguous = true;
++                            break;
++                        }
++                        if side.iter().all(|s| (*s > q(0)) == (area > q(0))) {
++                            winding += if area > q(0) { 1 } else { -1 };
++                        }
++                    }
++                    if !ambiguous {
++                        sampled = Some((p, winding));
++                        break;
++                    }
++                }
++                let (p, winding) =
++                    sampled.ok_or("oracle-error: nondegenerate ray bound exhausted")?;
++                let inside = expected(a.contains(&p), b.contains(&p));
++                if (winding != 0) != inside {
++                    return Err(format!(
++                        "incorrect-result: cell winding {winding}, expected {inside}, point {p:?}"
++                    ));
++                }
++                count.cells += 1;
++                if inside {
++                    volume = volume + &size[0] * &size[1] * &size[2];
++                }
++            }
++        }
++    }
++    if six_volume != q(6) * &volume {
++        return Err(
++            "incorrect-result: oriented volume differs from independent occupied-cell volume"
++                .into(),
++        );
++    }
++    if volume == q(0) && (!mesh.positions.is_empty() || !mesh.triangles.is_empty()) {
++        return Err("incorrect-result: empty set is not canonical empty geometry".into());
++    }
++    Ok(count)
++}
