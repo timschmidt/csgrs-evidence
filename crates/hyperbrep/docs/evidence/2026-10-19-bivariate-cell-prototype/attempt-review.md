@@ -1,0 +1,9 @@
+# Development attempts and remaining public blocker
+
+The raw bundle preserves all commands, exits, logs and source patches, including failed attempts. Final-source qualification is distinguished from these development runs.
+
+- `baseline-interior-loop` failed to compile because the probe used the wrong `Vector3` constructor shape. The corrected, full-size probe compiled and reproduced `UnsupportedIntersection` in `baseline-interior-loop-02`. The initial source and both logs remain.
+- `topology-prototype-01` exposed an all-zero polynomial classification bug and a test assumption about optional rational-root materialization. The constructor now classifies all-zero input explicitly. The test compares exact selected-root values against the independent rational oracle, preserving the original equation and every connectivity assertion; it no longer requires an optional storage form. See `attempt-01-review.json` and both source snapshots.
+- `topology-prototype-03` failed to compile after moving shared recipes into integration-test support because `BivariatePolynomial` was not imported. The import was added; the later ten-group run and final 985-test owner suite pass. This compile attempt is not runtime evidence.
+- The first diagnostic metric analysis could not parse native mixed-fraction display strings. The parser was corrected with positive and negative rational controls. No geometry code or diagnostic output changed; `artifact-metrics-attempt-01.json` records that analysis failure.
+- `candidate-original-interior-loop` reran the unchanged public BRep acceptance probe against the final candidate. It still returns `UnsupportedIntersection` and fails the original success assertion. This is an explicitly open WP05b workflow, not a regression or a passing BRep capability. No boundary, fixture, policy or assertion was weakened to conceal it.
