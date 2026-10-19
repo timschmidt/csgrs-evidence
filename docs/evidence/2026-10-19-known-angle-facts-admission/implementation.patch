@@ -1,0 +1,4937 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index 36268ca58..5f1e44932 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -430,6 +430,12 @@ nodes keep their wire graphs, and previously serialized derived graphs
+ remain supported.
+ Native sine and cosine also consume retained signed half-π complements
+ directly, preserving their algebraic facts without refining the angle.
++The same native reader recovers the selected arctangent arguments for π/6,
++π/4 and π/3, including sign, integer-π shifts and half-π complements. This
++keeps their sine/cosine identities available after `atan` normalizes an exact
++argument to a π fraction. The angle's existing representation is preserved;
++new derived native outputs use existing algebraic forms, while older serialized
++trig graphs remain consumable. Other rational angles keep their existing paths.
+ The negative-rational `acos` complement reserves the combined error of its
+ π and positive-`acos` samples before subtraction, then rounds once. This
+ keeps its enclosure valid when a shared π sample is reused at a coarser
+diff --git a/crates/hyperreal/src/computable/node.rs b/crates/hyperreal/src/computable/node.rs
+index 883eb06f3..63d8c8bb5 100644
+--- a/crates/hyperreal/src/computable/node.rs
++++ b/crates/hyperreal/src/computable/node.rs
+@@ -26,6 +26,7 @@ include!("node/primitive_constructors.rs");
+ include!("node/structural_analysis.rs");
+ include!("node/exp_relation.rs");
+ include!("node/exp_relation_reuse.rs");
++include!("node/atan_pi_anchors.rs");
+ include!("node/exp_trig.rs");
+ include!("node/logarithms.rs");
+ include!("node/roots_inverse_hyperbolic.rs");
+@@ -62,3 +63,4 @@ include!("node/atanh_rational_range_tests.rs");
+ include!("node/integral_atan_range_tests.rs");
+ include!("node/acos_complement_range_tests.rs");
+ include!("node/integral_atan_facts_tests.rs");
++include!("node/atan_pi_anchor_tests.rs");
+diff --git a/crates/hyperreal/src/computable/node/algebra.rs b/crates/hyperreal/src/computable/node/algebra.rs
+index acf024f17..7c7f526b2 100644
+--- a/crates/hyperreal/src/computable/node/algebra.rs
++++ b/crates/hyperreal/src/computable/node/algebra.rs
+@@ -714,10 +714,20 @@ impl Computable {
+     pub(crate) fn integer_pi_plus_or_minus_atan_argument(
+         &self,
+     ) -> Option<(Sign, Sign, Computable)> {
++        // Real already has canonical rational-pi trig forms. Preserve that
++        // consumer's established argument recognition and representation path.
++        self.pi_atan_trig_argument(false)
++    }
++
++    fn pi_atan_trig_argument(&self, recover_pi_anchor: bool) -> Option<(Sign, Sign, Computable)> {
+         let form = self.pi_atan_linear_form(64)?;
+-        if form.constant.sign() != Sign::NoSign
+-            || (!form.atan.is_one() && !form.atan.is_minus_one())
+-        {
++        if form.constant.sign() != Sign::NoSign {
++            return None;
++        }
++        if recover_pi_anchor && form.atan.is_zero() && form.argument.is_none() {
++            return AtanPiAnchor::periodic_trig_argument(form.pi);
++        }
++        if !form.atan.is_one() && !form.atan.is_minus_one() {
+             return None;
+         }
+         let multiple = form.pi.integer_magnitude()?;
+diff --git a/crates/hyperreal/src/computable/node/exp_trig.rs b/crates/hyperreal/src/computable/node/exp_trig.rs
+index 15331e44d..542c3cc22 100644
+--- a/crates/hyperreal/src/computable/node/exp_trig.rs
++++ b/crates/hyperreal/src/computable/node/exp_trig.rs
+@@ -540,9 +540,7 @@ impl Computable {
+ 
+     fn pi_atan_sin_cos(&self) -> Option<(Computable, Computable)> {
+         let (sine_sign, cosine_sign, argument, swap) =
+-            if let Some((sine_sign, cosine_sign, argument)) =
+-                self.integer_pi_plus_or_minus_atan_argument()
+-            {
++            if let Some((sine_sign, cosine_sign, argument)) = self.pi_atan_trig_argument(true) {
+                 (sine_sign, cosine_sign, argument, false)
+             } else {
+                 let (orientation, argument) = self.half_pi_minus_atan_argument()?;
+diff --git a/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs b/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
+index d275e3278..068db4f68 100644
+--- a/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
++++ b/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
+@@ -235,19 +235,9 @@ impl Computable {
+             } else {
+                 scale.clone()
+             };
+-            let denominator = if magnitude.is_one() {
+-                Some(3)
+-            } else if magnitude == Rational::fraction(1, 3).expect("three is nonzero") {
+-                Some(6)
+-            } else {
+-                None
+-            };
+-            if let Some(denominator) = denominator {
+-                let numerator = if scale.sign() == Sign::Minus { -1 } else { 1 };
++            if let Some(anchor) = AtanPiAnchor::from_root_three_scale(&magnitude) {
+                 crate::trace_dispatch!("computable", "atan", "quadratic-surd-pi-anchor");
+-                return Self::pi().multiply_rational(
+-                    Rational::fraction(numerator, denominator).expect("denominator is nonzero"),
+-                );
++                return anchor.angle(scale.sign());
+             }
+         }
+         if let Some(rational) = self
+@@ -260,12 +250,7 @@ impl Computable {
+             }
+             if rational.is_one() || rational.is_minus_one() {
+                 crate::trace_dispatch!("computable", "atan", "exact-quarter-turn");
+-                let quarter_turn = Self::pi().shift_right(2);
+-                return if rational.sign() == Sign::Minus {
+-                    quarter_turn.negate()
+-                } else {
+-                    quarter_turn
+-                };
++                return AtanPiAnchor::Unit.angle(rational.sign());
+             }
+             match rational.sign() {
+                 Sign::Plus => {
+diff --git a/crates/hyperreal/src/computable/node/atan_pi_anchor_tests.rs b/crates/hyperreal/src/computable/node/atan_pi_anchor_tests.rs
+new file mode 100644
+index 000000000..fb3d77f80
+--- /dev/null
++++ b/crates/hyperreal/src/computable/node/atan_pi_anchor_tests.rs
+@@ -0,0 +1,165 @@
++#[cfg(test)]
++mod atan_pi_anchor_tests {
++    use super::*;
++
++    fn anchors() -> [(Computable, Rational); 3] {
++        let three = Computable::rational(Rational::new(3)).sqrt();
++        [
++            (Computable::one(), Rational::fraction(1, 2).unwrap()),
++            (three.clone(), Rational::fraction(3, 4).unwrap()),
++            (three.inverse(), Rational::fraction(1, 4).unwrap()),
++        ]
++    }
++
++    fn assert_square(value: Computable, expected: &Rational) {
++        assert_eq!(
++            value
++                .square()
++                .add(Computable::rational(-expected.clone()))
++                .sign_until(0),
++            Some(RealSign::Zero)
++        );
++    }
++
++    #[test]
++    fn atan_pi_anchors_preserve_facts_through_periods_and_complements() {
++        let periods = [
++            -(BigInt::one() << 256_usize),
++            BigInt::from(-17),
++            BigInt::from(-1),
++            BigInt::zero(),
++            BigInt::one(),
++            BigInt::from(16),
++            (BigInt::one() << 256_usize) + BigInt::one(),
++        ];
++        for (argument, sine_square) in anchors() {
++            let cosine_square = Rational::one() - sine_square.clone();
++            for sign in [-1, 1] {
++                for period in &periods {
++                    let principal = argument
++                        .clone()
++                        .multiply_rational(Rational::new(sign))
++                        .atan();
++                    let angle = principal.add(
++                        Computable::pi().multiply_rational(Rational::from_bigint(period.clone())),
++                    );
++                    let parity = if period.bit(0) { -1 } else { 1 };
++                    for (composed, squares, signs) in [
++                        (
++                            angle.clone(),
++                            [sine_square.clone(), cosine_square.clone()],
++                            [sign * parity, parity],
++                        ),
++                        (
++                            Computable::pi().shift_right(1).add(angle.clone().negate()),
++                            [cosine_square.clone(), sine_square.clone()],
++                            [parity, sign * parity],
++                        ),
++                        (
++                            Computable::pi()
++                                .shift_right(1)
++                                .negate()
++                                .add(angle.clone().negate()),
++                            [cosine_square.clone(), sine_square.clone()],
++                            [-parity, -sign * parity],
++                        ),
++                    ] {
++                        assert!(composed.cached().is_none());
++                        for warm in [false, true] {
++                            if warm {
++                                let _ = composed.approx(-128);
++                            }
++                            for (i, value) in [composed.clone().sin(), composed.clone().cos()]
++                                .into_iter()
++                                .enumerate()
++                            {
++                                assert_eq!(
++                                    value.sign_until(0),
++                                    Some(if signs[i] > 0 {
++                                        RealSign::Positive
++                                    } else {
++                                        RealSign::Negative
++                                    })
++                                );
++                                assert_square(value.clone(), &squares[i]);
++                                if !warm {
++                                    assert!(composed.cached().is_none());
++                                }
++                                let _ = value.approx(-256);
++                                assert_square(value, &squares[i]);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn atan_pi_anchor_reader_declines_unproved_correspondences() {
++        for denominator in [1, 2, 5, 7, 8, 12, 1009] {
++            let angle =
++                Computable::pi().multiply_rational(Rational::fraction(1, denominator).unwrap());
++            assert!(angle.pi_atan_trig_argument(true).is_none());
++        }
++        let epsilon = Rational::from_bigint_fraction(BigInt::one(), BigUint::one() << 512).unwrap();
++        for (argument, square) in anchors() {
++            let principal = argument.atan();
++            for sign in [-1, 1] {
++                let offset = &epsilon * Rational::new(sign);
++                let angle = principal.clone().add(Computable::rational(offset));
++                assert!(angle.pi_atan_trig_argument(true).is_none());
++                let delta = angle
++                    .sin()
++                    .square()
++                    .add(Computable::rational(-square.clone()));
++                // The positive principal anchors are inside (0, pi/2), where
++                // sine squared is strictly increasing. The offset is nonzero.
++                assert_ne!(delta.sign_until(0), Some(RealSign::Zero));
++                assert_eq!(
++                    delta.sign_until(-1024),
++                    Some(if sign > 0 {
++                        RealSign::Positive
++                    } else {
++                        RealSign::Negative
++                    })
++                );
++            }
++        }
++        let doubled = Computable::rational(Rational::fraction(1, 2).unwrap())
++            .atan()
++            .shift_left(1);
++        assert!(doubled.pi_atan_trig_argument(true).is_none());
++        let offset = Computable::pi().shift_right(2).add(Computable::one());
++        assert!(offset.pi_atan_trig_argument(true).is_none());
++    }
++
++    #[test]
++    fn atan_pi_anchor_facts_survive_concurrent_refinement() {
++        let values: Vec<_> = anchors()
++            .into_iter()
++            .map(|(argument, square)| (argument.atan(), square))
++            .collect();
++        let threads: Vec<_> = (0..16)
++            .map(|worker| {
++                let values = values.clone();
++                std::thread::spawn(move || {
++                    for (angle, sine_square) in values {
++                        if worker % 2 == 0 {
++                            let _ = angle.approx(-128);
++                        }
++                        assert_square(angle.clone().sin(), &sine_square);
++                        assert_square(angle.cos(), &(Rational::one() - sine_square));
++                    }
++                })
++            })
++            .collect();
++        for thread in threads {
++            thread.join().unwrap();
++        }
++        for (angle, sine_square) in values {
++            assert_square(angle.clone().sin(), &sine_square);
++            assert_square(angle.cos(), &(Rational::one() - sine_square));
++        }
++    }
++}
+diff --git a/crates/hyperreal/src/computable/node/atan_pi_anchors.rs b/crates/hyperreal/src/computable/node/atan_pi_anchors.rs
+new file mode 100644
+index 000000000..1c113ed21
+--- /dev/null
++++ b/crates/hyperreal/src/computable/node/atan_pi_anchors.rs
+@@ -0,0 +1,98 @@
++// Selected principal arctangents already normalized by native construction.
++// Keep the forward angle and recovered argument in one correspondence so
++// subsequent trig operations can consume the normalized pi representation.
++#[derive(Clone, Copy)]
++enum AtanPiAnchor {
++    Unit,
++    SqrtThree,
++    InverseSqrtThree,
++}
++
++impl AtanPiAnchor {
++    fn from_root_three_scale(scale: &Rational) -> Option<Self> {
++        if scale.is_one() {
++            Some(Self::SqrtThree)
++        } else if *scale == Rational::fraction(1, 3).expect("three is nonzero") {
++            Some(Self::InverseSqrtThree)
++        } else {
++            None
++        }
++    }
++
++    fn from_positive_turn(turn: &Rational) -> Option<Self> {
++        if turn.sign() != Sign::Plus || !turn.numerator().is_one() {
++            return None;
++        }
++        Self::from_denominator(turn.denominator())
++    }
++
++    fn from_denominator(denominator: &BigUint) -> Option<Self> {
++        match num::ToPrimitive::to_u64(denominator)? {
++            3 => Some(Self::SqrtThree),
++            4 => Some(Self::Unit),
++            6 => Some(Self::InverseSqrtThree),
++            _ => None,
++        }
++    }
++
++    fn angle(self, sign: Sign) -> Computable {
++        debug_assert_ne!(sign, Sign::NoSign);
++        if let Self::Unit = self {
++            let angle = Computable::pi().shift_right(2);
++            return if sign == Sign::Minus {
++                angle.negate()
++            } else {
++                angle
++            };
++        }
++        let denominator = match self {
++            Self::SqrtThree => 3,
++            Self::InverseSqrtThree => 6,
++            Self::Unit => unreachable!("unit angle returned above"),
++        };
++        Computable::pi().multiply_rational(
++            Rational::fraction(if sign == Sign::Minus { -1 } else { 1 }, denominator)
++                .expect("anchor denominator is nonzero"),
++        )
++    }
++
++    fn argument(self) -> Computable {
++        match self {
++            Self::Unit => Computable::one(),
++            Self::SqrtThree => Computable::sqrt_constant(3).expect("sqrt(3) is canonical"),
++            Self::InverseSqrtThree => Computable::sqrt_constant(3)
++                .expect("sqrt(3) is canonical")
++                .inverse(),
++        }
++    }
++
++    fn periodic_trig_argument(pi: Rational) -> Option<(Sign, Sign, Computable)> {
++        Self::from_denominator(pi.denominator())?;
++        let negative = pi.sign() == Sign::Minus;
++        let magnitude = if negative { pi.neg() } else { pi };
++        let odd = magnitude.shifted_big_integer(0).bit(0);
++        let fraction = magnitude.fract();
++        let reflected = fraction > *HALF_RATIONAL;
++        let reduced = if reflected {
++            Rational::one() - fraction
++        } else {
++            fraction
++        };
++        let argument = Self::from_positive_turn(&reduced)?.argument();
++        // For q=k+f>0, integer-pi parity changes both signs. Reflection
++        // f -> 1-f changes only cosine; q -> -q changes only sine.
++        Some((
++            if negative ^ odd {
++                Sign::Minus
++            } else {
++                Sign::Plus
++            },
++            if reflected ^ odd {
++                Sign::Minus
++            } else {
++                Sign::Plus
++            },
++            argument,
++        ))
++    }
++}
+diff --git a/crates/hyperreal/tests/fixtures/atan_pi_anchor_legacy_trig.json b/crates/hyperreal/tests/fixtures/atan_pi_anchor_legacy_trig.json
+new file mode 100644
+index 000000000..6545cd206
+--- /dev/null
++++ b/crates/hyperreal/tests/fixtures/atan_pi_anchor_legacy_trig.json
+@@ -0,0 +1,4300 @@
++[
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      3
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": -1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  3
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": -1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      3
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": -1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  3
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": -1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Multiply": [
++                          {
++                            "internal": {
++                              "Ratio": {
++                                "denominator": [
++                                  3
++                                ],
++                                "numerator": [
++                                  1
++                                ],
++                                "sign": -1
++                              }
++                            }
++                          },
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Negate": {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": -1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      3
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": -1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Offset": [
++                            {
++                              "internal": {
++                                "Constant": "Pi"
++                              }
++                            },
++                            -1
++                          ]
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": -1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      3
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": 1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      3
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": 1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Negate": {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Negate": {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      3
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": 1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  3
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": 1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      3
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": 1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  3
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": 1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      3
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": 1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Multiply": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Int": [
++                              -1,
++                              [
++                                3
++                              ]
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Multiply": [
++                          {
++                            "internal": {
++                              "Ratio": {
++                                "denominator": [
++                                  3
++                                ],
++                                "numerator": [
++                                  1
++                                ],
++                                "sign": 1
++                              }
++                            }
++                          },
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -1
++                        ]
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Int": [
++                          -1,
++                          [
++                            3
++                          ]
++                        ]
++                      }
++                    }
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        3
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Negate": {
++                    "internal": {
++                      "Multiply": [
++                        {
++                          "internal": {
++                            "Ratio": {
++                              "denominator": [
++                                3
++                              ],
++                              "numerator": [
++                                1
++                              ],
++                              "sign": 1
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        }
++                      ]
++                    }
++                  }
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Negate": {
++                    "internal": {
++                      "Multiply": [
++                        {
++                          "internal": {
++                            "Ratio": {
++                              "denominator": [
++                                3
++                              ],
++                              "numerator": [
++                                1
++                              ],
++                              "sign": 1
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        }
++                      ]
++                    }
++                  }
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Multiply": [
++                                  {
++                                    "internal": {
++                                      "Ratio": {
++                                        "denominator": [
++                                          3
++                                        ],
++                                        "numerator": [
++                                          1
++                                        ],
++                                        "sign": 1
++                                      }
++                                    }
++                                  },
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  }
++                                ]
++                              }
++                            }
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 3,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Multiply": [
++                                  {
++                                    "internal": {
++                                      "Ratio": {
++                                        "denominator": [
++                                          3
++                                        ],
++                                        "numerator": [
++                                          1
++                                        ],
++                                        "sign": 1
++                                      }
++                                    }
++                                  },
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  }
++                                ]
++                              }
++                            }
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            3
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Offset": [
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  },
++                  -2
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "Offset": [
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              },
++              -2
++            ]
++          }
++        }
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Offset": [
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              },
++              -2
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "Offset": [
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              },
++              -2
++            ]
++          }
++        }
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Negate": {
++                  "internal": {
++                    "Offset": [
++                      {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      },
++                      -2
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Negate": {
++                  "internal": {
++                    "Offset": [
++                      {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      },
++                      -2
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -2
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -2
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -2
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Negate": {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -2
++                        ]
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Offset": [
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              },
++              -2
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Offset": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          -2
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Offset": [
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              },
++              -2
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Offset": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          -2
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -2
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Multiply": [
++                        {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Int": [
++                              -1,
++                              [
++                                3
++                              ]
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -2
++                        ]
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -1
++                        ]
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Int": [
++                          -1,
++                          [
++                            3
++                          ]
++                        ]
++                      }
++                    }
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -2
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Negate": {
++              "internal": {
++                "Offset": [
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  },
++                  -2
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Negate": {
++                  "internal": {
++                    "Offset": [
++                      {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      },
++                      -2
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -2
++                                ]
++                              }
++                            }
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 4,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -2
++                                ]
++                              }
++                            }
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -2
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      6
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": -1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  6
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": -1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      6
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": -1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  6
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": -1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": -1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": -1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": -1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": -1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      6
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": 1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": 1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      6
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": 1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Negate": {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Multiply": [
++                          {
++                            "internal": {
++                              "Ratio": {
++                                "denominator": [
++                                  6
++                                ],
++                                "numerator": [
++                                  1
++                                ],
++                                "sign": 1
++                              }
++                            }
++                          },
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          }
++                        ]
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": -1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      6
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": 1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  6
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": 1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "direct",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Multiply": [
++              {
++                "internal": {
++                  "Ratio": {
++                    "denominator": [
++                      6
++                    ],
++                    "numerator": [
++                      1
++                    ],
++                    "sign": 1
++                  }
++                }
++              },
++              {
++                "internal": {
++                  "Constant": "Pi"
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Multiply": [
++          {
++            "internal": {
++              "Ratio": {
++                "denominator": [
++                  6
++                ],
++                "numerator": [
++                  1
++                ],
++                "sign": 1
++              }
++            }
++          },
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": 1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "pi-plus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": 1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Constant": "Pi"
++            }
++          },
++          {
++            "internal": {
++              "Multiply": [
++                {
++                  "internal": {
++                    "Ratio": {
++                      "denominator": [
++                        6
++                      ],
++                      "numerator": [
++                        1
++                      ],
++                      "sign": 1
++                    }
++                  }
++                },
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                }
++              ]
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledCos": {
++          "internal": {
++            "Negate": {
++              "internal": {
++                "Multiply": [
++                  {
++                    "internal": {
++                      "Ratio": {
++                        "denominator": [
++                          6
++                        ],
++                        "numerator": [
++                          1
++                        ],
++                        "sign": 1
++                      }
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Constant": "Pi"
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            6
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Negate": {
++                  "internal": {
++                    "Multiply": [
++                      {
++                        "internal": {
++                          "Ratio": {
++                            "denominator": [
++                              6
++                            ],
++                            "numerator": [
++                              1
++                            ],
++                            "sign": 1
++                          }
++                        }
++                      },
++                      {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      }
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Offset": [
++                {
++                  "internal": {
++                    "Constant": "Pi"
++                  }
++                },
++                -1
++              ]
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            6
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "sin",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "Negate": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "Add": [
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Offset": [
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  },
++                                  -1
++                                ]
++                              }
++                            }
++                          }
++                        },
++                        {
++                          "internal": {
++                            "Negate": {
++                              "internal": {
++                                "Multiply": [
++                                  {
++                                    "internal": {
++                                      "Ratio": {
++                                        "denominator": [
++                                          6
++                                        ],
++                                        "numerator": [
++                                          1
++                                        ],
++                                        "sign": 1
++                                      }
++                                    }
++                                  },
++                                  {
++                                    "internal": {
++                                      "Constant": "Pi"
++                                    }
++                                  }
++                                ]
++                              }
++                            }
++                          }
++                        }
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            6
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  },
++  {
++    "composition": "negative-half-minus",
++    "contradicted": false,
++    "denominator": 6,
++    "function": "cos",
++    "history": "cold",
++    "legacy_output": {
++      "internal": {
++        "PrescaledSin": {
++          "internal": {
++            "Add": [
++              {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "Negate": {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Negate": {
++                          "internal": {
++                            "Multiply": [
++                              {
++                                "internal": {
++                                  "Ratio": {
++                                    "denominator": [
++                                      6
++                                    ],
++                                    "numerator": [
++                                      1
++                                    ],
++                                    "sign": 1
++                                  }
++                                }
++                              },
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              }
++                            ]
++                          }
++                        }
++                      }
++                    }
++                  ]
++                }
++              },
++              {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            ]
++          }
++        }
++      }
++    },
++    "mode": "native-atan",
++    "sign": 1,
++    "sign_certified": true,
++    "source_wire": {
++      "internal": {
++        "Add": [
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Offset": [
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    },
++                    -1
++                  ]
++                }
++              }
++            }
++          },
++          {
++            "internal": {
++              "Negate": {
++                "internal": {
++                  "Multiply": [
++                    {
++                      "internal": {
++                        "Ratio": {
++                          "denominator": [
++                            6
++                          ],
++                          "numerator": [
++                            1
++                          ],
++                          "sign": 1
++                        }
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Constant": "Pi"
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        ]
++      }
++    },
++    "square_certified": false
++  }
++]
+diff --git a/crates/hyperreal/tests/serde_atan_pi_anchors.rs b/crates/hyperreal/tests/serde_atan_pi_anchors.rs
+new file mode 100644
+index 000000000..9daa746d8
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_atan_pi_anchors.rs
+@@ -0,0 +1,233 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real, RealSign};
++use num::{BigInt, BigUint, One};
++use rug::{Float, Rational as Q, float::Round};
++use serde_json::{Value, json};
++use std::cmp::Ordering;
++
++#[path = "support/mpfr.rs"]
++mod mpfr;
++
++fn bytes(value: &Value) -> Vec<u8> {
++    let mut result = Vec::new();
++    ciborium::ser::into_writer(value, &mut result).unwrap();
++    result
++}
++
++fn native_square(value: Computable, square: &Rational) {
++    assert_eq!(
++        value
++            .square()
++            .add(Computable::rational(-square.clone()))
++            .sign_until(0),
++        Some(RealSign::Zero)
++    );
++}
++
++fn real_square(value: Real, square: &Rational) {
++    assert_eq!(
++        (&value * &value)
++            .certified_cmp_until(&Real::from(square.clone()), 0)
++            .ordering(),
++        Some(Ordering::Equal)
++    );
++}
++
++fn sine_square(denominator: u64) -> Rational {
++    Rational::fraction(
++        match denominator {
++            3 => 3,
++            4 => 2,
++            6 => 1,
++            _ => unreachable!(),
++        },
++        4,
++    )
++    .unwrap()
++}
++
++#[test]
++fn atan_pi_anchors_retain_trig_facts_through_interchange() {
++    for d in [3, 4, 6] {
++        for sign in [-1, 1] {
++            for period in [-1, 0, 1] {
++                let q = Rational::new(period) + Rational::fraction(sign, d).unwrap();
++                let angle = Computable::pi().multiply(Computable::rational(q));
++                let graph = serde_json::to_value(&angle).unwrap();
++                let collection = json!([graph]);
++                let mut json_values: Vec<Computable> =
++                    serde_json::from_value(collection.clone()).unwrap();
++                let mut cbor_values: Vec<Computable> =
++                    ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++                let expected = [sine_square(d), Rational::one() - sine_square(d)];
++                for angle in [
++                    angle,
++                    serde_json::from_value(graph.clone()).unwrap(),
++                    ciborium::de::from_reader(bytes(&graph).as_slice()).unwrap(),
++                    json_values.pop().unwrap(),
++                    cbor_values.pop().unwrap(),
++                ] {
++                    for warm in [false, true] {
++                        if warm {
++                            let _ = angle.approx(-128);
++                        }
++                        for (i, value) in [angle.clone().sin(), angle.clone().cos()]
++                            .into_iter()
++                            .enumerate()
++                        {
++                            let wire = serde_json::to_value(&value).unwrap();
++                            native_square(value.clone(), &expected[i]);
++                            native_square(
++                                serde_json::from_value(wire.clone()).unwrap(),
++                                &expected[i],
++                            );
++                            native_square(
++                                ciborium::de::from_reader(bytes(&wire).as_slice()).unwrap(),
++                                &expected[i],
++                            );
++                            assert_eq!(serde_json::to_value(value).unwrap(), wire);
++                        }
++                    }
++                    assert_eq!(serde_json::to_value(angle).unwrap(), graph);
++                }
++                for scale in [0, -1, 1, 2] {
++                    let wire = json!({"rational":Rational::new(scale),"class":"Irrational","computable":graph});
++                    let encoded = bytes(&wire);
++                    let value = ciborium::Value::serialized(&wire).unwrap();
++                    let collection = json!([wire]);
++                    let mut json_values: Vec<Real> =
++                        serde_json::from_value(collection.clone()).unwrap();
++                    let mut cbor_values: Vec<Real> =
++                        ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++                    for angle in [
++                        Real::from_json(&wire.to_string()).unwrap(),
++                        Real::from_bytes(&encoded).unwrap(),
++                        Real::try_from(&value).unwrap(),
++                        Real::try_from(value).unwrap(),
++                        json_values.pop().unwrap(),
++                        cbor_values.pop().unwrap(),
++                    ] {
++                        let original_json = angle.to_json();
++                        let original_cbor = angle.to_bytes();
++                        for warm in [false, true] {
++                            if warm {
++                                let _ = angle.certified_rational_interval(-128).unwrap();
++                            }
++                            let squares = match scale {
++                                0 => [Rational::zero(), Rational::one()],
++                                2 => {
++                                    // sin(2x)^2=4sin(x)^2cos(x)^2; cos(2x)^2=1-sin(2x)^2.
++                                    let sine = Rational::new(4) * &expected[0] * &expected[1];
++                                    [sine.clone(), Rational::one() - sine]
++                                }
++                                _ => expected.clone(),
++                            };
++                            let sine = angle.clone().sin();
++                            let cosine = angle.clone().cos();
++                            if scale == 0 {
++                                assert!(matches!(angle.clone().cot(), Err(Problem::NotANumber)));
++                            } else {
++                                let cotangent = angle.clone().cot().unwrap();
++                                real_square(cotangent.clone(), &(&squares[1] / &squares[0]));
++                                assert_eq!(
++                                    (cotangent * &sine - &cosine).certified_sign_until(0).sign(),
++                                    Some(RealSign::Zero)
++                                );
++                            }
++                            assert_eq!(
++                                (&sine * &sine + &cosine * &cosine)
++                                    .certified_cmp_until(&Real::one(), 0)
++                                    .ordering(),
++                                Some(Ordering::Equal)
++                            );
++                            for (i, value) in [sine, cosine].into_iter().enumerate() {
++                                let json = value.to_json();
++                                let cbor = value.to_bytes();
++                                real_square(value, &squares[i]);
++                                real_square(Real::from_json(&json).unwrap(), &squares[i]);
++                                real_square(Real::from_bytes(&cbor).unwrap(), &squares[i]);
++                            }
++                        }
++                        assert_eq!(angle.to_json(), original_json);
++                        assert_eq!(angle.to_bytes(), original_cbor);
++                    }
++                }
++            }
++        }
++    }
++}
++
++fn bounds(square: &Rational, negative: bool) -> [Rational; 2] {
++    let square = square.to_string().parse::<Q>().unwrap();
++    let mut lo = Float::with_val_round(512, &square, Round::Down).0;
++    let mut hi = Float::with_val_round(512, &square, Round::Up).0;
++    lo.sqrt_round(Round::Down);
++    hi.sqrt_round(Round::Up);
++    let [lo, hi] = [lo, hi].map(|v| {
++        v.to_rational()
++            .unwrap()
++            .to_string()
++            .parse::<Rational>()
++            .unwrap()
++    });
++    if negative { [-hi, -lo] } else { [lo, hi] }
++}
++
++#[test]
++fn prior_atan_pi_anchor_graphs_remain_consumable() {
++    mpfr::cleanup_on_thread_exit();
++    let rows: Vec<Value> =
++        serde_json::from_str(include_str!("fixtures/atan_pi_anchor_legacy_trig.json")).unwrap();
++    assert_eq!(rows.len(), 48);
++    for row in rows {
++        let d = row["denominator"].as_u64().unwrap();
++        let sign = row["sign"].as_i64().unwrap();
++        let sine = row["function"] == "sin";
++        let s2 = sine_square(d);
++        let c2 = Rational::one() - s2.clone();
++        let (squares, signs) = match row["composition"].as_str().unwrap() {
++            "direct" => ([s2, c2], [sign, 1]),
++            "pi-plus" => ([s2, c2], [-sign, -1]),
++            "half-minus" => ([c2, s2], [1, sign]),
++            "negative-half-minus" => ([c2, s2], [-1, -sign]),
++            _ => unreachable!(),
++        };
++        let i = usize::from(!sine);
++        let expected = bounds(&squares[i], signs[i] < 0);
++        let argument = match d {
++            3 => Computable::rational(Rational::new(3)).sqrt(),
++            4 => Computable::one(),
++            6 => Computable::rational(Rational::new(3)).sqrt().inverse(),
++            _ => unreachable!(),
++        }
++        .multiply(Computable::rational(Rational::new(sign)))
++        .atan();
++        let source = match row["composition"].as_str().unwrap() {
++            "direct" => argument,
++            "pi-plus" => Computable::pi().add(argument),
++            "half-minus" => Computable::pi()
++                .multiply(Computable::rational(Rational::fraction(1, 2).unwrap()))
++                .add(argument.negate()),
++            "negative-half-minus" => Computable::pi()
++                .multiply(Computable::rational(Rational::fraction(-1, 2).unwrap()))
++                .add(argument.negate()),
++            _ => unreachable!(),
++        };
++        assert_eq!(serde_json::to_value(source).unwrap(), row["source_wire"]);
++        let wire = &row["legacy_output"];
++        for value in [
++            serde_json::from_value::<Computable>(wire.clone()).unwrap(),
++            ciborium::de::from_reader(bytes(wire).as_slice()).unwrap(),
++        ] {
++            let original = serde_json::to_value(&value).unwrap();
++            for p in [0, -128, 0] {
++                let unit =
++                    Rational::from_bigint_fraction(BigInt::one(), BigUint::one() << -p).unwrap();
++                let center = Rational::from_bigint(value.approx(p)) * &unit;
++                assert!(&center - &unit <= expected[0] && &center + &unit >= expected[1]);
++            }
++            assert_eq!(serde_json::to_value(value).unwrap(), original);
++        }
++    }
++}
