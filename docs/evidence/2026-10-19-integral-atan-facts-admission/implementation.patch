@@ -1,0 +1,4675 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index 069b66391..36268ca58 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -423,6 +423,13 @@ The integral arctangent kernel represents `atan(1/n)` for nonzero integers.
+ Unit denominators reuse the native exact `atan(±1) = ±π/4` identity, so valid
+ imported endpoints refine without the slowly converging unit-argument series.
+ The stored graph and its wire representation remain intact.
++Sine, cosine and cotangent consumers also reuse the exact argument retained
++by imported `IntegralAtan(n)` nodes. Newly derived results can carry exact
++algebraic proofs and serialize using existing algebraic forms. The input
++nodes keep their wire graphs, and previously serialized derived graphs
++remain supported.
++Native sine and cosine also consume retained signed half-π complements
++directly, preserving their algebraic facts without refining the angle.
+ The negative-rational `acos` complement reserves the combined error of its
+ π and positive-`acos` samples before subtraction, then rounds once. This
+ keeps its enclosure valid when a shared π sample is reused at a coarser
+diff --git a/crates/hyperreal/src/computable/node.rs b/crates/hyperreal/src/computable/node.rs
+index 24f32a901..883eb06f3 100644
+--- a/crates/hyperreal/src/computable/node.rs
++++ b/crates/hyperreal/src/computable/node.rs
+@@ -61,3 +61,4 @@ include!("node/atan_range_tests.rs");
+ include!("node/atanh_rational_range_tests.rs");
+ include!("node/integral_atan_range_tests.rs");
+ include!("node/acos_complement_range_tests.rs");
++include!("node/integral_atan_facts_tests.rs");
+diff --git a/crates/hyperreal/src/computable/node/algebra.rs b/crates/hyperreal/src/computable/node/algebra.rs
+index ac9e44842..acf024f17 100644
+--- a/crates/hyperreal/src/computable/node/algebra.rs
++++ b/crates/hyperreal/src/computable/node/algebra.rs
+@@ -691,7 +691,7 @@ impl Computable {
+         }
+     }
+ 
+-    pub(crate) fn signed_half_pi_minus_atan_argument(&self) -> Option<(Sign, Computable)> {
++    fn half_pi_minus_atan_argument(&self) -> Option<(Sign, Computable)> {
+         let form = self.pi_atan_linear_form(32)?;
+         if form.constant.sign() != Sign::NoSign || !form.atan.is_minus_one() {
+             return None;
+@@ -703,7 +703,11 @@ impl Computable {
+         } else {
+             return None;
+         };
+-        let argument = form.argument?;
++        Some((orientation, form.argument?))
++    }
++
++    pub(crate) fn signed_half_pi_minus_atan_argument(&self) -> Option<(Sign, Computable)> {
++        let (orientation, argument) = self.half_pi_minus_atan_argument()?;
+         (argument.exact_sign()? == orientation).then_some((orientation, argument))
+     }
+ 
+diff --git a/crates/hyperreal/src/computable/node/exp_trig.rs b/crates/hyperreal/src/computable/node/exp_trig.rs
+index c0e4d28f1..15331e44d 100644
+--- a/crates/hyperreal/src/computable/node/exp_trig.rs
++++ b/crates/hyperreal/src/computable/node/exp_trig.rs
+@@ -89,11 +89,13 @@ impl Computable {
+     /// kernel also uses this when construction deferred the reduction work.
+     pub(crate) fn reduced_exp(&self) -> Option<Self> {
+         let (reduced, multiple) = self.reduce_by_divisor(&Self::ln2(), -4, 64)?;
+-        Some(reduced.prescaled_exp().shift_left(
+-            multiple
+-                .try_into()
+-                .expect("binary exponent should fit in i32"),
+-        ))
++        Some(
++            reduced.prescaled_exp().shift_left(
++                multiple
++                    .try_into()
++                    .expect("binary exponent should fit in i32"),
++            ),
++        )
+     }
+ 
+     fn prescaled_exp(self) -> Self {
+@@ -103,7 +105,11 @@ impl Computable {
+         // exp(x) stays strictly positive across all domain values, so cache
+         // that fact directly for fast sign/zero checks.
+         Self {
+-            internal: Arc::new(Node::new(Approximation::PrescaledExp(self), BoundCache::Invalid, ExactSignCache::Valid(Sign::Plus))),
++            internal: Arc::new(Node::new(
++                Approximation::PrescaledExp(self),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(Sign::Plus),
++            )),
+             signal: None,
+         }
+     }
+@@ -189,7 +195,11 @@ impl Computable {
+             None => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Expm1(self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Expm1(self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -256,9 +266,7 @@ impl Computable {
+             return None;
+         }
+ 
+-        let precision_bits = msd
+-            .checked_add(quotient_guard_bits.max(16))?
+-            .max(16);
++        let precision_bits = msd.checked_add(quotient_guard_bits.max(16))?.max(16);
+         let shift = usize::try_from(precision_bits).ok()?;
+         let pi_scaled = Self::pi().approx(-precision_bits).to_biguint()?;
+         let numerator = rational.numerator() << (shift + 1);
+@@ -338,9 +346,9 @@ impl Computable {
+         match &self.internal.approximation {
+             // pi > 1, so every exact rational r satisfies |r| < |r| * pi.
+             Approximation::One => Some(Rational::one()),
+-            Approximation::Int(value) => {
+-                Some(Self::rational_magnitude(Rational::from_bigint(value.clone())))
+-            }
++            Approximation::Int(value) => Some(Self::rational_magnitude(Rational::from_bigint(
++                value.clone(),
++            ))),
+             Approximation::Ratio(value) => Some(Self::rational_magnitude(value.clone())),
+             Approximation::Constant(SharedConstant::Pi) => Some(Rational::one()),
+             Approximation::Constant(SharedConstant::Tau) => Some(Rational::new(2)),
+@@ -358,9 +366,7 @@ impl Computable {
+             Approximation::AsinRational(_)
+             | Approximation::PrescaledAsin(_)
+             | Approximation::AsinDeferred(_) => Some(HALF_RATIONAL.clone()),
+-            Approximation::Negate(child) => {
+-                child.trig_pi_magnitude_upper_bound(next_budget)
+-            }
++            Approximation::Negate(child) => child.trig_pi_magnitude_upper_bound(next_budget),
+             Approximation::Offset(child, shift) => {
+                 // Keep this proof helper cheap even for deliberately enormous
+                 // symbolic shifts; the ordinary magnitude/reduction path can
+@@ -421,8 +427,8 @@ impl Computable {
+         let quadrant =
+             ((&multiplier % signed::FOUR.deref()) + signed::FOUR.deref()) % signed::FOUR.deref();
+ 
+-        if let Some((sine, cosine)) = reduced.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "cos", "reduced-integer-pi-atan-rewrite");
++        if let Some((sine, cosine)) = reduced.pi_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "cos", "reduced-pi-atan-rewrite");
+             return if quadrant.is_zero() {
+                 cosine
+             } else if quadrant == *signed::ONE {
+@@ -452,8 +458,8 @@ impl Computable {
+         let quadrant =
+             ((&multiplier % signed::FOUR.deref()) + signed::FOUR.deref()) % signed::FOUR.deref();
+ 
+-        if let Some((sine, cosine)) = reduced.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "sin", "reduced-integer-pi-atan-rewrite");
++        if let Some((sine, cosine)) = reduced.pi_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "sin", "reduced-pi-atan-rewrite");
+             return if quadrant.is_zero() {
+                 sine
+             } else if quadrant == *signed::ONE {
+@@ -477,9 +483,8 @@ impl Computable {
+ 
+     fn atan_argument(&self) -> Option<Computable> {
+         match &self.internal.approximation {
+-            Approximation::AtanRational(argument) => {
+-                Some(Self::rational(argument.clone()))
+-            }
++            Approximation::AtanRational(argument) => Some(Self::rational(argument.clone())),
++            Approximation::IntegralAtan(_) => self.atan_rational_argument().map(Self::rational),
+             Approximation::PrescaledAtan(argument) | Approximation::AtanDeferred(argument) => {
+                 Some(argument.clone())
+             }
+@@ -490,9 +495,12 @@ impl Computable {
+     pub(crate) fn atan_rational_argument(&self) -> Option<Rational> {
+         match &self.internal.approximation {
+             Approximation::AtanRational(argument) => Some(argument.clone()),
+-            Approximation::Negate(argument) => {
+-                argument.atan_rational_argument().map(Rational::neg)
++            // IntegralAtan retains atan(1/n), including the sign of n.
++            // Share this exact inversion with native and Real consumers.
++            Approximation::IntegralAtan(denominator) => {
++                Rational::from_bigint(denominator.clone()).inverse().ok()
+             }
++            Approximation::Negate(argument) => argument.atan_rational_argument().map(Rational::neg),
+             _ => None,
+         }
+     }
+@@ -503,9 +511,7 @@ impl Computable {
+ 
+     pub(crate) fn asin_argument(&self) -> Option<Computable> {
+         match &self.internal.approximation {
+-            Approximation::AsinRational(argument) => {
+-                Some(Self::rational(argument.clone()))
+-            }
++            Approximation::AsinRational(argument) => Some(Self::rational(argument.clone())),
+             Approximation::PrescaledAsin(argument) | Approximation::AsinDeferred(argument) => {
+                 Some(argument.clone())
+             }
+@@ -516,9 +522,7 @@ impl Computable {
+     pub(crate) fn acos_argument(&self) -> Option<Computable> {
+         match &self.internal.approximation {
+             Approximation::AcosPositive(argument) => Some(argument.clone()),
+-            Approximation::AcosPositiveRational(argument) => {
+-                Some(Self::rational(argument.clone()))
+-            }
++            Approximation::AcosPositiveRational(argument) => Some(Self::rational(argument.clone())),
+             Approximation::AcosNegativeRational(argument) => {
+                 Some(Self::rational(argument.clone().neg()))
+             }
+@@ -531,16 +535,28 @@ impl Computable {
+     }
+ 
+     fn unit_complement(argument: &Computable) -> Computable {
+-        Self::one()
+-            .add(argument.clone().square().negate())
+-            .sqrt()
++        Self::one().add(argument.clone().square().negate()).sqrt()
+     }
+ 
+-    fn integer_pi_atan_sin_cos(&self) -> Option<(Computable, Computable)> {
+-        let (sine_sign, cosine_sign, argument) =
+-            self.integer_pi_plus_or_minus_atan_argument()?;
++    fn pi_atan_sin_cos(&self) -> Option<(Computable, Computable)> {
++        let (sine_sign, cosine_sign, argument, swap) =
++            if let Some((sine_sign, cosine_sign, argument)) =
++                self.integer_pi_plus_or_minus_atan_argument()
++            {
++                (sine_sign, cosine_sign, argument, false)
++            } else {
++                let (orientation, argument) = self.half_pi_minus_atan_argument()?;
++                (orientation, orientation, argument, true)
++            };
+         let inverse_hypotenuse = Self::unit_hypotenuse(&argument).inverse();
+         let sine = argument.multiply(inverse_hypotenuse.clone());
++        // sin(s*pi/2-atan(a))=s*cos(atan(a)),
++        // cos(s*pi/2-atan(a))=s*sin(atan(a)), for s in {-1,+1}.
++        let (sine, cosine) = if swap {
++            (inverse_hypotenuse, sine)
++        } else {
++            (sine, inverse_hypotenuse)
++        };
+         Some((
+             if sine_sign == Sign::Minus {
+                 sine.negate()
+@@ -548,9 +564,9 @@ impl Computable {
+                 sine
+             },
+             if cosine_sign == Sign::Minus {
+-                inverse_hypotenuse.negate()
++                cosine.negate()
+             } else {
+-                inverse_hypotenuse
++                cosine
+             },
+         ))
+     }
+@@ -569,8 +585,8 @@ impl Computable {
+             crate::trace_dispatch!("computable", "cos", "atan-inverse-rewrite");
+             return Self::unit_hypotenuse(&argument).inverse();
+         }
+-        if let Some((_, cosine)) = self.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "cos", "integer-pi-atan-rewrite");
++        if let Some((_, cosine)) = self.pi_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "cos", "pi-atan-rewrite");
+             return cosine;
+         }
+         if let Some(argument) = self.asin_argument() {
+@@ -670,8 +686,8 @@ impl Computable {
+                 .clone()
+                 .multiply(Self::unit_hypotenuse(&argument).inverse());
+         }
+-        if let Some((sine, _)) = self.integer_pi_atan_sin_cos() {
+-            crate::trace_dispatch!("computable", "sin", "integer-pi-atan-rewrite");
++        if let Some((sine, _)) = self.pi_atan_sin_cos() {
++            crate::trace_dispatch!("computable", "sin", "pi-atan-rewrite");
+             return sine;
+         }
+         if let Some(argument) = self.asin_argument() {
+@@ -798,7 +814,11 @@ impl Computable {
+             // Known |x| < 2: enter the tangent quotient kernel directly.
+             crate::trace_dispatch!("computable", "tan", "structural-small-prescaled");
+             return Self {
+-                internal: Arc::new(Node::new(Approximation::PrescaledTan(self), BoundCache::Invalid, ExactSignCache::Invalid)),
++                internal: Arc::new(Node::new(
++                    Approximation::PrescaledTan(self),
++                    BoundCache::Invalid,
++                    ExactSignCache::Invalid,
++                )),
+                 signal: None,
+             };
+         }
+@@ -813,7 +833,11 @@ impl Computable {
+         if abs_rough_appr < unsigned::TWO.deref() {
+             crate::trace_dispatch!("computable", "tan", "rough-small-prescaled");
+             return Self {
+-                internal: Arc::new(Node::new(Approximation::PrescaledTan(self), BoundCache::Invalid, ExactSignCache::Invalid)),
++                internal: Arc::new(Node::new(
++                    Approximation::PrescaledTan(self),
++                    BoundCache::Invalid,
++                    ExactSignCache::Invalid,
++                )),
+                 signal: None,
+             };
+         }
+@@ -824,7 +848,11 @@ impl Computable {
+             let complement = Self::pi().shift_right(1).add(self.negate());
+             crate::trace_dispatch!("computable", "tan", "near-half-pi-cotangent-rewrite");
+             return Self {
+-                internal: Arc::new(Node::new(Approximation::PrescaledCot(complement), BoundCache::Invalid, ExactSignCache::Invalid)),
++                internal: Arc::new(Node::new(
++                    Approximation::PrescaledCot(complement),
++                    BoundCache::Invalid,
++                    ExactSignCache::Invalid,
++                )),
+                 signal: None,
+             };
+         }
+diff --git a/crates/hyperreal/src/computable/node/representation.rs b/crates/hyperreal/src/computable/node/representation.rs
+index badc1973f..9064586ca 100644
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -246,6 +246,7 @@ impl Node {
+         match approximation {
+             Approximation::Constant(SharedConstant::Pi)
+             | Approximation::AtanRational(_)
++            | Approximation::IntegralAtan(_)
+             | Approximation::PrescaledAtan(_)
+             | Approximation::AtanDeferred(_)
+             | Approximation::AcosPositive(_)
+diff --git a/crates/hyperreal/src/computable/node/integral_atan_facts_tests.rs b/crates/hyperreal/src/computable/node/integral_atan_facts_tests.rs
+new file mode 100644
+index 000000000..32c4e7407
+--- /dev/null
++++ b/crates/hyperreal/src/computable/node/integral_atan_facts_tests.rs
+@@ -0,0 +1,162 @@
++#[cfg(test)]
++mod integral_atan_facts_tests {
++    use super::*;
++
++    fn imported(n: &BigInt) -> Computable {
++        Computable {
++            internal: Arc::new(Node::new(
++                Approximation::IntegralAtan(n.clone()),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
++            signal: None,
++        }
++    }
++
++    fn denominators() -> Vec<BigInt> {
++        [
++            BigInt::one(),
++            BigInt::from(2),
++            BigInt::from(5),
++            BigInt::from(239),
++            BigInt::one() << 512,
++        ]
++        .into_iter()
++        .flat_map(|n| [-n.clone(), n])
++        .collect()
++    }
++
++    fn squared_expectations(n: &BigInt) -> [Rational; 2] {
++        let square = n * n;
++        let denominator = (&square + BigInt::one()).to_biguint().unwrap();
++        [
++            Rational::from_bigint_fraction(BigInt::one(), denominator.clone()).unwrap(),
++            Rational::from_bigint_fraction(square, denominator).unwrap(),
++        ]
++    }
++
++    fn exact_square(value: Computable, expected: &Rational) {
++        let delta = value.square().add(Computable::rational(-expected.clone()));
++        assert_eq!(delta.sign_until(0), Some(RealSign::Zero));
++    }
++
++    #[test]
++    fn integral_atan_readers_retain_exact_argument_and_family() {
++        for n in denominators() {
++            let angle = imported(&n);
++            let sign = if n.sign() == Sign::Minus { -1 } else { 1 };
++            let expected =
++                Rational::from_bigint_fraction(BigInt::from(sign), n.magnitude().clone()).unwrap();
++            assert_eq!(angle.atan_rational_argument(), Some(expected.clone()));
++            assert_eq!(
++                angle.atan_argument().unwrap().exact_rational(),
++                Some(expected)
++            );
++            assert!(angle.internal.contains_inverse_trig_or_pi());
++            assert!(angle.cached().is_none());
++            assert!(
++                matches!(&angle.internal.approximation, Approximation::IntegralAtan(stored) if stored == &n)
++            );
++        }
++        let undefined = imported(&BigInt::zero());
++        assert!(undefined.atan_rational_argument().is_none());
++        assert!(undefined.atan_argument().is_none());
++    }
++
++    #[test]
++    fn integral_atan_facts_compose_through_trig_and_arithmetic() {
++        for n in denominators() {
++            let angle = imported(&n);
++            let [sine_square, cosine_square] = squared_expectations(&n);
++            let sign = if n.sign() == Sign::Minus {
++                RealSign::Negative
++            } else {
++                RealSign::Positive
++            };
++            for warm in [false, true] {
++                if warm {
++                    let _ = angle.approx(-128);
++                }
++                let sine = angle.clone().sin();
++                let cosine = angle.clone().cos();
++                assert_eq!(sine.sign_until(0), Some(sign));
++                assert_eq!(cosine.sign_until(0), Some(RealSign::Positive));
++                exact_square(sine, &sine_square);
++                exact_square(cosine, &cosine_square);
++
++                let shifted = Computable::pi().add(angle.clone());
++                let shifted_sine = shifted.clone().sin();
++                let shifted_cosine = shifted.cos();
++                assert_eq!(shifted_cosine.sign_until(0), Some(RealSign::Negative));
++                assert_eq!(
++                    shifted_sine.sign_until(0),
++                    Some(if sign == RealSign::Positive {
++                        RealSign::Negative
++                    } else {
++                        RealSign::Positive
++                    })
++                );
++                exact_square(shifted_sine, &sine_square);
++                exact_square(shifted_cosine, &cosine_square);
++
++                for orientation in [-1, 1] {
++                    let complement = Computable::pi()
++                        .shift_right(1)
++                        .multiply_rational(Rational::new(orientation))
++                        .add(angle.clone().negate());
++                    let sine = complement.clone().sin();
++                    let cosine = complement.cos();
++                    assert_eq!(
++                        sine.sign_until(0),
++                        Some(if orientation == 1 {
++                            RealSign::Positive
++                        } else {
++                            RealSign::Negative
++                        })
++                    );
++                    assert_eq!(
++                        cosine.sign_until(0),
++                        Some(if (orientation == 1) == (sign == RealSign::Positive) {
++                            RealSign::Positive
++                        } else {
++                            RealSign::Negative
++                        })
++                    );
++                    exact_square(sine, &cosine_square);
++                    exact_square(cosine, &sine_square);
++                }
++                if !warm {
++                    assert!(angle.cached().is_none());
++                }
++            }
++        }
++        // atan is strictly increasing; these fresh imported arguments are
++        // exact rationals with 1/2 > 1/5. No refinement is needed for the order.
++        let difference = imported(&BigInt::from(2)).add(imported(&BigInt::from(5)).negate());
++        assert_eq!(difference.sign_until(0), Some(RealSign::Positive));
++    }
++
++    #[test]
++    fn integral_atan_facts_survive_concurrent_reuse() {
++        for n in [-5, -1, 1, 5] {
++            let n = BigInt::from(n);
++            let angle = imported(&n);
++            let expected = squared_expectations(&n);
++            std::thread::scope(|scope| {
++                for warm in [false, true, false, true] {
++                    let angle = angle.clone();
++                    let expected = expected.clone();
++                    scope.spawn(move || {
++                        if warm {
++                            let _ = angle.approx(-128);
++                        }
++                        exact_square(angle.clone().sin(), &expected[0]);
++                        exact_square(angle.cos(), &expected[1]);
++                    });
++                }
++            });
++            exact_square(angle.clone().sin(), &expected[0]);
++            exact_square(angle.cos(), &expected[1]);
++        }
++    }
++}
+diff --git a/crates/hyperreal/tests/fixtures/integral_atan_legacy_trig.json b/crates/hyperreal/tests/fixtures/integral_atan_legacy_trig.json
+new file mode 100644
+index 000000000..4c5ebc5df
+--- /dev/null
++++ b/crates/hyperreal/tests/fixtures/integral_atan_legacy_trig.json
+@@ -0,0 +1,3930 @@
++{
++  "oracle": "Independent directed MPFR square-root bounds of exact rational squares, 512 bits; every original, JSON import and CBOR import checked at p=-64.",
++  "rows": [
++    {
++      "denominator": -5,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        5
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledSin": {
++            "internal": {
++              "IntegralAtan": [
++                -1,
++                [
++                  5
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              5
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -5,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        5
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledCos": {
++            "internal": {
++              "IntegralAtan": [
++                -1,
++                [
++                  5
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              5
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -2,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        2
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledSin": {
++            "internal": {
++              "IntegralAtan": [
++                -1,
++                [
++                  2
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              2
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -2,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        2
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledCos": {
++            "internal": {
++              "IntegralAtan": [
++                -1,
++                [
++                  2
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              2
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -1,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "internal": {
++          "Negate": {
++            "internal": {
++              "PrescaledCos": {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "IntegralAtan": [
++                          -1,
++                          [
++                            1
++                          ]
++                        ]
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -1
++                        ]
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              1
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -1,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledSin": {
++            "internal": {
++              "Add": [
++                {
++                  "internal": {
++                    "IntegralAtan": [
++                      -1,
++                      [
++                        1
++                      ]
++                    ]
++                  }
++                },
++                {
++                  "internal": {
++                    "Offset": [
++                      {
++                        "internal": {
++                          "Constant": "Pi"
++                        }
++                      },
++                      -1
++                    ]
++                  }
++                }
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            -1,
++            [
++              1
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 1,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledCos": {
++            "internal": {
++              "Add": [
++                {
++                  "internal": {
++                    "IntegralAtan": [
++                      1,
++                      [
++                        1
++                      ]
++                    ]
++                  }
++                },
++                {
++                  "internal": {
++                    "Negate": {
++                      "internal": {
++                        "Offset": [
++                          {
++                            "internal": {
++                              "Constant": "Pi"
++                            }
++                          },
++                          -1
++                        ]
++                      }
++                    }
++                  }
++                }
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              1
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 1,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "internal": {
++          "Negate": {
++            "internal": {
++              "PrescaledSin": {
++                "internal": {
++                  "Add": [
++                    {
++                      "internal": {
++                        "IntegralAtan": [
++                          1,
++                          [
++                            1
++                          ]
++                        ]
++                      }
++                    },
++                    {
++                      "internal": {
++                        "Negate": {
++                          "internal": {
++                            "Offset": [
++                              {
++                                "internal": {
++                                  "Constant": "Pi"
++                                }
++                              },
++                              -1
++                            ]
++                          }
++                        }
++                      }
++                    }
++                  ]
++                }
++              }
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              1
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 2,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        2
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledSin": {
++            "internal": {
++              "IntegralAtan": [
++                1,
++                [
++                  2
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              2
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 2,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        2
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledCos": {
++            "internal": {
++              "IntegralAtan": [
++                1,
++                [
++                  2
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              2
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 5,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        5
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledSin": {
++            "internal": {
++              "IntegralAtan": [
++                1,
++                [
++                  5
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "sin",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              5
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": 5,
++      "derived_cbor": [
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        5
++      ],
++      "derived_json": {
++        "internal": {
++          "PrescaledCos": {
++            "internal": {
++              "IntegralAtan": [
++                1,
++                [
++                  5
++                ]
++              ]
++            }
++          }
++        }
++      },
++      "mode": "native",
++      "operation": "cos",
++      "source_json": {
++        "internal": {
++          "IntegralAtan": [
++            1,
++            [
++              5
++            ]
++          ]
++        }
++      }
++    },
++    {
++      "denominator": -5,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        5
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "IntegralAtan": [
++                  -1,
++                  [
++                    5
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                5
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": -5,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        5
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "IntegralAtan": [
++                  -1,
++                  [
++                    5
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                5
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": -2,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        2
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "IntegralAtan": [
++                  -1,
++                  [
++                    2
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                2
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": -2,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        2
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "IntegralAtan": [
++                  -1,
++                  [
++                    2
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                2
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": -1,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "Negate": {
++              "internal": {
++                "PrescaledCos": {
++                  "internal": {
++                    "Add": [
++                      {
++                        "internal": {
++                          "IntegralAtan": [
++                            -1,
++                            [
++                              1
++                            ]
++                          ]
++                        }
++                      },
++                      {
++                        "internal": {
++                          "Offset": [
++                            {
++                              "internal": {
++                                "Constant": "Pi"
++                              }
++                            },
++                            -1
++                          ]
++                        }
++                      }
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                1
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": -1,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        32,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "IntegralAtan": [
++                        -1,
++                        [
++                          1
++                        ]
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Offset": [
++                        {
++                          "internal": {
++                            "Constant": "Pi"
++                          }
++                        },
++                        -1
++                      ]
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              -1,
++              [
++                1
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 1,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "Add": [
++                  {
++                    "internal": {
++                      "IntegralAtan": [
++                        1,
++                        [
++                          1
++                        ]
++                      ]
++                    }
++                  },
++                  {
++                    "internal": {
++                      "Negate": {
++                        "internal": {
++                          "Offset": [
++                            {
++                              "internal": {
++                                "Constant": "Pi"
++                              }
++                            },
++                            -1
++                          ]
++                        }
++                      }
++                    }
++                  }
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                1
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 1,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        99,
++        65,
++        100,
++        100,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        1,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        78,
++        101,
++        103,
++        97,
++        116,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        102,
++        79,
++        102,
++        102,
++        115,
++        101,
++        116,
++        130,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        104,
++        67,
++        111,
++        110,
++        115,
++        116,
++        97,
++        110,
++        116,
++        98,
++        80,
++        105,
++        32
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "Negate": {
++              "internal": {
++                "PrescaledSin": {
++                  "internal": {
++                    "Add": [
++                      {
++                        "internal": {
++                          "IntegralAtan": [
++                            1,
++                            [
++                              1
++                            ]
++                          ]
++                        }
++                      },
++                      {
++                        "internal": {
++                          "Negate": {
++                            "internal": {
++                              "Offset": [
++                                {
++                                  "internal": {
++                                    "Constant": "Pi"
++                                  }
++                                },
++                                -1
++                              ]
++                            }
++                          }
++                        }
++                      }
++                    ]
++                  }
++                }
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                1
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 2,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        2
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "IntegralAtan": [
++                  1,
++                  [
++                    2
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                2
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 2,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        2
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "IntegralAtan": [
++                  1,
++                  [
++                    2
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                2
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 5,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        83,
++        105,
++        110,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        5
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledSin": {
++              "internal": {
++                "IntegralAtan": [
++                  1,
++                  [
++                    5
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "sin",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                5
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    },
++    {
++      "denominator": 5,
++      "derived_cbor": [
++        163,
++        104,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        163,
++        100,
++        115,
++        105,
++        103,
++        110,
++        1,
++        105,
++        110,
++        117,
++        109,
++        101,
++        114,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        107,
++        100,
++        101,
++        110,
++        111,
++        109,
++        105,
++        110,
++        97,
++        116,
++        111,
++        114,
++        129,
++        1,
++        101,
++        99,
++        108,
++        97,
++        115,
++        115,
++        106,
++        73,
++        114,
++        114,
++        97,
++        116,
++        105,
++        111,
++        110,
++        97,
++        108,
++        106,
++        99,
++        111,
++        109,
++        112,
++        117,
++        116,
++        97,
++        98,
++        108,
++        101,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        80,
++        114,
++        101,
++        115,
++        99,
++        97,
++        108,
++        101,
++        100,
++        67,
++        111,
++        115,
++        161,
++        104,
++        105,
++        110,
++        116,
++        101,
++        114,
++        110,
++        97,
++        108,
++        161,
++        108,
++        73,
++        110,
++        116,
++        101,
++        103,
++        114,
++        97,
++        108,
++        65,
++        116,
++        97,
++        110,
++        130,
++        1,
++        129,
++        5
++      ],
++      "derived_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "PrescaledCos": {
++              "internal": {
++                "IntegralAtan": [
++                  1,
++                  [
++                    5
++                  ]
++                ]
++              }
++            }
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      },
++      "mode": "real",
++      "operation": "cos",
++      "source_json": {
++        "class": "Irrational",
++        "computable": {
++          "internal": {
++            "IntegralAtan": [
++              1,
++              [
++                5
++              ]
++            ]
++          }
++        },
++        "rational": {
++          "denominator": [
++            1
++          ],
++          "numerator": [
++            1
++          ],
++          "sign": 1
++        }
++      }
++    }
++  ],
++  "target_revision": "d5b16c26471768ff53a59fbce8285e288c447e2f"
++}
+diff --git a/crates/hyperreal/tests/serde_integral_atan_facts.rs b/crates/hyperreal/tests/serde_integral_atan_facts.rs
+new file mode 100644
+index 000000000..41076b9bb
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_integral_atan_facts.rs
+@@ -0,0 +1,237 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real, RealSign};
++use num::{BigInt, BigUint, One};
++use rug::{Float, Rational as Q, float::Round};
++use serde_json::{Value, json};
++use std::cmp::Ordering;
++
++#[path = "support/mpfr.rs"]
++mod mpfr;
++
++fn bytes(value: &Value) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++fn squared_expectations(n: &BigInt) -> [Rational; 2] {
++    let square = n * n;
++    let denominator = (&square + BigInt::one()).to_biguint().unwrap();
++    [
++        Rational::from_bigint_fraction(BigInt::one(), denominator.clone()).unwrap(),
++        Rational::from_bigint_fraction(square, denominator).unwrap(),
++    ]
++}
++
++fn native_square(value: Computable, expected: &Rational) {
++    assert_eq!(
++        value
++            .square()
++            .add(Computable::rational(-expected.clone()))
++            .sign_until(0),
++        Some(RealSign::Zero)
++    );
++}
++
++fn real_square(value: &Real, expected: &Rational) {
++    assert_eq!(
++        (value * value)
++            .certified_cmp_until(&Real::from(expected.clone()), 0)
++            .ordering(),
++        Some(Ordering::Equal)
++    );
++}
++
++#[test]
++fn integral_atan_retains_trig_facts_through_interchange() {
++    let denominators = [
++        BigInt::one(),
++        BigInt::from(2),
++        BigInt::from(5),
++        BigInt::from(239),
++        BigInt::one() << 512,
++    ];
++    for n in denominators.into_iter().flat_map(|n| [-n.clone(), n]) {
++        // theta=atan(1/n): sin(theta)^2=1/(n^2+1),
++        // cos(theta)^2=n^2/(n^2+1), cot(theta)=n.
++        let expected = squared_expectations(&n);
++        let graph = json!({"internal":{"IntegralAtan":n}});
++        let collection = json!([graph]);
++        let mut json_values: Vec<Computable> = serde_json::from_value(collection.clone()).unwrap();
++        let mut cbor_values: Vec<Computable> =
++            ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++        let angles = [
++            serde_json::from_value::<Computable>(graph.clone()).unwrap(),
++            ciborium::de::from_reader(bytes(&graph).as_slice()).unwrap(),
++            json_values.pop().unwrap(),
++            cbor_values.pop().unwrap(),
++        ];
++        for angle in angles {
++            assert_eq!(serde_json::to_value(&angle).unwrap(), graph);
++            for warm in [false, true] {
++                if warm {
++                    let _ = angle.approx(-128);
++                }
++                for (value, square) in [
++                    (angle.clone().sin(), &expected[0]),
++                    (angle.clone().cos(), &expected[1]),
++                ] {
++                    let wire = serde_json::to_value(&value).unwrap();
++                    let mut encoded = Vec::new();
++                    ciborium::ser::into_writer(&value, &mut encoded).unwrap();
++                    native_square(value, square);
++                    native_square(serde_json::from_value(wire).unwrap(), square);
++                    native_square(
++                        ciborium::de::from_reader(encoded.as_slice()).unwrap(),
++                        square,
++                    );
++                }
++            }
++            assert_eq!(serde_json::to_value(angle).unwrap(), graph);
++        }
++        for scale in [0, 1, -1, 2] {
++            let wire =
++                json!({"rational":Rational::new(scale),"class":"Irrational","computable":graph});
++            let cbor = ciborium::Value::serialized(&wire).unwrap();
++            let collection = json!([wire]);
++            let mut json_values: Vec<Real> = serde_json::from_value(collection.clone()).unwrap();
++            let mut cbor_values: Vec<Real> =
++                ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++            let angles = [
++                Real::from_json(&wire.to_string()).unwrap(),
++                Real::from_bytes(&bytes(&wire)).unwrap(),
++                Real::try_from(&cbor).unwrap(),
++                Real::try_from(cbor).unwrap(),
++                json_values.pop().unwrap(),
++                cbor_values.pop().unwrap(),
++            ];
++            for angle in angles {
++                let original_json = angle.to_json();
++                let original_cbor = angle.to_bytes();
++                for warm in [false, true] {
++                    if warm {
++                        let _ = angle.certified_rational_interval(-128).unwrap();
++                    }
++                    let sine = angle.clone().sin();
++                    let cosine = angle.clone().cos();
++                    if scale == 2 {
++                        // A scaled atan must not be mistaken for the unscaled
++                        // angle: sin(2 theta)=2n/(n^2+1),
++                        // cos(2 theta)=(n^2-1)/(n^2+1).
++                        let square = &n * &n;
++                        let denominator = (&square + BigInt::one()).to_biguint().unwrap();
++                        let twice_sine = Rational::from_bigint_fraction(
++                            &n * BigInt::from(2),
++                            denominator.clone(),
++                        )
++                        .unwrap();
++                        let twice_cosine =
++                            Rational::from_bigint_fraction(square - BigInt::one(), denominator)
++                                .unwrap();
++                        for (value, target) in [(sine, twice_sine), (cosine, twice_cosine)] {
++                            let [lo, hi] = value.certified_rational_interval(-128).unwrap();
++                            assert!(lo <= target && hi >= target);
++                        }
++                    } else {
++                        let squares = if scale == 0 {
++                            [Rational::zero(), Rational::one()]
++                        } else {
++                            expected.clone()
++                        };
++                        for (value, square) in [(sine, &squares[0]), (cosine, &squares[1])] {
++                            real_square(&value, square);
++                            let json = value.to_json();
++                            let cbor = value.to_bytes();
++                            real_square(&Real::from_json(&json).unwrap(), square);
++                            real_square(&Real::from_bytes(&cbor).unwrap(), square);
++                            assert_eq!(value.to_json(), json);
++                            assert_eq!(value.to_bytes(), cbor);
++                        }
++                        if scale == 0 {
++                            assert!(matches!(angle.clone().cot(), Err(Problem::NotANumber)));
++                        } else {
++                            let cotangent = angle.clone().cot().unwrap();
++                            let expected = Real::from(Rational::from_bigint(&n * scale));
++                            assert_eq!(
++                                cotangent.certified_cmp_until(&expected, 0).ordering(),
++                                Some(Ordering::Equal)
++                            );
++                            assert_eq!(
++                                (cotangent - expected).certified_sign_until(0).sign(),
++                                Some(RealSign::Zero)
++                            );
++                        }
++                    }
++                }
++                assert_eq!(angle.to_json(), original_json);
++                assert_eq!(angle.to_bytes(), original_cbor);
++            }
++        }
++    }
++}
++
++fn legacy_bounds(n: i64, sine: bool) -> [Rational; 2] {
++    let square = Q::from((if sine { 1 } else { n * n }, n * n + 1));
++    let mut lo = Float::with_val_round(512, &square, Round::Down).0;
++    let mut hi = Float::with_val_round(512, &square, Round::Up).0;
++    lo.sqrt_round(Round::Down);
++    hi.sqrt_round(Round::Up);
++    let [lo, hi] = [lo, hi].map(|v| {
++        v.to_rational()
++            .unwrap()
++            .to_string()
++            .parse::<Rational>()
++            .unwrap()
++    });
++    if sine && n < 0 { [-hi, -lo] } else { [lo, hi] }
++}
++
++#[test]
++fn prior_integral_atan_trig_graphs_remain_consumable() {
++    mpfr::cleanup_on_thread_exit();
++    let fixture: Value =
++        serde_json::from_str(include_str!("fixtures/integral_atan_legacy_trig.json")).unwrap();
++    assert_eq!(
++        fixture["target_revision"],
++        "d5b16c26471768ff53a59fbce8285e288c447e2f"
++    );
++    let rows = fixture["rows"].as_array().unwrap();
++    assert_eq!(rows.len(), 24);
++    for row in rows {
++        let bounds = legacy_bounds(
++            row["denominator"].as_i64().unwrap(),
++            row["operation"] == "sin",
++        );
++        let wire = &row["derived_json"];
++        let encoded: Vec<u8> = serde_json::from_value(row["derived_cbor"].clone()).unwrap();
++        if row["mode"] == "native" {
++            for value in [
++                serde_json::from_value::<Computable>(wire.clone()).unwrap(),
++                ciborium::de::from_reader(encoded.as_slice()).unwrap(),
++            ] {
++                let before = serde_json::to_value(&value).unwrap();
++                for p in [0, -128, 0] {
++                    let unit = Rational::from_bigint_fraction(BigInt::one(), BigUint::one() << -p)
++                        .unwrap();
++                    let center = Rational::from_bigint(value.approx(p)) * &unit;
++                    assert!(&center - &unit <= bounds[0] && &center + &unit >= bounds[1]);
++                }
++                assert_eq!(serde_json::to_value(&value).unwrap(), before);
++            }
++        } else {
++            assert_eq!(row["mode"], "real");
++            for value in [
++                Real::from_json(&wire.to_string()).unwrap(),
++                Real::from_bytes(&encoded).unwrap(),
++            ] {
++                let before = value.to_json();
++                for p in [0, -128, 0] {
++                    let [lo, hi] = value.certified_rational_interval(p).unwrap();
++                    assert!(lo <= bounds[0] && hi >= bounds[1]);
++                }
++                assert_eq!(value.to_json(), before);
++            }
++        }
++    }
++}
