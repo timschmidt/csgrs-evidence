@@ -1,0 +1,328 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index f614735d7..761ad5d31 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -415,6 +415,10 @@ time. Larger rational arguments reuse native rational reduction; other real
+ arguments use the shared half-angle construction twice to ensure convergence.
+ This preserves valid imported graphs and their meaning across refinement,
+ without proving the domain of an arbitrary child expression.
++The rational `atanh` kernel likewise proves its tiny-argument range before
++using either its series or a coarse-zero result. Other valid rationals in
++`(-1, 1)` reuse native exact logarithm reduction, preserving imported values
++near the endpoints through cold and warm refinement.
+ Inverse-cosine endpoint facts distinguish `acos(1) = acosh(1) = 0`; an imported
+ `acosh` node needs evidence about its argument before claiming a positive sign.
+ The native rational reader recognizes these exact endpoints so later arithmetic
+diff --git a/crates/hyperreal/src/computable/approximation/inverse_hyperbolic.rs b/crates/hyperreal/src/computable/approximation/inverse_hyperbolic.rs
+index 4cdc5724d..4e13a2f75 100644
+--- a/crates/hyperreal/src/computable/approximation/inverse_hyperbolic.rs
++++ b/crates/hyperreal/src/computable/approximation/inverse_hyperbolic.rs
+@@ -229,6 +229,20 @@ fn atanh_rational(signal: &Option<Signal>, r: &Rational, p: Precision) -> BigInt
+     // Direct exact-rational variant of the tiny atanh series. This mirrors the
+     // direct rational trig kernels: preserve the symbolic rational payload and
+     // round only once at the requested working precision.
++    // A stored rational tag does not prove the tiny-series range. For nonzero
++    // r, an exact MSD <= -4 proves |r| < 1/8 and justifies both this series
++    // and the coarse-zero shortcut. Missing metadata is not a range proof.
++    if r.sign() != Sign::NoSign && r.msd_exact().is_none_or(|msd| msd >= -3) {
++        if should_stop(signal) {
++            return Zero::zero();
++        }
++        // Native rational atanh uses this kernel only for MSD <= -4, so this
++        // fallback instead reaches its exact logarithm reduction or endpoint
++        // identities without recreating the inadmissible series node.
++        return Computable::rational(r.clone())
++            .atanh()
++            .approx_signal(signal, p);
++    }
+     if p >= 1 {
+         return Zero::zero();
+     }
+diff --git a/crates/hyperreal/src/computable/node.rs b/crates/hyperreal/src/computable/node.rs
+index 9a2e025b9..d38babd51 100644
+--- a/crates/hyperreal/src/computable/node.rs
++++ b/crates/hyperreal/src/computable/node.rs
+@@ -58,3 +58,4 @@ include!("node/trig_range_proof_tests.rs");
+ include!("node/asinh_range_tests.rs");
+ include!("node/log_rational_range_tests.rs");
+ include!("node/atan_range_tests.rs");
++include!("node/atanh_rational_range_tests.rs");
+diff --git a/crates/hyperreal/src/computable/node/atanh_rational_range_tests.rs b/crates/hyperreal/src/computable/node/atanh_rational_range_tests.rs
+new file mode 100644
+index 000000000..5ee045846
+--- /dev/null
++++ b/crates/hyperreal/src/computable/node/atanh_rational_range_tests.rs
+@@ -0,0 +1,92 @@
++#[cfg(test)]
++mod atanh_rational_range_tests {
++    use super::*;
++    use rug::{Float, Integer, Rational as Q, float::Round};
++
++    fn imported(q: &Q) -> Computable {
++        Computable {
++            internal: Arc::new(Node::new(
++                Approximation::AtanhRational(q.to_string().parse().unwrap()),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
++            signal: None,
++        }
++    }
++
++    fn oracle(q: &Q) -> [Q; 2] {
++        let mut lo = Float::with_val_round(2048, q, Round::Down).0;
++        let mut hi = Float::with_val_round(2048, q, Round::Up).0;
++        lo.atanh_round(Round::Down);
++        hi.atanh_round(Round::Up);
++        [lo.to_rational().unwrap(), hi.to_rational().unwrap()]
++    }
++
++    fn encloses(value: &Computable, p: i32, bounds: &[Q; 2]) {
++        let a = Integer::from_str_radix(&value.approx(p).to_string(), 10).unwrap();
++        let unit = if p > 0 {
++            Q::from(Integer::from(1) << p)
++        } else {
++            Q::from((1, Integer::from(1) << -p))
++        };
++        let center = Q::from(a) * &unit;
++        assert!(
++            Q::from(&center - &unit) <= bounds[0] && Q::from(&center + &unit) >= bounds[1],
++            "p={p}, center={center}, unit={unit}"
++        );
++    }
++
++    #[test]
++    fn imported_rational_atanh_encloses_tiny_boundary_and_endpoint_inputs() {
++        crate::mpfr_test::cleanup_on_thread_exit();
++        let mut inputs = vec![Q::from(0)];
++        for q in [
++            Q::from((1, 16)),
++            Q::from((15, 128)),
++            Q::from((1, 8)),
++            Q::from((17, 128)),
++            Q::from((1, 3)),
++            Q::from((1, 2)),
++            Q::from((3, 4)),
++            Q::from((31, 32)),
++            Q::from((63, 64)),
++            Q::from((1, Integer::from(1) << 512)),
++        ] {
++            inputs.extend([q.clone(), -q]);
++        }
++        for bits in [64, 512] {
++            let q = Q::from(1) - Q::from((1, Integer::from(1) << bits));
++            inputs.extend([q.clone(), -q]);
++        }
++        assert_eq!(inputs.len(), 25);
++        for q in inputs {
++            let bounds = oracle(&q);
++            let warm = imported(&q);
++            for p in [4, 2, 1, 0, -1, -32, -128, -512, -8, 2, 1, 0] {
++                encloses(&imported(&q), p, &bounds);
++                encloses(&warm, p, &bounds);
++            }
++        }
++    }
++
++    #[test]
++    fn rational_atanh_range_reduction_recovers_after_cancellation() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        crate::mpfr_test::cleanup_on_thread_exit();
++        for magnitude in [
++            Q::from((31, 32)),
++            Q::from(1) - Q::from((1, Integer::from(1) << 512)),
++        ] {
++            for q in [magnitude.clone(), -magnitude] {
++                let value = imported(&q);
++                let signal = Arc::new(AtomicBool::new(true));
++                let _ = value.approx_signal(&Some(signal.clone()), -128);
++                assert!(value.cached().is_none());
++                signal.store(false, Ordering::Relaxed);
++                let resumed = value.approx_signal(&Some(signal), -128);
++                assert_eq!(resumed, value.approx(-128));
++                encloses(&value, -128, &oracle(&q));
++            }
++        }
++    }
++}
+diff --git a/crates/hyperreal/tests/serde_atanh_rational_ranges.rs b/crates/hyperreal/tests/serde_atanh_rational_ranges.rs
+new file mode 100644
+index 000000000..4f27f0791
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_atanh_rational_ranges.rs
+@@ -0,0 +1,175 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real, RealSign};
++use serde_json::{Value, json};
++
++fn node(kind: &str, argument: Value) -> Value {
++    json!({"internal": {kind: argument}})
++}
++
++fn bytes(value: &Value) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++#[test]
++fn imported_rational_atanh_preserves_enclosures_and_following_arithmetic() {
++    // atanh(31/32)=ln(63)/2. From 8/3<e<11/4, e^4<63<e^6,
++    // hence 2<atanh(31/32)<3 independently of the scalar evaluator.
++    let mut cases = vec![(
++        Rational::fraction(31, 32).unwrap(),
++        1,
++        Rational::new(2),
++        Rational::new(3),
++    )];
++    // atanh((2^256-1)/(2^256+1))=128*ln(2). The independent
++    // bounds e^2<8 and e>2 give 256/3 < 128*ln(2) < 128.
++    let power: num::BigInt = num::BigInt::from(1) << 256;
++    let near_one = Rational::from_bigint_fraction(
++        &power - 1,
++        (&power + num::BigInt::from(1)).to_biguint().unwrap(),
++    )
++    .unwrap();
++    cases.push((
++        near_one,
++        4,
++        Rational::fraction(256, 3).unwrap(),
++        Rational::new(128),
++    ));
++    for (magnitude, coarse, positive_lo, positive_hi) in cases {
++        for negative in [false, true] {
++            let (argument, lower, upper) = if negative {
++                (
++                    -magnitude.clone(),
++                    -positive_hi.clone(),
++                    -positive_lo.clone(),
++                )
++            } else {
++                (magnitude.clone(), positive_lo.clone(), positive_hi.clone())
++            };
++            let graph = node("AtanhRational", serde_json::to_value(argument).unwrap());
++            let collection = json!([node("Ratio", json!(Rational::one())), graph]);
++            let mut json_collection: Vec<Computable> =
++                serde_json::from_value(collection.clone()).unwrap();
++            let mut cbor_collection: Vec<Computable> =
++                ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++            let values = [
++                serde_json::from_value::<Computable>(graph.clone()).unwrap(),
++                ciborium::de::from_reader(bytes(&graph).as_slice()).unwrap(),
++                json_collection.pop().unwrap(),
++                cbor_collection.pop().unwrap(),
++            ];
++            for value in values {
++                assert_eq!(serde_json::to_value(&value).unwrap(), graph);
++                for p in [coarse, -64, coarse] {
++                    let a = Rational::from_bigint(value.approx(p));
++                    let unit: Rational = if p >= 0 {
++                        Rational::new(1_i64 << p)
++                    } else {
++                        format!("1/{}", 1_u128 << -p).parse().unwrap()
++                    };
++                    let center = a * &unit;
++                    assert!(&center - &unit < upper && &center + &unit > lower);
++                }
++                assert_eq!(serde_json::to_value(value).unwrap(), graph);
++            }
++            for scale in [0, 1, -3] {
++                let wire = json!({"rational":Rational::new(scale),"class":"Irrational","computable":graph});
++                let cbor = ciborium::Value::serialized(&wire).unwrap();
++                let collection = json!([Real::one(), wire]);
++                let mut values = vec![
++                    Real::from_json(&wire.to_string()).unwrap(),
++                    Real::from_bytes(&bytes(&wire)).unwrap(),
++                    Real::try_from(&cbor).unwrap(),
++                    Real::try_from(cbor).unwrap(),
++                ];
++                let mut a: Vec<Real> = serde_json::from_value(collection.clone()).unwrap();
++                let mut b: Vec<Real> =
++                    ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++                values.push(a.pop().unwrap());
++                values.push(b.pop().unwrap());
++                let factor = Rational::new(scale);
++                let (lo_bound, hi_bound) = if scale >= 0 {
++                    (&lower * &factor, &upper * &factor)
++                } else {
++                    (&upper * &factor, &lower * &factor)
++                };
++                let sign = if scale == 0 {
++                    RealSign::Zero
++                } else if lo_bound > Rational::zero() {
++                    RealSign::Positive
++                } else {
++                    RealSign::Negative
++                };
++                for value in values {
++                    let json = value.to_json();
++                    let cbor = value.to_bytes();
++                    for p in [coarse, -64, coarse] {
++                        let [lo, hi] = value.certified_rational_interval(p).unwrap();
++                        if scale == 0 {
++                            assert!(lo <= Rational::zero() && hi >= Rational::zero());
++                        } else {
++                            assert!(lo < hi_bound && hi > lo_bound);
++                            if p == -64 {
++                                assert!(lo > lo_bound && hi < hi_bound);
++                            }
++                        }
++                        assert_eq!(value.certified_sign_until(p).sign(), Some(sign));
++                    }
++                    let [lo, hi] = (&value + Real::one())
++                        .certified_rational_interval(-32)
++                        .unwrap();
++                    assert!(lo >= &lo_bound + Rational::one() && hi <= &hi_bound + Rational::one());
++                    assert_eq!(value.to_json(), json);
++                    assert_eq!(value.to_bytes(), cbor);
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn rational_atanh_import_preserves_typed_domain_failures() {
++    for argument in [-2, -1, 1, 2] {
++        let graph = node("AtanhRational", json!(Rational::new(argument)));
++        for invalid in [
++            graph.clone(),
++            node(
++                "Multiply",
++                json!([node("Ratio", json!(Rational::zero())), graph]),
++            ),
++        ] {
++            assert!(serde_json::from_value::<Computable>(invalid.clone()).is_err());
++            assert!(
++                ciborium::de::from_reader::<Computable, _>(bytes(&invalid).as_slice()).is_err()
++            );
++            let collection = json!([node("Ratio", json!(Rational::one())), invalid]);
++            assert!(serde_json::from_value::<Vec<Computable>>(collection.clone()).is_err());
++            assert!(
++                ciborium::de::from_reader::<Vec<Computable>, _>(bytes(&collection).as_slice())
++                    .is_err()
++            );
++            for scale in [0, 1, -3] {
++                let wire = json!({"rational":Rational::new(scale),"class":"Irrational","computable":invalid});
++                let cbor = ciborium::Value::serialized(&wire).unwrap();
++                assert!(matches!(
++                    Real::from_json(&wire.to_string()),
++                    Err(Problem::ParseError)
++                ));
++                assert!(matches!(
++                    Real::from_bytes(&bytes(&wire)),
++                    Err(Problem::ParseError)
++                ));
++                assert!(matches!(Real::try_from(&cbor), Err(Problem::ParseError)));
++                assert!(matches!(Real::try_from(cbor), Err(Problem::ParseError)));
++                let collection = json!([Real::one(), wire]);
++                assert!(serde_json::from_value::<Vec<Real>>(collection.clone()).is_err());
++                assert!(
++                    ciborium::de::from_reader::<Vec<Real>, _>(bytes(&collection).as_slice())
++                        .is_err()
++                );
++            }
++        }
++    }
++}
