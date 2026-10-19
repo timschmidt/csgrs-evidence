@@ -1,0 +1,612 @@
+diff --git a/crates/hypercurve/tests/svg_scalar_failures.rs b/crates/hypercurve/tests/svg_scalar_failures.rs
+index 6e8def212..144aca819 100644
+--- a/crates/hypercurve/tests/svg_scalar_failures.rs
++++ b/crates/hypercurve/tests/svg_scalar_failures.rs
+@@ -40,12 +40,19 @@ fn exact_svg_rejects_a_coordinate_without_its_required_scalar_payload() {
+ fn exact_svg_rejects_undefined_scalar_graphs_before_publishing_a_path() {
+     // CBOR Real records with rational=1 and class=Irrational. The respective
+     // graphs include Sqrt(-1), Inverse(0), Inverse(1 + (-1)), and a zero
+-    // product hiding that last inverse. None denotes a real coordinate.
++    // product hiding that last inverse, and Inverse(pi - pi). None denotes
++    // a real coordinate.
+     for invalid in [
+         b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
+             \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\
+             \xa1\x68internal\xa1\x64Sqrt\xa1\x68internal\xa1\x63Int\x82\x20\x81\x01"
+             .as_slice(),
++        b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
++            \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\
++            \xa1\x68internal\xa1\x67Inverse\xa1\x68internal\xa1\x63Add\x82\
++            \xa1\x68internal\xa1\x68Constant\x62Pi\
++            \xa1\x68internal\xa1\x66Negate\xa1\x68internal\xa1\x68Constant\x62Pi"
++            .as_slice(),
+         b"\xa3\x68rational\xa3\x64sign\x01\x69numerator\x81\x01\
+             \x6bdenominator\x81\x01\x65class\x6aIrrational\x6acomputable\
+             \xa1\x68internal\xa1\x67Inverse\xa1\x68internal\xa1\x63Int\x82\x00\x80"
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index aa494412d..02717b480 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -390,10 +390,17 @@ Such invalid graphs previously accepted, or reported as `UnknownCertificate`,
+ now return `ParseError`. Valid graphs retain their wire representation.
+ This optional proof uses the existing limits of 512 nodes, depth 64, 8192
+ operations and 4096 coefficient bits; existing exact-leaf checks still apply
+-to larger leaves. Both operands are checked even under a zero factor. An
+-opaque operand or exhausted proof budget leaves the domain unproved; acceptance
+-does not certify an arbitrary graph's domain. General expression domains,
+-kernel ranges and whole-input resource limits remain incomplete.
++to larger leaves. Both operands are checked even under a zero factor.
++When these proofs decline, a separate attempt uses the same bounded algebra
++to reject symbolic domain contradictions, such as `inverse(x - x)`. Either a
++dependency is undefined, or every dependency is real and the denominator is
++zero; neither case defines a reciprocal. This conditional proof publishes no
++value or sign and cannot certify a cancelled dependency. A conditional value
++inside the requested domain does not establish validity. The attempt also
++retains the existing limits of 32 atoms, 64 terms and polynomial degree 8.
++An inconclusive or exhausted proof leaves the domain unproved; acceptance does
++not certify an arbitrary graph's domain. General expression domains, kernel
++ranges and whole-input resource limits remain incomplete.
+ Inverse-cosine endpoint facts distinguish `acos(1) = acosh(1) = 0`; an imported
+ `acosh` node needs evidence about its argument before claiming a positive sign.
+ The native rational reader recognizes these exact endpoints so later arithmetic
+diff --git a/crates/hyperreal/src/computable/node/representation.rs b/crates/hyperreal/src/computable/node/representation.rs
+index d8611bd03..badc1973f 100644
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -7,9 +7,11 @@
+ /// With `serde`, decoding rejects out-of-domain exact rational arguments to
+ /// partial functions and known violations of stored kernel parameter ranges.
+ /// This includes defined rational arithmetic recognized by the bounded shared
+-/// evaluator. An opaque expression or an exhausted recognition budget leaves
+-/// the domain unproved; decoding does not validate arbitrary expression domains
+-/// or refine an operand to decide them. Valid expression graphs are preserved.
++/// evaluator, and symbolic identities that contradict a required domain.
++/// Conditional identities can reject a graph but never certify its value.
++/// An inconclusive proof leaves the domain unproved; decoding does not validate
++/// arbitrary expression domains or refine an operand to decide them. Valid
++/// expression graphs are preserved.
+ #[derive(Clone, Debug)]
+ #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+ #[cfg(not(verus_keep_ghost))]
+@@ -63,14 +65,25 @@ impl<'de> Deserialize<'de> for Node {
+ 
+ #[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+ impl Node {
+-    fn serialized_rational_argument(value: &Computable) -> Option<Rational> {
++    fn serialized_argument_violates(
++        value: &Computable,
++        invalid: impl Fn(&Rational) -> bool,
++    ) -> bool {
+         // Preserve existing exact proofs, including large rational leaves.
+         // The bounded fallback checks every operand and inverse denominator;
+         // unlike general algebraic cancellation, it never erases an opaque
+         // child's unresolved domain obligation, even under a zero factor.
+-        value
++        if let Some(rational) = value
+             .exact_rational()
+             .or_else(|| value.bounded_defined_rational())
++        {
++            return invalid(&rational);
++        }
++        // For rejection only, assume opaque dependencies denote reals and
++        // ask whether the existing quotient proof contradicts the domain.
++        // No conditional value/sign is published, including when it happens
++        // to satisfy this domain: that does not prove its dependencies valid.
++        value.bounded_domain_contradiction(invalid)
+     }
+ 
+     fn check_serialized_kernel_parameters(
+@@ -91,9 +104,11 @@ impl Node {
+                     || Computable::exact_rational_half_pi_shortcut_magnitude(r).is_none()
+             }
+             Approximation::SincSmall(argument) | Approximation::CoscSmall(argument) => {
+-                if let Some(rational) = Self::serialized_rational_argument(argument) {
++                if Self::serialized_argument_violates(argument, |rational| {
+                     let limit = Rational::fraction(3, 4).expect("nonzero constant denominator");
+                     rational.compare_magnitude(&limit) == Ordering::Greater
++                }) {
++                    true
+                 } else if let Approximation::Constant(constant) = &argument.internal.approximation {
+                     // A certified MSD >= 0 proves |x| >= 1 > 3/4. Inspect only
+                     // these trusted constants; do not refine an untrusted
+@@ -127,13 +142,13 @@ impl Node {
+         let outside_positive_unit = |r: &Rational| r.sign() == Sign::Minus || r > &Rational::one();
+         let invalid = match approximation {
+             Approximation::Inverse(value) | Approximation::PrescaledCot(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| r.sign() == Sign::NoSign)
++                Self::serialized_argument_violates(value, |r| r.sign() == Sign::NoSign)
+             }
+             Approximation::Sqrt(value) | Approximation::NthRoot(value, _) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| r.sign() == Sign::Minus)
++                Self::serialized_argument_violates(value, |r| r.sign() == Sign::Minus)
+             }
+             Approximation::PrescaledLn(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| r <= -Rational::one())
++                Self::serialized_argument_violates(value, |r| r <= &-Rational::one())
+             }
+             // These variants store x for ln(1+x), not the logarithm's input.
+             Approximation::PrescaledLnRational(r)
+@@ -141,24 +156,27 @@ impl Node {
+             Approximation::IntegralAtan(denominator) => denominator.is_zero(),
+             Approximation::AsinRational(r) => outside_closed_unit(r),
+             Approximation::PrescaledAsin(value) | Approximation::AsinDeferred(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| outside_closed_unit(&r))
++                Self::serialized_argument_violates(value, outside_closed_unit)
+             }
+             // Both rational endpoint variants store an absolute argument.
+             Approximation::AcosPositiveRational(r) | Approximation::AcosNegativeRational(r) => {
+                 outside_positive_unit(r)
+             }
+             Approximation::AcosPositive(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| outside_positive_unit(&r))
++                Self::serialized_argument_violates(value, outside_positive_unit)
+             }
+             Approximation::AtanhRational(r) => outside_open_unit(r),
+             Approximation::PrescaledAtanh(value) | Approximation::AtanhDirect(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| outside_open_unit(&r))
++                Self::serialized_argument_violates(value, outside_open_unit)
+             }
+             Approximation::AcoshNearOne(value) | Approximation::AcoshDirect(value) => {
+-                Self::serialized_rational_argument(value).is_some_and(|r| r < Rational::one())
++                Self::serialized_argument_violates(value, |r| r < &Rational::one())
++            }
++            Approximation::NormalQuantile(data) => {
++                Self::serialized_argument_violates(&data.p, |r| {
++                    r.sign() != Sign::Plus || r >= &Rational::one()
++                })
+             }
+-            Approximation::NormalQuantile(data) => Self::serialized_rational_argument(&data.p)
+-                .is_some_and(|r| r.sign() != Sign::Plus || r >= Rational::one()),
+             _ => false,
+         };
+         if invalid {
+diff --git a/crates/hyperreal/src/computable/node/ring_quotient.rs b/crates/hyperreal/src/computable/node/ring_quotient.rs
+index cdacd5dc3..f8b0032b0 100644
+--- a/crates/hyperreal/src/computable/node/ring_quotient.rs
++++ b/crates/hyperreal/src/computable/node/ring_quotient.rs
+@@ -248,6 +248,38 @@ impl<'a> RingRecognition<'a> {
+ }
+ 
+ impl Computable {
++    // A conditional identity can refute an imported domain even when an
++    // opaque atom's own domain is unknown: either a dependency is undefined,
++    // or all dependencies are real and the projected argument is invalid.
++    // Keep this rejection-only. Publishing the conditional rational or its
++    // sign would turn an assumed domain into a certificate of a real value.
++    #[cfg(feature = "serde")]
++    fn bounded_domain_contradiction(&self, invalid: impl FnOnce(&Rational) -> bool) -> bool {
++        // The caller already tried exact leaves and defined rational forms.
++        // Every other non-arithmetic root expands to one opaque atom, which
++        // cannot project to a rational. Avoid allocating that doomed attempt.
++        if !matches!(
++            self.internal.approximation,
++            Approximation::Add(..)
++                | Approximation::Multiply(..)
++                | Approximation::Square(..)
++                | Approximation::Negate(..)
++                | Approximation::Offset(..)
++                | Approximation::LinearCombination3(..)
++                | Approximation::Inverse(..)
++        ) {
++            return false;
++        }
++        let mut recognition = RingRecognition::new(self);
++        let Some(quotient) = recognition.expand_quotient(self, RingRecognition::MAX_DEPTH) else {
++            return false;
++        };
++        let Some(rational) = recognition.project_quotient(&quotient) else {
++            return false;
++        };
++        !should_stop(&self.signal) && invalid(&rational)
++    }
++
+     pub(crate) fn bounded_quotient_rational(&self) -> Option<Rational> {
+         self.bounded_quotient_projection(false, false)
+     }
+diff --git a/crates/hyperreal/src/computable/node/ring_quotient_tests.rs b/crates/hyperreal/src/computable/node/ring_quotient_tests.rs
+index 5570eea5b..e14f396d5 100644
+--- a/crates/hyperreal/src/computable/node/ring_quotient_tests.rs
++++ b/crates/hyperreal/src/computable/node/ring_quotient_tests.rs
+@@ -40,6 +40,57 @@ mod ring_quotient_tests {
+         assert!(value.cached().is_none());
+     }
+ 
++    #[test]
++    #[cfg(feature = "serde")]
++    fn domain_contradictions_never_publish_conditional_facts() {
++        let atom = raw(Approximation::Sqrt(raw(Approximation::Negate(raw(
++            Approximation::AtanRational(Rational::one()),
++        )))));
++        let value = raw(Approximation::Multiply(Computable::zero(), atom.clone()));
++        // If the atom denotes a real, this product is zero. That condition
++        // suffices to reject its reciprocal, but does not define the product.
++        assert!(value.bounded_domain_contradiction(Rational::is_zero));
++        assert!(!value.bounded_domain_contradiction(|r| r.sign() == Sign::Minus));
++        assert_unproved(&value);
++        assert_unproved(&atom);
++        assert_eq!(value.bounded_defined_rational(), None);
++        assert_unproved(&value);
++
++        let distinct = raw(Approximation::Add(Computable::pi(), Computable::one()));
++        assert!(!distinct.bounded_domain_contradiction(|_| true));
++        assert_unproved(&distinct);
++    }
++
++    #[test]
++    #[cfg(feature = "serde")]
++    fn domain_contradiction_limits_and_abort_preserve_facts_and_recover() {
++        let atom = raw(Approximation::PrescaledSin(Computable::rational(
++            Rational::fraction(1, 2).unwrap(),
++        )));
++        let mut value = raw(Approximation::Add(
++            atom.clone(),
++            raw(Approximation::Negate(atom.clone())),
++        ));
++        let mut deep = value.clone();
++        for _ in 0..RingRecognition::MAX_DEPTH {
++            deep = raw(Approximation::Negate(deep));
++        }
++        assert!(!deep.bounded_domain_contradiction(Rational::is_zero));
++        assert_unproved(&deep);
++        assert_unproved(&value);
++        let signal = Arc::new(AtomicBool::new(true));
++        value.abort(signal.clone());
++        assert!(!value.bounded_domain_contradiction(Rational::is_zero));
++        assert_unproved(&value);
++        signal.store(false, std::sync::atomic::Ordering::Relaxed);
++        for precision in [-8, -64, -8] {
++            assert_eq!(atom.sign_until(precision), Some(RealSign::Positive));
++            assert!(value.bounded_domain_contradiction(Rational::is_zero));
++            assert_unproved(&value);
++            assert_eq!(atom.immediate_sign(), Some(RealSign::Positive));
++        }
++    }
++
+     #[test]
+     fn quotient_reuse_requires_a_real_nonzero_proof_and_can_recover() {
+         let denominator = positive_denominator();
+@@ -221,7 +272,10 @@ mod ring_quotient_tests {
+                 raw(Approximation::Add(left, right)),
+                 raw(Approximation::Negate(eighth_power.clone())),
+             ));
+-            assert_eq!(difference.bounded_quotient_rational(), Some(Rational::zero()));
++            assert_eq!(
++                difference.bounded_quotient_rational(),
++                Some(Rational::zero())
++            );
+             assert!(product.cached().is_none());
+             assert!(difference.cached().is_none());
+         }
+diff --git a/crates/hyperreal/src/serde.rs b/crates/hyperreal/src/serde.rs
+index 8392d678f..218ebe380 100644
+--- a/crates/hyperreal/src/serde.rs
++++ b/crates/hyperreal/src/serde.rs
+@@ -23,9 +23,11 @@ impl Real {
+     /// equality is undecided returns [`Problem::UnknownCertificate`]. A supplied
+     /// payload is preserved only after proving its relationship to the class.
+     /// Known domain and kernel-range violations, including bounded rational
+-    /// arithmetic arguments, return [`Problem::ParseError`] before an outer
+-    /// scale or identity can hide them. Opaque expressions and expressions that
+-    /// exceed the rational recognizer's budget are not fully domain-validated.
++    /// arithmetic arguments and symbolic domain contradictions, return
++    /// [`Problem::ParseError`] before an outer scale or identity can hide them.
++    /// Conditional algebraic identities are used only to reject invalid inputs,
++    /// never to certify their values. General expression domains and expressions
++    /// exceeding the bounded recognizer's budget are not fully validated.
+     pub fn from_json(json: &str) -> Result<Self, Problem> {
+         serde_json::from_str::<RealWire>(json)
+             .map_err(|_| Problem::ParseError)?
+diff --git a/crates/hyperreal/tests/serde_kernel_invariants.rs b/crates/hyperreal/tests/serde_kernel_invariants.rs
+index a38e3d5c5..6c928f0b1 100644
+--- a/crates/hyperreal/tests/serde_kernel_invariants.rs
++++ b/crates/hyperreal/tests/serde_kernel_invariants.rs
+@@ -146,13 +146,27 @@ fn endpoint_proofs_reject_undefined_rational_arithmetic_children() {
+ }
+ 
+ #[test]
+-fn endpoint_proofs_do_not_erase_unresolved_domain_obligations() {
+-    // The rational-only domain proof deliberately does not cancel opaque
+-    // atoms. Keep this unresolved case alongside the rejected rational one.
++fn endpoint_import_rejects_symbolically_zero_denominators() {
++    // Retain the original regression: its reciprocal is undefined whether
++    // the opaque sine denotes a real value or has an invalid stored range.
+     let sine = node("PrescaledSin", leaf(1, 1));
+     let denominator = node("Add", json!([sine, node("Negate", sine.clone())]));
+     let invalid = node("Inverse", denominator);
+     let hidden = node("Multiply", json!([leaf(0, 1), invalid]));
++    assert!(serde_json::from_value::<Computable>(hidden.clone()).is_err());
++    for kind in ["AcoshNearOne", "AcoshDirect"] {
++        let argument = node("Add", json!([hidden, leaf(1, 1)]));
++        assert!(serde_json::from_value::<Computable>(node(kind, argument)).is_err());
++    }
++}
++
++#[test]
++fn endpoint_proofs_do_not_erase_unresolved_domain_obligations() {
++    // sqrt(-atan(1)) is undefined but is not a rational-domain contradiction
++    // recognized by this bounded proof. Conditional cancellation may refute
++    // an outer domain; it must never certify this child or an endpoint value.
++    let invalid = node("Sqrt", node("Negate", node("AtanRational", q(1, 1))));
++    let hidden = node("Multiply", json!([leaf(0, 1), invalid]));
+     let value: Computable = serde_json::from_value(hidden.clone()).unwrap();
+     // General graph admission still accepts this undefined expression. Its
+     // existing sign fact is not a domain proof and must not erase the inverse.
+diff --git a/tests/scalar_certificate_failures.rs b/tests/scalar_certificate_failures.rs
+index 7de7d018d..a52641809 100644
+--- a/tests/scalar_certificate_failures.rs
++++ b/tests/scalar_certificate_failures.rs
+@@ -84,6 +84,35 @@ fn an_undefined_arithmetic_import_cannot_publish_a_model() {
+     }
+ }
+ 
++#[test]
++#[cfg(feature = "svg-io")]
++fn a_symbolically_undefined_import_cannot_publish_a_model() {
++    // pi - pi is zero independently of any numerical refinement.
++    let pi = r#"{"internal":{"Constant":"Pi"}}"#;
++    let graph = format!(
++        r#"{{"internal":{{"Inverse":{{"internal":{{"Add":[{pi},{{"internal":{{"Negate":{pi}}}}}]}}}}}}}}"#
++    );
++    for rational in [
++        r#"{"sign":0,"numerator":[],"denominator":[1]}"#,
++        r#"{"sign":1,"numerator":[1],"denominator":[1]}"#,
++    ] {
++        let wire =
++            format!(r#"{{"rational":{rational},"class":"Irrational","computable":{graph}}}"#);
++        let mut constructed = false;
++        let result = csgrs::Real::from_json(&wire)
++            .map_err(ValidationError::from)
++            .and_then(|side| {
++                constructed = true;
++                csgrs::solid::cube(side)
++            });
++        assert!(!constructed);
++        assert!(matches!(
++            result,
++            Err(ValidationError::Scalar(Problem::ParseError))
++        ));
++    }
++}
++
+ #[test]
+ #[cfg(feature = "svg-io")]
+ fn svg_import_retains_the_typed_scalar_failure() {
+diff --git a/crates/hyperreal/tests/serde_symbolic_domains.rs b/crates/hyperreal/tests/serde_symbolic_domains.rs
+new file mode 100644
+index 000000000..6ccec1833
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_symbolic_domains.rs
+@@ -0,0 +1,233 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real};
++use serde_json::{Value, json};
++
++fn q(n: i64, d: u64) -> Value {
++    serde_json::to_value(Rational::fraction(n, d).unwrap()).unwrap()
++}
++
++fn node(kind: &str, argument: Value) -> Value {
++    json!({"internal": {kind: argument}})
++}
++
++fn leaf(n: i64, d: u64) -> Value {
++    node("Ratio", q(n, d))
++}
++
++fn add(a: Value, b: Value) -> Value {
++    node("Add", json!([a, b]))
++}
++
++fn multiply(a: Value, b: Value) -> Value {
++    node("Multiply", json!([a, b]))
++}
++
++fn cbor(value: &impl serde::Serialize) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++// Each form is n/d whenever x denotes a real. This is a conditional ring
++// identity, not a proof that x or the resulting expression is defined.
++fn spellings(x: &Value, n: i64, d: u64) -> Vec<Value> {
++    let cancelled = add(x.clone(), node("Negate", x.clone()));
++    let square = node("Square", x.clone());
++    let expanded = multiply(add(x.clone(), leaf(1, 1)), add(x.clone(), leaf(-1, 1)));
++    vec![
++        add(cancelled.clone(), leaf(n, d)),
++        add(multiply(leaf(0, 1), x.clone()), leaf(n, d)),
++        add(node("Offset", json!([cancelled.clone(), 2])), leaf(n, d)),
++        add(
++            add(
++                square.clone(),
++                node("Negate", multiply(x.clone(), x.clone())),
++            ),
++            leaf(n, d),
++        ),
++        add(add(expanded, node("Negate", square)), leaf(n + d as i64, d)),
++        node(
++            "LinearCombination3",
++            json!({
++                "coefficients": [x, x, leaf(n, d)], "values": [q(2, 1), q(-2, 1), q(1, 1)],
++            }),
++        ),
++        add(
++            node("Inverse", add(cancelled, leaf(2, 1))),
++            leaf(2 * n - d as i64, 2 * d),
++        ),
++    ]
++}
++
++fn function(kind: &str, argument: Value) -> Value {
++    match kind {
++        "NthRoot" => node(kind, json!([argument, 3])),
++        "NormalQuantile" => node(kind, json!({"p":argument,"seed":[0,[]],"seed_prec":-16})),
++        _ => node(kind, argument),
++    }
++}
++
++fn atoms() -> Vec<Value> {
++    vec![
++        node("PrescaledSin", leaf(1, 2)),
++        node("Constant", json!("Pi")),
++        node("Sqrt", leaf(2, 1)),
++        // Unknown to rational admission, although sqrt(-atan(1)) is undefined.
++        node("Sqrt", node("Negate", node("AtanRational", q(1, 1)))),
++    ]
++}
++
++#[test]
++fn symbolic_domain_contradictions_fail_before_wrappers_can_publish_values() {
++    for x in atoms() {
++        for (kind, n, d) in [
++            ("Inverse", 0, 1),
++            ("PrescaledCot", 0, 1),
++            ("Sqrt", -1, 1_000_000_000_000),
++            ("NthRoot", -1, 1_000_000_000_000),
++            ("PrescaledLn", -1, 1),
++            ("PrescaledAsin", 1001, 1000),
++            ("AsinDeferred", -1001, 1000),
++            ("AcosPositive", -1, 1000),
++            ("PrescaledAtanh", -1, 1),
++            ("AtanhDirect", 1, 1),
++            ("AcoshNearOne", 999, 1000),
++            ("AcoshDirect", 999, 1000),
++            ("NormalQuantile", 1, 1),
++            ("SincSmall", 751, 1000),
++            ("CoscSmall", -751, 1000),
++        ] {
++            for argument in spellings(&x, n, d) {
++                let invalid = function(kind, argument);
++                for graph in [
++                    invalid.clone(),
++                    multiply(leaf(0, 1), invalid.clone()),
++                    multiply(invalid.clone(), leaf(0, 1)),
++                    add(invalid.clone(), node("Negate", invalid.clone())),
++                    node(
++                        "LinearCombination3",
++                        json!({
++                            "coefficients": [leaf(1,1),invalid,leaf(2,1)],
++                            "values": [q(1,1),q(0,1),q(1,1)],
++                        }),
++                    ),
++                ] {
++                    let error = serde_json::from_value::<Computable>(graph.clone()).unwrap_err();
++                    let message = error.to_string();
++                    assert!(
++                        message.contains("domain") || message.contains("kernel range"),
++                        "{message}"
++                    );
++                    assert!(
++                        ciborium::de::from_reader::<Computable, _>(cbor(&graph).as_slice())
++                            .is_err()
++                    );
++                    for scale in [0, 1, -3] {
++                        let wire =
++                            json!({"rational":q(scale,1),"class":"Irrational","computable":graph});
++                        assert_eq!(Real::from_json(&wire.to_string()), Err(Problem::ParseError));
++                        assert_eq!(Real::from_bytes(&cbor(&wire)), Err(Problem::ParseError));
++                        let value = ciborium::Value::serialized(&wire).unwrap();
++                        assert_eq!(Real::try_from(&value), Err(Problem::ParseError));
++                        assert_eq!(Real::try_from(value), Err(Problem::ParseError));
++                        let collection = json!([Real::one(), wire]);
++                        assert!(serde_json::from_value::<Vec<Real>>(collection.clone()).is_err());
++                        assert!(
++                            ciborium::de::from_reader::<Vec<Real>, _>(cbor(&collection).as_slice())
++                                .is_err()
++                        );
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn valid_symbolic_cancellation_keeps_graphs_and_composes_after_import() {
++    // Use only defined x here. The function bounds are independent elementary
++    // inequalities; agreement of JSON and CBOR alone is not the oracle.
++    for x in atoms().into_iter().take(3) {
++        for (kind, n, d, lower, upper) in [
++            ("Inverse", 2, 1, 0, 1),
++            ("PrescaledCot", 1, 2, 1, 2),
++            ("Sqrt", 4, 1, 2, 2),
++            ("NthRoot", 8, 1, 2, 2),
++            ("PrescaledLn", 1, 2, 0, 1),
++            ("PrescaledAsin", 1, 2, 0, 1),
++            ("AsinDeferred", -1, 2, -1, 0),
++            ("AcosPositive", 1, 2, 1, 2),
++            ("PrescaledAtanh", -1, 2, -1, 0),
++            ("AtanhDirect", 1, 2, 0, 1),
++            ("AcoshNearOne", 2, 1, 1, 2),
++            ("AcoshDirect", 2, 1, 1, 2),
++            ("NormalQuantile", 1, 2, 0, 0),
++            ("SincSmall", 1, 2, 0, 1),
++            ("CoscSmall", -1, 2, 0, 1),
++        ] {
++            for argument in spellings(&x, n, d) {
++                let graph = function(kind, argument);
++                let wire = json!({"rational":q(1,1),"class":"Irrational","computable":graph});
++                let source = Real::from_json(&wire.to_string()).unwrap();
++                assert_eq!(serde_json::to_value(&source).unwrap(), wire);
++                let bytes = source.to_bytes();
++                let restored = Real::from_bytes(&bytes).unwrap();
++                assert_eq!(restored.to_bytes(), bytes);
++                let mut known = restored.structural_facts().sign;
++                let unit = Rational::fraction(1, 1_u64 << 32).unwrap();
++                for precision in [-8, -32, -8] {
++                    let [lo, hi] = restored.certified_rational_interval(precision).unwrap();
++                    if precision == -32 {
++                        assert!(
++                            lo >= Rational::new(lower) - &unit
++                                && hi <= Rational::new(upper) + &unit,
++                            "{kind}: [{lo},{hi}]"
++                        );
++                    }
++                    let facts = restored.structural_facts().sign;
++                    if known.is_some() {
++                        assert_eq!(facts, known);
++                    }
++                    known = facts;
++                }
++                assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
++                let [lo, hi] = (restored + Real::one())
++                    .certified_rational_interval(-32)
++                    .unwrap();
++                assert!(
++                    lo >= Rational::new(lower + 1) - &unit
++                        && hi <= Rational::new(upper + 1) + &unit
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn distinct_symbolic_inputs_are_not_cancelled_and_declined_proofs_can_recover() {
++    let sine = node("PrescaledSin", leaf(1, 2));
++    let other = node("PrescaledSin", leaf(1, 4));
++    // Sine is increasing on [1/4,1/2], so this reciprocal is defined and > 1.
++    let graph = node("Inverse", add(sine.clone(), node("Negate", other)));
++    let wire = json!({"rational":q(1,1),"class":"Irrational","computable":graph});
++    let value = Real::from_json(&wire.to_string()).unwrap();
++    assert_eq!(serde_json::to_value(&value).unwrap(), wire);
++    assert!(value.certified_rational_interval(-32).unwrap()[0] > Rational::one());
++
++    // Exceed only optional proof depth. Acceptance is not a validity proof.
++    let mut deep = sine.clone();
++    for _ in 0..70 {
++        deep = node("Negate", deep);
++    }
++    let graph = node("Inverse", add(deep, leaf(1, 1)));
++    let value: Computable = ciborium::Value::serialized(&graph)
++        .unwrap()
++        .deserialized()
++        .unwrap();
++    assert_eq!(serde_json::to_value(value).unwrap(), graph);
++    let invalid = node("Inverse", add(sine.clone(), node("Negate", sine)));
++    for _ in 0..3 {
++        assert!(serde_json::from_value::<Computable>(invalid.clone()).is_err());
++    }
++}
