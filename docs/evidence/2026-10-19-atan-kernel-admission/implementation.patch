@@ -1,0 +1,622 @@
+diff --git a/crates/hyperreal/README.md b/crates/hyperreal/README.md
+index 693c15e4c..f614735d7 100644
+--- a/crates/hyperreal/README.md
++++ b/crates/hyperreal/README.md
+@@ -410,6 +410,11 @@ Rational logarithm kernels likewise prove their residual is small before using
+ the series or a coarse-zero shortcut. Larger or near-minus-one residuals reuse
+ native exact-rational logarithm reduction, including the binary-scaled form;
+ valid stored graphs retain their meaning and wire representation.
++The `PrescaledAtan` evaluator also checks the small-series range at evaluation
++time. Larger rational arguments reuse native rational reduction; other real
++arguments use the shared half-angle construction twice to ensure convergence.
++This preserves valid imported graphs and their meaning across refinement,
++without proving the domain of an arbitrary child expression.
+ Inverse-cosine endpoint facts distinguish `acos(1) = acosh(1) = 0`; an imported
+ `acosh` node needs evidence about its argument before claiming a positive sign.
+ The native rational reader recognizes these exact endpoints so later arithmetic
+diff --git a/crates/hyperreal/src/computable/approximation/inverse_trig.rs b/crates/hyperreal/src/computable/approximation/inverse_trig.rs
+index 5197109f6..4656cb6b4 100644
+--- a/crates/hyperreal/src/computable/approximation/inverse_trig.rs
++++ b/crates/hyperreal/src/computable/approximation/inverse_trig.rs
+@@ -52,9 +52,7 @@ fn atan(signal: &Option<Signal>, i: &BigInt, p: Precision) -> BigInt {
+ 
+ // Approximate atan(c) for |c| <= 1/2.
+ fn atan_computable(signal: &Option<Signal>, c: &Computable, p: Precision) -> BigInt {
+-    // Kernel precondition: |c| is small. Larger atan inputs are reduced by
+-    // subtraction of atan(1/2) or the reciprocal identity before reaching here.
+-    // Reduce the argument before evaluating the series.
++    // This coarse result is valid for every finite real c: |atan(c)| < pi/2 < 2.
+     if p >= 1 {
+         return Zero::zero();
+     }
+@@ -63,6 +61,25 @@ fn atan_computable(signal: &Option<Signal>, c: &Computable, p: Precision) -> Big
+     let calc_precision = p - bound_log2(2 * iterations_needed) - 5;
+     let op_prec = calc_precision - 3;
+     let op_appr = c.approx_signal(signal, op_prec);
++    // A stored PrescaledAtan tag is not a range certificate. The working
++    // sample has error at most one, so reserve that unit when proving |c| <= 1/2.
++    if op_appr.magnitude().bits()
++        > u64::try_from(-op_prec - 1).expect("atan series scale is positive")
++    {
++        if should_stop(signal) {
++            return Zero::zero();
++        }
++        if let Some(rational) = c.exact_rational() {
++            return atan_rational(signal, &rational, p);
++        }
++        // The ordinary reducer can select this same kernel from a valid
++        // coarse sample near 1/2. Two half-angle steps instead guarantee a
++        // strictly smaller argument, even at such cache-rounding boundaries.
++        return c
++            .clone()
++            .atan_with_half_angle_reduction()
++            .approx_signal(signal, p);
++    }
+     let op_squared = scale(&op_appr * &op_appr, op_prec);
+ 
+     // Borrowed magnitude checks matter here because tiny inverse-trig benches
+@@ -316,8 +333,8 @@ fn asin_rational(signal: &Option<Signal>, r: &Rational, p: Precision) -> BigInt
+         } else {
+             r.clone()
+         };
+-        let residual = (Rational::one() - magnitude.clone())
+-            / (Rational::one() + magnitude.clone());
++        let residual =
++            (Rational::one() - magnitude.clone()) / (Rational::one() + magnitude.clone());
+         if residual > Rational::fraction(1, 4).expect("nonzero denominator") {
+             // The generic acos residual branch has its own adaptive error
+             // schedule. Preserve the former expression-level approximation
+@@ -328,8 +345,7 @@ fn asin_rational(signal: &Option<Signal>, r: &Rational, p: Precision) -> BigInt
+                 "asin",
+                 "generic-rational-acos-complement"
+             );
+-            let half_pi = Computable::pi()
+-                .multiply(Computable::rational(HALF_RATIONAL.clone()));
++            let half_pi = Computable::pi().multiply(Computable::rational(HALF_RATIONAL.clone()));
+             let reduced = half_pi.add(Computable::rational(magnitude).acos().negate());
+             let result = reduced.approx_signal(signal, p);
+             return if sign == Sign::Minus { -result } else { result };
+@@ -398,7 +414,9 @@ fn asin_computable(signal: &Option<Signal>, c: &Computable, p: Precision) -> Big
+     // Reuse the series' own operand sample as its domain proof. With
+     // k = -op_prec-3, bits(|a|) <= k implies |a| <= 2^k-1; including the
+     // one-unit sample error gives |c| <= 1/8. No preliminary sample is needed.
+-    if op_appr.magnitude().bits() > u64::try_from(-op_prec - 3).expect("tiny-series scale is positive") {
++    if op_appr.magnitude().bits()
++        > u64::try_from(-op_prec - 3).expect("tiny-series scale is positive")
++    {
+         if should_stop(signal) {
+             return Zero::zero();
+         }
+diff --git a/crates/hyperreal/src/computable/node.rs b/crates/hyperreal/src/computable/node.rs
+index 63fd779df..9a2e025b9 100644
+--- a/crates/hyperreal/src/computable/node.rs
++++ b/crates/hyperreal/src/computable/node.rs
+@@ -57,3 +57,4 @@ include!("node/exact_sign_cache_tests.rs");
+ include!("node/trig_range_proof_tests.rs");
+ include!("node/asinh_range_tests.rs");
+ include!("node/log_rational_range_tests.rs");
++include!("node/atan_range_tests.rs");
+diff --git a/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs b/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
+index c03e5259f..d275e3278 100644
+--- a/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
++++ b/crates/hyperreal/src/computable/node/roots_inverse_hyperbolic.rs
+@@ -23,7 +23,11 @@ impl Computable {
+             _ => ExactSignCache::Valid(Sign::Plus),
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Sqrt(child), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Sqrt(child),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -120,7 +124,11 @@ impl Computable {
+             _ => ExactSignCache::Invalid,
+         };
+         Self {
+-            internal: Arc::new(Node::new(Approximation::Sqrt(self), BoundCache::Invalid, exact_sign)),
++            internal: Arc::new(Node::new(
++                Approximation::Sqrt(self),
++                BoundCache::Invalid,
++                exact_sign,
++            )),
+             signal: None,
+         }
+     }
+@@ -146,7 +154,11 @@ impl Computable {
+         // atan(1/n) kernel used by pi and atan reduction constants. Passing the
+         // denominator as an integer keeps the series loop division-only.
+         Self {
+-            internal: Arc::new(Node::new(Approximation::IntegralAtan(n), BoundCache::Invalid, ExactSignCache::Invalid)),
++            internal: Arc::new(Node::new(
++                Approximation::IntegralAtan(n),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
+             signal: None,
+         }
+     }
+@@ -158,7 +170,11 @@ impl Computable {
+         // same range reductions directly in the approximation kernel.
+         crate::trace_dispatch!("computable", "constructor", "atan-rational-deferred");
+         Self {
+-            internal: Arc::new(Node::new(Approximation::AtanRational(rational), BoundCache::Invalid, ExactSignCache::Invalid)),
++            internal: Arc::new(Node::new(
++                Approximation::AtanRational(rational),
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
+             signal: None,
+         }
+     }
+@@ -184,7 +200,11 @@ impl Computable {
+         crate::trace_dispatch!("computable", "constructor", "asin-rational-deferred");
+         let sign = rational.sign();
+         Self {
+-            internal: Arc::new(Node::new(Approximation::AsinRational(rational), BoundCache::Invalid, ExactSignCache::Valid(sign))),
++            internal: Arc::new(Node::new(
++                Approximation::AsinRational(rational),
++                BoundCache::Invalid,
++                ExactSignCache::Valid(sign),
++            )),
+             signal: None,
+         }
+     }
+@@ -200,11 +220,9 @@ impl Computable {
+                 scale.clone()
+             };
+             if magnitude == Rational::fraction(1, 35).expect("thirty-five is nonzero") {
+-                let argument = Rational::fraction(
+-                    if scale.sign() == Sign::Minus { -1 } else { 1 },
+-                    6,
+-                )
+-                .expect("six is nonzero");
++                let argument =
++                    Rational::fraction(if scale.sign() == Sign::Minus { -1 } else { 1 }, 6)
++                        .expect("six is nonzero");
+                 crate::trace_dispatch!("computable", "atan", "quadratic-surd-asin-anchor");
+                 return Self::asin_rational_deferred(argument);
+             }
+@@ -284,7 +302,11 @@ impl Computable {
+             if msd < -1 {
+                 crate::trace_dispatch!("computable", "atan", "structural-small-prescaled");
+                 return Self {
+-                    internal: Arc::new(Node::new(Approximation::PrescaledAtan(self), BoundCache::Invalid, ExactSignCache::Invalid)),
++                    internal: Arc::new(Node::new(
++                        Approximation::PrescaledAtan(self),
++                        BoundCache::Invalid,
++                        ExactSignCache::Invalid,
++                    )),
+                     signal: None,
+                 };
+             }
+@@ -301,7 +323,11 @@ impl Computable {
+             // |approx(-4)| <= 7 and its one-unit error prove |self| <= 1/2.
+             crate::trace_dispatch!("computable", "atan", "rough-small-prescaled");
+             return Self {
+-                internal: Arc::new(Node::new(Approximation::PrescaledAtan(self), BoundCache::Invalid, ExactSignCache::Invalid)),
++                internal: Arc::new(Node::new(
++                    Approximation::PrescaledAtan(self),
++                    BoundCache::Invalid,
++                    ExactSignCache::Invalid,
++                )),
+                 signal: None,
+             };
+         }
+@@ -362,11 +388,7 @@ impl Computable {
+     ///
+     /// Returns `None` rather than treating an unresolved sign as an axis value.
+     #[inline]
+-    pub fn try_atan2_until(
+-        self,
+-        x: Computable,
+-        min_precision: Precision,
+-    ) -> Option<Computable> {
++    pub fn try_atan2_until(self, x: Computable, min_precision: Precision) -> Option<Computable> {
+         let y_sign = self.structural_facts().sign.map(private_sign);
+         let x_sign = x.structural_facts().sign.map(private_sign);
+         match (y_sign, x_sign) {
+@@ -396,8 +418,7 @@ impl Computable {
+                 Some(self.multiply(x.inverse()).atan())
+             }
+             Some(Sign::Minus) => {
+-                let y_sign =
+-                    y_sign.or_else(|| self.sign_until(min_precision).map(private_sign))?;
++                let y_sign = y_sign.or_else(|| self.sign_until(min_precision).map(private_sign))?;
+                 let base = self.multiply(x.inverse()).atan();
+                 match y_sign {
+                     Sign::NoSign => {
+@@ -415,8 +436,7 @@ impl Computable {
+                 }
+             }
+             Some(Sign::NoSign) => {
+-                let y_sign =
+-                    y_sign.or_else(|| self.sign_until(min_precision).map(private_sign))?;
++                let y_sign = y_sign.or_else(|| self.sign_until(min_precision).map(private_sign))?;
+                 match y_sign {
+                     Sign::NoSign => Some(Self::zero()),
+                     Sign::Plus => Some(Self::pi().shift_right(1)),
+@@ -436,8 +456,22 @@ impl Computable {
+     }
+ 
+     fn atan2_half_angle(y: Computable, x: Computable) -> Computable {
++        Self::atan2_half_angle_argument(y, x).atan().shift_left(1)
++    }
++
++    fn atan2_half_angle_argument(y: Computable, x: Computable) -> Computable {
+         let radius = x.clone().square().add(y.clone().square()).sqrt();
+-        y.multiply(radius.add(x).inverse()).atan().shift_left(1)
++        y.multiply(radius.add(x).inverse())
++    }
++
++    pub(crate) fn atan_with_half_angle_reduction(self) -> Computable {
++        // For theta = atan(self), each step maps tan(theta) to tan(theta/2).
++        // Since |theta| < pi/2, two steps give an argument of magnitude
++        // below tan(pi/8) = sqrt(2)-1 < 1/2. Both denominators are positive,
++        // and the factor four retains the native approximation error budget.
++        let half = Self::atan2_half_angle_argument(self, Self::one());
++        let quarter = Self::atan2_half_angle_argument(half, Self::one());
++        quarter.atan().shift_left(2)
+     }
+ 
+     /// Inverse sine of this number.
+@@ -767,5 +801,4 @@ impl Computable {
+             .is_some_and(|msd| msd <= -4)
+             || self.approx_signal(signal, -8).magnitude() <= &BigUint::from(31_u8)
+     }
+-
+ }
+diff --git a/crates/hyperreal/src/computable/node/atan_range_tests.rs b/crates/hyperreal/src/computable/node/atan_range_tests.rs
+new file mode 100644
+index 000000000..9fa817617
+--- /dev/null
++++ b/crates/hyperreal/src/computable/node/atan_range_tests.rs
+@@ -0,0 +1,187 @@
++#[cfg(test)]
++mod atan_range_tests {
++    use super::*;
++    use rug::{Float, Integer, Rational as Q, float::Round};
++
++    fn raw(kind: Approximation) -> Computable {
++        Computable {
++            internal: Arc::new(Node::new(
++                kind,
++                BoundCache::Invalid,
++                ExactSignCache::Invalid,
++            )),
++            signal: None,
++        }
++    }
++
++    fn oracle(q: &Q) -> [Q; 2] {
++        let mut lo = Float::with_val_round(2048, q, Round::Down).0;
++        let mut hi = Float::with_val_round(2048, q, Round::Up).0;
++        lo.atan_round(Round::Down);
++        hi.atan_round(Round::Up);
++        [lo.to_rational().unwrap(), hi.to_rational().unwrap()]
++    }
++
++    fn encloses(value: &Computable, p: i32, bounds: &[Q; 2]) {
++        let a = Integer::from_str_radix(&value.approx(p).to_string(), 10).unwrap();
++        let unit = if p > 0 {
++            Q::from(Integer::from(1) << p)
++        } else {
++            Q::from((1, Integer::from(1) << -p))
++        };
++        let center = Q::from(a) * &unit;
++        assert!(
++            Q::from(&center - &unit) <= bounds[0] && Q::from(&center + &unit) >= bounds[1],
++            "p={p}, center={center}, unit={unit}"
++        );
++    }
++
++    #[test]
++    fn imported_atan_series_preserve_rational_and_generic_arguments() {
++        crate::mpfr_test::cleanup_on_thread_exit();
++        let mut inputs = vec![Q::from(0)];
++        for q in [
++            Q::from((1, 16)),
++            Q::from((1, 3)),
++            Q::from((127, 256)),
++            Q::from((1, 2)),
++            Q::from((129, 256)),
++            Q::from((3, 4)),
++            Q::from(1),
++            Q::from(2),
++            Q::from(4),
++            Q::from(1000),
++            Q::from(Integer::from(1) << 512),
++            Q::from((1, Integer::from(1) << 512)),
++        ] {
++            inputs.extend([q.clone(), -q]);
++        }
++        for q in inputs {
++            let bounds = oracle(&q);
++            let rational: Rational = q.to_string().parse().unwrap();
++            for generic in [false, true] {
++                let build = || {
++                    let leaf = Computable::rational(rational.clone());
++                    let child = if generic {
++                        let child = raw(Approximation::Add(leaf, Computable::zero()));
++                        assert!(child.exact_rational().is_none());
++                        child
++                    } else {
++                        leaf
++                    };
++                    raw(Approximation::PrescaledAtan(child))
++                };
++                let warm = build();
++                for p in [2, 0, -1, -32, -128, -512, -8, 2, 0] {
++                    encloses(&build(), p, &bounds);
++                    encloses(&warm, p, &bounds);
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn atan_half_angle_fallback_encloses_symbolic_children() {
++        crate::mpfr_test::cleanup_on_thread_exit();
++        for n in [2, 5, 17] {
++            for shift in [-32, -2, 0, 32] {
++                let mut lo = Float::with_val(2048, n);
++                let mut hi = lo.clone();
++                lo.sqrt_round(Round::Down);
++                hi.sqrt_round(Round::Up);
++                lo <<= shift;
++                hi <<= shift;
++                lo.atan_round(Round::Down);
++                hi.atan_round(Round::Up);
++                let bounds = [lo.to_rational().unwrap(), hi.to_rational().unwrap()];
++                for negative in [false, true] {
++                    let bounds = if negative {
++                        [-bounds[1].clone(), -bounds[0].clone()]
++                    } else {
++                        bounds.clone()
++                    };
++                    let build = || {
++                        let child = Computable::rational(Rational::new(n))
++                            .sqrt()
++                            .shift_left(shift);
++                        let child = if negative { child.negate() } else { child };
++                        assert!(child.exact_rational().is_none());
++                        raw(Approximation::PrescaledAtan(child))
++                    };
++                    let warm = build();
++                    for p in [2, 0, -32, -128, -512, -8, 2] {
++                        encloses(&build(), p, &bounds);
++                        encloses(&warm, p, &bounds);
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn atan_range_proof_handles_every_allowed_working_sample_rounding() {
++        crate::mpfr_test::cleanup_on_thread_exit();
++        let mut checks = 0;
++        // Actual working precisions of the original recurrence. The injected
++        // sample is admitted only when it satisfies the public +/-1 contract.
++        for (p, s) in [
++            (0_i32, -12_i32),
++            (-1, -13),
++            (-32, -46),
++            (-128, -144),
++            (-512, -530),
++        ] {
++            let threshold = Integer::from(1) << (-s - 1);
++            for delta in -8_i32..=8 {
++                for negative in [false, true] {
++                    let q = Q::from((threshold.clone() * 4 + delta, Integer::from(1) << (-s + 2)));
++                    let q = if negative { -q } else { q };
++                    let base = threshold.clone() + delta.div_euclid(4);
++                    let base = if negative { -base } else { base };
++                    let bounds = oracle(&q);
++                    for rounding in -1..=1 {
++                        let sample: Integer = base.clone() + rounding;
++                        let unit = Q::from((1, Integer::from(1) << -s));
++                        if (Q::from(sample.clone()) * &unit - &q).abs() > unit {
++                            continue;
++                        }
++                        let child = raw(Approximation::Add(
++                            Computable::rational(q.to_string().parse().unwrap()),
++                            Computable::zero(),
++                        ));
++                        assert!(child.exact_rational().is_none());
++                        child
++                            .internal
++                            .store_cache_value(s, sample.to_string().parse().unwrap());
++                        let value = raw(Approximation::PrescaledAtan(child));
++                        for precision in [p, -1024, p] {
++                            encloses(&value, precision, &bounds);
++                            checks += 1;
++                        }
++                    }
++                }
++            }
++        }
++        assert_eq!(checks, 1170);
++    }
++
++    #[test]
++    fn aborted_atan_range_reduction_recovers_without_publishing_a_cache() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        crate::mpfr_test::cleanup_on_thread_exit();
++        for n in [-4, 4] {
++            let child = raw(Approximation::Add(
++                Computable::rational(Rational::new(n)),
++                Computable::zero(),
++            ));
++            let value = raw(Approximation::PrescaledAtan(child));
++            let signal = Arc::new(AtomicBool::new(true));
++            let _ = value.approx_signal(&Some(signal.clone()), -128);
++            assert!(value.cached().is_none());
++            signal.store(false, Ordering::Relaxed);
++            let resumed = value.approx_signal(&Some(signal), -128);
++            assert_eq!(resumed, value.approx(-128));
++            encloses(&value, -128, &oracle(&Q::from(n)));
++        }
++    }
++}
+diff --git a/crates/hyperreal/tests/serde_atan_ranges.rs b/crates/hyperreal/tests/serde_atan_ranges.rs
+new file mode 100644
+index 000000000..6d62531ec
+--- /dev/null
++++ b/crates/hyperreal/tests/serde_atan_ranges.rs
+@@ -0,0 +1,152 @@
++#![cfg(feature = "serde")]
++
++use hyperreal::{Computable, Problem, Rational, Real, RealSign};
++use serde_json::{Value, json};
++
++fn q(n: i64) -> Value {
++    serde_json::to_value(Rational::new(n)).unwrap()
++}
++
++fn node(kind: &str, value: Value) -> Value {
++    json!({"internal": {kind: value}})
++}
++
++fn bytes(value: &Value) -> Vec<u8> {
++    let mut bytes = Vec::new();
++    ciborium::ser::into_writer(value, &mut bytes).unwrap();
++    bytes
++}
++
++#[test]
++fn imported_atan_preserves_refinement_interchange_and_following_arithmetic() {
++    // For x >= 2, atan(x) = pi/2 - atan(1/x), 3 < pi < 4, and
++    // 0 < atan(1/x) < 1/x <= 1/2 give 1 < atan(x) < 2.
++    // The symbolic arguments pi and sqrt(5) are also greater than two.
++    // These bounds are independent of the implementation being tested.
++    let zero = node("Ratio", q(0));
++    for positive in [
++        node("Ratio", q(2)),
++        node("Add", json!([node("Ratio", q(2)), zero])),
++        node("Ratio", q(4)),
++        node("Add", json!([node("Ratio", q(4)), zero])),
++        node("Constant", json!("Pi")),
++        node("Sqrt", node("Ratio", q(5))),
++    ] {
++        for sign in [-1, 1] {
++            let argument = if sign < 0 {
++                node("Negate", positive.clone())
++            } else {
++                positive.clone()
++            };
++            let graph = node("PrescaledAtan", argument);
++            let collection = json!([node("Ratio", q(1)), graph]);
++            let mut json_collection: Vec<Computable> =
++                serde_json::from_value(collection.clone()).unwrap();
++            let mut cbor_collection: Vec<Computable> =
++                ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++            let values = [
++                serde_json::from_value::<Computable>(graph.clone()).unwrap(),
++                ciborium::de::from_reader(bytes(&graph).as_slice()).unwrap(),
++                json_collection.pop().unwrap(),
++                cbor_collection.pop().unwrap(),
++            ];
++            for value in values {
++                assert_eq!(serde_json::to_value(&value).unwrap(), graph);
++                for p in [0, -64, 0] {
++                    let approximation = value.approx(p);
++                    assert!(if sign > 0 {
++                        approximation > 0.into()
++                    } else {
++                        approximation < 0.into()
++                    });
++                }
++                assert_eq!(serde_json::to_value(value).unwrap(), graph);
++            }
++            for scale in [0, 1, -3] {
++                let wire = json!({"rational":q(scale),"class":"Irrational","computable":graph});
++                let cbor = ciborium::Value::serialized(&wire).unwrap();
++                let collection = json!([Real::one(), wire]);
++                let mut values = vec![
++                    Real::from_json(&wire.to_string()).unwrap(),
++                    Real::from_bytes(&bytes(&wire)).unwrap(),
++                    Real::try_from(&cbor).unwrap(),
++                    Real::try_from(cbor).unwrap(),
++                ];
++                let mut json_collection: Vec<Real> =
++                    serde_json::from_value(collection.clone()).unwrap();
++                let mut cbor_collection: Vec<Real> =
++                    ciborium::de::from_reader(bytes(&collection).as_slice()).unwrap();
++                values.push(json_collection.pop().unwrap());
++                values.push(cbor_collection.pop().unwrap());
++                let factor = sign * scale;
++                let expected_sign = match factor.cmp(&0) {
++                    std::cmp::Ordering::Less => RealSign::Negative,
++                    std::cmp::Ordering::Equal => RealSign::Zero,
++                    std::cmp::Ordering::Greater => RealSign::Positive,
++                };
++                let (lower, upper) = if factor >= 0 {
++                    (factor, 2 * factor)
++                } else {
++                    (2 * factor, factor)
++                };
++                for value in values {
++                    let json = value.to_json();
++                    let cbor = value.to_bytes();
++                    for p in [2, 0, -32, -128, 0] {
++                        let [lo, hi] = value.certified_rational_interval(p).unwrap();
++                        if factor == 0 {
++                            assert!(lo <= Rational::zero() && hi >= Rational::zero());
++                        } else {
++                            assert!(lo < Rational::new(upper) && hi > Rational::new(lower));
++                            if p < 0 {
++                                assert!(lo > Rational::new(lower) && hi < Rational::new(upper));
++                            }
++                        }
++                        assert_eq!(value.certified_sign_until(p).sign(), Some(expected_sign));
++                    }
++                    let translated = &value + Real::one();
++                    let [lo, hi] = translated.certified_rational_interval(-32).unwrap();
++                    assert!(lo >= Rational::new(lower + 1) && hi <= Rational::new(upper + 1));
++                    assert_eq!(value.to_json(), json);
++                    assert_eq!(value.to_bytes(), cbor);
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn imported_atan_preserves_typed_rejection_of_invalid_children() {
++    for child in [
++        node("Sqrt", node("Ratio", q(-1))),
++        node("Inverse", node("Ratio", q(0))),
++        node("PrescaledLn", node("Ratio", q(-2))),
++    ] {
++        let atan = node("PrescaledAtan", child);
++        for graph in [
++            atan.clone(),
++            node("Multiply", json!([node("Ratio", q(0)), atan])),
++        ] {
++            assert!(serde_json::from_value::<Computable>(graph.clone()).is_err());
++            assert!(ciborium::de::from_reader::<Computable, _>(bytes(&graph).as_slice()).is_err());
++            for scale in [0, 1, -3] {
++                let wire = json!({"rational":q(scale),"class":"Irrational","computable":graph});
++                let cbor = ciborium::Value::serialized(&wire).unwrap();
++                for result in [
++                    Real::from_json(&wire.to_string()),
++                    Real::from_bytes(&bytes(&wire)),
++                    Real::try_from(&cbor),
++                    Real::try_from(cbor),
++                ] {
++                    assert!(matches!(result, Err(Problem::ParseError)));
++                }
++                let collection = json!([Real::one(), wire]);
++                assert!(serde_json::from_value::<Vec<Real>>(collection.clone()).is_err());
++                assert!(
++                    ciborium::de::from_reader::<Vec<Real>, _>(bytes(&collection).as_slice())
++                        .is_err()
++                );
++            }
++        }
++    }
++}
