@@ -1,0 +1,2783 @@
+diff --git a/bindings/cpp/csgrs.hpp b/bindings/cpp/csgrs.hpp
+index 5aa7fc28b..82bfa5565 100644
+--- a/bindings/cpp/csgrs.hpp
++++ b/bindings/cpp/csgrs.hpp
+@@ -186,6 +186,11 @@ public:
+   TriangleMesh inverse() const { return unary(Traits::mesh_inverse); }
+   TriangleMesh center() const { return unary(Traits::mesh_center); }
+   TriangleMesh floating() const { return unary(Traits::mesh_float); }
++  csgrs_construction_evidence_t construction_evidence() const {
++    csgrs_construction_evidence_t out{};
++    check(csgrs_triangle_mesh_construction_evidence(handle_, &out));
++    return out;
++  }
+   std::optional<aabb_type> bounding_box() const {
+     aabb_type out{};
+     const auto status = Traits::mesh_bounding_box(handle_, &out);
+diff --git a/bindings/python/csgrs.py b/bindings/python/csgrs.py
+index 5ff41e591..368eda235 100644
+--- a/bindings/python/csgrs.py
++++ b/bindings/python/csgrs.py
+@@ -29,6 +29,14 @@ MeshPtr = ctypes.POINTER(_MeshHandle)
+ CurveRegionPtr = ctypes.POINTER(_CurveRegionHandle)
+ 
+ 
++class ConstructionEvidence(ctypes.Structure):
++    """Native summary; false approximate alone does not certify missing history."""
++    _fields_ = [(name, ctypes.c_uint8) for name in (
++        "source_history_missing", "approximate_512_consumed", "coordinates_projected",
++        "source_sampled", "buffers_changed",
++    )]
++
++
+ class I128(ctypes.Structure):
+     _fields_ = [("hi", ctypes.c_int64), ("lo", ctypes.c_uint64)]
+ 
+@@ -466,6 +474,11 @@ class TriangleMesh:
+     def center(self): return self._unary("center")
+     def floating(self): return self._unary("float")
+ 
++    def construction_evidence(self):
++        out = ConstructionEvidence()
++        _call("csgrs_triangle_mesh_construction_evidence", self.ptr, ctypes.byref(out))
++        return out
++
+     def _unary(self, op):
+         out = MeshPtr()
+         _call(f"csgrs_triangle_mesh_{self.family.prefix}_{op}", self.ptr, ctypes.byref(out))
+diff --git a/crates/csgrs-ffi/include/csgrs.h b/crates/csgrs-ffi/include/csgrs.h
+index b7fd12b0c..08c1b7fd5 100644
+--- a/crates/csgrs-ffi/include/csgrs.h
++++ b/crates/csgrs-ffi/include/csgrs.h
+@@ -36,6 +36,20 @@ typedef struct csgrs_real_t csgrs_real_t;
+ typedef struct csgrs_triangle_mesh_t csgrs_triangle_mesh_t;
+ typedef struct csgrs_curve_region_t csgrs_curve_region_t;
+ 
++/* Independent of local certainty, topology and geometric fidelity. Fields are
++   0 or 1. A false approximate flag does not certify missing source history. */
++typedef struct csgrs_construction_evidence_t {
++  uint8_t source_history_missing;
++  uint8_t approximate_512_consumed;
++  uint8_t coordinates_projected;
++  uint8_t source_sampled;
++  uint8_t buffers_changed;
++} csgrs_construction_evidence_t;
++
++/* Accepts any valid mesh family. Failure leaves the output untouched. */
++csgrs_status_t csgrs_triangle_mesh_construction_evidence(
++    const csgrs_triangle_mesh_t *mesh, csgrs_construction_evidence_t *out);
++
+ typedef struct csgrs_i128_t {
+   int64_t hi;
+   uint64_t lo;
+diff --git a/crates/csgrs-ffi/src/lib.rs b/crates/csgrs-ffi/src/lib.rs
+index cbdce5465..53543d496 100644
+--- a/crates/csgrs-ffi/src/lib.rs
++++ b/crates/csgrs-ffi/src/lib.rs
+@@ -62,6 +62,42 @@ pub enum CsgrsScalarFamily {
+     Real = 4,
+ }
+ 
++/// Construction summary. Each field is 0 or 1; unknown history cannot be
++/// certified by interpreting `approximate_512_consumed == 0` alone.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct CsgrsConstructionEvidence {
++    pub source_history_missing: u8,
++    pub approximate_512_consumed: u8,
++    pub coordinates_projected: u8,
++    pub source_sampled: u8,
++    pub buffers_changed: u8,
++}
++
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn csgrs_triangle_mesh_construction_evidence(
++    mesh: *const CsgrsTriangleMesh,
++    out: *mut CsgrsConstructionEvidence,
++) -> CsgrsStatus {
++    ffi_status(|| {
++        let mesh = unsafe { ptr_ref(mesh) }?;
++        let evidence = match &mesh.inner {
++            TriangleMeshKind::F32(mesh) => mesh.native().construction_evidence(),
++            TriangleMeshKind::F64(mesh) => mesh.native().construction_evidence(),
++            TriangleMeshKind::I128(mesh) => mesh.native().construction_evidence(),
++            TriangleMeshKind::Real(mesh) => mesh.native().construction_evidence(),
++        };
++        *unsafe { out_ptr(out) }? = CsgrsConstructionEvidence {
++            source_history_missing: u8::from(evidence.source_history_missing()),
++            approximate_512_consumed: u8::from(evidence.approximate_512_consumed()),
++            coordinates_projected: u8::from(evidence.coordinates_projected()),
++            source_sampled: u8::from(evidence.source_sampled()),
++            buffers_changed: u8::from(evidence.buffers_changed()),
++        };
++        Ok(())
++    })
++}
++
+ #[repr(C)]
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct CsgrsI128 {
+diff --git a/crates/hypermesh/fuzz/fuzz_targets/support/mod.rs b/crates/hypermesh/fuzz/fuzz_targets/support/mod.rs
+index 7b17b9f64..a2fa6b046 100644
+--- a/crates/hypermesh/fuzz/fuzz_targets/support/mod.rs
++++ b/crates/hypermesh/fuzz/fuzz_targets/support/mod.rs
+@@ -262,7 +262,7 @@ pub fn volume_numerator(vertices: &[Point3], result: &BooleanMeshResult) -> Real
+ 
+ pub fn validate_batch(batch: &BooleanMeshBatch) {
+     batch.validate().unwrap();
+-    for result in &batch.results {
++    for result in batch.results.iter() {
+         assert!(
+             result
+                 .sources
+@@ -271,7 +271,7 @@ pub fn validate_batch(batch: &BooleanMeshBatch) {
+         );
+         assert!(boolean_mesh_closure_evidence(result).has_no_boundary());
+         let mesh = TriangleMesh::new(
+-            batch.vertices.clone(),
++            batch.vertices.to_vec(),
+             result
+                 .triangles
+                 .iter()
+diff --git a/crates/hypermesh/src/boolean.rs b/crates/hypermesh/src/boolean.rs
+index b4bf8714c..4a13dc272 100644
+--- a/crates/hypermesh/src/boolean.rs
++++ b/crates/hypermesh/src/boolean.rs
+@@ -35,7 +35,13 @@ pub fn boolean(
+     let arrangement =
+         build_surface_arrangement(&decisions, &soup.polygons, soup.source_vertex_count)?;
+     crate::trace_dispatch!("boolean", "surface-arranged");
+-    let output = arrangement.materialize_program(&decisions, &soup.polygons, program)?;
++    let evidence = meshes.iter().fold(
++        crate::ConstructionEvidence::DECLARED_COORDINATES,
++        |evidence, mesh| evidence.combine(mesh.construction_evidence()),
++    );
++    let output = arrangement
++        .materialize_program(&decisions, &soup.polygons, program)?
++        .with_inherited_construction(evidence);
+     crate::trace_dispatch!("boolean", "output-certified");
+     crate::trace_dispatch!("boolean", "complete");
+     Ok(decisions.finish(output))
+diff --git a/crates/hypermesh/src/context.rs b/crates/hypermesh/src/context.rs
+index 74fd4faac..8fcb9bd3d 100644
+--- a/crates/hypermesh/src/context.rs
++++ b/crates/hypermesh/src/context.rs
+@@ -36,7 +36,9 @@ pub enum MeshCertainty {
+     Approximate512Consumed,
+ }
+ 
+-/// A completed value paired with its aggregate predicate certainty.
++/// A completed value paired with its operation-local predicate certainty.
++/// Native meshes and Boolean batches additionally retain their construction
++/// qualifications; a certified local receipt does not certify preceding intent.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct MeshOutcome<T> {
+     /// Completed operation value.
+diff --git a/crates/hypermesh/src/convex_hull.rs b/crates/hypermesh/src/convex_hull.rs
+index 40ecf22f7..689c26391 100644
+--- a/crates/hypermesh/src/convex_hull.rs
++++ b/crates/hypermesh/src/convex_hull.rs
+@@ -590,7 +590,12 @@ fn compact_hull(
+             )
+         })
+         .collect();
+-    Ok(TriangleMesh::new(positions, triangles).with_valid_pwn_certainty(certainty))
++    Ok(TriangleMesh::from_construction(
++        positions,
++        triangles,
++        crate::ConstructionEvidence::DECLARED_COORDINATES.with_predicate_certainty(certainty),
++    )
++    .with_valid_pwn_certainty(certainty))
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/hypermesh/src/lib.rs b/crates/hypermesh/src/lib.rs
+index 71946149e..937ba3f5f 100644
+--- a/crates/hypermesh/src/lib.rs
++++ b/crates/hypermesh/src/lib.rs
+@@ -28,6 +28,7 @@
+ mod trace;
+ pub(crate) use trace::trace_dispatch;
+ mod boolean;
++mod construction;
+ pub mod context;
+ mod storage_hash;
+ mod surface_arrangement;
+@@ -53,6 +54,7 @@ pub mod winding;
+ 
+ pub use boolean::boolean;
+ pub use bvh::{ExactBvh, ExactPointBvh, PolygonBounds};
++pub use construction::ConstructionEvidence;
+ pub use context::{MeshCertainty, MeshContext, MeshOutcome};
+ pub use convex_hull::{
+     convex_hull, convex_hull_with_coplanar_groups, convex_hull_with_retained_facts,
+diff --git a/crates/hypermesh/src/mesh.rs b/crates/hypermesh/src/mesh.rs
+index 4bb1e5dae..356bd51d4 100644
+--- a/crates/hypermesh/src/mesh.rs
++++ b/crates/hypermesh/src/mesh.rs
+@@ -9,6 +9,7 @@ use std::sync::{
+ 
+ use hyperlattice::{Aabb as ExactAabb, HomogeneousPoint3, Matrix4, Point3, Real, Vector3, Vector4};
+ 
++use crate::ConstructionEvidence;
+ use crate::context::{CertaintyFact, DecisionContext, MeshCertainty, MeshContext, MeshOutcome};
+ use crate::error::{HypermeshError, HypermeshResult};
+ use crate::geometry::{
+@@ -116,6 +117,7 @@ pub struct TriangleMesh {
+     /// Triangle indices. Use `Arc::make_mut` for edits; retained identities hold weak references.
+     pub triangles: Arc<[Triangle]>,
+     pub(crate) facts: Arc<TriangleMeshFacts>,
++    construction: ConstructionEvidence,
+ }
+ 
+ impl PartialEq for TriangleMesh {
+@@ -125,14 +127,37 @@ impl PartialEq for TriangleMesh {
+ }
+ 
+ impl TriangleMesh {
+-    /// Creates an owned triangle mesh.
++    /// Creates geometry with untracked preceding construction history.
++    /// Use [`Self::from_construction`] to explicitly start a declared-coordinate
++    /// claim or carry evidence at a construction boundary.
+     pub fn new(positions: Vec<Point3>, triangles: Vec<Triangle>) -> Self {
+         Self::from_shared_positions(positions.into(), triangles)
+     }
+ 
++    /// Creates a new construction claim with the supplied qualifications.
++    /// This is an explicit source boundary, not proof of preceding intent.
++    /// Derived operations must combine every parent's evidence and their actual
++    /// consumed certainty. For existing meshes use the monotone
++    /// [`Self::with_inherited_construction`] instead.
++    pub fn from_construction(
++        positions: Vec<Point3>,
++        triangles: Vec<Triangle>,
++        evidence: ConstructionEvidence,
++    ) -> Self {
++        Self::from_shared_construction(positions.into(), triangles, evidence)
++    }
++
+     pub(crate) fn from_shared_positions(
+         positions: Arc<[Point3]>,
+         triangles: Vec<Triangle>,
++    ) -> Self {
++        Self::from_shared_construction(positions, triangles, ConstructionEvidence::UNTRACKED)
++    }
++
++    pub(crate) fn from_shared_construction(
++        positions: Arc<[Point3]>,
++        triangles: Vec<Triangle>,
++        construction: ConstructionEvidence,
+     ) -> Self {
+         let triangles = Arc::<[Triangle]>::from(triangles);
+         let facts = Arc::new(TriangleMeshFacts::new(&positions, &triangles));
+@@ -140,9 +165,28 @@ impl TriangleMesh {
+             positions,
+             triangles,
+             facts,
++            construction,
+         }
+     }
+ 
++    /// Construction qualifications bound to the current geometry buffers.
++    /// Replacing or editing either buffer exposes missing history and retains
++    /// every previously known qualification. Validation cannot clear it.
++    pub fn construction_evidence(&self) -> ConstructionEvidence {
++        if self.geometry_facts().is_some() {
++            self.construction
++        } else {
++            self.construction.after_buffer_mutation()
++        }
++    }
++
++    /// Monotonically add dependency qualifications without changing geometry
++    /// or local topology facts. This cannot certify a previously untracked mesh.
++    pub fn with_inherited_construction(mut self, evidence: ConstructionEvidence) -> Self {
++        self.construction = self.construction_evidence().combine(evidence);
++        self
++    }
++
+     fn position_facts(&self) -> Option<&TriangleMeshFacts> {
+         self.facts
+             .matches_positions(&self.positions)
+@@ -480,12 +524,18 @@ impl TriangleMesh {
+                 ))
+             })
+             .collect::<Option<Vec<_>>>()?;
+-        Some(Self::new(positions, self.triangles.to_vec()))
++        Some(Self::from_construction(
++            positions,
++            self.triangles.to_vec(),
++            self.construction_evidence().with_coordinate_projection(),
++        ))
+     }
+ 
+     /// Returns the retained exact convex hull of this mesh's native positions.
+     pub fn convex_hull(&self, context: &MeshContext) -> HypermeshResult<MeshOutcome<Self>> {
+-        crate::convex_hull(context, &self.positions)
++        crate::convex_hull(context, &self.positions).map(|outcome| {
++            outcome.map(|mesh| mesh.with_inherited_construction(self.construction_evidence()))
++        })
+     }
+ 
+     /// Returns policy-certified bounds when the native rows form one complete
+@@ -686,7 +736,12 @@ impl TriangleMesh {
+             }
+             positions
+         };
+-        let transformed = Self::new(positions, self.triangles.to_vec());
++        let transformed = Self::from_construction(
++            positions,
++            self.triangles.to_vec(),
++            self.construction_evidence()
++                .with_predicate_certainty(decisions.certainty()),
++        );
+         let preserves_valid_pwn = matches!(
+             matrix_facts.transform_kind,
+             hyperlattice::Matrix4TransformKind::Identity
+@@ -708,12 +763,13 @@ impl TriangleMesh {
+     /// The returned mesh owns its derived index buffer; callers that need it
+     /// repeatedly retain the returned value explicitly.
+     pub fn reversed_winding(&self) -> Self {
+-        let mesh = Self::from_shared_positions(
++        let mesh = Self::from_shared_construction(
+             Arc::clone(&self.positions),
+             self.triangles
+                 .iter()
+                 .map(|triangle| Triangle::new(triangle.v2, triangle.v1, triangle.v0))
+                 .collect(),
++            self.construction_evidence(),
+         );
+         if let Some(certainty) = self
+             .geometry_facts()
+@@ -849,7 +905,7 @@ impl TriangleMesh {
+             }
+             triangles = refined;
+         }
+-        let mesh = Self::new(positions, triangles);
++        let mesh = Self::from_construction(positions, triangles, self.construction_evidence());
+         if let Some(certainty) = self
+             .geometry_facts()
+             .and_then(|facts| facts.valid_pwn.certainty())
+@@ -1183,7 +1239,11 @@ impl TriangleMesh {
+             smooth_positions_once(&positions, &mut scratch, &adjacency, lambda);
+             std::mem::swap(&mut positions, &mut scratch);
+         }
+-        Ok(Self::new(positions, self.triangles.to_vec()))
++        Ok(Self::from_construction(
++            positions,
++            self.triangles.to_vec(),
++            self.construction_evidence(),
++        ))
+     }
+ 
+     /// Applies alternating Laplacian shrink and inflation passes.
+@@ -1206,7 +1266,11 @@ impl TriangleMesh {
+             smooth_positions_once(&positions, &mut scratch, &adjacency, mu);
+             std::mem::swap(&mut positions, &mut scratch);
+         }
+-        Ok(Self::new(positions, self.triangles.to_vec()))
++        Ok(Self::from_construction(
++            positions,
++            self.triangles.to_vec(),
++            self.construction_evidence(),
++        ))
+     }
+ }
+ 
+@@ -1244,6 +1308,21 @@ pub struct TriangleMeshRef<'a> {
+ }
+ 
+ impl<'a> TriangleMeshRef<'a> {
++    /// Construction summary of the owner, when this view still names both of
++    /// its buffers. Bare slices expose missing preceding source history.
++    pub fn construction_evidence(self) -> ConstructionEvidence {
++        match self.native {
++            Some(native)
++                if std::ptr::eq(self.positions, native.positions.as_ref())
++                    && std::ptr::eq(self.triangles, native.triangles.as_ref()) =>
++            {
++                native.construction_evidence()
++            }
++            Some(native) => native.construction_evidence().after_buffer_mutation(),
++            None => ConstructionEvidence::UNTRACKED,
++        }
++    }
++
+     /// Borrows position and triangle slices without retained native facts.
+     pub const fn new(positions: &'a [Point3], triangles: &'a [Triangle]) -> Self {
+         Self {
+diff --git a/crates/hypermesh/src/mesh/concatenation.rs b/crates/hypermesh/src/mesh/concatenation.rs
+index ab1ae473e..7205655fc 100644
+--- a/crates/hypermesh/src/mesh/concatenation.rs
++++ b/crates/hypermesh/src/mesh/concatenation.rs
+@@ -81,7 +81,11 @@ impl TriangleMesh {
+                 Triangle::new(base + triangle.v0, base + triangle.v1, base + triangle.v2)
+             }));
+         }
+-        let result = Self::new(positions, triangles);
++        let evidence = meshes.iter().fold(
++            crate::ConstructionEvidence::DECLARED_COORDINATES,
++            |evidence, mesh| evidence.combine(mesh.construction_evidence()),
++        );
++        let result = Self::from_construction(positions, triangles, evidence);
+         if !result.triangles.is_empty()
+             && let Some(certainty) = pwn_certainty
+         {
+diff --git a/crates/hypermesh/src/minkowski.rs b/crates/hypermesh/src/minkowski.rs
+index c0ceacc62..dc9a990b3 100644
+--- a/crates/hypermesh/src/minkowski.rs
++++ b/crates/hypermesh/src/minkowski.rs
+@@ -73,8 +73,8 @@ impl MinkowskiOptions<'_> {
+ /// empty identity is applied. A successful result is reusable closed-PWN geometry
+ /// (or canonical empty), not a claim about an intended analytic surface.
+ ///
+-/// The receipt covers decisions consumed by this operation. Bare input meshes
+-/// do not carry the provenance of earlier approximate modeling operations.
++/// The receipt covers decisions consumed by this operation. The native mesh
++/// additionally retains the construction qualifications of both operands.
+ pub fn minkowski_sum(
+     context: &MeshContext,
+     left: &TriangleMesh,
+@@ -96,16 +96,23 @@ pub fn minkowski_sum_with_options(
+ ) -> HypermeshResult<MeshOutcome<TriangleMesh>> {
+     options.check_cancelled()?;
+     let decisions = DecisionContext::new(context);
++    let evidence = left
++        .construction_evidence()
++        .combine(right.construction_evidence());
+     let left = prepare_source(context, &decisions, left, 0)?;
+     let right = prepare_source(context, &decisions, right, 1)?;
+     if left.triangles.is_empty() || right.triangles.is_empty() {
+         options.check_cancelled()?;
+-        return Ok(decisions.finish(empty()));
++        return Ok(decisions.finish(empty().with_inherited_construction(
++            evidence.with_predicate_certainty(decisions.certainty()),
++        )));
+     }
+     let left = convex_cells(context, &decisions, left, options)?;
+     if left.is_empty() {
+         options.check_cancelled()?;
+-        return Ok(decisions.finish(empty()));
++        return Ok(decisions.finish(empty().with_inherited_construction(
++            evidence.with_predicate_certainty(decisions.certainty()),
++        )));
+     }
+     let right = convex_cells(context, &decisions, right, options)?;
+     let count = product(left.len(), right.len(), "Minkowski convex pairs")?;
+@@ -136,7 +143,10 @@ pub fn minkowski_sum_with_options(
+     }
+     let result = accumulated.unwrap_or_else(empty);
+     options.check_cancelled()?;
+-    Ok(decisions.finish(result))
++    Ok(decisions.finish(
++        result
++            .with_inherited_construction(evidence.with_predicate_certainty(decisions.certainty())),
++    ))
+ }
+ 
+ /// Computes `conv({a+b | a in left, b in right})` for stored point sets.
+@@ -155,11 +165,20 @@ pub fn minkowski_hull(
+     } else {
+         pair_hull(&decisions, left, right, &MinkowskiOptions::default())?
+     };
+-    Ok(decisions.finish(result))
++    Ok(decisions.finish(
++        result.with_inherited_construction(
++            crate::ConstructionEvidence::DECLARED_COORDINATES
++                .with_predicate_certainty(decisions.certainty()),
++        ),
++    ))
+ }
+ 
+ fn empty() -> TriangleMesh {
+-    TriangleMesh::new(Vec::new(), Vec::new())
++    TriangleMesh::from_construction(
++        Vec::new(),
++        Vec::new(),
++        crate::ConstructionEvidence::DECLARED_COORDINATES,
++    )
+ }
+ 
+ fn check_limit(resource: &'static str, required: usize, limit: usize) -> HypermeshResult<()> {
+@@ -197,7 +216,7 @@ fn prepare_source(
+     mesh_index: usize,
+ ) -> HypermeshResult<TriangleMesh> {
+     if mesh.positions.is_empty() && mesh.triangles.is_empty() {
+-        return Ok(empty());
++        return Ok(mesh.clone());
+     }
+     let mut mapping = reserved(mesh.positions.len(), "Minkowski source indices")?;
+     mapping.resize(mesh.positions.len(), usize::MAX);
+@@ -230,7 +249,7 @@ fn prepare_source(
+             let [a, b, c] = triangle.indices().map(|index| mapping[index]);
+             Triangle::new(a, b, c)
+         }));
+-        TriangleMesh::new(positions, triangles)
++        TriangleMesh::from_construction(positions, triangles, mesh.construction_evidence())
+     };
+     decisions.absorb(source.validate_closed_pwn(context)?.certainty);
+     Ok(source)
+diff --git a/crates/hypermesh/src/output.rs b/crates/hypermesh/src/output.rs
+index 2ca9de7ab..94b4fab73 100644
+--- a/crates/hypermesh/src/output.rs
++++ b/crates/hypermesh/src/output.rs
+@@ -1,10 +1,11 @@
+ //! Compact exact Boolean output carriers and topology evidence.
+ 
+ use std::collections::{BTreeMap, BTreeSet};
+-use std::sync::Arc;
++use std::sync::{Arc, Weak};
+ 
+ use hyperlattice::Point3;
+ 
++use crate::ConstructionEvidence;
+ use crate::error::{HypermeshError, HypermeshResult};
+ use crate::mesh::{Triangle, TriangleMesh};
+ 
+@@ -37,19 +38,73 @@ pub struct BooleanMeshResult {
+ ///
+ /// Every result indexes the same compact vertex arena, so requesting several
+ /// expressions does not duplicate exact coordinate storage.
+-#[derive(Clone, Debug, Default, PartialEq)]
++#[derive(Clone, Debug)]
+ pub struct BooleanMeshBatch {
+-    /// Exact vertices used by at least one requested result.
+-    pub vertices: Vec<Point3>,
+-    /// Requested results in program-root order.
+-    pub results: Vec<BooleanMeshResult>,
++    /// Exact vertices used by at least one requested result. Use `Arc::make_mut`
++    /// to edit; doing so invalidates the retained construction identity.
++    pub vertices: Arc<[Point3]>,
++    /// Requested results in program-root order. Use `Arc::make_mut` to edit.
++    pub results: Arc<[BooleanMeshResult]>,
++    source_vertices: Weak<[Point3]>,
++    source_results: Weak<[BooleanMeshResult]>,
++    construction: ConstructionEvidence,
++}
++
++impl Default for BooleanMeshBatch {
++    fn default() -> Self {
++        Self::new(Vec::new(), Vec::new())
++    }
++}
++
++impl PartialEq for BooleanMeshBatch {
++    fn eq(&self, other: &Self) -> bool {
++        self.vertices == other.vertices && self.results == other.results
++    }
+ }
+ 
+ impl BooleanMeshBatch {
++    /// Constructs a raw batch with untracked source history. Carrier validation
++    /// is deferred to [`Self::validate`] or [`Self::into_triangle_meshes`].
++    pub fn new(vertices: Vec<Point3>, results: Vec<BooleanMeshResult>) -> Self {
++        Self::from_construction(vertices, results, ConstructionEvidence::UNTRACKED)
++    }
++
++    pub(crate) fn from_construction(
++        vertices: Vec<Point3>,
++        results: Vec<BooleanMeshResult>,
++        construction: ConstructionEvidence,
++    ) -> Self {
++        let vertices: Arc<[Point3]> = vertices.into();
++        let results: Arc<[BooleanMeshResult]> = results.into();
++        Self {
++            source_vertices: Arc::downgrade(&vertices),
++            source_results: Arc::downgrade(&results),
++            vertices,
++            results,
++            construction,
++        }
++    }
++
++    /// Retained qualifications, with missing history exposed after buffer edits.
++    pub fn construction_evidence(&self) -> ConstructionEvidence {
++        if std::ptr::eq(self.source_vertices.as_ptr(), Arc::as_ptr(&self.vertices))
++            && std::ptr::eq(self.source_results.as_ptr(), Arc::as_ptr(&self.results))
++        {
++            self.construction
++        } else {
++            self.construction.after_buffer_mutation()
++        }
++    }
++
++    pub(crate) fn with_inherited_construction(mut self, evidence: ConstructionEvidence) -> Self {
++        self.construction = self.construction_evidence().combine(evidence);
++        self
++    }
++
+     /// Checks carrier dimensions and compact indices without evaluating any
+     /// geometric predicates.
+     pub fn validate(&self) -> HypermeshResult<()> {
+-        for result in &self.results {
++        for result in self.results.iter() {
+             if result.triangles.len() != result.sources.len() {
+                 return Err(HypermeshError::TriangleSourceCountMismatch {
+                     triangles: result.triangles.len(),
+@@ -76,8 +131,9 @@ impl BooleanMeshBatch {
+     /// Empty results have neither positions nor triangles, so they remain
+     /// canonical empty geometry even when other batch rows use vertices.
+     ///
+-    /// Source provenance remains available only on this batch and is discarded
+-    /// by this explicit carrier conversion.
++    /// Construction qualifications survive this conversion, including empty
++    /// rows. Per-triangle source mappings remain available only on the batch;
++    /// this summary is not a replacement for those mappings.
+     pub fn into_triangle_meshes(self) -> HypermeshResult<Vec<TriangleMesh>> {
+         self.validate()?;
+         for (output, result) in self.results.iter().enumerate() {
+@@ -86,16 +142,21 @@ impl BooleanMeshBatch {
+             }
+         }
+ 
+-        let positions: Arc<[Point3]> = self.vertices.into();
++        let evidence = self.construction_evidence();
++        let positions = self.vertices;
+         let mut meshes = Vec::new();
+         meshes.try_reserve_exact(self.results.len()).map_err(|_| {
+             HypermeshError::CapacityOverflow {
+                 operation: "Boolean triangle mesh results",
+             }
+         })?;
+-        for result in self.results {
++        for result in self.results.iter() {
+             if result.triangles.is_empty() {
+-                meshes.push(TriangleMesh::new(Vec::new(), Vec::new()));
++                meshes.push(TriangleMesh::from_construction(
++                    Vec::new(),
++                    Vec::new(),
++                    evidence,
++                ));
+                 continue;
+             }
+             let mut triangles = Vec::new();
+@@ -107,12 +168,13 @@ impl BooleanMeshBatch {
+             triangles.extend(
+                 result
+                     .triangles
+-                    .into_iter()
+-                    .map(|[a, b, c]| Triangle::new(a as usize, b as usize, c as usize)),
++                    .iter()
++                    .map(|&[a, b, c]| Triangle::new(a as usize, b as usize, c as usize)),
+             );
+-            meshes.push(TriangleMesh::from_shared_positions(
++            meshes.push(TriangleMesh::from_shared_construction(
+                 Arc::clone(&positions),
+                 triangles,
++                evidence,
+             ));
+         }
+         Ok(meshes)
+@@ -219,14 +281,14 @@ mod tests {
+             triangle: 0,
+             orientation: 1,
+         };
+-        let batch = BooleanMeshBatch {
+-            vertices: vec![
++        let batch = BooleanMeshBatch::new(
++            vec![
+                 point(0, 0, 0),
+                 point(1, 0, 0),
+                 point(0, 1, 0),
+                 point(0, 0, 1),
+             ],
+-            results: vec![
++            vec![
+                 BooleanMeshResult {
+                     triangles: vec![[0, 1, 2]],
+                     sources: vec![source],
+@@ -238,7 +300,7 @@ mod tests {
+                     exterior_inside: false,
+                 },
+             ],
+-        };
++        );
+         let meshes = batch.into_triangle_meshes().unwrap();
+         assert!(Arc::ptr_eq(&meshes[0].positions, &meshes[1].positions));
+         assert_eq!(meshes[0].triangles[0], Triangle::new(0, 1, 2));
+@@ -254,19 +316,16 @@ mod tests {
+             exterior_inside,
+         };
+         assert_eq!(
+-            BooleanMeshBatch {
+-                vertices: vertices.clone(),
+-                results: vec![result(Vec::new(), Vec::new(), true)],
+-            }
+-            .into_triangle_meshes()
+-            .unwrap_err(),
++            BooleanMeshBatch::new(vertices.clone(), vec![result(Vec::new(), Vec::new(), true)],)
++                .into_triangle_meshes()
++                .unwrap_err(),
+             HypermeshError::UnboundedBooleanOutput { output: 0 }
+         );
+         assert_eq!(
+-            BooleanMeshBatch {
+-                vertices: vertices.clone(),
+-                results: vec![result(vec![[0, 1, 2]], Vec::new(), false)],
+-            }
++            BooleanMeshBatch::new(
++                vertices.clone(),
++                vec![result(vec![[0, 1, 2]], Vec::new(), false)],
++            )
+             .into_triangle_meshes()
+             .unwrap_err(),
+             HypermeshError::TriangleSourceCountMismatch {
+@@ -275,14 +334,14 @@ mod tests {
+             }
+         );
+         assert_eq!(
+-            BooleanMeshBatch {
++            BooleanMeshBatch::new(
+                 vertices,
+-                results: vec![result(
++                vec![result(
+                     vec![[0, 1, 3]],
+                     vec![TriangleSource::default()],
+                     false,
+                 )],
+-            }
++            )
+             .into_triangle_meshes()
+             .unwrap_err(),
+             HypermeshError::VertexIndexOutOfBounds {
+diff --git a/crates/hypermesh/src/surface_arrangement.rs b/crates/hypermesh/src/surface_arrangement.rs
+index adc63cb4d..0ee66edf5 100644
+--- a/crates/hypermesh/src/surface_arrangement.rs
++++ b/crates/hypermesh/src/surface_arrangement.rs
+@@ -4325,10 +4325,12 @@ fn materialize_surface_outputs(
+             });
+         }
+     }
+-    Ok(BooleanMeshBatch {
++    Ok(BooleanMeshBatch::from_construction(
+         vertices,
+-        results: outputs,
+-    })
++        outputs,
++        crate::ConstructionEvidence::DECLARED_COORDINATES
++            .with_predicate_certainty(decisions.certainty()),
++    ))
+ }
+ 
+ fn certify_selected_surface_output(
+diff --git a/crates/hypermesh/src/surface_nets.rs b/crates/hypermesh/src/surface_nets.rs
+index 4c4f77127..f95bc4e61 100644
+--- a/crates/hypermesh/src/surface_nets.rs
++++ b/crates/hypermesh/src/surface_nets.rs
+@@ -246,7 +246,13 @@ fn surface_nets_impl(
+     builder.transform_positions_to_world();
+     builder.validate_triangles(&decisions)?;
+     let active_cell_count = builder.active_cells.len();
+-    let mesh = TriangleMesh::new(builder.positions, builder.triangles);
++    let mesh = TriangleMesh::from_construction(
++        builder.positions,
++        builder.triangles,
++        crate::ConstructionEvidence::DECLARED_COORDINATES
++            .with_sampling()
++            .with_predicate_certainty(decisions.certainty()),
++    );
+     Ok(decisions.finish(SurfaceNetsOutput {
+         mesh,
+         active_cell_count,
+diff --git a/crates/hypermesh/tests/boolean.rs b/crates/hypermesh/tests/boolean.rs
+index eb83f24a6..bea43dae4 100644
+--- a/crates/hypermesh/tests/boolean.rs
++++ b/crates/hypermesh/tests/boolean.rs
+@@ -247,7 +247,7 @@ fn one_program_reuses_the_arrangement_for_all_builtin_results() {
+         );
+     }
+     let mut globally_used = vec![false; outcome.value.vertices.len()];
+-    for result in &outcome.value.results {
++    for result in outcome.value.results.iter() {
+         for &vertex in result.triangles.iter().flatten() {
+             globally_used[vertex as usize] = true;
+         }
+diff --git a/crates/hypermesh/tests/competitive.rs b/crates/hypermesh/tests/competitive.rs
+index a5fd738c0..ce0d31f87 100644
+--- a/crates/hypermesh/tests/competitive.rs
++++ b/crates/hypermesh/tests/competitive.rs
+@@ -103,7 +103,7 @@ fn assert_translated_batch_equivalent(
+     assert_eq!(actual.vertices.len(), expected.vertices.len(), "{label}");
+ 
+     let mut vertex_map = Vec::with_capacity(actual.vertices.len());
+-    for point in &actual.vertices {
++    for point in actual.vertices.iter() {
+         let translated = [
+             &point.x - &offsets[0],
+             &point.y - &offsets[1],
+@@ -128,7 +128,12 @@ fn assert_translated_batch_equivalent(
+         vertex_map.push(matches[0]);
+     }
+ 
+-    for (output, (actual, expected)) in actual.results.iter().zip(&expected.results).enumerate() {
++    for (output, (actual, expected)) in actual
++        .results
++        .iter()
++        .zip(expected.results.iter())
++        .enumerate()
++    {
+         assert_eq!(
+             actual.exterior_inside, expected.exterior_inside,
+             "{label} output {output}"
+diff --git a/docs/workflow-corpus.md b/docs/workflow-corpus.md
+index 5f8d14e6f..a783ca058 100644
+--- a/docs/workflow-corpus.md
++++ b/docs/workflow-corpus.md
+@@ -14,6 +14,7 @@ original difficult fixtures.
+ | Empty results | Valid-set identities, disconnected and symbolic operands, invalid operands paired with empty, subsequent operations | [empty_composition.rs](../tests/empty_composition.rs) |
+ | Transformed primitives | Exact scaling, translation, rotation and reflection; volume and topology; finite projective transforms and typed unbounded/invalid/undecided outcomes | [transform_failures.rs](../tests/transform_failures.rs) |
+ | Profile extrusion with a hole | Rational line profiles, including a translation beyond binary64 range; exact area and volume, manifoldness, native diagnostics | [exact_linear_modeling.rs](../tests/exact_linear_modeling.rs) |
++| Construction evidence through interchange | Twelve exact/qualified hull pipelines, including the original tiny outside point; local proofs, inherited qualifications and binary32 endpoint semantics checked independently | [construction_evidence.rs](../tests/construction_evidence.rs) |
+ 
+ ## Transformed box domain
+ 
+diff --git a/readme.md b/readme.md
+index 69f2207d2..2977370ce 100644
+--- a/readme.md
++++ b/readme.md
+@@ -470,6 +470,13 @@ explicit tessellation choices; CSGRS has no global tolerance setting.
+ 
+ ### Solid operations and queries
+ 
++Native meshes retain a [construction evidence summary](docs/construction-evidence.md)
++separately from operation-local certainty and topology proofs. It survives
++extraction, transforms, Boolean composition and empty results. Raw buffer and
++plain format imports expose missing history; bound binary STL artifacts retain
++the summary through in-process export/import. The guide describes mutation,
++the Boolean batch API migration, bindings, and remaining proof-replay limits.
++
+ `solid::SolidExt` supplies fluent native operations:
+ 
+ - `try_union`, `try_difference`, `try_intersection`, and `try_xor` use
+diff --git a/scripts/test-wasm-bindings.sh b/scripts/test-wasm-bindings.sh
+index 9a4252639..ba44d0f6e 100644
+--- a/scripts/test-wasm-bindings.sh
++++ b/scripts/test-wasm-bindings.sh
+@@ -47,3 +47,10 @@ cp tests/wasm/mesh_errors.ts "${wasm_bindings_dir}/mesh_errors.ts"
+     --module Node16 --moduleResolution Node16 --outDir "${wasm_bindings_dir}" \
+     "${wasm_bindings_dir}/mesh_errors.ts"
+ node "${wasm_bindings_dir}/mesh_errors.js"
++
++# Retain native construction qualifications through extraction and bound STL artifacts.
++cp tests/wasm/construction_evidence.ts "${wasm_bindings_dir}/construction_evidence.ts"
++"${tsc_bin}" --strict --target ES2020 --lib ES2020,DOM,ESNext.Disposable \
++    --module Node16 --moduleResolution Node16 --outDir "${wasm_bindings_dir}" \
++    "${wasm_bindings_dir}/construction_evidence.ts"
++node "${wasm_bindings_dir}/construction_evidence.js"
+diff --git a/src/adapter/mesh.rs b/src/adapter/mesh.rs
+index 512577150..d75e4cedf 100644
+--- a/src/adapter/mesh.rs
++++ b/src/adapter/mesh.rs
+@@ -244,13 +244,7 @@ where
+     }
+ 
+     pub fn inverse(&self) -> Self {
+-        let triangles = self
+-            .inner
+-            .triangles
+-            .iter()
+-            .map(|triangle| Triangle::new(triangle.v2, triangle.v1, triangle.v0))
+-            .collect();
+-        Self::from_native(TriangleMesh::new(self.inner.positions.to_vec(), triangles))
++        Self::from_native(self.inner.reversed_winding())
+     }
+ 
+     pub fn center(&self) -> AdapterResult<Self> {
+diff --git a/src/context.rs b/src/context.rs
+index 09df4f4bd..283f51b2f 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -53,7 +53,11 @@ pub enum GeometryCertainty {
+     Approximate512Consumed,
+ }
+ 
+-/// Completed CSG value paired with aggregate predicate certainty.
++/// Completed CSG value paired with operation-local predicate certainty.
++///
++/// For meshes, inherited construction qualifications are separately queryable
++/// through [`hypermesh::TriangleMesh::construction_evidence`]. A certified local
++/// receipt does not clear an earlier approximate construction or missing history.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct GeometryOutcome<T> {
+     /// Completed value.
+@@ -93,6 +97,7 @@ pub(crate) struct GeometryDecisions {
+     context: GeometryContext,
+     mesh_context: MeshContext,
+     certainty: Cell<GeometryCertainty>,
++    construction: Cell<hypermesh::ConstructionEvidence>,
+ }
+ 
+ #[allow(dead_code)]
+@@ -102,6 +107,7 @@ impl GeometryDecisions {
+             context: *context,
+             mesh_context: context.mesh_context(),
+             certainty: Cell::new(GeometryCertainty::Certified),
++            construction: Cell::new(hypermesh::ConstructionEvidence::DECLARED_COORDINATES),
+         }
+     }
+ 
+@@ -121,6 +127,31 @@ impl GeometryDecisions {
+         GeometryOutcome::new(value, self.certainty.get())
+     }
+ 
++    pub(crate) fn record_construction(&self, evidence: hypermesh::ConstructionEvidence) {
++        self.construction
++            .set(self.construction.get().combine(evidence));
++    }
++
++    pub(crate) fn qualify_mesh(
++        &self,
++        mesh: hypermesh::TriangleMesh,
++    ) -> hypermesh::TriangleMesh {
++        let certainty = match self.certainty.get() {
++            GeometryCertainty::Certified => MeshCertainty::Certified,
++            GeometryCertainty::Approximate512Consumed => MeshCertainty::Approximate512Consumed,
++        };
++        mesh.with_inherited_construction(
++            self.construction.get().with_predicate_certainty(certainty),
++        )
++    }
++
++    pub(crate) fn finish_mesh(
++        &self,
++        mesh: hypermesh::TriangleMesh,
++    ) -> GeometryOutcome<hypermesh::TriangleMesh> {
++        self.finish(self.qualify_mesh(mesh))
++    }
++
+     pub(crate) fn observe(&self, certainty: GeometryCertainty) {
+         if certainty == GeometryCertainty::Approximate512Consumed {
+             self.certainty.set(certainty);
+diff --git a/src/curve/native.rs b/src/curve/native.rs
+index 507c32510..d05a4d916 100644
+--- a/src/curve/native.rs
++++ b/src/curve/native.rs
+@@ -2219,7 +2219,7 @@ pub fn try_triangulate(
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
+     let mesh = try_triangulate_with(input, &decisions)?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ fn try_triangulate_with(
+@@ -2261,6 +2261,11 @@ fn try_modeling_profiles_with(
+     if let Some(profiles) = exact {
+         return Ok(profiles);
+     }
++    decisions.record_construction(
++        hypermesh::ConstructionEvidence::UNTRACKED
++            .with_sampling()
++            .with_coordinate_projection(),
++    );
+     let quantized_contour = |ring: &FinitePolyline2| -> Result<Contour2, ValidationError> {
+         let coordinates = ring
+             .points()
+@@ -2303,6 +2308,11 @@ fn try_finite_profiles_with(
+     input: &CurveRegion2,
+     decisions: &GeometryDecisions,
+ ) -> Result<Vec<FiniteRegionProfile2>, ValidationError> {
++    decisions.record_construction(
++        hypermesh::ConstructionEvidence::UNTRACKED
++            .with_sampling()
++            .with_coordinate_projection(),
++    );
+     let options = FiniteProjectionOptions::try_new(1.0e-3)
+         .expect("positive finite projection tolerance");
+     let profiles =
+@@ -2338,7 +2348,7 @@ pub fn try_extrude_vector(
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
+     let mesh = try_extrude_vector_with(region, direction, &decisions)?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ fn try_extrude_vector_with(
+@@ -2456,7 +2466,7 @@ fn validate_surface_mesh(
+             .map_err(|error| ValidationError::Geometry(error.to_string()))?,
+     );
+     if valid {
+-        Ok(mesh)
++        Ok(decisions.qualify_mesh(mesh))
+     } else {
+         Err(ValidationError::Geometry(
+             "triangulation emitted duplicate, invalid, or degenerate triangles".into(),
+@@ -2470,14 +2480,14 @@ fn validate_closed_mesh(
+     decisions: &GeometryDecisions,
+ ) -> Result<TriangleMesh, ValidationError> {
+     if allow_empty && mesh.triangles.is_empty() {
+-        return Ok(mesh);
++        return Ok(decisions.qualify_mesh(mesh));
+     }
+     let closed = decisions.consume_mesh(
+         mesh.is_closed_manifold_geometry(decisions.mesh_context())
+             .map_err(|error| ValidationError::Geometry(error.to_string()))?,
+     );
+     if closed {
+-        Ok(mesh)
++        Ok(decisions.qualify_mesh(mesh))
+     } else {
+         Err(ValidationError::Geometry(
+             "operation did not produce a unique nondegenerate closed manifold".into(),
+@@ -2711,7 +2721,7 @@ pub fn revolve(
+         region.is_empty(),
+         &decisions,
+     )?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Sweeps a native filled region along a 3D point path.
+@@ -2874,7 +2884,7 @@ pub fn try_sweep(
+         region.is_empty(),
+         &decisions,
+     )?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Extrudes while varying twist and terminal XY scale.
+@@ -2997,7 +3007,7 @@ pub fn extrude_twisted(
+         input.is_empty(),
+         &decisions,
+     )?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Filled contours sampled from Hypersdf's normalized inverse-square field.
+diff --git a/src/implicit/sdf.rs b/src/implicit/sdf.rs
+index aa3dfa8f7..221ffb963 100644
+--- a/src/implicit/sdf.rs
++++ b/src/implicit/sdf.rs
+@@ -306,7 +306,7 @@ fn sample_indexed(
+             samples.into_grid_report(preview_grid, metric_status),
+         ));
+     }
+-    Ok(decisions.finish((output.mesh, diagnostics)))
++    Ok(decisions.finish((decisions.qualify_mesh(output.mesh), diagnostics)))
+ }
+ 
+ #[derive(Clone, Debug)]
+diff --git a/src/implicit/tpms.rs b/src/implicit/tpms.rs
+index c55ed89f7..049346f27 100644
+--- a/src/implicit/tpms.rs
++++ b/src/implicit/tpms.rs
+@@ -336,7 +336,11 @@ fn tetrahedral_isosurface(
+             }
+         }
+     }
+-    Ok(TriangleMesh::new(positions, triangles))
++    Ok(TriangleMesh::from_construction(
++        positions,
++        triangles,
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES.with_sampling(),
++    ))
+ }
+ 
+ // ------------  Specific minimal‑surface flavours  --------------------
+diff --git a/src/io/dxf.rs b/src/io/dxf.rs
+index 2d691640f..f32e064dd 100644
+--- a/src/io/dxf.rs
++++ b/src/io/dxf.rs
+@@ -164,6 +164,9 @@ pub fn from_dxf_with_context(
+                 append_polygon(points)?;
+             },
+             EntityType::Circle(circle) => {
++                decisions.record_construction(
++                    hypermesh::ConstructionEvidence::UNTRACKED.with_sampling(),
++                );
+                 if circle.thickness != 0.0 {
+                     return Err(IoError::Unsupported {
+                         format: "DXF",
+@@ -260,7 +263,11 @@ pub fn from_dxf_with_context(
+             },
+         }
+     }
+-    Ok(decisions.finish(TriangleMesh::new(positions, triangles)))
++    Ok(decisions.finish_mesh(
++        TriangleMesh::new(positions, triangles).with_inherited_construction(
++            hypermesh::ConstructionEvidence::UNTRACKED.with_coordinate_projection(),
++        ),
++    ))
+ }
+ 
+ fn point_from_wcs(point: dxf::Point) -> Result<Point3, IoError> {
+diff --git a/src/io/gltf.rs b/src/io/gltf.rs
+index b7781a0f8..00ad893a0 100644
+--- a/src/io/gltf.rs
++++ b/src/io/gltf.rs
+@@ -146,7 +146,9 @@ pub fn from_gltf(bytes: &[u8]) -> Result<GltfMeshImport, IoError> {
+         let _ = normal;
+         native_triangles.push(Triangle::new(a, b, c));
+     }
+-    let mesh = TriangleMesh::new(positions, native_triangles);
++    let mesh = TriangleMesh::new(positions, native_triangles).with_inherited_construction(
++        hypermesh::ConstructionEvidence::UNTRACKED.with_coordinate_projection(),
++    );
+ 
+     Ok(GltfMeshImport {
+         mesh,
+diff --git a/src/io/obj.rs b/src/io/obj.rs
+index 5abab0d31..cb9b71d77 100644
+--- a/src/io/obj.rs
++++ b/src/io/obj.rs
+@@ -120,7 +120,7 @@ pub fn from_obj_with_context<R: BufRead>(
+             _ => {},
+         }
+     }
+-    Ok(decisions.finish(TriangleMesh::new(positions, triangles)))
++    Ok(decisions.finish_mesh(TriangleMesh::new(positions, triangles)))
+ }
+ 
+ /// Imports OBJ geometry with an optional per-position authored-normal sidecar.
+@@ -231,7 +231,7 @@ pub fn from_obj_attributed_with_context<R: BufRead>(
+         }
+     }
+ 
+-    let geometry = TriangleMesh::new(positions, triangles);
++    let geometry = decisions.qualify_mesh(TriangleMesh::new(positions, triangles));
+     let metadata = vec![(); geometry.triangles.len()];
+     let attributed = crate::AttributedMesh::with_authored_normals(
+         geometry,
+diff --git a/src/io/stl.rs b/src/io/stl.rs
+index 38c5eb363..2bbfcf702 100644
+--- a/src/io/stl.rs
++++ b/src/io/stl.rs
+@@ -4,7 +4,7 @@ use crate::io::{
+     IoError, decimal_f64, finite_f32, finite_f64, finite_triangle_normal, single_line_metadata,
+ };
+ use hyperlattice::{Point3, Real};
+-use hypermesh::{Triangle, TriangleMesh};
++use hypermesh::{ConstructionEvidence, Triangle, TriangleMesh};
+ use std::cell::RefCell;
+ use std::io::Cursor;
+ use std::sync::Arc;
+@@ -20,6 +20,59 @@ thread_local! {
+     static BINARY_STL_CACHE: RefCell<Vec<CachedBinaryStl>> = const { RefCell::new(Vec::new()) };
+ }
+ 
++/// Immutable binary STL bytes bound to their source construction qualifications.
++///
++/// Coordinates were projected by the STL exporter to binary32; the exporter
++/// proves nondegenerate encoded triangles, not manifoldness or a geometric
++/// error bound. The receipt is an in-process summary, not a serializable proof.
++/// There is intentionally no constructor accepting arbitrary bytes and a flag.
++#[derive(Clone, Debug)]
++pub struct BinaryStlArtifact {
++    bytes: Arc<[u8]>,
++    source: ConstructionEvidence,
++}
++
++impl BinaryStlArtifact {
++    /// Borrow the encoded geometry without changing the bound artifact.
++    pub fn bytes(&self) -> &[u8] {
++        &self.bytes
++    }
++
++    /// Qualifications of the authoritative source before export.
++    pub const fn source_construction_evidence(&self) -> ConstructionEvidence {
++        self.source
++    }
++
++    /// Qualifications of the encoded geometry, including binary32 projection.
++    pub const fn construction_evidence(&self) -> ConstructionEvidence {
++        self.source.with_coordinate_projection()
++    }
++
++    /// Validate and import these exact bytes while retaining their bound summary.
++    /// The topology proof concerns the parsed geometry only.
++    pub fn import(&self) -> Result<TriangleMesh, IoError> {
++        from_stl_with_construction(self.bytes(), self.construction_evidence())
++    }
++
++    /// Extract plain bytes, explicitly discarding the bound source receipt.
++    pub fn into_bytes(self) -> Vec<u8> {
++        self.bytes.to_vec()
++    }
++}
++
++/// Export binary32 STL while retaining a bound source construction summary.
++/// Geometry bytes are identical to [`to_stl_binary`]. The native source remains
++/// authoritative and unchanged; the artifact does not assert lossless export.
++pub fn to_stl_binary_artifact(
++    mesh: &TriangleMesh,
++    name: &str,
++) -> Result<BinaryStlArtifact, IoError> {
++    Ok(BinaryStlArtifact {
++        bytes: to_stl_binary(mesh, name)?.into(),
++        source: mesh.construction_evidence(),
++    })
++}
++
+ fn triangle_points(mesh: &TriangleMesh, triangle: &Triangle) -> Result<[Point3; 3], IoError> {
+     let [a, b, c] = triangle.indices();
+     let point = |index| {
+@@ -85,6 +138,8 @@ pub fn to_stl_ascii(mesh: &TriangleMesh, name: &str) -> Result<String, IoError>
+ /// is certified nondegenerate under the strict native policy before complete
+ /// bytes are published or cached. Open triangle surfaces remain exportable;
+ /// closed topology and fidelity before projection are separate claims.
++/// Plain bytes omit construction history. Use [`to_stl_binary_artifact`] when
++/// the next operation must retain a bound source summary.
+ pub fn to_stl_binary(mesh: &TriangleMesh, name: &str) -> Result<Vec<u8>, IoError> {
+     use stl_io::{Normal, Triangle as StlTriangle, Vertex, write_stl};
+ 
+@@ -174,6 +229,16 @@ pub fn to_stl_binary(mesh: &TriangleMesh, name: &str) -> Result<Vec<u8>, IoError
+ /// or analytic surface. Invalid topology returns [`IoError::Construction`] with
+ /// the native mesh error preserved as its cause; parsing errors remain IO errors.
+ pub fn from_stl(data: &[u8]) -> Result<TriangleMesh, IoError> {
++    from_stl_with_construction(
++        data,
++        ConstructionEvidence::UNTRACKED.with_coordinate_projection(),
++    )
++}
++
++fn from_stl_with_construction(
++    data: &[u8],
++    evidence: ConstructionEvidence,
++) -> Result<TriangleMesh, IoError> {
+     let mut cursor = Cursor::new(data);
+     let indexed = stl_io::read_stl(&mut cursor)?;
+     let positions = indexed
+@@ -201,7 +266,7 @@ pub fn from_stl(data: &[u8]) -> Result<TriangleMesh, IoError> {
+             face.vertices[2],
+         ));
+     }
+-    let mesh = TriangleMesh::new(positions, triangles);
++    let mesh = TriangleMesh::from_construction(positions, triangles, evidence);
+     if !(mesh.positions.is_empty() && mesh.triangles.is_empty()) {
+         mesh.validate_closed_pwn(&crate::GeometryContext::STRICT.mesh_context())
+             .map_err(|error| IoError::Construction {
+diff --git a/src/io/vrml.rs b/src/io/vrml.rs
+index bfa59f7fb..0110d6059 100644
+--- a/src/io/vrml.rs
++++ b/src/io/vrml.rs
+@@ -108,7 +108,8 @@ pub fn from_vrml_with_context(
+                 .into(),
+         });
+     }
+-    let mesh = TriangleMesh::new(flattened.positions, native_triangles);
++    let mesh =
++        decisions.qualify_mesh(TriangleMesh::new(flattened.positions, native_triangles));
+ 
+     Ok(decisions.finish(VrmlMeshImport {
+         mesh,
+diff --git a/src/lib.rs b/src/lib.rs
+index fd381b1ed..2d7c39b39 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -69,7 +69,7 @@ pub mod solid;
+ pub mod voxels;
+ 
+ pub use context::{GeometryCertainty, GeometryContext, GeometryOutcome};
+-pub use hypermesh::TriangleMesh;
++pub use hypermesh::{ConstructionEvidence, TriangleMesh};
+ pub use hyperreal::Real;
+ 
+ pub(crate) const PREDICATE_POLICY: hyperlimit::PredicatePolicy =
+diff --git a/src/solid.rs b/src/solid.rs
+index db335f042..40240a458 100644
+--- a/src/solid.rs
++++ b/src/solid.rs
+@@ -124,12 +124,13 @@ fn indexed(
+     positions: Vec<Point3>,
+     triangles: impl IntoIterator<Item = [usize; 3]>,
+ ) -> TriangleMesh {
+-    TriangleMesh::new(
++    TriangleMesh::from_construction(
+         positions,
+         triangles
+             .into_iter()
+             .map(|[a, b, c]| Triangle::new(a, b, c))
+             .collect(),
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES,
+     )
+ }
+ 
+@@ -142,7 +143,11 @@ fn indexed_convex(
+ 
+ /// Empty native triangle geometry.
+ pub fn empty() -> TriangleMesh {
+-    TriangleMesh::new(Vec::new(), Vec::new())
++    TriangleMesh::from_construction(
++        Vec::new(),
++        Vec::new(),
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES,
++    )
+ }
+ 
+ /// Axis-aligned cube with its minimum corner at the origin.
+@@ -290,7 +295,11 @@ fn sphere_uncached(
+             slot(longitude, stacks),
+         ]);
+     }
+-    Ok(indexed_convex(positions, triangles))
++    Ok(
++        indexed_convex(positions, triangles).with_inherited_construction(
++            hypermesh::ConstructionEvidence::DECLARED_COORDINATES.with_sampling(),
++        ),
++    )
+ }
+ 
+ /// Tessellated cylinder along +Z.
+@@ -458,7 +467,11 @@ fn frustum_between_uncached(
+             (true, true) => {},
+         }
+     }
+-    Ok(indexed_convex(positions, triangles))
++    Ok(
++        indexed_convex(positions, triangles).with_inherited_construction(
++            hypermesh::ConstructionEvidence::DECLARED_COORDINATES.with_sampling(),
++        ),
++    )
+ }
+ 
+ /// Regular octahedron centered at the origin.
+@@ -748,7 +761,9 @@ pub fn arrow(
+             });
+         },
+     }
+-    Ok(indexed(positions, triangles))
++    Ok(indexed(positions, triangles).with_inherited_construction(
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES.with_sampling(),
++    ))
+ }
+ 
+ /// Tessellated torus around the Z axis.
+@@ -821,7 +836,9 @@ fn torus_uncached(
+             triangles.push([a, c, d]);
+         }
+     }
+-    Ok(indexed(positions, triangles))
++    Ok(indexed(positions, triangles).with_inherited_construction(
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES.with_sampling(),
++    ))
+ }
+ 
+ /// Extruded teardrop solid.
+@@ -842,7 +859,7 @@ pub fn teardrop_cylinder(
+     )?);
+     let mesh =
+         decisions.consume_geometry(crate::curve::try_extrude(&profile, height, context)?);
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Extruded involute spur gear.
+@@ -869,7 +886,7 @@ pub fn spur_gear_involute(
+     )?);
+     let mesh =
+         decisions.consume_geometry(crate::curve::try_extrude(&profile, thickness, context)?);
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Extruded cycloidal spur gear.
+@@ -894,7 +911,7 @@ pub fn spur_gear_cycloid(
+     )?);
+     let mesh =
+         decisions.consume_geometry(crate::curve::try_extrude(&profile, thickness, context)?);
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Twisted extrusion of an involute gear region.
+@@ -930,7 +947,7 @@ pub fn helical_involute_gear(
+         slices,
+         context,
+     )?);
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Builds native triangle geometry from simple planar polygon index rows.
+@@ -985,7 +1002,11 @@ pub fn polyhedron_with_context(
+             Triangle::new(face[triangle[0]], face[triangle[1]], face[triangle[2]])
+         }));
+     }
+-    Ok(decisions.finish(TriangleMesh::new(positions, triangles)))
++    Ok(decisions.finish_mesh(TriangleMesh::from_construction(
++        positions,
++        triangles,
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES,
++    )))
+ }
+ 
+ fn triangulate_planar_ring(
+@@ -1102,10 +1123,14 @@ pub fn boolean_with_context(
+     context: &GeometryContext,
+ ) -> HypermeshResult<GeometryOutcome<TriangleMesh>> {
+     let decisions = GeometryDecisions::new(context);
++    decisions.record_construction(
++        left.construction_evidence()
++            .combine(right.construction_evidence()),
++    );
+     let left_empty = left.positions.is_empty() && left.triangles.is_empty();
+     let right_empty = right.positions.is_empty() && right.triangles.is_empty();
+     let outcome = match (left_empty, right_empty) {
+-        (true, true) => return Ok(decisions.finish(empty())),
++        (true, true) => return Ok(decisions.finish_mesh(empty())),
+         (false, false) => hypermesh::boolean(
+             decisions.mesh_context(),
+             &[left.as_ref(), right.as_ref()],
+@@ -1164,7 +1189,7 @@ pub fn boolean_with_context(
+         .ok_or(hypermesh::HypermeshError::InvalidBooleanProgram {
+             reason: "one CSG Boolean operation produced no result row",
+         })?;
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Applies a homogeneous transform and returns native geometry.
+@@ -1193,7 +1218,7 @@ pub fn try_transform_with_context(
+         orientation == RealSign::Negative,
+         &decisions,
+     )?;
+-    Ok(decisions.finish(transformed))
++    Ok(decisions.finish_mesh(transformed))
+ }
+ 
+ fn try_transform_with_known_orientation(
+@@ -1247,7 +1272,7 @@ pub fn try_rotate_with_context(
+         y,
+         z,
+     )?);
+-    Ok(decisions.finish(rotated))
++    Ok(decisions.finish_mesh(rotated))
+ }
+ 
+ /// Rotates native geometry by Euler angles in degrees.
+@@ -1299,7 +1324,7 @@ pub fn try_scale_with_context(
+         reverse_winding,
+         &decisions,
+     )?;
+-    Ok(decisions.finish(scaled))
++    Ok(decisions.finish_mesh(scaled))
+ }
+ 
+ /// Scales native geometry independently along each axis.
+@@ -1331,7 +1356,7 @@ pub fn try_mirror_with_context(
+     let matrix = decisions.consume_mesh(plane.reflection_matrix(decisions.mesh_context())?);
+     // A valid plane reflection always reverses orientation.
+     let mirrored = try_transform_with_known_orientation(mesh, &matrix, true, &decisions)?;
+-    Ok(decisions.finish(mirrored))
++    Ok(decisions.finish_mesh(mirrored))
+ }
+ 
+ /// Reflects native geometry across a plane.
+@@ -1744,7 +1769,7 @@ pub fn try_center_with_context(
+     let Some(bounds) =
+         decisions.consume_geometry(try_bounding_box_with_context(mesh, context)?)
+     else {
+-        return Ok(decisions.finish(mesh.clone()));
++        return Ok(decisions.finish_mesh(mesh.clone()));
+     };
+     let two = Real::from(2_u8);
+     let x = -((&bounds.mins.x + &bounds.maxs.x) / &two)?;
+@@ -1756,7 +1781,7 @@ pub fn try_center_with_context(
+         false,
+         &decisions,
+     )?;
+-    Ok(decisions.finish(centered))
++    Ok(decisions.finish_mesh(centered))
+ }
+ 
+ /// Translates the center of the exact bounds to the origin.
+@@ -1778,7 +1803,7 @@ pub fn try_float_with_context(
+     let Some(bounds) =
+         decisions.consume_geometry(try_bounding_box_with_context(mesh, context)?)
+     else {
+-        return Ok(decisions.finish(mesh.clone()));
++        return Ok(decisions.finish_mesh(mesh.clone()));
+     };
+     let floated = try_transform_with_known_orientation(
+         mesh,
+@@ -1786,7 +1811,7 @@ pub fn try_float_with_context(
+         false,
+         &decisions,
+     )?;
+-    Ok(decisions.finish(floated))
++    Ok(decisions.finish_mesh(floated))
+ }
+ 
+ /// Translates the minimum Z bound to zero.
+@@ -1908,6 +1933,7 @@ pub fn distribute_linear_with_context(
+     context: &GeometryContext,
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
++    decisions.record_construction(mesh.construction_evidence());
+     let parameters = DistributionParameters::Linear {
+         count,
+         direction: direction.clone(),
+@@ -1927,7 +1953,7 @@ pub fn distribute_linear_with_context(
+         RealSign::Negative => return Err(ValidationError::InvalidArguments),
+     }
+     if empty_source || count == 0 {
+-        return Ok(decisions.finish(empty()));
++        return Ok(decisions.finish_mesh(empty()));
+     }
+     let mut copies = distribution_buffer(mesh, count)?;
+     let step = direction.normalize_checked()? * spacing;
+@@ -1940,7 +1966,7 @@ pub fn distribute_linear_with_context(
+             &decisions,
+         )?);
+     }
+-    let result = decisions.finish(union_copies(copies, &decisions)?);
++    let result = decisions.finish_mesh(union_copies(copies, &decisions)?);
+     retain_distribution(mesh, parameters, context, &result);
+     Ok(result)
+ }
+@@ -1969,6 +1995,7 @@ pub fn distribute_grid_with_context(
+     context: &GeometryContext,
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
++    decisions.record_construction(mesh.construction_evidence());
+     let parameters = DistributionParameters::Grid {
+         rows,
+         columns,
+@@ -1979,7 +2006,7 @@ pub fn distribute_grid_with_context(
+         return Ok(result);
+     }
+     if validate_distribution_source(mesh, &decisions)? || rows == 0 || columns == 0 {
+-        return Ok(decisions.finish(empty()));
++        return Ok(decisions.finish_mesh(empty()));
+     }
+     let count = rows
+         .checked_mul(columns)
+@@ -1999,7 +2026,7 @@ pub fn distribute_grid_with_context(
+             )?);
+         }
+     }
+-    let result = decisions.finish(union_copies(copies, &decisions)?);
++    let result = decisions.finish_mesh(union_copies(copies, &decisions)?);
+     retain_distribution(mesh, parameters, context, &result);
+     Ok(result)
+ }
+@@ -2035,6 +2062,7 @@ pub fn distribute_arc_with_context(
+     context: &GeometryContext,
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
++    decisions.record_construction(mesh.construction_evidence());
+     let parameters = DistributionParameters::Arc {
+         count,
+         radius: radius.clone(),
+@@ -2045,7 +2073,7 @@ pub fn distribute_arc_with_context(
+         return Ok(result);
+     }
+     if validate_distribution_source(mesh, &decisions)? || count == 0 {
+-        return Ok(decisions.finish(empty()));
++        return Ok(decisions.finish_mesh(empty()));
+     }
+     let mut copies = distribution_buffer(mesh, count)?;
+     let start = start_angle_degrees.to_radians();
+@@ -2071,7 +2099,7 @@ pub fn distribute_arc_with_context(
+             &decisions,
+         )?);
+     }
+-    let result = decisions.finish(union_copies(copies, &decisions)?);
++    let result = decisions.finish_mesh(union_copies(copies, &decisions)?);
+     retain_distribution(mesh, parameters, context, &result);
+     Ok(result)
+ }
+@@ -2368,7 +2396,7 @@ pub fn convex_hull_with_context(
+ ) -> HypermeshResult<GeometryOutcome<TriangleMesh>> {
+     let decisions = GeometryDecisions::new(context);
+     let hull = decisions.consume_mesh(mesh.convex_hull(decisions.mesh_context())?);
+-    Ok(decisions.finish(hull))
++    Ok(decisions.finish_mesh(hull))
+ }
+ 
+ /// Regularized Minkowski sum of the represented bounded closed-PWN solids.
+@@ -2412,7 +2440,7 @@ pub fn minkowski_sum_with_options(
+         right,
+         options,
+     )?);
+-    Ok(decisions.finish(sum))
++    Ok(decisions.finish_mesh(sum))
+ }
+ 
+ /// Convex hull of pairwise stored-position sums, explicitly ignoring triangles.
+@@ -2435,12 +2463,16 @@ pub fn minkowski_hull_with_context(
+     context: &GeometryContext,
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
++    decisions.record_construction(
++        left.construction_evidence()
++            .combine(right.construction_evidence()),
++    );
+     let hull = decisions.consume_mesh(hypermesh::minkowski_hull(
+         decisions.mesh_context(),
+         &left.positions,
+         &right.positions,
+     )?);
+-    Ok(decisions.finish(hull))
++    Ok(decisions.finish_mesh(hull))
+ }
+ 
+ /// Lofts corresponding simple planar point loops into closed PWN geometry.
+@@ -2563,9 +2595,13 @@ pub fn loft_with_context(
+             triangles.push(Triangle::new(second[0], second[1], second[2]));
+         }
+     }
+-    let mesh = TriangleMesh::new(positions, triangles);
++    let mesh = TriangleMesh::from_construction(
++        positions,
++        triangles,
++        hypermesh::ConstructionEvidence::DECLARED_COORDINATES,
++    );
+     decisions.consume_mesh(mesh.validate_closed_pwn(decisions.mesh_context())?);
+-    Ok(decisions.finish(mesh))
++    Ok(decisions.finish_mesh(mesh))
+ }
+ 
+ /// Fluent CSG grammar implemented directly for native Hypermesh geometry.
+diff --git a/src/solid/cache.rs b/src/solid/cache.rs
+index 2977e54e7..e5ec33eee 100644
+--- a/src/solid/cache.rs
++++ b/src/solid/cache.rs
+@@ -4,7 +4,8 @@
+ //! predicate policy, change precision, cache errors, or certify geometry.
+ //! Context-sensitive entries retain both the selected [`crate::GeometryContext`]
+ //! and the result's certainty. A warm approximate entry cannot answer a strict
+-//! request. Source meshes are keyed by shared position/index storage identity;
++//! request. Source meshes are keyed by shared position/index storage identity
++//! and construction qualifications;
+ //! primitive parameters and slice heights use structural scalar equality.
+ //!
+ //! Budgets count entries, **not bytes**: an entry can retain arbitrarily large
+diff --git a/src/solid/cache/storage.rs b/src/solid/cache/storage.rs
+index 5a6992b6e..0743f0ea4 100644
+--- a/src/solid/cache/storage.rs
++++ b/src/solid/cache/storage.rs
+@@ -43,6 +43,7 @@ pub(in crate::solid) enum DistributionParameters {
+ struct MeshStorage {
+     positions: Arc<[Point3]>,
+     triangles: Arc<[Triangle]>,
++    construction: hypermesh::ConstructionEvidence,
+ }
+ 
+ impl MeshStorage {
+@@ -50,12 +51,14 @@ impl MeshStorage {
+         Self {
+             positions: Arc::clone(&mesh.positions),
+             triangles: Arc::clone(&mesh.triangles),
++            construction: mesh.construction_evidence(),
+         }
+     }
+ 
+     fn matches(&self, mesh: &TriangleMesh) -> bool {
+         Arc::ptr_eq(&self.positions, &mesh.positions)
+             && Arc::ptr_eq(&self.triangles, &mesh.triangles)
++            && self.construction == mesh.construction_evidence()
+     }
+ }
+ 
+diff --git a/src/wasm/context_js.rs b/src/wasm/context_js.rs
+index 5de7b20a2..16fbfcaa3 100644
+--- a/src/wasm/context_js.rs
++++ b/src/wasm/context_js.rs
+@@ -35,6 +35,55 @@ impl From<hypercurve::CurveCertainty> for GeometryCertaintyJs {
+     }
+ }
+ 
++/// Native construction qualifications, independent of operation-local certainty.
++/// A missing predicate certainty means source history is unavailable. Projection
++/// and sampling flags are separate and supply no geometric error bound.
++#[wasm_bindgen]
++pub struct ConstructionEvidenceJs {
++    pub(crate) inner: hypermesh::ConstructionEvidence,
++}
++
++#[wasm_bindgen]
++#[allow(clippy::missing_const_for_fn)]
++impl ConstructionEvidenceJs {
++    #[wasm_bindgen(getter, js_name = sourceHistoryMissing)]
++    pub fn source_history_missing(&self) -> bool {
++        self.inner.source_history_missing()
++    }
++
++    #[wasm_bindgen(getter, js_name = approximate512Consumed)]
++    pub fn approximate_512_consumed(&self) -> bool {
++        self.inner.approximate_512_consumed()
++    }
++
++    #[wasm_bindgen(getter, js_name = coordinatesProjected)]
++    pub fn coordinates_projected(&self) -> bool {
++        self.inner.coordinates_projected()
++    }
++
++    #[wasm_bindgen(getter, js_name = sourceSampled)]
++    pub fn source_sampled(&self) -> bool {
++        self.inner.source_sampled()
++    }
++
++    #[wasm_bindgen(getter, js_name = buffersChanged)]
++    pub fn buffers_changed(&self) -> bool {
++        self.inner.buffers_changed()
++    }
++
++    #[wasm_bindgen(getter, js_name = predicateCertainty)]
++    pub fn predicate_certainty(&self) -> Option<GeometryCertaintyJs> {
++        self.inner
++            .predicate_certainty()
++            .map(|certainty| match certainty {
++                hypermesh::MeshCertainty::Certified => GeometryCertaintyJs::Certified,
++                hypermesh::MeshCertainty::Approximate512Consumed => {
++                    GeometryCertaintyJs::Approximate512Consumed
++                },
++            })
++    }
++}
++
+ /// Outcome of a point query, separate from its predicate certainty.
+ #[wasm_bindgen]
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/src/wasm/mesh_js.rs b/src/wasm/mesh_js.rs
+index 22c811408..e9d933038 100644
+--- a/src/wasm/mesh_js.rs
++++ b/src/wasm/mesh_js.rs
+@@ -86,6 +86,24 @@ impl From<TriangleMesh> for MeshJs {
+ #[wasm_bindgen]
+ #[allow(clippy::missing_const_for_fn)]
+ impl MeshJs {
++    /// Construction qualifications remain queryable after outcome extraction.
++    #[wasm_bindgen(getter, js_name = constructionEvidence)]
++    pub fn construction_evidence(&self) -> super::context_js::ConstructionEvidenceJs {
++        super::context_js::ConstructionEvidenceJs {
++            inner: self.inner.construction_evidence(),
++        }
++    }
++
++    /// Export immutable bytes with a bound construction receipt. Plain byte
++    /// extraction alone cannot preserve that receipt through reimport.
++    #[cfg(feature = "stl-io")]
++    #[wasm_bindgen(js_name = toStlBinaryArtifact)]
++    pub fn to_stl_binary_artifact(&self) -> Result<BinaryStlArtifactJs, JsValue> {
++        crate::io::stl::to_stl_binary_artifact(&self.inner, "mesh")
++            .map(|inner| BinaryStlArtifactJs { inner })
++            .map_err(|error| io_error(error, "STL"))
++    }
++
+     #[wasm_bindgen(constructor)]
+     pub fn new() -> Self {
+         solid::empty().into()
+@@ -769,6 +787,39 @@ impl MeshJs {
+     }
+ }
+ 
++/// In-process binary32 STL artifact; the bytes and source receipt are immutable.
++#[cfg(feature = "stl-io")]
++#[wasm_bindgen]
++pub struct BinaryStlArtifactJs {
++    inner: crate::io::stl::BinaryStlArtifact,
++}
++
++#[cfg(feature = "stl-io")]
++#[wasm_bindgen]
++#[allow(clippy::missing_const_for_fn)]
++impl BinaryStlArtifactJs {
++    /// Returns a copy; editing it cannot alter the bound artifact.
++    #[wasm_bindgen(getter)]
++    pub fn bytes(&self) -> Vec<u8> {
++        self.inner.bytes().to_vec()
++    }
++
++    #[wasm_bindgen(getter, js_name = constructionEvidence)]
++    pub fn construction_evidence(&self) -> super::context_js::ConstructionEvidenceJs {
++        super::context_js::ConstructionEvidenceJs {
++            inner: self.inner.construction_evidence(),
++        }
++    }
++
++    #[wasm_bindgen(js_name = intoMesh)]
++    pub fn into_mesh(self) -> Result<MeshJs, JsValue> {
++        self.inner
++            .import()
++            .map(MeshJs::from)
++            .map_err(|error| io_error(error, "STL"))
++    }
++}
++
+ impl Default for MeshJs {
+     fn default() -> Self {
+         Self::new()
+diff --git a/tests/wasm_certainty.rs b/tests/wasm_certainty.rs
+index a6fe76704..447f67706 100644
+--- a/tests/wasm_certainty.rs
++++ b/tests/wasm_certainty.rs
+@@ -15,6 +15,33 @@ fn unresolved_zero() -> Real {
+     &sine * &sine + &cosine * &cosine - Real::one()
+ }
+ 
++#[test]
++fn actual_approximate_mesh_evidence_survives_js_outcome_extraction() {
++    let cube = solid::cube(Real::one()).unwrap();
++    let mut points = cube.positions.to_vec();
++    points.push(Point3::new(unresolved_zero(), 0.into(), 0.into()));
++    let hull = hypermesh::convex_hull(
++        &csgrs::GeometryContext::APPROXIMATE_512.mesh_context(),
++        &points,
++    )
++    .unwrap();
++    assert_eq!(
++        hull.certainty,
++        hypermesh::MeshCertainty::Approximate512Consumed
++    );
++    let mesh = GeometryMeshResultJs::from(GeometryOutcome {
++        value: hull.value,
++        certainty: GeometryCertainty::Approximate512Consumed,
++    })
++    .into_mesh();
++    let evidence = mesh.construction_evidence();
++    assert!(evidence.approximate_512_consumed());
++    assert_eq!(
++        evidence.predicate_certainty(),
++        Some(GeometryCertaintyJs::Approximate512Consumed)
++    );
++}
++
+ #[test]
+ fn named_receipts_preserve_both_certainty_values() {
+     for certainty in [
+diff --git a/crates/hypermesh/src/construction.rs b/crates/hypermesh/src/construction.rs
+new file mode 100644
+index 000000000..3f2c4833b
+--- /dev/null
++++ b/crates/hypermesh/src/construction.rs
+@@ -0,0 +1,101 @@
++//! Bounded qualifications of a mesh's construction dependencies.
++
++use crate::MeshCertainty;
++
++/// Monotone summary of construction dependencies, separate from local predicate
++/// receipts, topology proofs and geometric error bounds.
++///
++/// This one-byte value retains qualifications, not a replayable proof or a
++/// boundary-to-source mapping. `Some(Certified)` from [`Self::predicate_certainty`]
++/// concerns decisions since the declared coordinate source only. Sampling and
++/// coordinate projection remain separate fidelity boundaries even in that case.
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub struct ConstructionEvidence(u8);
++
++impl Default for ConstructionEvidence {
++    fn default() -> Self {
++        Self::UNTRACKED
++    }
++}
++
++impl ConstructionEvidence {
++    const MISSING: u8 = 1;
++    const APPROXIMATE: u8 = 2;
++    const PROJECTED: u8 = 4;
++    const SAMPLED: u8 = 8;
++    const MUTATED: u8 = 16;
++
++    /// Start a new claim at explicitly declared coordinates. This does not prove
++    /// their relationship to any earlier model or intended analytic surface.
++    pub const DECLARED_COORDINATES: Self = Self(0);
++    /// The preceding construction history is unavailable.
++    pub const UNTRACKED: Self = Self(Self::MISSING);
++
++    /// Retain every qualification from both dependency chains.
++    pub const fn combine(self, other: Self) -> Self {
++        Self(self.0 | other.0)
++    }
++
++    /// Record actual predicate consumption. A later certified operation cannot
++    /// clear an earlier approximate decision or fill missing source history.
++    pub const fn with_predicate_certainty(self, certainty: MeshCertainty) -> Self {
++        match certainty {
++            MeshCertainty::Certified => self,
++            MeshCertainty::Approximate512Consumed => Self(self.0 | Self::APPROXIMATE),
++        }
++    }
++
++    /// Record a coordinate projection, independently of predicate certainty.
++    /// The boundary API supplies its format and loss model.
++    pub const fn with_coordinate_projection(self) -> Self {
++        Self(self.0 | Self::PROJECTED)
++    }
++
++    /// Record construction from samples; this supplies no continuous-source
++    /// fidelity or error-bound claim.
++    pub const fn with_sampling(self) -> Self {
++        Self(self.0 | Self::SAMPLED)
++    }
++
++    pub(crate) const fn after_buffer_mutation(self) -> Self {
++        Self(self.0 | Self::MISSING | Self::MUTATED)
++    }
++
++    /// Whether any preceding construction history is unavailable.
++    pub const fn source_history_missing(self) -> bool {
++        self.0 & Self::MISSING != 0
++    }
++
++    /// Whether retained evidence records an actual approximate predicate.
++    /// False does not certify missing history.
++    pub const fn approximate_512_consumed(self) -> bool {
++        self.0 & Self::APPROXIMATE != 0
++    }
++
++    /// Whether the dependency chain contains a coordinate projection.
++    pub const fn coordinates_projected(self) -> bool {
++        self.0 & Self::PROJECTED != 0
++    }
++
++    /// Whether the dependency chain contains construction from samples.
++    pub const fn source_sampled(self) -> bool {
++        self.0 & Self::SAMPLED != 0
++    }
++
++    /// Whether buffers ceased to match a retained construction identity.
++    pub const fn buffers_changed(self) -> bool {
++        self.0 & Self::MUTATED != 0
++    }
++
++    /// Aggregate predicate certainty when source history is available. This
++    /// never certifies topology, geometric fidelity or preceding source intent.
++    pub const fn predicate_certainty(self) -> Option<MeshCertainty> {
++        if self.source_history_missing() {
++            None
++        } else if self.approximate_512_consumed() {
++            Some(MeshCertainty::Approximate512Consumed)
++        } else {
++            Some(MeshCertainty::Certified)
++        }
++    }
++}
+diff --git a/docs/construction-evidence.md b/docs/construction-evidence.md
+new file mode 100644
+index 000000000..084c205be
+--- /dev/null
++++ b/docs/construction-evidence.md
+@@ -0,0 +1,138 @@
++# Construction evidence on native meshes
++
++`GeometryOutcome::certainty` and `MeshOutcome::certainty` describe decisions
++consumed by that operation. `TriangleMesh::construction_evidence()` separately
++retains qualifications of the construction dependencies. Extracting `.value`,
++cloning, transforming, or composing a mesh keeps those qualifications. A strict
++PWN or manifold validation proves a fact about the current geometry; it does
++not clear an earlier approximate construction.
++
++The summary exposes five independent facts:
++
++| Query | Meaning |
++| --- | --- |
++| `source_history_missing()` | Some preceding construction history is unavailable. |
++| `approximate_512_consumed()` | Available history records an actual terminal predicate decision. |
++| `coordinates_projected()` | A coordinate projection occurred; its boundary API defines the loss model. |
++| `source_sampled()` | Construction used samples; no continuous-source error bound is implied. |
++| `buffers_changed()` | Geometry ceased to match a retained construction identity. |
++
++`predicate_certainty()` is absent when history is missing. Otherwise it reports
++the weakest retained predicate certainty since the declared coordinate source.
++Selecting `APPROXIMATE_512` alone does not qualify an exact construction. A false
++approximate flag cannot certify missing history. Predicate certainty, topology,
++and fidelity remain separate contracts even when all retained predicates are
++certified.
++
++This is a bounded qualification summary, not a replayable proof or a complete
++boundary-to-source mapping. Full curve lineage and persistent proof replay remain
++open under `properties.md` P15/P19. Bare curve-to-mesh conversions expose missing
++history; finite sampled-profile conversions additionally expose sampling and
++projection. Mesh evidence cannot reconstruct a discarded curve receipt.
++
++## Source and mutation boundaries
++
++`TriangleMesh::new` imports raw coordinates with untracked preceding history.
++`TriangleMesh::from_construction` explicitly starts a new claim with supplied
++qualifications. `ConstructionEvidence::DECLARED_COORDINATES` declares the current
++coordinates as the source; it does not prove their relation to earlier intent.
++Primitive constructors and free point-set hull construction make this source
++boundary explicit in their domain. The mesh hull method also inherits its mesh
++input's evidence. Modeling parameters are declared scalar inputs.
++
++`with_inherited_construction` only adds qualifications. Supported native
++operations use that invariant and combine all consumed parents, including empty
++outputs. A new proof of topology cannot upgrade a construction claim. Replacing
++or editing public buffers exposes missing history while retaining known
++approximate, sampling and projection qualifications. Reauthoring equal raw
++coordinates starts a new source claim; it does not restore the earlier evidence.
++
++Geometry equality still compares coordinates and indices. Compare evidence
++separately. Modeling caches also key on construction qualifications, so two
++meshes sharing geometry buffers cannot exchange differently qualified outputs.
++
++### Boolean batch API migration
++
++`BooleanMeshBatch` now uses `Arc<[Point3]>` and `Arc<[BooleanMeshResult]>` with
++private weak identity witnesses. Replace raw struct literals with
++`BooleanMeshBatch::new(vertices, results)`; use `.iter()` for iteration,
++`.to_vec()` for an owned vector, and `Arc::make_mut` for intentional edits.
++Editing either shared buffer invalidates its construction identity. Malformed
++carrier validation and typed failures retain their existing contract.
++
++`into_triangle_meshes` preserves the summary for every row, including canonical
++empty results, and shares positions across nonempty results. Per-triangle
++`TriangleSource` mappings still belong to the batch and are discarded by this
++explicit conversion; the summary does not replace them.
++
++## Complete in-process STL path
++
++With the `stl-io` feature, preserve a bound artifact through export/import:
++
++```rust
++use csgrs::{GeometryContext, Real, solid};
++use csgrs::io::stl::to_stl_binary_artifact;
++use hyperlattice::Matrix4;
++
++let source = solid::cube(Real::one())?;
++let shifted = solid::try_transform_with_context(
++    &source,
++    &Matrix4::affine_translation([3.into(), 5.into(), 7.into()]),
++    &GeometryContext::STRICT,
++)?;
++let model = solid::boolean_with_context(
++    &shifted.value, &solid::empty(), hypermesh::BooleanOp::Union,
++    &GeometryContext::STRICT,
++)?.value;
++let artifact = to_stl_binary_artifact(&model, "model")?;
++let imported = artifact.import()?;
++let local = imported.validate_closed_pwn(&GeometryContext::STRICT.mesh_context())?;
++assert_eq!(local.certainty, hypermesh::MeshCertainty::Certified);
++let inherited = imported.construction_evidence();
++assert_eq!(inherited, model.construction_evidence().with_coordinate_projection());
++# Ok::<(), Box<dyn std::error::Error>>(())
++```
++
++`BinaryStlArtifact` binds immutable bytes to the source summary within the
++process. It encodes the same bytes as `to_stl_binary`; coordinates cross the
++existing binary32 projection, and the exporter checks encoded triangles for
++nondegeneracy. Import validates the parsed closed-PWN geometry. Neither operation
++promises manifoldness or a geometric error bound, and the authoritative exact
++source remains unchanged.
++
++`bytes()` borrows the artifact; `into_bytes()` deliberately extracts bytes without
++the receipt. Plain `from_stl(bytes)` reports missing source history and projection.
++Identical STL bytes can originate from differently qualified constructions.
++There is no API to restore a certified receipt from an unverified serialized
++flag. Persistent proof-preserving interchange remains open.
++
++JavaScript exposes `mesh.constructionEvidence` separately from outcome certainty.
++`mesh.toStlBinaryArtifact()` returns an artifact with a read-only receipt, a
++copying `bytes` getter, and `intoMesh()` for receipt-preserving import. Editing
++that byte copy cannot change the artifact. C exposes
++`csgrs_triangle_mesh_construction_evidence` for every scalar family; C++ and
++Python provide `construction_evidence()`. These summaries outlive their queried
++handles. The C ABI currently exposes strict construction APIs; this addition
++does not introduce an approximate-policy constructor or bound STL ABI.
++
++## Resource and acceptance scope
++
++The summary occupies one byte before carrier alignment. Mesh binding reuses
++existing weak buffer identities; Boolean batches add two weak identities.
++There is no dependency graph. Weak identities retain backing allocations after
++their values are dropped: editing or replacing a batch buffer can retain its old
++allocation until the batch and its identity witnesses are dropped. Thus a
++constant-sized summary does not imply constant retained heap usage, and edits
++can increase peak memory. The admission measurements include this cost.
++
++An STL artifact owns encoded bytes and a summary. Existing geometry, expression,
++cache-byte and total-work limitations remain; the metadata does not add an
++internal work or heap budget.
++
++The regression corpus retains the twelve E98 exact/approximate/outside-point,
++integral/fractional, cold/warm pipelines, including the original `2^-1200` point
++and 512-bit modeling policy. It separately checks current geometry, local proofs,
++inherited evidence, binary32 endpoint expectations, and mutation/cache/empty
++boundaries. A delayed stronger scalar proof does not retroactively certify the
++earlier construction. Admission evidence records actual executed configurations;
++this document alone makes no release or full P19 completion claim.
+diff --git a/tests/construction_evidence.rs b/tests/construction_evidence.rs
+new file mode 100644
+index 000000000..21aeacb4c
+--- /dev/null
++++ b/tests/construction_evidence.rs
+@@ -0,0 +1,260 @@
++//! Construction qualifications are independent of geometry equality and local proofs.
++use csgrs::{
++    ConstructionEvidence as Evidence, GeometryCertainty, GeometryContext, Real, TriangleMesh,
++    solid,
++};
++use hyperlattice::{Matrix4, Point3, Vector3};
++use hypermesh::{BooleanOp, BooleanProgram, MeshCertainty};
++use std::{num::NonZeroU32, sync::Arc};
++
++fn unresolved_zero() -> Real {
++    let sine = Real::e().sin();
++    let cosine = Real::e().cos();
++    &sine * &sine + &cosine * &cosine - Real::one()
++}
++
++fn approximate_mesh() -> TriangleMesh {
++    let cube = solid::cube(Real::one()).unwrap();
++    let mut points = cube.positions.to_vec();
++    points.push(Point3::new(unresolved_zero(), 0.into(), 0.into()));
++    let outcome =
++        hypermesh::convex_hull(&GeometryContext::APPROXIMATE_512.mesh_context(), &points)
++            .unwrap();
++    assert_eq!(outcome.certainty, MeshCertainty::Approximate512Consumed);
++    outcome.into_value()
++}
++
++fn assert_approximate(mesh: &TriangleMesh) {
++    assert_eq!(
++        mesh.construction_evidence().predicate_certainty(),
++        Some(MeshCertainty::Approximate512Consumed)
++    );
++}
++
++#[test]
++fn local_validation_and_parent_composition_preserve_approximation() {
++    let mesh = approximate_mesh();
++    let context = GeometryContext::STRICT.mesh_context();
++    assert_eq!(
++        mesh.validate_closed_pwn(&context).unwrap().certainty,
++        MeshCertainty::Certified
++    );
++    assert_approximate(&mesh);
++    let cube = solid::cube(1.into()).unwrap();
++    let evidence = mesh.construction_evidence();
++    assert_eq!(core::mem::size_of::<Evidence>(), 1);
++    assert_eq!(
++        evidence.with_predicate_certainty(MeshCertainty::Certified),
++        evidence
++    );
++    for derived in [
++        mesh.clone(),
++        mesh.reversed_winding(),
++        mesh.subdivide_triangles(NonZeroU32::new(1).unwrap()).unwrap(),
++        mesh.laplacian_smooth(&Real::from(0), 1).unwrap(),
++        mesh.taubin_smooth(&Real::from(0), &Real::from(0), 1).unwrap(),
++        mesh.convex_hull(&context).unwrap().value,
++        mesh.try_transformed(
++            &context,
++            &Matrix4::affine_translation([2.into(), 3.into(), 4.into()]),
++        )
++        .unwrap()
++        .value,
++        TriangleMesh::try_concatenate(&[cube.clone(), mesh.clone()]).unwrap(),
++        solid::minkowski_hull(&mesh, &cube).unwrap(),
++        solid::minkowski_sum(&mesh, &solid::empty()).unwrap(),
++        csgrs::adapter::TriangleMeshF64::from_native(mesh.clone())
++            .inverse()
++            .into_native(),
++    ] {
++        assert_approximate(&derived);
++    }
++    let projected = mesh.materialize_finite().unwrap();
++    assert_approximate(&projected);
++    assert!(projected.construction_evidence().coordinates_projected());
++    assert!(!mesh.construction_evidence().coordinates_projected());
++}
++
++#[test]
++fn mutation_and_borrowed_views_expose_missing_history_without_erasing_known_facts() {
++    let mesh = approximate_mesh();
++    let mut changed = mesh.clone();
++    // Even an equal replacement lacks the retained construction identity.
++    Arc::make_mut(&mut changed.positions)[0] = mesh.positions[0].clone();
++    let evidence = changed.construction_evidence();
++    assert!(evidence.source_history_missing() && evidence.buffers_changed());
++    assert!(evidence.approximate_512_consumed());
++    assert_eq!(evidence.predicate_certainty(), None);
++    changed
++        .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++        .unwrap();
++    assert_eq!(changed.construction_evidence(), evidence);
++    assert_approximate(&mesh);
++    assert_eq!(
++        mesh.as_ref().construction_evidence(),
++        mesh.construction_evidence()
++    );
++    let mut view = mesh.as_ref();
++    view.triangles = &[];
++    assert!(view.construction_evidence().source_history_missing());
++    assert!(view.construction_evidence().approximate_512_consumed());
++    let mut changed_indices = mesh.clone();
++    Arc::make_mut(&mut changed_indices.triangles).swap(0, 1);
++    assert!(changed_indices.construction_evidence().buffers_changed());
++    let raw = TriangleMesh::new(mesh.positions.to_vec(), mesh.triangles.to_vec());
++    assert_eq!(raw.construction_evidence(), Evidence::UNTRACKED);
++    assert!(
++        raw.convex_hull(&GeometryContext::STRICT.mesh_context())
++            .unwrap()
++            .value
++            .construction_evidence()
++            .source_history_missing()
++    );
++    // Public new-claim construction is explicit; equality still compares geometry.
++    assert_eq!(raw, mesh);
++    assert_ne!(raw.construction_evidence(), mesh.construction_evidence());
++}
++
++#[test]
++fn boolean_batch_and_empty_bridges_keep_both_parents() {
++    let mesh = approximate_mesh();
++    let cube = solid::cube(1.into()).unwrap();
++    let batch = hypermesh::boolean(
++        &GeometryContext::STRICT.mesh_context(),
++        &[mesh.as_ref(), cube.as_ref()],
++        BooleanProgram::Operation(BooleanOp::Union),
++    )
++    .unwrap();
++    assert_eq!(batch.certainty, MeshCertainty::Certified);
++    assert_eq!(
++        batch.value.construction_evidence(),
++        mesh.construction_evidence()
++    );
++    assert_approximate(&batch.value.clone().into_triangle_meshes().unwrap()[0]);
++    let mut changed = batch.value.clone();
++    Arc::make_mut(&mut changed.results)[0].triangles.swap(0, 1);
++    let changed_evidence = changed.construction_evidence();
++    assert!(
++        changed_evidence.source_history_missing()
++            && changed_evidence.approximate_512_consumed()
++    );
++    assert_eq!(
++        changed.into_triangle_meshes().unwrap()[0].construction_evidence(),
++        changed_evidence
++    );
++    let mut changed = batch.value;
++    Arc::make_mut(&mut changed.vertices)[0] = mesh.positions[0].clone();
++    assert!(changed.construction_evidence().buffers_changed());
++    let empty = solid::boolean_with_context(
++        &mesh,
++        &mesh,
++        BooleanOp::Difference,
++        &GeometryContext::STRICT,
++    )
++    .unwrap();
++    assert!(empty.value.positions.is_empty() && empty.value.triangles.is_empty());
++    assert_eq!(empty.certainty, GeometryCertainty::Certified);
++    assert_approximate(&empty.value);
++    for (left, right) in [
++        (&empty.value, &cube),
++        (&cube, &empty.value),
++        (&empty.value, &solid::empty()),
++    ] {
++        for operation in [
++            BooleanOp::Union,
++            BooleanOp::Intersection,
++            BooleanOp::Difference,
++        ] {
++            let result =
++                solid::boolean_with_context(left, right, operation, &GeometryContext::STRICT)
++                    .unwrap();
++            assert_eq!(result.certainty, GeometryCertainty::Certified);
++            assert_approximate(&result.value);
++        }
++    }
++}
++
++#[test]
++fn modeling_cache_keys_include_construction_qualifications() {
++    use solid::cache::{CachePolicy, with_policy};
++    let cube = solid::cube(1.into()).unwrap();
++    let qualified = cube
++        .clone()
++        .with_inherited_construction(approximate_mesh().construction_evidence());
++    assert!(Arc::ptr_eq(&cube.positions, &qualified.positions));
++    assert!(Arc::ptr_eq(&cube.triangles, &qualified.triangles));
++    for policy in [
++        CachePolicy::DEFAULT,
++        CachePolicy::DISABLED,
++        CachePolicy {
++            distributions: 1,
++            merges: 1,
++            ..CachePolicy::DEFAULT
++        },
++    ] {
++        with_policy(policy, || {
++            for context in [
++                GeometryContext::STRICT,
++                GeometryContext::APPROXIMATE_512,
++                GeometryContext::STRICT,
++            ] {
++                for source in [&cube, &qualified, &cube, &qualified] {
++                    for count in [0, 1, 2] {
++                        let result = solid::distribute_linear_with_context(
++                            source,
++                            count,
++                            Vector3::x(),
++                            3.into(),
++                            &context,
++                        )
++                        .unwrap();
++                        assert_eq!(
++                            result.value.construction_evidence(),
++                            source.construction_evidence()
++                        );
++                        assert_eq!(result.certainty, GeometryCertainty::Certified);
++                    }
++                    let merged = solid::merge(&[source.clone(), solid::empty()]).unwrap();
++                    assert_eq!(merged.construction_evidence(), source.construction_evidence());
++                }
++            }
++        });
++    }
++}
++
++#[test]
++fn concurrent_local_proofs_do_not_upgrade_construction() {
++    let mesh = approximate_mesh();
++    std::thread::scope(|scope| {
++        for _ in 0..4 {
++            let mesh = mesh.clone();
++            scope.spawn(move || {
++                for _ in 0..8 {
++                    let local = mesh
++                        .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++                        .unwrap();
++                    assert_eq!(local.certainty, MeshCertainty::Certified);
++                    assert_approximate(&mesh);
++                }
++            });
++        }
++    });
++    assert_approximate(&mesh);
++}
++
++#[cfg(feature = "curve")]
++#[test]
++fn bare_curve_history_is_untracked_and_sampling_is_separate() {
++    let square = csgrs::curve::square(1.into()).unwrap();
++    let mesh = csgrs::curve::try_extrude(&square, 1.into(), &GeometryContext::STRICT).unwrap();
++    assert_eq!(mesh.certainty, GeometryCertainty::Certified);
++    assert!(mesh.value.construction_evidence().source_history_missing());
++    let sphere = solid::sphere(1.into(), 8, 4).unwrap();
++    let evidence = sphere.construction_evidence();
++    assert!(evidence.source_sampled());
++    assert_eq!(evidence.predicate_certainty(), Some(MeshCertainty::Certified));
++}
++
++#[cfg(feature = "stl-io")]
++#[path = "support/construction_evidence_pipeline.rs"]
++mod pipeline;
+diff --git a/tests/ffi/construction_evidence.c b/tests/ffi/construction_evidence.c
+new file mode 100644
+index 000000000..4feffa741
+--- /dev/null
++++ b/tests/ffi/construction_evidence.c
+@@ -0,0 +1,28 @@
++#include "csgrs.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++int main(void) {
++  csgrs_triangle_mesh_t *cube = NULL, *shifted = NULL, *empty = NULL, *sphere = NULL;
++  assert(csgrs_triangle_mesh_f64_cube(1, &cube) == CSGRS_STATUS_OK);
++  csgrs_construction_evidence_t evidence;
++  memset(&evidence, 0x77, sizeof evidence);
++  const csgrs_construction_evidence_t sentinel = evidence;
++  assert(csgrs_triangle_mesh_construction_evidence(NULL, &evidence) == CSGRS_STATUS_NULL_POINTER);
++  assert(memcmp(&sentinel, &evidence, sizeof evidence) == 0);
++  assert(csgrs_triangle_mesh_construction_evidence(cube, NULL) == CSGRS_STATUS_NULL_POINTER);
++  assert(csgrs_triangle_mesh_construction_evidence(cube, &evidence) == CSGRS_STATUS_OK);
++  assert(!evidence.source_history_missing && !evidence.approximate_512_consumed);
++  assert(!evidence.coordinates_projected && !evidence.source_sampled && !evidence.buffers_changed);
++  assert(csgrs_triangle_mesh_f64_translate(cube, 3, 5, 7, &shifted) == CSGRS_STATUS_OK);
++  assert(csgrs_triangle_mesh_f64_difference(shifted, shifted, &empty) == CSGRS_STATUS_OK);
++  assert(csgrs_triangle_mesh_construction_evidence(empty, &evidence) == CSGRS_STATUS_OK);
++  assert(!evidence.source_history_missing && !evidence.approximate_512_consumed);
++  assert(csgrs_triangle_mesh_f64_sphere(1, 8, 4, &sphere) == CSGRS_STATUS_OK);
++  assert(csgrs_triangle_mesh_construction_evidence(sphere, &evidence) == CSGRS_STATUS_OK);
++  assert(evidence.source_sampled && !evidence.source_history_missing);
++  csgrs_triangle_mesh_free(sphere); csgrs_triangle_mesh_free(empty);
++  csgrs_triangle_mesh_free(shifted); csgrs_triangle_mesh_free(cube);
++  assert(evidence.source_sampled); /* Caller-owned summary outlives the handle. */
++  puts("C construction evidence and typed null failures passed");
++}
+diff --git a/tests/ffi/construction_evidence.cpp b/tests/ffi/construction_evidence.cpp
+new file mode 100644
+index 000000000..beb453266
+--- /dev/null
++++ b/tests/ffi/construction_evidence.cpp
+@@ -0,0 +1,16 @@
++#include "csgrs.hpp"
++#include <cassert>
++#include <iostream>
++int main() {
++  using Mesh = csgrs::TriangleMesh<csgrs::F64>;
++  const auto cube = Mesh::cube(1);
++  const auto moved = cube.translate(3, 5, 7);
++  const auto removed = moved.difference(moved);
++  for (const auto *mesh : {&cube, &moved, &removed}) {
++    const auto evidence = mesh->construction_evidence();
++    assert(!evidence.source_history_missing && !evidence.approximate_512_consumed);
++  }
++  const auto sphere = Mesh::sphere(1, 8, 4);
++  assert(sphere.inverse().construction_evidence().source_sampled);
++  std::cout << "C++ native construction evidence passed\n";
++}
+diff --git a/tests/ffi/construction_evidence.py b/tests/ffi/construction_evidence.py
+new file mode 100644
+index 000000000..c8362bb10
+--- /dev/null
++++ b/tests/ffi/construction_evidence.py
+@@ -0,0 +1,17 @@
++import sys
++sys.dont_write_bytecode = True
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'bindings/python'))
++import csgrs
++cube = csgrs.TriangleMeshF64.cube(1)
++moved = cube.translate(3, 5, 7)
++removed = moved.difference(moved)
++for mesh in [cube, moved, removed]:
++    evidence = mesh.construction_evidence()
++    assert not evidence.source_history_missing and not evidence.approximate_512_consumed
++sphere = csgrs.TriangleMeshF64.sphere(1, 8, 4)
++evidence = sphere.inverse().construction_evidence()
++assert evidence.source_sampled and not evidence.source_history_missing
++del sphere
++assert evidence.source_sampled
++print('Python native construction evidence passed')
+diff --git a/tests/support/construction_evidence_pipeline.rs b/tests/support/construction_evidence_pipeline.rs
+new file mode 100644
+index 000000000..879003d96
+--- /dev/null
++++ b/tests/support/construction_evidence_pipeline.rs
+@@ -0,0 +1,291 @@
++use csgrs::{GeometryCertainty, GeometryContext, Real, TriangleMesh, solid};
++use hyperlattice::{Matrix4, Point3};
++use hypermesh::{BooleanOp, MeshCertainty};
++use hyperreal::Rational;
++
++fn q(n: i64, d: u64) -> Real {
++    Real::from(Rational::fraction(n, d).unwrap())
++}
++fn unresolved_zero() -> Real {
++    let sine = Real::e().sin();
++    let cosine = Real::e().cos();
++    &sine * &sine + &cosine * &cosine - Real::one()
++}
++fn check_box(mesh: &TriangleMesh, low: [Real; 3], high: [Real; 3]) {
++    for p in mesh.positions.iter() {
++        for (axis, value) in [&p.x, &p.y, &p.z].into_iter().enumerate() {
++            let n = value.exact_rational_normal_form().unwrap();
++            assert!(n >= low[axis].exact_rational_normal_form().unwrap());
++            assert!(n <= high[axis].exact_rational_normal_form().unwrap());
++        }
++    }
++    let mut six_volume = Real::zero();
++    for triangle in mesh.triangles.iter() {
++        let [a, b, c] = triangle.indices().map(|i| &mesh.positions[i]);
++        let points = [a, b, c].map(|p| [p.x.clone(), p.y.clone(), p.z.clone()]);
++        assert!((0..3).any(|axis| {
++            points[0][axis] == points[1][axis]
++                && points[0][axis] == points[2][axis]
++                && (points[0][axis] == low[axis] || points[0][axis] == high[axis])
++        }));
++        six_volume += &a.x * (&b.y * &c.z - &b.z * &c.y)
++            + &a.y * (&b.z * &c.x - &b.x * &c.z)
++            + &a.z * (&b.x * &c.y - &b.y * &c.x);
++    }
++    let expected =
++        Real::from(6) * (&high[0] - &low[0]) * (&high[1] - &low[1]) * (&high[2] - &low[2]);
++    assert_eq!(
++        six_volume.exact_rational_normal_form(),
++        expected.exact_rational_normal_form()
++    );
++    let pwn = mesh
++        .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++        .unwrap();
++    assert_eq!(pwn.certainty, MeshCertainty::Certified);
++    let manifold = mesh
++        .is_closed_manifold_geometry(&GeometryContext::STRICT.mesh_context())
++        .unwrap();
++    assert!(manifold.value);
++    assert_eq!(manifold.certainty, MeshCertainty::Certified);
++}
++fn run(source: &str, translation: &str, cache: &str) {
++    let args: Vec<String> = ["pipeline", source, translation, cache]
++        .into_iter()
++        .map(str::to_owned)
++        .collect();
++    assert_eq!(args.len(), 4);
++    let approximate = match args[1].as_str() {
++        "approximate" | "outside" => true,
++        "exact" => false,
++        _ => panic!("source"),
++    };
++    let outside = args[1] == "outside";
++    let lossy = match args[2].as_str() {
++        "fractional" => true,
++        "integral" => false,
++        _ => panic!("chart"),
++    };
++    let warmed = match args[3].as_str() {
++        "cold" => false,
++        "warm" => true,
++        _ => panic!("cache"),
++    };
++    let cube = solid::cube(Real::one()).unwrap();
++    let mut positions = cube.positions.to_vec();
++    if approximate {
++        let x = if outside {
++            unresolved_zero() - Real::from(2).powi((-1200).into()).unwrap()
++        } else {
++            unresolved_zero()
++        };
++        positions.push(Point3::new(x, Real::zero(), Real::zero()));
++    }
++    let input = TriangleMesh::from_construction(
++        positions,
++        cube.triangles.to_vec(),
++        csgrs::ConstructionEvidence::DECLARED_COORDINATES,
++    );
++    let strict = solid::convex_hull_with_context(&input, &GeometryContext::STRICT);
++    println!(
++        "source-strict\t{:?}",
++        strict.as_ref().map(|out| out.certainty)
++    );
++    if approximate {
++        assert!(strict.is_err());
++    } else {
++        assert_eq!(strict.unwrap().certainty, GeometryCertainty::Certified);
++    }
++    let hull =
++        solid::convex_hull_with_context(&input, &GeometryContext::APPROXIMATE_512).unwrap();
++    let expected = if approximate {
++        GeometryCertainty::Approximate512Consumed
++    } else {
++        GeometryCertainty::Certified
++    };
++    assert_eq!(hull.certainty, expected);
++    let evidence = csgrs::ConstructionEvidence::DECLARED_COORDINATES.with_predicate_certainty(
++        if approximate {
++            MeshCertainty::Approximate512Consumed
++        } else {
++            MeshCertainty::Certified
++        },
++    );
++    assert_eq!(hull.value.construction_evidence(), evidence);
++    println!(
++        "stage\thull\t{:?}\t{}\t{}",
++        hull.certainty,
++        hull.value.positions.len(),
++        hull.value.triangles.len()
++    );
++    if warmed {
++        check_box(
++            &hull.value,
++            [0.into(), 0.into(), 0.into()],
++            [1.into(), 1.into(), 1.into()],
++        );
++        println!("warm\tstrict-pwn-and-manifold\tCertified");
++    }
++    let shift = if lossy { q(10, 3) } else { Real::from(3) };
++    let matrix = Matrix4::affine_translation([shift.clone(), 5.into(), 7.into()]);
++    let transformed =
++        solid::try_transform_with_context(&hull.value, &matrix, &GeometryContext::STRICT)
++            .unwrap();
++    assert_eq!(transformed.certainty, GeometryCertainty::Certified);
++    assert_eq!(transformed.value.construction_evidence(), evidence);
++    println!(
++        "stage\ttransform\t{:?}\t{}\t{}",
++        transformed.certainty,
++        transformed.value.positions.len(),
++        transformed.value.triangles.len()
++    );
++    let right = solid::try_transform_with_context(
++        &cube,
++        &Matrix4::affine_translation([&shift + Real::one(), 5.into(), 7.into()]),
++        &GeometryContext::STRICT,
++    )
++    .unwrap();
++    let composed = solid::boolean_with_context(
++        &transformed.value,
++        &right.value,
++        BooleanOp::Union,
++        &GeometryContext::STRICT,
++    )
++    .unwrap();
++    assert_eq!(composed.certainty, GeometryCertainty::Certified);
++    assert_eq!(composed.value.construction_evidence(), evidence);
++    println!(
++        "stage\tboolean\t{:?}\t{}\t{}",
++        composed.certainty,
++        composed.value.positions.len(),
++        composed.value.triangles.len()
++    );
++    check_box(
++        &composed.value,
++        [shift.clone(), 5.into(), 7.into()],
++        [&shift + Real::from(2), 6.into(), 8.into()],
++    );
++    let bytes = csgrs::io::stl::to_stl_binary(&composed.value, "provenance").unwrap();
++    println!("stage\texport\tno-receipt\t{}", bytes.len());
++    let artifact =
++        csgrs::io::stl::to_stl_binary_artifact(&composed.value, "provenance").unwrap();
++    assert_eq!(artifact.bytes(), bytes);
++    assert_eq!(artifact.source_construction_evidence(), evidence);
++    assert_eq!(
++        artifact.construction_evidence(),
++        evidence.with_coordinate_projection()
++    );
++    let plain = csgrs::io::stl::from_stl(&bytes).unwrap();
++    assert_eq!(
++        plain.construction_evidence(),
++        csgrs::ConstructionEvidence::UNTRACKED.with_coordinate_projection()
++    );
++    let parsed = artifact.import().unwrap();
++    assert_eq!(parsed, plain);
++    assert_eq!(
++        parsed.construction_evidence(),
++        evidence.with_coordinate_projection()
++    );
++    assert_eq!(artifact.clone().into_bytes(), bytes);
++    println!(
++        "stage\timport\tno-receipt\t{}\t{}",
++        parsed.positions.len(),
++        parsed.triangles.len()
++    );
++    let (lo, hi) = if lossy {
++        (q(13_981_013, 4_194_304), q(11_184_811, 2_097_152))
++    } else {
++        (3.into(), 5.into())
++    };
++    check_box(
++        &parsed,
++        [lo.clone(), 5.into(), 7.into()],
++        [hi.clone(), 6.into(), 8.into()],
++    );
++    let validation = parsed
++        .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++        .unwrap();
++    println!("stage\tvalidation\t{:?}", validation.certainty);
++    let repeated = solid::boolean_with_context(
++        &parsed,
++        &solid::empty(),
++        BooleanOp::Union,
++        &GeometryContext::STRICT,
++    )
++    .unwrap();
++    assert_eq!(repeated.certainty, GeometryCertainty::Certified);
++    assert_eq!(
++        repeated.value.construction_evidence(),
++        evidence.with_coordinate_projection()
++    );
++    check_box(
++        &repeated.value,
++        [lo.clone(), 5.into(), 7.into()],
++        [hi, 6.into(), 8.into()],
++    );
++    println!("stage\treuse-import\t{:?}", repeated.certainty);
++    println!("fidelity\tbinary32-shift-preserved\t{}", lo == shift);
++    assert_eq!(lo == shift, !lossy);
++    if outside {
++        // Run this stronger proof only after the complete pipeline. It must
++        // not warm the original hull's coordinate decisions before observation.
++        let proof = input.positions.last().unwrap().x.certified_sign_until(-1400);
++        assert_eq!(proof.sign(), Some(hyperreal::RealSign::Negative));
++        println!("source-outside-proof\t{:?}", proof);
++        // sin(e)^2+cos(e)^2=1 makes the appended point (-2^-1200,0,0).
++        // Its hull with the unit cube adds a pyramid of volume 2^-1200/3.
++        // The output above has exactly the unexpanded box's volume instead.
++        println!("intent-difference\tmissing-positive-volume\t2^-1200/3");
++    }
++    assert_eq!(hull.value.construction_evidence(), evidence);
++    println!("result\tcompleted\t{}\t{}\t{}", args[1], args[2], args[3]);
++}
++
++// Separate named tests permit a fresh process for every cold/warm fixture.
++#[test]
++fn exact_integral_cold() {
++    run("exact", "integral", "cold");
++}
++#[test]
++fn exact_integral_warm() {
++    run("exact", "integral", "warm");
++}
++#[test]
++fn exact_fractional_cold() {
++    run("exact", "fractional", "cold");
++}
++#[test]
++fn exact_fractional_warm() {
++    run("exact", "fractional", "warm");
++}
++#[test]
++fn approximate_integral_cold() {
++    run("approximate", "integral", "cold");
++}
++#[test]
++fn approximate_integral_warm() {
++    run("approximate", "integral", "warm");
++}
++#[test]
++fn approximate_fractional_cold() {
++    run("approximate", "fractional", "cold");
++}
++#[test]
++fn approximate_fractional_warm() {
++    run("approximate", "fractional", "warm");
++}
++#[test]
++fn outside_integral_cold() {
++    run("outside", "integral", "cold");
++}
++#[test]
++fn outside_integral_warm() {
++    run("outside", "integral", "warm");
++}
++#[test]
++fn outside_fractional_cold() {
++    run("outside", "fractional", "cold");
++}
++#[test]
++fn outside_fractional_warm() {
++    run("outside", "fractional", "warm");
++}
+diff --git a/tests/wasm/construction_evidence.ts b/tests/wasm/construction_evidence.ts
+new file mode 100644
+index 000000000..4f744b901
+--- /dev/null
++++ b/tests/wasm/construction_evidence.ts
+@@ -0,0 +1,42 @@
++// The runner compiles and executes this beside the generated declarations.
++import { MeshJs, CurveRegionJs, GeometryCertaintyJs, ConstructionEvidenceJs } from './csgrs';
++function check(condition: boolean): void { if (!condition) throw new Error('construction evidence assertion failed'); }
++function known(mesh: MeshJs): void {
++  const evidence: ConstructionEvidenceJs = mesh.constructionEvidence;
++  check(!evidence.sourceHistoryMissing);
++  check(evidence.predicateCertainty === GeometryCertaintyJs.Certified);
++  evidence.free();
++}
++const cube = MeshJs.cube(1);
++known(cube);
++const outcome = cube.convexHullWithContext(true);
++check(outcome.certainty === GeometryCertaintyJs.Certified);
++const extracted = outcome.intoMesh();
++known(extracted);
++const moved = extracted.translate(3, 5, 7);
++const adjacent = cube.translate(4, 5, 7);
++const union = moved.union(adjacent);
++known(union);
++const artifact = union.toStlBinaryArtifact();
++const evidence = artifact.constructionEvidence;
++check(evidence.coordinatesProjected && !evidence.sourceHistoryMissing);
++check(evidence.predicateCertainty === GeometryCertaintyJs.Certified);
++evidence.free();
++const detached = artifact.bytes;
++detached.fill(0); // This copy cannot change the bound artifact or its receipt.
++const plain = MeshJs.fromSTL(artifact.bytes);
++const missing = plain.constructionEvidence;
++check(missing.sourceHistoryMissing && missing.predicateCertainty === undefined);
++missing.free();
++const restored = artifact.intoMesh();
++known(restored);
++const empty = restored.difference(restored);
++known(empty);
++const region = CurveRegionJs.square(1);
++const extrusion = region.extrude(1, false).intoMesh();
++const regionEvidence = extrusion.constructionEvidence;
++check(regionEvidence.sourceHistoryMissing);
++regionEvidence.free();
++for (const mesh of [cube, extracted, moved, adjacent, union, plain, restored, empty, extrusion]) mesh.free();
++region.free();
++console.log('TypeScript bound artifacts, extraction, missing history and native evidence passed');
