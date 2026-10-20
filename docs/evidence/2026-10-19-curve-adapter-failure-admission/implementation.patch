@@ -1,0 +1,152 @@
+diff --git a/bindings/README.md b/bindings/README.md
+index ed2ffa4cf..a1154cc34 100644
+--- a/bindings/README.md
++++ b/bindings/README.md
+@@ -109,6 +109,14 @@ Boolean now returns `PREDICATE_UNDECIDED` (5), replacing generic
+ operands paired with empty geometry. The diagnostic message is retained and
+ failed operations publish no model handle; signatures are unchanged.
+ 
++Curve Booleans, revolve and profile extraction preserve the same native
++categories. Undecided curve operations now report status (5) instead of (4);
++invalid parameters and non-finite profile projections remain (4). C++ and
++Python expose those statuses with unchanged diagnostic text. Failures leave
++output handles and profile records untouched. Rust scalar adapters retain
++`AdapterError::Construction` and its native cause instead of a string-only
++`AdapterError::Validation`. No method signature or numeric status value changes.
++
+ Opaque handles may cross only the ABI version that created them. Callers must
+ use the matching free function, must not mix scalar families, and must copy any
+ borrowed last-error text before another ABI call. The wrappers are currently
+diff --git a/crates/csgrs-ffi/README.md b/crates/csgrs-ffi/README.md
+index a8c651e90..057dff5d4 100644
+--- a/crates/csgrs-ffi/README.md
++++ b/crates/csgrs-ffi/README.md
+@@ -87,6 +87,12 @@ finite region projections, and curve-to-solid operations.
+   generic `VALIDATION_FAILED` (4); invalid inputs still report (4), even when
+   paired with empty geometry. Diagnostic text is retained and failed Booleans
+   publish no model handle. Signatures and numeric status values are unchanged.
++- Curve union, difference, intersection, xor, revolve and profile extraction
++  also retain native failure categories. Undecided operations report
++  `PREDICATE_UNDECIDED` (5), replacing generic `VALIDATION_FAILED` (4).
++  Invalid revolve parameters and non-finite profile projections still report
++  (4). Diagnostic text, signatures and numeric status values are unchanged;
++  failures leave output handles and profile records untouched.
+ - Mesh and curve bounds return `NO_BOUNDS` (10) for a completed empty query.
+   They require a valid output pointer but leave its record untouched; no
+   opaque-real endpoints are allocated. Only `OK` writes an owned bounds record.
+diff --git a/crates/csgrs-ffi/src/lib.rs b/crates/csgrs-ffi/src/lib.rs
+index 53543d496..2aa9cc5ef 100644
+--- a/crates/csgrs-ffi/src/lib.rs
++++ b/crates/csgrs-ffi/src/lib.rs
+@@ -2310,6 +2310,38 @@ pub unsafe extern "C" fn csgrs_region_profiles_real_free(value: CsgrsRegionProfi
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn undecided_revolve_preserves_status_and_output_ownership() {
++        let sine = Real::e().sin();
++        let cosine = Real::e().cos();
++        let zero = CsgrsReal {
++            inner: &sine * &sine + &cosine * &cosine - Real::one(),
++        };
++        let square = curve_region_handle::<RealFamily>(ScalarCurve::from_native(
++            csgrs::curve::square(2.into()).unwrap(),
++        ));
++        let mut output = ptr::null_mut();
++        unsafe {
++            assert_eq!(
++                csgrs_curve_region_real_revolve(&square, &zero, 4, &mut output),
++                CsgrsStatus::PredicateUndecided
++            );
++            assert!(output.is_null());
++            assert!(
++                CStr::from_ptr(csgrs_last_error_message())
++                    .to_str()
++                    .unwrap()
++                    .contains("revolution angle sign is undecided")
++            );
++            let full = CsgrsReal { inner: 360.into() };
++            assert_eq!(
++                csgrs_curve_region_real_revolve(&square, &full, 1, &mut output),
++                CsgrsStatus::ValidationFailed
++            );
++            assert!(output.is_null());
++        }
++    }
++
+     #[test]
+     fn bounds_absence_and_uncertainty_do_not_publish_real_values() {
+         let null_point = CsgrsVec3Real {
+diff --git a/src/adapter/curve.rs b/src/adapter/curve.rs
+index 2c017207b..f09b7d081 100644
+--- a/src/adapter/curve.rs
++++ b/src/adapter/curve.rs
+@@ -80,28 +80,28 @@ where
+         self.inner
+             .boolean_region(&other.inner, hypercurve::BooleanOp::Union)
+             .map(Self::from_native)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn difference(&self, other: &Self) -> AdapterResult<Self> {
+         self.inner
+             .boolean_region(&other.inner, hypercurve::BooleanOp::Difference)
+             .map(Self::from_native)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn intersection(&self, other: &Self) -> AdapterResult<Self> {
+         self.inner
+             .boolean_region(&other.inner, hypercurve::BooleanOp::Intersection)
+             .map(Self::from_native)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn xor(&self, other: &Self) -> AdapterResult<Self> {
+         self.inner
+             .boolean_region(&other.inner, hypercurve::BooleanOp::Xor)
+             .map(Self::from_native)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     /// Applies a checked transform whose image remains in the XY plane.
+@@ -253,7 +253,7 @@ where
+     ) -> AdapterResult<GeometryOutcome<ScalarMesh<A>>> {
+         curve::revolve(&self.inner, A::into_real(angle_degrees)?, segments, context)
+             .map(|outcome| outcome.map(ScalarMesh::from_native))
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn region_profiles(
+@@ -261,7 +261,7 @@ where
+         context: &GeometryContext,
+     ) -> AdapterResult<GeometryOutcome<Vec<RegionProfile<A::Scalar>>>> {
+         curve::try_finite_profiles(&self.inner, context)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))?
++            .map_err(AdapterError::from)?
+             .try_map(|profiles| {
+                 profiles
+                     .iter()
+diff --git a/src/adapter/scalar.rs b/src/adapter/scalar.rs
+index 8b5fb423d..1accca6e4 100644
+--- a/src/adapter/scalar.rs
++++ b/src/adapter/scalar.rs
+@@ -52,6 +52,13 @@ impl From<hypermesh::HypermeshError> for AdapterError {
+     }
+ }
+ 
++#[cfg(feature = "curve")]
++impl From<hypercurve::ExactCurveError> for AdapterError {
++    fn from(value: hypercurve::ExactCurveError) -> Self {
++        Self::from(crate::errors::ValidationError::from(value))
++    }
++}
++
+ impl From<Problem> for AdapterError {
+     fn from(value: Problem) -> Self {
+         Self::Hyperreal(value)
