@@ -1,0 +1,9 @@
+# Next implementation domains
+
+Continue WP05a/WP05b/WP06 with complete selected surface-section restrictions and branch/event replay. `geometry/surface_point.rs` now owns a joint UV point boundary; `surface_point/rational.rs` prepares rational maps and Hypercurve owns rational source queries. Reuse this authority for whole section carriers without substituting independently reconstructed coordinates or sampled contours. Preserve both original surface charts and source parameter identity through every restriction, inverse query, trim and replay.
+
+Keep the original complete interior-loop success assertion in `interior/baseline` and `interior/candidate` unchanged. Both still report UnsupportedIntersection. Point evaluation and scalar image identities are prerequisites, not completed surface arrangements. Selected angular surfaces and general procedural extrusion profiles remain separate typed boundaries.
+
+The affine curve carrier now preserves sheared retained rotation edges. Complete native conic face-image agreement before enabling automatic general affine conic model transport. The rejected nonuniform cylinder succeeds numerically but fails cold replay with UnsupportedEdgeUseAgreement; retain that probe and the original negative control. Do not publish a partially replayable model as complete.
+
+Preserve all prior exact workflows, version migrations, malformed-input and policy/budget controls, original full fixtures and adverse cost samples. Native and actual WASM consumers must exercise the same complete new contracts. Keep installation, MSRV, bindings, whole-work/resource bounds, directed fuzz/ASan/lexicase, coverage/formal and full repository push gates explicitly open until separately qualified. Respect surrounding-crate ownership and concurrently developed upstream fixes.

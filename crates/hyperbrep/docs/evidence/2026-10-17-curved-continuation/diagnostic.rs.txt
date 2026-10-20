@@ -1,0 +1,84 @@
+use hyperbrep::{BodySet, BooleanOperation, Matrix4, Point3, Real, boolean, builder};
+use std::path::Path;
+
+fn p(x: i32, y: i32, z: i32) -> Point3 {
+    Point3::new(x.into(), y.into(), z.into())
+}
+fn q(x: i32, y: i32) -> Real {
+    (Real::from(x) / Real::from(y)).unwrap()
+}
+fn save(path: &Path, name: &str, bodies: &BodySet) {
+    std::fs::write(path.join(name), bodies.model().to_json().unwrap()).unwrap();
+}
+fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    let family = &args[1];
+    let operation = &args[2];
+    let out = Path::new(&args[3]);
+    std::fs::create_dir_all(out).unwrap();
+    let source = match family.as_str() {
+        "cone" => builder::cone_frustum(5.into(), 2.into(), 6.into()),
+        "torus" => builder::torus(5.into(), 2.into()),
+        _ => panic!("unsupported family"),
+    }.unwrap();
+    let (c, s) = (q(3, 5), q(4, 5));
+    let map = Matrix4::from_row_major([
+        c.clone(), -&s, 0.into(), 0.into(), s, c, 0.into(), 0.into(),
+        0.into(), 0.into(), 1.into(), 0.into(), 0.into(), 0.into(), 0.into(), 1.into(),
+    ]);
+    let cutter = builder::cuboid(p(0, -20, -20), p(20, 20, 20)).unwrap()
+        .transformed(&map).unwrap();
+    let half = boolean::intersection(&source, &cutter).unwrap();
+    let (other, op) = match operation.as_str() {
+        "band" => (builder::cuboid(p(-20, -20, 1), p(20, 20, 20)).unwrap(), BooleanOperation::Intersection),
+        "restore" => (boolean::difference(&source, &cutter).unwrap(), BooleanOperation::Union),
+        _ => panic!("unsupported operation"),
+    };
+    save(out, "first.json", &half);
+    save(out, "second.json", &other);
+    let a = half.bodies().next().unwrap();
+    let b = other.bodies().next().unwrap();
+    println!("fixture={family}/{operation}");
+    match boolean::intersection_graph(a, b) {
+        Err(error) => {
+            println!("graph error={error:?}");
+            for fa in a.outer().faces() {
+                for fb in b.outer().faces() {
+                    match boolean::intersect_faces(fa, fb) {
+                        Err(error) => println!("pair {}/{} {:?}/{:?}: error={error:?}",
+                            fa.index(), fb.index(), fa.surface().geometry().kind(), fb.surface().geometry().kind()),
+                        Ok(_) => {},
+                    }
+                }
+            }
+        },
+        Ok(graph) => {
+            println!("graph pairs={} unresolved={} unsupported={}",
+                graph.candidate_pairs(), graph.unresolved_trim_pairs(), graph.unsupported_pairs());
+            for (side, partition) in [
+                ("first", graph.partition_first_faces()),
+                ("second", graph.partition_second_faces()),
+            ] {
+                match partition {
+                    Err(error) => println!("partition {side}: error={error:?}"),
+                    Ok(partition) => {
+                        println!("partition {side}: {:?}", partition.model().counts());
+                        std::fs::write(out.join(format!("partition-{side}.json")), partition.model().to_json().unwrap()).unwrap();
+                        for face in partition.model().faces() {
+                            println!("partition {side} face {}: {:?}", face.index(), face.surface().geometry().kind());
+                        }
+                    },
+                }
+            }
+            for (side, selection) in [
+                ("first", graph.select_first_faces(op)),
+                ("second", graph.select_second_faces(op)),
+            ] {
+                match selection {
+                    Err(error) => println!("selection {side}: error={error:?}"),
+                    Ok(selection) => println!("selection {side}: faces={}", selection.faces().len()),
+                }
+            }
+        },
+    }
+}

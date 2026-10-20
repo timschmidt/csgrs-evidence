@@ -1,0 +1,36 @@
+use hyperbrep::{BooleanOperation, FacePairTrim, FacePairRelation, boolean};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod fixture;
+fn main(){
+ for kind in 0..3 {
+  let (source,cutter,_,_)=fixture::fixture(kind);
+  let half=boolean::intersection(&source,&cutter).unwrap();
+  let other=boolean::difference(&source,&cutter).unwrap();
+  println!("CASE {kind}");
+  for a in half.model().faces(){for b in other.model().faces(){
+   match boolean::intersect_faces(a,b){
+    Err(error)=>println!("pair {}/{:?} {}/{:?} ERROR {error:?}",a.index(),a.surface().kind(),b.index(),b.surface().kind()),
+    Ok(Some(pair))=>{
+     let label=match pair.trim(){
+      FacePairTrim::NotAvailable=>Some("unavailable".to_string()),
+      FacePairTrim::Unresolved(reason)=>Some(format!("unresolved {reason:?}")),
+      FacePairTrim::CoincidentPlanar{first_traces,second_traces}=>Some(format!("coplanar {}/{}",first_traces.len(),second_traces.len())),
+      _=>None,
+     };
+     if let Some(label)=label{println!("pair {}/{:?} {}/{:?} {label} unsupported={}",a.index(),a.surface().kind(),b.index(),b.surface().kind(),matches!(pair.relation(),FacePairRelation::Unsupported));}
+    }
+    Ok(None)=>{}
+   }
+  }}
+  match boolean::intersection_graph(half.bodies().next().unwrap(),other.bodies().next().unwrap()) {
+   Err(error)=>println!("GRAPH {error:?}"),
+   Ok(graph)=>{
+    println!("GRAPH pairs={} unresolved={}",graph.exact_intersection_pairs(),graph.unresolved_trim_pairs());
+    println!("partition first {:?}",graph.partition_first_faces().map(|p|p.model().counts()));
+    println!("partition second {:?}",graph.partition_second_faces().map(|p|p.model().counts()));
+    println!("select first {:?}",graph.select_first_faces(BooleanOperation::Union).map(|s|s.faces().count()));
+    println!("select second {:?}",graph.select_second_faces(BooleanOperation::Union).map(|s|s.faces().count()));
+   }
+  }
+ }
+}

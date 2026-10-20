@@ -1,0 +1,31 @@
+use hyperbrep::{Point3,boolean::{self,BooleanOperation,FacePairTrim},ArchiveLimits,BodySet,RawModel};
+fn show(p: Point3)->[Option<f64>;3] { [p.x.to_f64_lossy(),p.y.to_f64_lossy(),p.z.to_f64_lossy()] }
+fn main() {
+ let load=|name| {
+  let json=std::fs::read_to_string(format!("/tmp/hyperbrep-sector-3-{name}.json")).unwrap();
+  let model=RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate().unwrap();
+  BodySet::from_solid(model.solids().next().unwrap())
+ };
+ let a=load("intersection"); let b=load("difference");
+ for (name,a,b) in [("forward",&a,&b),("reverse",&b,&a)] {
+  println!("order={name}");
+  let graph=boolean::intersection_graph(a.bodies().next().unwrap(),b.bodies().next().unwrap()).unwrap();
+  for pair in graph.intersections() {
+   let summary=match pair.trim() {
+    FacePairTrim::CurveFragments(c)=>format!("curves={}",c.len()),
+    FacePairTrim::SurfaceCurveFragments(c)=>format!("surface_curves={}",c.len()),
+    FacePairTrim::CoincidentFaces{first_traces,second_traces}=>format!("coincident={}/{}",first_traces.len(),second_traces.len()),
+    _=>continue,
+   };
+   println!("face {}/{} {:?}/{:?} {summary}",pair.first_face().index(),pair.second_face().index(),pair.first_face().surface().geometry().kind(),pair.second_face().surface().geometry().kind());
+   if matches!(pair.first_face().index(), 4 | 8) {
+    if let FacePairTrim::SurfaceCurveFragments(traces)=pair.trim() {
+     for t in traces {println!("  start={:?} end={:?} domain={:?}..{:?}",show(t.curve().start().unwrap()),show(t.curve().end().unwrap()),t.curve().domain().start().to_f64_lossy(),t.curve().domain().end().to_f64_lossy());}
+    }
+   }
+  }
+  println!("partition_first={:?}",graph.partition_first_faces().map(|p|p.model().counts()));
+  println!("partition_second={:?}",graph.partition_second_faces().map(|p|p.model().counts()));
+  println!("union={:?}",graph.stitch_selected_faces(BooleanOperation::Union).map(|p|p.len()));
+ }
+}

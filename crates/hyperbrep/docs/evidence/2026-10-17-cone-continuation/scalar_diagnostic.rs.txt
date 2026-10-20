@@ -1,0 +1,41 @@
+use hyperbrep::Real;
+use hyperlimit::{PredicatePolicy, compare_reals};
+use std::path::Path;
+
+fn report(name:&str, bytes:&[u8]) {
+    let fresh=||serde_json::from_slice::<Real>(bytes).unwrap();
+    let floor=fresh().floor_certified();
+    let ceil=fresh().ceil_certified();
+    let value=fresh();
+    let sign=compare_reals(&value,&Real::zero(),PredicatePolicy::STRICT);
+    let normal=value.exact_rational_normal_form();
+    let warm_floor=value.floor_certified();
+    let warm_ceil=value.ceil_certified();
+    println!("{name}: cold_floor={floor:?} cold_ceil={ceil:?} strict_sign={sign:?} normal={normal:?} warm_floor={warm_floor:?} warm_ceil={warm_ceil:?}");
+}
+fn main() {
+    let args:Vec<_>=std::env::args().collect();
+    if args[1]=="cone-joints" {
+        let d:serde_json::Value=serde_json::from_slice(&std::fs::read(&args[2]).unwrap()).unwrap();
+        let w=d["faces"][7]["outer"].as_u64().unwrap() as usize;
+        let lines:Vec<_>=d["wires"][w]["edge_uses"].as_array().unwrap().iter().map(|u|{
+            let pc=d["edge_uses"][u.as_u64().unwrap() as usize]["pcurve"].as_u64().unwrap() as usize;
+            &d["pcurves"][pc]["Line"]
+        }).collect();
+        let out=Path::new(&args[3]);std::fs::create_dir_all(out).unwrap();
+        for i in 0..lines.len() {
+            for axis in 0..2 {
+                let a=serde_json::from_value::<Real>(lines[i]["end"][axis].clone()).unwrap();
+                let b=serde_json::from_value::<Real>(lines[(i+1)%lines.len()]["start"][axis].clone()).unwrap();
+                let bytes=serde_json::to_vec_pretty(&(a-b)).unwrap();
+                let name=format!("joint-{i}-{axis}");
+                std::fs::write(out.join(format!("{name}.json")),&bytes).unwrap();
+                report(&name,&bytes);
+            }
+        }
+    } else {
+        let mut paths:Vec<_>=std::fs::read_dir(&args[2]).unwrap().map(|p|p.unwrap().path()).filter(|p|p.extension().is_some_and(|s|s=="json")).collect();
+        paths.sort();
+        for p in paths {report(p.file_stem().unwrap().to_str().unwrap(),&std::fs::read(&p).unwrap());}
+    }
+}

@@ -1,0 +1,98 @@
+//! Exact expectations shared by native and WASM similarity consumers.
+use hyperbrep::{
+    ArchiveLimits, BodySet, Matrix4, Model, Point2, Point3, RawModel, Real,
+    SolidPointLocation, builder,
+};
+use hyperlimit::{compare_reals, point3_equal};
+
+pub fn ratio(n: i32, d: i32) -> Real {
+    (Real::from(n) / Real::from(d)).unwrap()
+}
+
+pub fn equal(actual: &Real, expected: &Real) {
+    assert_eq!(
+        compare_reals(actual, expected, hyperbrep::STRICT_PREDICATES).value(),
+        Some(std::cmp::Ordering::Equal),
+        "actual={actual:?}, expected={expected:?}"
+    );
+}
+
+pub fn point(x: i32, y: i32, z: i32) -> Point3 {
+    Point3::new(x.into(), y.into(), z.into())
+}
+
+pub fn similarity(scale: &Real, reflected: bool) -> Matrix4 {
+    let sign = if reflected { -Real::one() } else { Real::one() };
+    Matrix4::from_row_major([
+        scale * ratio(3, 5) * &sign, -scale * ratio(4, 5), 0.into(), 3.into(),
+        scale * ratio(4, 5) * sign, scale * ratio(3, 5), 0.into(), (-2).into(),
+        0.into(), 0.into(), scale.clone(), 7.into(),
+        0.into(), 0.into(), 0.into(), 1.into(),
+    ])
+}
+
+pub fn reload(model: &Model) -> Model {
+    let json = model.to_json().unwrap();
+    let loaded = RawModel::from_json(&json, &ArchiveLimits::default())
+        .unwrap().validate().unwrap();
+    assert_eq!(loaded.counts(), model.counts());
+    assert_eq!(loaded.to_json().unwrap(), json);
+    loaded
+}
+
+pub fn check_images(model: &Model) {
+    for edge_use in model.edge_uses() {
+        let pcurve = edge_use.pcurve();
+        for parameter in [pcurve.domain_start().unwrap(), pcurve.domain_end().unwrap()] {
+            let uv = pcurve.point_at(&parameter).unwrap();
+            let Some(uv) = uv.coordinates() else { continue };
+            let on_surface = edge_use.wire().face().surface()
+                .point_at(&Point2::new(uv.x().clone(), uv.y().clone())).unwrap();
+            let edge_parameter = edge_use.edge_parameter_at(&parameter).unwrap();
+            let on_edge = edge_use.edge().curve().point_at(&edge_parameter).unwrap();
+            assert!(on_edge.coincides_with(&on_surface.into()).unwrap());
+        }
+    }
+}
+
+pub fn primitives() {
+    let cases: Vec<(&str, BodySet, Real, Real, Point3, Point3)> = vec![
+        ("cylinder", builder::cylinder(5.into(), 7.into()).unwrap(),
+         Real::from(175) * Real::pi(), Real::from(120) * Real::pi(), point(0,0,3), point(5,0,3)),
+        ("sphere", builder::sphere(5.into()).unwrap(),
+         ratio(500,3) * Real::pi(), Real::from(100) * Real::pi(), point(0,0,0), point(5,0,0)),
+        ("cone", builder::cone_frustum(5.into(), 2.into(), 6.into()).unwrap(),
+         Real::from(78) * Real::pi(), (Real::from(29) + Real::from(21) * Real::from(5).sqrt().unwrap()) * Real::pi(),
+         point(0,0,3), point(5,0,0)),
+        ("torus", builder::torus(5.into(), 2.into()).unwrap(),
+         Real::from(40) * Real::pi() * Real::pi(), Real::from(40) * Real::pi() * Real::pi(),
+         point(5,0,0), point(7,0,0)),
+        ("revolution", builder::revolve(&[Point2::new(2.into(),0.into()), Point2::new(4.into(),0.into()),
+          Point2::new(4.into(),3.into()), Point2::new(2.into(),3.into())]).unwrap(),
+         Real::from(36) * Real::pi(), Real::from(60) * Real::pi(), point(3,0,1), point(4,0,1)),
+    ];
+    for (name, source, volume, area, inside, boundary) in cases {
+        for scale in [ratio(1,1000), ratio(127,5000), Real::from(2), Real::from(2).sqrt().unwrap()] {
+            for reflected in [false, true] {
+                let transform = similarity(&scale, reflected);
+                let moved = source.transformed(&transform).unwrap_or_else(|e| panic!("{name}, {scale:?}, reflected={reflected}: {e:?}"));
+                let loaded = reload(moved.model());
+                for model in [moved.model(), &loaded] {
+                    let body = model.solids().next().unwrap();
+                    equal(&body.volume().unwrap(), &(&volume * &scale * &scale * &scale));
+                    equal(&model.faces().map(|f| f.area().unwrap()).fold(Real::zero(), |sum, a| sum + a), &(&area * &scale * &scale));
+                    for (p, expected) in [(&inside,SolidPointLocation::Inside), (&boundary,SolidPointLocation::Boundary), (&point(20,20,20),SolidPointLocation::Outside)] {
+                        assert_eq!(body.classify_point(&transform.transform_point3(p).unwrap()).unwrap(),expected, "{name}");
+                    }
+                    check_images(model);
+                }
+                let inverse = loaded.transformed(&transform.inverse().unwrap()).unwrap();
+                let restored = reload(&inverse);
+                equal(&restored.solids().next().unwrap().volume().unwrap(), &volume);
+                for (before,after) in source.model().vertices().zip(restored.vertices()) {
+                    assert_eq!(point3_equal(before.point().try_coordinates().unwrap(),after.point().try_coordinates().unwrap(),hyperbrep::STRICT_PREDICATES).value(),Some(true));
+                }
+            }
+        }
+    }
+}

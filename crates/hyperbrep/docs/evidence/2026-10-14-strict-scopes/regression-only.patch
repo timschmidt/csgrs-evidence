@@ -1,0 +1,47 @@
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -10838,0 +10839,44 @@
++    fn pcurve_evaluation_is_strict_inside_an_approximate_scope() {
++        let curve = Pcurve::new(Curve2::from(
++            hypercurve::LineSeg2::try_new(
++                CurvePoint2::new(r(0), r(0)),
++                CurvePoint2::new(r(1), r(0)),
++            )
++            .unwrap(),
++        ));
++        let tiny: Real = "1e-2000".parse().unwrap();
++        let first = (Real::pi() + &tiny + &tiny).exp().unwrap();
++        let second = (Real::pi() + tiny).exp().unwrap();
++        // Strict comparison cannot certify this positive distance outside
++        // the endpoint. A surrounding approximation policy must not admit it.
++        let parameter = Real::one() + (first - second);
++        let strict_error = curve.point_at(&parameter).unwrap_err();
++        assert!(matches!(
++            strict_error,
++            GeometryError::PlanarCurve(hypercurve::ExactCurveError::Blocked(_))
++        ));
++        let attempted = hypercurve::provisional(|| curve.point_at(&parameter));
++        assert_eq!(attempted.certainty(), hypercurve::CurveCertainty::Certified);
++        assert_eq!(attempted.into_unverified().unwrap_err(), strict_error);
++
++        // A later direct Hypercurve call still sees its caller's approximate
++        // policy. BREP must restore that scope instead of disabling it globally.
++        let restored = hypercurve::provisional(|| {
++            assert_eq!(curve.point_at(&parameter).unwrap_err(), strict_error);
++            curve.curve().point_at(&parameter.clone().into())
++        });
++        assert_eq!(
++            restored.certainty(),
++            hypercurve::CurveCertainty::Approximate512Consumed
++        );
++        assert!(restored.into_unverified().is_ok());
++
++        // A warmed approximate result and explicit display tolerances cannot
++        // become authority for the next BREP query either.
++        let preview = hypercurve::CurvePreviewOptions::try_approximate_512(1e-6, 0.0).unwrap();
++        let previewed = hypercurve::provisional(|| preview.evaluate(|| curve.point_at(&parameter)));
++        assert_eq!(previewed.certainty(), hypercurve::CurveCertainty::Certified);
++        assert_eq!(previewed.into_unverified().unwrap_err(), strict_error);
++    }
++
++    #[test]

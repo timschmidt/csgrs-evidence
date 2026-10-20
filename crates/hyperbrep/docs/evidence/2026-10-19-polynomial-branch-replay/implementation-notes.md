@@ -1,0 +1,9 @@
+# Ownership and replay
+
+Hypersolve retains the original `BivariateTopologyConfig` with each complete topology. Hypercurve exposes that source, its separate evaluation controls and branch traversal. Public polynomial restrictions use the existing checked branch restriction instead of the authored native-curve path. Similarity point coordinates pull their affine query into the original polynomial field; equality aggregates the existing coordinate evidence, including definitive separation in either axis.
+
+HyperBRep owns `persistence/polynomial.rs`: untrusted source and branch records, deterministic source interning and checked replay. Source records have exact coefficients/domain and both control sets; branches have source/slab/root/range, traversal and an optional similarity. Decoder source tables reconstruct complete solver graphs before selected parameters and dependent curve sources. No trusted connectivity or proof bits are serialized. The new required collection is a deliberate archive-13 break, not an optional old-reader adapter.
+
+Projection-slab and root ordering are part of the archive selector semantics. Future solver changes to event partitions or ordering must requalify saved branch selection against preserved semantic fixtures and declare a format migration if its meaning changes. A successful parse alone cannot establish that an old ordinal still selects the same branch.
+
+The CGAL algebraic arrangement documentation retains the supporting curve and branch ordinal for algebraic segments and points. This supports the representation strategy, not a correctness or performance claim about this implementation. See `research.json` for the official primary-source links and the distinction between observation and inference. No external production kernel is introduced.

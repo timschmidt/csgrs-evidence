@@ -1,0 +1,35 @@
+"""Qualify the changed package boundary and unchanged native consumer inputs."""
+import hashlib,json,subprocess,sys,tomllib
+from pathlib import Path
+from check import ROOT,OUT,ENV,hashes,run,sha
+
+source=hashes();baseline=json.loads((OUT/'baseline.json').read_text())
+assert all(sha(ROOT/n)==h for n,h in baseline['runtime'].items())
+prior=OUT.parent/'2026-10-17-axial-shells'
+qualified=json.loads((prior/'final-source.json').read_text())
+changed={n for n,h in qualified.items() if sha(ROOT/n)!=h}
+allowed={'Cargo.toml','readme.md','tests/readme.rs','crates/hyperbrep/Cargo.toml','crates/hypercurve/README.md','crates/hyperlimit/README.md','crates/hypersolve/README.md','crates/hypertri/README.md'}
+assert changed<=allowed,changed-allowed
+for name in ['Cargo.toml','crates/hyperbrep/Cargo.toml']:
+ before=tomllib.loads(subprocess.check_output(['git','show',baseline['baseline']+':'+name],cwd=ROOT,text=True))
+ after=tomllib.loads((ROOT/name).read_text());assert after['package'].pop('exclude')==['/docs/evidence'];assert before==after
+binary=json.loads((prior/'consumer-binary.json').read_text());assert sha(Path(binary['path']))==binary['sha256']
+(OUT/'consumer-source-bridge.json').write_text(json.dumps(dict(source=source,binary=binary,qualified_source=str(prior/'final-source.json'),changed_guarded_files=sorted(changed),all_production_and_lock_files_identical=True,package_metadata_only='Both manifest changes add only package.exclude; every other TOML value is identical. Cargo metadata is compared independently.',scope='Reuse of the exact frozen complete native/STEP acceptance executable is justified by identical production Rust, locks, features, test fixtures and consumer sources. README/license/package-list changes do not change its runtime inputs. This is not a fresh merged-source build, new benchmark or release qualification.'),indent=2)+'\n')
+commands=[]
+def check(label,cmd,seconds=300,extra=None):
+ row=run(label,cmd,seconds,extra);commands.append(row);assert row['exit_code']==0,(label,row)
+for crate in ['hyperbrep','hyperbrep-io','csgrs']:
+ check('merged-package-'+crate,['cargo','package','--list','--allow-dirty','--offline','-p',crate])
+check('merged-metadata',['cargo','metadata','--offline','--locked','--no-deps','--format-version','1'])
+version=tomllib.loads((ROOT/'Cargo.toml').read_text())['package']['version']
+check('readme-build',['rustc','--edition=2024','--test','tests/readme.rs','-D','warnings','-o','/tmp/hyperbrep-package-upstream-readme'],extra={'CARGO_PKG_VERSION':version})
+check('readme-tests',['/tmp/hyperbrep-package-upstream-readme'])
+check('readme-clippy',['clippy-driver','--edition=2024','--test','tests/readme.rs','-D','warnings','-o','/tmp/hyperbrep-package-upstream-readme-clippy'],extra={'CARGO_PKG_VERSION':version})
+check('format',['cargo','fmt','--all','--','--check'])
+dest=OUT/'consumer-artifacts';dest.mkdir()
+for kind in range(4):
+ for reflected in ['false','true']:
+  check(f'consumer-{kind}-{reflected}',[binary['path'],str(dest),str(kind),reflected],600)
+assert hashes()==source
+(OUT/'qualification.json').write_text(json.dumps(dict(source=source,commands=commands,source_bridge='consumer-source-bridge.json',recipe_sha256=sha(Path(__file__)),scope='Package inventory, root README tests/lint, formatting, metadata graph and eight complete unchanged-runtime native/STEP consumers. No new performance, full-workspace, installed-package or complete pre-push claim.'),indent=2)+'\n')
+print('Package integration checks passed.',flush=True)

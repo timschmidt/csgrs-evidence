@@ -1,0 +1,28 @@
+use hyperbrep::*;
+fn p(x:i32,y:i32,z:i32)->Point3 { Point3::new(x.into(),y.into(),z.into()) }
+fn main() {
+ let a=builder::torus(10.into(),5.into()).unwrap();
+ let b=builder::cuboid(p(-40,-40,3),p(40,40,40)).unwrap();
+ let result=boolean::intersection(&a,&b).unwrap();
+ println!("volume={:?}",result.bodies().next().unwrap().volume());
+ let area=result.model().faces().map(|f|f.area().unwrap()).fold(Real::zero(),|a,b|a+b);
+ println!("area={area:?}");
+ let g=boolean::intersection_graph(a.bodies().next().unwrap(),b.bodies().next().unwrap()).unwrap();
+ for (name,result) in [("first",g.select_first_faces(BooleanOperation::Intersection)),("second",g.select_second_faces(BooleanOperation::Intersection))] {println!("{name}: {:?}",result.as_ref().map(|v|v.faces().len()));}
+ for (name,partition) in [("first",g.partition_first_faces()),("second",g.partition_second_faces())] {
+  let partition=partition.unwrap();
+  for face in partition.model().faces().filter(|f| f.index()==0) {
+   println!("{name} face {} kind {:?}",face.index(),face.surface().kind());
+   let curves=face.outer().unwrap().edge_uses().map(|u|u.pcurve().curve().clone()).collect::<Vec<_>>();
+   let vertices=curves.iter().map(|c|c.start().coordinates().unwrap().clone()).collect::<Vec<_>>();
+   let n=Real::from(vertices.len() as u64);
+   let x=(vertices.iter().map(|p|p.x().clone()).fold(Real::zero(),|a,b|a+b)/&n).unwrap();
+   let y=(vertices.iter().map(|p|p.y().clone()).fold(Real::zero(),|a,b|a+b)/&n).unwrap();
+   println!("vertices={vertices:?}");
+   let candidate=hypercurve::Point2::new(x,y);
+   println!("candidate={candidate:?}");
+   let path=hypercurve::CurvePath2::try_new(curves).unwrap();
+   println!("classification={:?}",hypercurve::evaluate_under(STRICT_PREDICATES,||path.classify_point(&candidate.into())));
+  }
+ }
+}

@@ -1,0 +1,17 @@
+use hyperbrep::{Real, boolean, RawModel, ArchiveLimits};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod acceptance;
+fn main(){
+ let (source,cutter,_,_)=acceptance::fixture(2);
+ let map=acceptance::similarity(&Real::from(2).sqrt().unwrap(),false);
+ let cut=boolean::intersection(&source.transformed(&map).unwrap(),&cutter.transformed(&map).unwrap()).unwrap();
+ let loaded=acceptance::reload(cut.model());
+ let e=loaded.edges().next().unwrap();
+ let mid=((e.domain().start().try_real().unwrap()+e.domain().end().try_real().unwrap())/Real::from(2)).unwrap();
+ let split=e.split(mid.into()).unwrap();
+ let replay=acceptance::reload(split.model());
+ let moved=replay.transformed(&acceptance::similarity(&acceptance::ratio(1,1000),true)).unwrap();
+ let json=moved.to_json().unwrap();
+ std::fs::write("/tmp/seam-cone-replay.json",&json).unwrap();
+ println!("final replay: {:?}",RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate().map(|m|m.counts()));
+}

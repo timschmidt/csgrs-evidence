@@ -1,0 +1,70 @@
+use hyperbrep::{ArchiveLimits, FaceRef, RawModel, Real};
+use hypercurve::{CurvePath2, Point2};
+use hyperlimit::{PredicatePolicy, compare_reals};
+use std::path::Path;
+
+fn path(face: FaceRef<'_>) -> CurvePath2 {
+    CurvePath2::try_new(face.outer().unwrap().edge_uses()
+        .map(|use_| use_.pcurve().geometry().curve().clone()).collect()).unwrap()
+}
+fn scalar(label: &str, value: &Real, out: &Path) {
+    println!("{label} sign={:?} rational={:?} floor={:?} ceil={:?}",
+        compare_reals(value, &Real::zero(), PredicatePolicy::STRICT),
+        value.exact_rational_normal_form(), value.floor_certified(), value.ceil_certified());
+    for i in -2..=2 {
+        let comparison = compare_reals(value, &Real::from(i), PredicatePolicy::STRICT);
+        println!("{label} compare {i}: {comparison:?}");
+    }
+    std::fs::write(out.join(format!("{label}.json")), serde_json::to_string_pretty(value).unwrap()).unwrap();
+}
+fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    let base = Path::new(&args[1]);
+    let out = Path::new(&args[2]);
+    std::fs::create_dir_all(out).unwrap();
+    if args[3] == "cone" {
+        let model = RawModel::from_json(&std::fs::read_to_string(base.join("partition-first.json")).unwrap(), &ArchiveLimits::default()).unwrap().validate().unwrap();
+        let face = model.faces().find(|f| f.index()==7).unwrap();
+        let path = path(face);
+        let points: Vec<_> = path.curves().iter().map(|c| c.start().coordinates().unwrap().clone()).collect();
+        let count = Real::from(points.len() as u64);
+        let sx = points.iter().fold(Real::zero(), |x,p| x+p.x());
+        let sy = points.iter().fold(Real::zero(), |y,p| y+p.y());
+        let middle = Point2::new((sx/&count).unwrap(), (sy/count).unwrap());
+        println!("bounds={:?}",path.bounds());
+        println!("middle location={:?}",path.classify_point(&middle.into()));
+        for (i,curve) in path.curves().iter().enumerate() {
+            let start=curve.start(); let end=curve.end();
+            let a=start.coordinates().unwrap(); let b=end.coordinates().unwrap();
+            scalar(&format!("line-{i}-dx"), &(b.x()-a.x()), out);
+            scalar(&format!("line-{i}-dy"), &(b.y()-a.y()), out);
+        }
+        return;
+    }
+    let first = RawModel::from_json(&std::fs::read_to_string(base.join("first.json")).unwrap(), &ArchiveLimits::default()).unwrap().validate().unwrap();
+    let second = RawModel::from_json(&std::fs::read_to_string(base.join("second.json")).unwrap(), &ArchiveLimits::default()).unwrap().validate().unwrap();
+    let target = first.faces().find(|f| f.index()==4).unwrap();
+    let source = second.faces().find(|f| f.index()==0).unwrap();
+    let bounds = path(target).bounds().unwrap();
+    for (i,use_) in source.outer().unwrap().edge_uses().enumerate() {
+        let pc = use_.pcurve().geometry();
+        let line = pc.line_segment().unwrap();
+        let (scale,offset)=use_.parameter_correspondence().affine_coefficients().unwrap();
+        let edge=use_.edge();
+        let first=edge.domain().start().try_real().unwrap();
+        let last=edge.domain().end().try_real().unwrap();
+        for (axis,a,b,min,max) in [
+            ("u",line.start().x(),line.end().x(),bounds.min_x(),bounds.max_x()),
+            ("v",line.start().y(),line.end().y(),bounds.min_y(),bounds.max_y()),
+        ] {
+            let m=((b-a)/scale).unwrap();
+            let o=a-&m*offset;
+            let a=&m*&first+&o;
+            let b=&m*&last+&o;
+            println!("edge {i} axis {axis} endpoint order={:?}",compare_reals(&a,&b,PredicatePolicy::STRICT));
+            let (low,high)=if matches!(compare_reals(&a,&b,PredicatePolicy::STRICT),hyperlimit::PredicateOutcome::Decided{value: std::cmp::Ordering::Greater,..}) {(b,a)} else {(a,b)};
+            scalar(&format!("edge-{i}-{axis}-first"),&((min-high)/Real::tau()).unwrap(),out);
+            scalar(&format!("edge-{i}-{axis}-last"),&((max-low)/Real::tau()).unwrap(),out);
+        }
+    }
+}

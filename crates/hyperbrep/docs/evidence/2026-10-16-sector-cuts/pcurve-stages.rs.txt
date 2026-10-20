@@ -1,0 +1,33 @@
+use hyperbrep::{Real,Model,RawModel,ArchiveLimits,boolean};
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/sectors.rs"] mod sector;
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep/tests/support/seam_cuts.rs"] mod seam;
+fn inspect(name:&str,model:&Model) {
+ for (index,pc) in model.pcurves().enumerate() {
+  if let Some(hypercurve::CurveGeometry2::Line(line))=pc.geometry().curve().geometry() {
+   println!("{name} native pcurve={} x_equal={} start_x_bytes={} end_x_bytes={} start_compact={} end_compact={}", index,line.start().x()==line.end().x(),serde_json::to_string(line.start().x()).unwrap().len(),serde_json::to_string(line.end().x()).unwrap().len(),line.start().x().compact_pi_laurent().is_some(),line.end().x().compact_pi_laurent().is_some());
+  }
+ }
+ let json=model.to_json().unwrap();
+ std::fs::write(format!("/tmp/hyperbrep-sector-pcurve-{name}.json"),&json).unwrap();
+ let raw:serde_json::Value=serde_json::from_str(&json).unwrap();
+ for (i,pc) in raw["pcurves"].as_array().unwrap().iter().enumerate() {
+  let Some(line)=pc.get("Line") else {continue};
+  let mut statuses=Vec::new();
+  for end in ["start","end"] { for axis in 0..2 {
+    let value:Real=serde_json::from_value(line[end][axis].clone()).unwrap();
+    statuses.push(format!("{end}:{axis}={:?}/compact:{}",value.to_f64_lossy(),value.compact_pi_laurent().is_some()));
+  }}
+  println!("{name} pcurve={i} bytes={} {}",pc.to_string().len(),statuses.join(" "));
+ }
+ println!("{name} replay={:?}",RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate().map(|_|()));
+}
+fn main() {
+ let (half,cutter,_,_)=sector::fixture(4); let scale=Real::from(2).sqrt().unwrap();
+ let map=seam::similarity(&scale,true);let half=half.transformed(&map).unwrap();let cutter=cutter.transformed(&map).unwrap();
+ inspect("source",half.model());
+ let graph=boolean::intersection_graph(half.bodies().next().unwrap(),cutter.bodies().next().unwrap()).unwrap();
+ inspect("partition",graph.partition_first_faces().unwrap().model());
+ inspect("result",boolean::intersection(&half,&cutter).unwrap().model());
+}

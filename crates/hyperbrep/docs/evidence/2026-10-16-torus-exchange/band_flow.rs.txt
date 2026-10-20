@@ -1,0 +1,28 @@
+use hyperbrep::*;
+use hyperbrep_io::step::*;
+#[allow(dead_code)]
+#[path="/mnt/development/csgrs/crates/hyperbrep-io/tests/support/analytic_export.rs"]
+mod analytic;
+fn p(x:i32,y:i32,z:i32)->Point3 {Point3::new(x.into(),y.into(),z.into())}
+fn main(){
+ let a=builder::torus(10.into(),5.into()).unwrap();
+ let b=builder::cuboid(p(-40,-40,3),p(40,40,40)).unwrap();
+ let cap=boolean::intersection(&a,&b).unwrap();
+ let options=StepWriteOptions::new("band.step","2026-10-16T00:00:00");
+ let output=analytic::export(&[StepBody{solid:cap.bodies().next().unwrap(),name:"band"}],&options);
+ let imported=analytic::reimport(&output);
+ let model=imported.bodies()[0].model();
+ let json=model.to_json().unwrap();
+ let replay=RawModel::from_json(&json,&ArchiveLimits::default()).unwrap().validate().unwrap();
+ let imported=BodySet::from_solid(replay.solids().next().unwrap());
+ println!("recut={:?}",boolean::intersection(&imported,&b).as_ref().map(|x|x.len()));
+ println!("clear={:?}",boolean::difference(&imported,&b).as_ref().map(|x|x.len()));
+ let graph=boolean::intersection_graph(imported.bodies().next().unwrap(),b.bodies().next().unwrap());
+ println!("graph={:?}",graph.as_ref().map(|_|()));
+ if let Ok(graph)=graph {
+  println!("partition first={:?}",graph.partition_first_faces().as_ref().map(|_|()));
+  println!("partition second={:?}",graph.partition_second_faces().as_ref().map(|_|()));
+  println!("select first={:?}",graph.select_first_faces(BooleanOperation::Intersection).as_ref().map(|x|x.faces().len()));
+  println!("select second={:?}",graph.select_second_faces(BooleanOperation::Intersection).as_ref().map(|x|x.faces().len()));
+ }
+}

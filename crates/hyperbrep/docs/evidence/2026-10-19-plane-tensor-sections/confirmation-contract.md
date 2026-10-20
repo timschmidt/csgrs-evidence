@@ -1,0 +1,5 @@
+# Fixed performance confirmation
+
+The original CPU-0 paired corpus remains authoritative as observed data and will not be replaced. Identical baseline binaries showed large changes between processes while allocation counts stayed identical. Candidate processes also varied widely. This does not prove the cause or exclude a regression.
+
+Run exactly three additional alternating process pairs for each of the same four preserved cohorts (all 25 workflows), pinned to CPU 10 on the second NUMA node. Use the same binaries, input functions, policies, first/repeated phases, assertions, materialization, validation and replay. Do not change source or counter harnesses, do not warm away the first-input phase, do not select only favorable cases, and do not repeat until a target ratio appears. New unmatched section groups do not need another absolute-cost run. Preserve both sets and every adverse observation. Record per-process CPU time/RSS and read-only CPU frequency observations; these observations do not establish causation or a controlled hardware experiment.

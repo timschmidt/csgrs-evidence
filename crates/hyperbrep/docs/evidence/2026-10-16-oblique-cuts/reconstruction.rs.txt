@@ -1,0 +1,25 @@
+use hyperbrep::{boolean::{self,BooleanOperation},builder,Matrix4,Point3,Real};
+fn p(x:i32,y:i32,z:i32)->Point3{Point3::new(x.into(),y.into(),z.into())}
+fn main(){
+ let source=builder::torus(5.into(),2.into()).unwrap();
+ let r=(Real::from(2).sqrt().unwrap()/Real::from(2)).unwrap();
+ let map=Matrix4::from_row_major([r.clone(),-&r,0.into(),0.into(),r.clone(),r,0.into(),0.into(),0.into(),0.into(),1.into(),0.into(),0.into(),0.into(),0.into(),1.into()]);
+ let cutter=builder::cuboid(p(0,-20,-20),p(20,20,20)).unwrap().transformed(&map).unwrap();
+ let half=boolean::intersection(&source,&cutter).unwrap();
+ let band=builder::cuboid(p(-20,-20,1),p(20,20,20)).unwrap();
+ let a=boolean::intersection(&half,&band).unwrap();let b=boolean::difference(&half,&band).unwrap();
+ std::fs::write("/tmp/hyperbrep-oblique-reconstruction-a.json",a.model().to_json().unwrap()).unwrap();
+ std::fs::write("/tmp/hyperbrep-oblique-reconstruction-b.json",b.model().to_json().unwrap()).unwrap();
+ for first in a.model().faces(){for second in b.model().faces(){
+  if let Err(error)=boolean::intersect_faces(first,second){println!("pair {}/{} kinds={:?}/{:?} error={error:?}",first.index(),second.index(),first.surface().kind(),second.surface().kind());}
+ }}
+ let graph=boolean::intersection_graph(a.bodies().next().unwrap(),b.bodies().next().unwrap());
+ println!("graph={:?}",graph.as_ref().map(|_|()));
+ if let Ok(graph)=graph{
+  println!("partition-first={:?}",graph.partition_first_faces().map(|x|x.model().counts()));
+  println!("partition-second={:?}",graph.partition_second_faces().map(|x|x.model().counts()));
+  println!("select-first={:?}",graph.select_first_faces(BooleanOperation::Union).map(|_|()));
+  println!("select-second={:?}",graph.select_second_faces(BooleanOperation::Union).map(|_|()));
+  println!("stitch={:?}",graph.stitch_selected_faces(BooleanOperation::Union).map(|x|x.len()));
+ }
+}

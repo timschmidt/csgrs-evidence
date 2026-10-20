@@ -1,0 +1,22 @@
+use hyperbrep::{Curve3,CurveParameterLocation,Point3,Real,Vector3};
+fn main(){
+ let n: i64=std::env::args().nth(1).unwrap().parse().unwrap();
+ let tiny=Real::from(2).powi_i64(-n).unwrap();
+ for (kind,delta) in [("rational",tiny.clone()),("cancellation",tiny.clone().exp().unwrap()-Real::one()),("normalized",tiny)]{
+  let angle=(Real::pi()/Real::from(2)).unwrap()+delta;
+  let x=angle.clone().cos();let y=if kind=="normalized" {(Real::one()-&x*&x).sqrt().unwrap()} else {angle.clone().sin()};
+  println!("kind={kind} n={n} x_sign={:?} y_sign={:?} x_display={:?}",hyperlimit::compare_reals(&x,&Real::zero(),hyperbrep::STRICT_PREDICATES),hyperlimit::compare_reals(&y,&Real::zero(),hyperbrep::STRICT_PREDICATES),x.to_f64_lossy());
+  println!("radius={:?}",hyperlimit::compare_reals(&(&x*&x+&y*&y),&Real::one(),hyperbrep::STRICT_PREDICATES));
+  let curve=Curve3::circle_arc(Point3::origin(),Vector3::x(),Vector3::y(),Real::one(),Real::zero(),Real::pi()).unwrap();
+  let location=curve.parameters_of(&Point3::new(x,y,Real::zero()));
+  match location{
+   Ok(CurveParameterLocation::Parameters(parameters))=>{
+    for p in parameters{
+     let p=p.try_real().unwrap();
+     println!("inverse: at_pole={:?}, expected_angle={:?}",hyperlimit::compare_reals(p,&(Real::pi()/Real::from(2)).unwrap(),hyperbrep::STRICT_PREDICATES),hyperlimit::compare_reals(p,&angle,hyperbrep::STRICT_PREDICATES));
+    }
+   }
+   result=>println!("inverse: {result:?}"),
+  }
+ }
+}

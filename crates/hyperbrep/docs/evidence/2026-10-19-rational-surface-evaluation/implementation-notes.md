@@ -1,0 +1,15 @@
+# Current design and qualification notes
+
+The original public tensor probe fails with UnsupportedSelectedEvaluation at ac81b38f1. The separate owner API probe fails because rational_form is absent. Preserve those logs; an initial network-dependent Cargo attempt failed before compilation and is not geometric evidence.
+
+Hypercurve rational queries retain source/N/D and certify the original denominator. Same-source comparison subtracts cross-products before sign evaluation; independent-source comparison uses the existing selected-field image authorities. Polynomial-fiber predicates remain in the original joint field; similarities pull back the polynomial; other admitted point families reuse recursive projective fields. A tested retained scalar affine chart already works through that machinery, so a second chart-specific polynomial map implementation is unnecessary.
+
+HyperBRep keeps the source Surface and entire CurvePoint2, plus immutable derived homogeneous coordinate maps for rational images. Queries combine those maps before invoking the owner. NURBS spans use original knot coordinates and right ownership at an internal knot. Transform and cold replay recompute maps from original definitions; no proof flags or new schema records are introduced. Rational extrusions currently mean native line, rational Bezier and NURBS profile carriers; general retained-profile nonlinear maps and angular surfaces remain separate required domains.
+
+Remaining checks before retention: precise pole diagnostics; source-lifetime/strict-policy/budget and hostile archive controls; complete previous fixtures updated only where formerly unsupported inputs now succeed with independent checks; format/Clippy/docs, owner and downstream full tests, actual native/WASM consumers, archived outputs and matched complete-workflow cost evidence. No commit or push qualification is claimed by this working note.
+
+## Rejected automatic native-conic transform extension
+
+The first full suite reproduces the unchanged `similarity::rejection_and_recovery` failure at the nonuniform cylinder transform. A standalone candidate probe, after correcting its BodySet volume accessor, shows construction returns success and volume 4200π, but cold replay returns `Build(UnsupportedEdgeUseAgreement { curve: AffineImage, pcurve: CircularArc, surface: Plane })`. Native conic fallback therefore does not satisfy evidentiary closure and is rejected. Restore the original native arc metric behavior and preserve every original rejection assertion. Keep only the automatic retained-Rotation fallback needed by the original complete new tensor workflow. Explicit generic affine curve construction remains qualified for point/derivative/domain/edge/model/archive operations in the declared domain; whole face/shell native-conic transport needs additional image proofs in a subsequent increment.
+
+The raw archive's affine source/matrix definition is boxed to prevent the sixteen-scalar matrix from inflating every raw curve record. JSON shape is unchanged by this layout correction. Final checks and paired costs must use the boxed representation.

@@ -1,0 +1,348 @@
+diff --git a/crates/hyperbrep/Cargo.toml b/crates/hyperbrep/Cargo.toml
+index 59f4291c7..1a7ce8749 100644
+--- a/crates/hyperbrep/Cargo.toml
++++ b/crates/hyperbrep/Cargo.toml
+@@ -67,3 +67,7 @@ harness = false
+ [[bench]]
+ name = "periodic_cylinder"
+ harness = false
++
++[[bench]]
++name = "closed_edges"
++harness = false
+diff --git a/crates/hyperbrep/README.md b/crates/hyperbrep/README.md
+index 6f1099855..3b0b9b3bb 100644
+--- a/crates/hyperbrep/README.md
++++ b/crates/hyperbrep/README.md
+@@ -56,6 +56,11 @@ or geometric validation; see the [archive contract](docs/SELECTED_ARCHIVE.md).
+   allocating the angular–axial grid. Caps, orientation, incidence and complete
+   edge images still require independent exact checks. See the
+   [periodic-cylinder evidence](docs/evidence/2026-10-15-periodic-cylinder/README.md).
++- Full-period circular and elliptic edges may share one endpoint vertex.
++  Circular caps can use one edge, with distinct cap/side uses and seam parameter
++  endpoints retained through subdivision and archive replay. Other closed
++  families require additional regularity proofs. See the
++  [closed-edge contract](docs/ARCHITECTURE.md#closed-edges-and-periodic-seam-uses).
+ - Geometric equality and ordering use Hyperlimit predicates, not structural
+   `PartialEq` or an epsilon.
+ - An unresolved predicate is a typed error, never `false`.
+diff --git a/crates/hyperbrep/docs/ARCHITECTURE.md b/crates/hyperbrep/docs/ARCHITECTURE.md
+index 0b98a6c9f..0bb426fdc 100644
+--- a/crates/hyperbrep/docs/ARCHITECTURE.md
++++ b/crates/hyperbrep/docs/ARCHITECTURE.md
+@@ -31,12 +31,41 @@ HyperTRI is an optional derived consumer behind the `tessellation` feature. It
+ is not a core dependency and cannot mutate or replace a source BREP.
+ 
+ The downstream [HyperBRep IO crate](../../hyperbrep-io/README.md) owns bounded
+-Part 21 syntax and source-entity accounting. Its initial syntax layer depends
+-only on Hyperreal for exact numeric conversion. Future document/geometry mapping
+-will consume the model interface; the core does not depend on the exchange layer.
++Part 21 syntax, supported STEP geometry mapping and source-entity accounting.
++It consumes the native model interface and Hyperreal's exact numeric conversion;
++the core does not depend on the exchange layer.
+ Parsed records confer no geometry authority. Source-scoped views and flat
+ parameter storage preserve references and avoid recursive parameter-tree drop.
+ 
++## Closed edges and periodic seam uses
++
++`ModelBuilder::edge` may reference the same vertex twice for a circle or ellipse
++whose exact parameter interval spans one `tau` period. Positive radii and
++independent axes, already required by the spatial carrier, prove that this
++closed curve is regular and simple. Both endpoint images must still agree with
++the vertex. A shorter interval returns `ClosedEdgePeriodMismatch`; other closed
++curve families return `UnsupportedClosedEdge` until they have an appropriate
++regularity certificate. Equality of endpoint coordinates alone is insufficient.
++
++Vertex adjacency lists each incident edge once. Edge uses remain distinct:
++a cylinder seam can have two uses on opposite boundaries of one UV rectangle.
++A circular edge can bound an entire cap and one full-period side interval.
++The seam's spatial endpoint identity never identifies the two parameter
++endpoints. Directed angular-sweep and affine correspondences retain those
++endpoints and interior parameters through reversal, subdivision and replay.
++Existing whole-image, cap, shell-incidence and periodic-coverage checks remain
++mandatory. This admission does not add general ellipse/plane image proofs,
++closed spline certificates, general chart gluing or curved STEP mapping.
++
++Hypercurve owns the corresponding planar rule. A `CircularArc2` with equal
++endpoints denotes a full circle; the arc carrier owns radius and incidence
++checks. Its constructor rejects known zero radius or unequal endpoint radii;
++unknown structural facts still require certification by exact consumers.
++`CurveString2` rechecks zero-length chords only for lines, which can
++be constructed unchecked. Full-circle contours use the existing single
++`CurveRegion2` carrier, winding, Boolean and offset algorithms. See the
++[closed-edge qualification](evidence/2026-10-15-closed-edges/README.md).
++
+ ## Retained inverse parameters
+ 
+ [`Parameter`](../src/parameter.rs) holds an authored `Real` or a certified
+@@ -427,8 +456,8 @@ polynomial B-splines and rational Bézier controls and weights are retained
+ without flattening. A single periodic polynomial B-spline or NURBS profile is
+ partitioned at its exact native knot intervals into finite clamped
+ piecewise-Bézier spline carriers before topology publication. This retains the
+-source parameter intervals and rational images while avoiding a degenerate
+-one-vertex closed edge. Hypercurve classifies the radial/axial boundary
++source parameter intervals and rational images while avoiding an unsupported
++one-vertex closed spline edge. Hypercurve classifies the radial/axial boundary
+ directly and supplies exact Green-theorem area moments for polynomial and
+ polynomial-equivalent Bézier fragments. Finite rational quadratics use exact
+ homogeneous Green integrals with denominator `W^4`, reduced symbolically to
+diff --git a/crates/hyperbrep/docs/DEVELOPMENT_PLAN.md b/crates/hyperbrep/docs/DEVELOPMENT_PLAN.md
+index dff1ac303..661499e63 100644
+--- a/crates/hyperbrep/docs/DEVELOPMENT_PLAN.md
++++ b/crates/hyperbrep/docs/DEVELOPMENT_PLAN.md
+@@ -1114,6 +1114,15 @@ uncertainty metadata describes the source, not permission to merge points.
+ Convert inch/millimeter and other supported rational unit relations exactly.
+ Represent unknown units as a blocking document issue, not an implicit guess.
+ 
++For analytic curves and surfaces, convert angular parameters using the actual
++representation angle unit. Keep independent angular and length scales for
++mixed cylinder/cone UV charts; native `tau` need not be the source parameter's
++numeric period. Retain declared conversion factors and source parameter maps,
++including non-radian contexts and reversed seam uses. A familiar unit name does
++not authorize replacing an approximate decimal factor with an exact symbolic
++one. Add explicit disagreement fixtures before admitting these mappings; see
++the [closed-edge and angle-unit research](ALGORITHM_RESEARCH.md#native-closed-edges-before-analytic-step-mapping-2026-10-15).
++
+ ```rust,ignore
+ pub fn read_step(bytes: &[u8], options: &StepReadOptions)
+     -> Result<RawCadDocument, ExchangeError>;
+diff --git a/crates/hyperbrep/docs/SELECTED_ARCHIVE.md b/crates/hyperbrep/docs/SELECTED_ARCHIVE.md
+index cd4877a51..b4eaeabd3 100644
+--- a/crates/hyperbrep/docs/SELECTED_ARCHIVE.md
++++ b/crates/hyperbrep/docs/SELECTED_ARCHIVE.md
+@@ -72,6 +72,15 @@ Edges store two `Scalar(Real)` or `Selected(index)` parameter records. Scalar
+ coefficients remain Hyperreal values; decimal/floating approximations are not
+ introduced.
+ 
++A closed circular or elliptic edge stores the same vertex index at both ends
++and two distinct parameter endpoints spanning exactly one period. It uses the
++existing version-9 records. Validation reconstructs the carrier's regularity,
++period and actual endpoint agreement; it does not trust an archive flag.
++Circular cap and periodic cylinder edge uses also replay their complete
++pcurve-image, direction and shell certificates. Distinct adjacency, parameter
++maps, split/reflection and forged-record rejection are covered in the
++[closed-edge evidence](evidence/2026-10-15-closed-edges/README.md).
++
+ `selection.parameters` contains two node forms:
+ 
+ - `Root { polynomial, interval }` supplies ascending power-basis coefficients
+diff --git a/crates/hyperbrep/docs/SUPPORT_MATRIX.md b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+index 1efc67e4f..50f91c852 100644
+--- a/crates/hyperbrep/docs/SUPPORT_MATRIX.md
++++ b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+@@ -61,6 +61,15 @@ recertification and bounded decoding remain open. See the
+ [parameter contract](ARCHITECTURE.md#retained-inverse-parameters) and
+ [spatial point contract](ARCHITECTURE.md#retained-spatial-points).
+ 
++Circle and ellipse edges may retain one vertex at both endpoints when their
++exact interval spans one full period. The vertex lists that edge once; incident
++edge uses and parameter endpoints remain distinct. Single-edge circular caps
++and a cylinder with one periodic side face validate, subdivide and replay.
++Standalone closed ellipse edges subdivide and replay; this does not add
++ellipse/plane pcurve-image admission. Other closed curve families return
++`UnsupportedClosedEdge`. See the [closed-edge contract](ARCHITECTURE.md#closed-edges-and-periodic-seam-uses)
++and [evidence](evidence/2026-10-15-closed-edges/README.md).
++
+ ## Surface carriers
+ 
+ | Family | Domain / evaluation / partials | Bounds | Supported topology image proof | Transform | Persistence |
+diff --git a/crates/hyperbrep/src/ownership/references.rs b/crates/hyperbrep/src/ownership/references.rs
+index 51457ff4f..c8111fb30 100644
+--- a/crates/hyperbrep/src/ownership/references.rs
++++ b/crates/hyperbrep/src/ownership/references.rs
+@@ -97,7 +97,8 @@ impl<'a> VertexRef<'a> {
+             .point()
+     }
+ 
+-    /// Iterates over incident edges in insertion order.
++    /// Iterates over distinct incident edges in insertion order. A closed edge
++    /// appears once even though this vertex is both of its endpoints.
+     pub fn edges(self) -> impl ExactSizeIterator<Item = EdgeRef<'a>> {
+         self.model
+             .inner
+diff --git a/crates/hyperbrep/src/ownership/staging.rs b/crates/hyperbrep/src/ownership/staging.rs
+index 59eb05518..ad7d10788 100644
+--- a/crates/hyperbrep/src/ownership/staging.rs
++++ b/crates/hyperbrep/src/ownership/staging.rs
+@@ -108,6 +108,10 @@ impl ModelBuilder {
+         })
+     }
+     /// Adds an edge after checking all key owners and exact endpoints.
++    ///
++    /// A circle or ellipse spanning exactly one period may use the same vertex
++    /// at both endpoints. Other closed curve families require a future
++    /// regularity certificate and return [`BuildError::UnsupportedClosedEdge`].
+     pub fn edge(
+         &mut self,
+         start: &VertexKey,
+diff --git a/crates/hyperbrep/src/topology/builder.rs b/crates/hyperbrep/src/topology/builder.rs
+index 6d80d30d1..7c3da526d 100644
+--- a/crates/hyperbrep/src/topology/builder.rs
++++ b/crates/hyperbrep/src/topology/builder.rs
+@@ -70,12 +70,27 @@ impl ArenaModelBuilder {
+         domain: ParameterRange,
+         endpoint_certificate: bool,
+     ) -> Result<EdgeId, BuildError> {
+-        if start == end {
+-            return Err(BuildError::DegenerateEdge);
+-        }
+         let start_point = self.vertex_ref(start)?.point();
+         let end_point = self.vertex_ref(end)?.point();
+         let curve_ref = self.curve_ref(curve)?;
++        if start == end {
++            // A shared endpoint is valid topology for one complete, regular
++            // periodic curve. Restrict admission to carriers whose positive
++            // radii and independent axes already prove regularity and whose
++            // exact parameter period is known. Endpoint agreement alone would
++            // also admit constant or self-intersecting spline carriers.
++            if !matches!(
++                curve_ref.kind(),
++                Curve3Kind::CircleArc | Curve3Kind::EllipseArc
++            ) {
++                return Err(BuildError::UnsupportedClosedEdge(curve_ref.kind()));
++            }
++            require_real_equal(
++                &(domain.represented_end()? - domain.represented_start()?),
++                &Real::tau(),
++                BuildError::ClosedEdgePeriodMismatch,
++            )?;
++        }
+         if !endpoint_certificate {
+             require_curve_point_at_parameter(
+                 curve_ref,
+@@ -105,7 +120,9 @@ impl ArenaModelBuilder {
+             endpoint_certificate,
+         });
+         self.vertex_edges[start.index()].push(id);
+-        self.vertex_edges[end.index()].push(id);
++        if end != start {
++            self.vertex_edges[end.index()].push(id);
++        }
+         self.edge_uses_by_edge.push(Vec::new());
+         Ok(id)
+     }
+diff --git a/crates/hyperbrep/src/topology/error.rs b/crates/hyperbrep/src/topology/error.rs
+index 4242aa1fa..50f10ddb2 100644
+--- a/crates/hyperbrep/src/topology/error.rs
++++ b/crates/hyperbrep/src/topology/error.rs
+@@ -376,8 +376,10 @@ pub enum BuildError {
+     },
+     /// Exact geometry construction or evaluation failed.
+     Geometry(GeometryError),
+-    /// An edge references the same topological vertex twice.
+-    DegenerateEdge,
++    /// This curve family lacks a certificate for a regular closed edge.
++    UnsupportedClosedEdge(Curve3Kind),
++    /// A closed circular/elliptic edge does not span exactly one period.
++    ClosedEdgePeriodMismatch,
+     /// A curve/domain endpoint does not agree with the edge's vertex point.
+     EdgeEndpointMismatch {
+         /// Mismatched endpoint.
+diff --git a/crates/hypercurve/src/curve_string.rs b/crates/hypercurve/src/curve_string.rs
+index f2a4b509b..0c859cb08 100644
+--- a/crates/hypercurve/src/curve_string.rs
++++ b/crates/hypercurve/src/curve_string.rs
+@@ -82,6 +82,12 @@ impl CurveString2 {
+         }
+ 
+         for segment in &segments {
++            // Equal arc endpoints denote a full circle, not a zero-length
++            // chord. CircularArc2 owns radius/incidence validation; only line
++            // segments need this extra check for public unchecked construction.
++            let Segment2::Line(segment) = segment else {
++                continue;
++            };
+             if segment.start() == segment.end() {
+                 return Err(CurveError::ZeroLengthLine);
+             }
+diff --git a/crates/hypercurve/tests/hypercurve_curve_string.rs b/crates/hypercurve/tests/hypercurve_curve_string.rs
+index b58745fb8..e06d9bd6a 100644
+--- a/crates/hypercurve/tests/hypercurve_curve_string.rs
++++ b/crates/hypercurve/tests/hypercurve_curve_string.rs
+@@ -80,6 +80,86 @@ fn curve_string_and_contour_reject_forged_zero_length_segments() {
+     );
+ }
+ 
++#[test]
++fn full_circle_segments_retain_area_moment_and_winding_in_native_contours() {
++    for clockwise in [false, true] {
++        let arc = CircularArc2::try_from_center(p(5, -2), p(5, -2), p(3, -2), clockwise).unwrap();
++        let segment = Segment2::Arc(arc);
++        let path =
++            CurveString2::try_new(vec![segment.clone(), line_segment(5, -2, 7, -2)]).unwrap();
++        assert_eq!(path.len(), 2);
++        let contour = Contour2::try_new(vec![segment]).unwrap();
++        assert_eq!(contour.len(), 1);
++        let sign = if clockwise { -1 } else { 1 };
++        assert_eq!(
++            contour.signed_area().unwrap(),
++            Some(Real::from(sign * 4) * Real::pi())
++        );
++        assert_eq!(
++            contour.signed_x_first_moment().unwrap(),
++            Some(Real::from(sign * 12) * Real::pi())
++        );
++        assert_eq!(
++            crate::support::under_classified_result(&policy(), || contour
++                .winding_number(&p(3, -2)))
++            .unwrap(),
++            Classification::Decided(sign)
++        );
++        assert_eq!(
++            crate::support::under_classified_result(&policy(), || contour
++                .winding_number(&p(6, -2)))
++            .unwrap(),
++            Classification::Decided(0)
++        );
++    }
++}
++
++#[test]
++fn full_circle_native_regions_boolean_offset_and_repeat_exactly() {
++    let contour = Contour2::try_new(vec![Segment2::Arc(
++        CircularArc2::try_from_center(p(2, 0), p(2, 0), p(0, 0), false).unwrap(),
++    )])
++    .unwrap();
++    let region = crate::support::under(&policy(), || {
++        CurveRegion2::try_from_native_material_contours(vec![contour])
++    })
++    .unwrap()
++    .into_value();
++    let area = |region: &CurveRegion2| {
++        crate::support::under(&policy(), || region.signed_area())
++            .unwrap()
++            .into_value()
++    };
++    assert_eq!(area(&region), Some(Real::from(4) * Real::pi()));
++    for op in [
++        hypercurve::BooleanOp::Union,
++        hypercurve::BooleanOp::Intersection,
++    ] {
++        let same = crate::support::under(&policy(), || region.boolean_region(&region, op))
++            .unwrap()
++            .into_value();
++        assert_eq!(area(&same), Some(Real::from(4) * Real::pi()));
++    }
++    let offset = crate::support::under(&policy(), || {
++        region.offset(Real::one(), &hypercurve::OffsetCornerStyle2::Round)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&offset), Some(Real::from(9) * Real::pi()));
++    let ring = crate::support::under(&policy(), || {
++        offset.boolean_region(&region, hypercurve::BooleanOp::Difference)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&ring), Some(Real::from(5) * Real::pi()));
++    let back = crate::support::under(&policy(), || {
++        offset.offset(-Real::one(), &hypercurve::OffsetCornerStyle2::Round)
++    })
++    .unwrap()
++    .into_value();
++    assert_eq!(area(&back), Some(Real::from(4) * Real::pi()));
++}
++
+ #[test]
+ fn curve_string_endpoint_connection_classifies_exactly() {
+     let first = CurveString2::try_new(vec![line_segment(0, 0, 1, 0)]).unwrap();

@@ -1,0 +1,87 @@
+"""Materialize the exact STEP text hashed by the two migrated exchange rows.
+
+The original acceptance functions and all their assertions remain; the only
+instrumentation writes each already-materialized export before hashing it.
+This diagnostic runs after the frozen cost campaign, outside its timings.
+"""
+import hashlib,json,re,shutil,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from check import OUT,ROOT,ENV,hashes,run
+
+sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+source=hashes()
+cost=json.loads((OUT/'cost-summary.json').read_text())
+assert cost['source']==source and cost['commands']==129
+baseline=json.loads((OUT/'baseline.json').read_text())['baseline']
+work=Path('/tmp/hyperbrep-axial-shell-step-migration-v2')
+work.mkdir(exist_ok=False)
+kept=Path(__file__).parent/'step-capture-inputs-v2';kept.mkdir(exist_ok=False)
+tracked=subprocess.check_output(['git','ls-tree','-rz','--name-only',baseline],cwd=ROOT).decode().split('\0')
+rows=[];inputs={};originals={}
+for side in ['baseline','candidate']:
+ project=work/side;project.mkdir()
+ for crate in ['hyperbrep','hyperbrep-io']:
+  prefix='crates/'+crate+'/'
+  names=[n for n in tracked if n.startswith(prefix) and (n.endswith('.rs') and '/docs/' not in n or n.startswith(prefix+'tests/fixtures/') or n==prefix+'Cargo.toml' or n==prefix+'README.md')]
+  for name in names:
+   if side=='candidate' and '/tests/' not in name:continue
+   path=project/name;path.parent.mkdir(parents=True,exist_ok=True)
+   data=subprocess.check_output(['git','show',baseline+':'+name],cwd=ROOT) if side=='baseline' else (ROOT/name).read_bytes()
+   path.write_bytes(data)
+   originals[str(path)]=dict(source=baseline+':'+name if side=='baseline' else name,sha256=sha(path))
+  if side=='baseline':
+   manifest=project/prefix/'Cargo.toml';text=manifest.read_text()
+   text=re.sub(r'path = "\.\./([^"]+)"',lambda m: 'path = "'+str(ROOT/'crates'/m[1])+'"' if m[1] not in ['hyperbrep','hyperbrep-io'] else m[0],text)
+   manifest.write_text(text)
+   shutil.copy2(manifest,kept/(side+'-'+crate+'-Cargo.toml'))
+ module=project/'crates/hyperbrep-io/tests/support/prism_export.rs'
+ text=module.read_text();needle='for byte in output.text().bytes() {'
+ assert text.count(needle)==4
+ module.write_text(text.replace(needle,'crate::capture(output.text());\n        '+needle))
+ shutil.copy2(module,kept/(side+'-prism_export.rs.txt'))
+ package='hyperbrep-step-migration-'+side
+ manifest='[package]\nname = "'+package+'"\nversion = "0.0.0"\nedition = "2024"\n\n[workspace]\n\n[dependencies]\n'
+ for crate in ['hyperbrep','hyperbrep-io','hypercurve','hyperlimit']:
+  directory=(project if side=='baseline' and crate in ['hyperbrep','hyperbrep-io'] else ROOT)/'crates'/crate
+  manifest+=crate+' = { path = '+json.dumps(str(directory))+' }\n'
+ (project/'Cargo.toml').write_text(manifest)
+ (project/'src').mkdir()
+ main='''#[allow(dead_code)]
+#[path = "../crates/hyperbrep-io/tests/support/prism_export.rs"]
+mod acceptance;
+static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn capture(text: &str) {
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::path::PathBuf::from(std::env::args().nth(1).unwrap());
+    std::fs::write(dir.join(format!("{n}.step")), text).unwrap();
+}
+fn main() {
+    let half = acceptance::same_height();
+    let annulus = acceptance::holes();
+    assert_eq!(NEXT.load(std::sync::atomic::Ordering::Relaxed), 4);
+    println!("half_cylinder={half}");
+    println!("annular_prism={annulus}");
+}
+'''
+ (project/'src/main.rs').write_text(main)
+ assert run('step-migration-'+side+'-lock',['cargo','generate-lockfile','--offline','--manifest-path',str(project/'Cargo.toml')],120)==0
+ for p in project.rglob('*'):
+  if p.is_file():inputs[str(p)]=sha(p)
+ for name in ['Cargo.toml','Cargo.lock','src/main.rs']:
+  shutil.copy2(project/name,kept/(side+'-'+Path(name).name))
+ assert run('step-migration-'+side+'-build',['cargo','build','--offline','--locked','--release','--manifest-path',str(project/'Cargo.toml')],900)==0
+ binary=Path('/tmp')/package;assert not binary.exists()
+ shutil.copy2(Path(ENV['CARGO_TARGET_DIR'])/'release'/package,binary)
+ dest=OUT/'step-receipt-artifacts'/side;dest.mkdir(parents=True)
+ assert run('step-migration-'+side+'-capture',[str(binary),str(dest)],600)==0
+ attempt=json.loads((OUT/'attempts.json').read_text())[-1]
+ receipts={k:int(v) for k,v in re.findall(r'^(half_cylinder|annular_prism)=(\d+)$',(OUT/attempt['log']).read_text(),re.M)}
+ expected={r['case'].split('/')[1]:r[side]['receipt'] for r in cost['migrations'] if r['corpus']=='prism_exchange'}
+ assert receipts==expected,(side,receipts,expected)
+ files=sorted(dest.glob('*.step'));assert len(files)==4
+ rows.append(dict(side=side,receipts=receipts,binary=dict(path=str(binary),sha256=sha(binary),bytes=binary.stat().st_size),artifacts=[dict(path=str(p.relative_to(OUT)),sha256=sha(p),bytes=p.stat().st_size) for p in files]))
+ assert hashes()==source and all(sha(Path(p))==h for p,h in inputs.items())
+report=dict(source=source,baseline=baseline,rows=rows,inputs=inputs,originals=originals,recipe_sha256=sha(Path(__file__)),scope='Supplemental byte materialization from the unchanged complete half-cylinder and annulus acceptance functions, with capture-only instrumentation. Both combined receipts exactly reproduce the frozen measured binaries. Baseline runtime is the committed revision; supporting crates are unchanged current source. All original exact measures, membership, replay, graph and continuation assertions execute. These runs are outside the timing campaign.')
+(OUT/'step-receipt-capture.json').write_text(json.dumps(report,indent=2)+'\n')
+print('Captured both revisions of four STEP exports; all measured receipts reproduced.',flush=True)
