@@ -1,0 +1,1150 @@
+diff --git a/bindings/README.md b/bindings/README.md
+index a1154cc34..3e5e05756 100644
+--- a/bindings/README.md
++++ b/bindings/README.md
+@@ -117,6 +117,14 @@ output handles and profile records untouched. Rust scalar adapters retain
+ `AdapterError::Construction` and its native cause instead of a string-only
+ `AdapterError::Validation`. No method signature or numeric status value changes.
+ 
++Polyhedron construction and graphics export also preserve native failure
++categories. Undecided triangulation or normal certification reports (5),
++replacing (4); malformed rings, invalid indices and proven degenerate normals
++remain (4). Failures leave output handles and graphics records untouched.
++Successful empty exports contain zero vertices and indices. The ABI signatures
++and status values are unchanged. Rust point-transform adapters now retain their
++original `hyperreal::Problem` through `AdapterError::Hyperreal`.
++
+ Opaque handles may cross only the ABI version that created them. Callers must
+ use the matching free function, must not mix scalar families, and must copy any
+ borrowed last-error text before another ABI call. The wrappers are currently
+diff --git a/crates/csgrs-ffi/README.md b/crates/csgrs-ffi/README.md
+index 057dff5d4..cdc87bc07 100644
+--- a/crates/csgrs-ffi/README.md
++++ b/crates/csgrs-ffi/README.md
+@@ -99,6 +99,12 @@ finite region projections, and curve-to-solid operations.
+   Nonempty zero-size bounds, invalid input, and undecided predicates remain
+   distinct. Centering and floating preserve canonical empty geometry and
+   propagate bounds errors without publishing a model handle.
++- Polyhedron and graphics-export errors preserve native categories. Undecided
++  triangulation and normal certification return `PREDICATE_UNDECIDED` (5),
++  replacing generic `VALIDATION_FAILED` (4). Invalid rings, indices and proven
++  degenerate normals remain (4). Failure leaves output handles and buffer
++  records untouched; successful empty graphics buffers have zero row counts.
++  ABI signatures and numeric status values are unchanged.
+ - C++ exceptions retain the C status in `error::status()`; Python exceptions
+   retain it in `CsgrsError.status`; Go retains it in `StatusError.Status`.
+   WASM primitive constructors, transforms, bounds, and positioning throw a
+diff --git a/crates/csgrs-ffi/src/lib.rs b/crates/csgrs-ffi/src/lib.rs
+index 2aa9cc5ef..dc05fab48 100644
+--- a/crates/csgrs-ffi/src/lib.rs
++++ b/crates/csgrs-ffi/src/lib.rs
+@@ -2310,6 +2310,109 @@ pub unsafe extern "C" fn csgrs_region_profiles_real_free(value: CsgrsRegionProfi
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn undecided_native_normals_leave_abi_buffers_untouched_and_recover() {
++        let sine = Real::e().sin();
++        let cosine = Real::e().cos();
++        let zero = &sine * &sine + &cosine * &cosine - Real::one();
++        for (height, expected) in [
++            (Real::zero(), CsgrsStatus::ValidationFailed),
++            (zero, CsgrsStatus::PredicateUndecided),
++        ] {
++            let mut mesh = csgrs::solid::polyhedron(
++                &[[0, 0, 0], [1, 0, 0], [0, 1, 0]].map(|row| row.map(Real::from)),
++                &[&[0, 1, 2]],
++            )
++            .unwrap();
++            std::sync::Arc::make_mut(&mut mesh.positions)[2].y = height;
++            let handle = triangle_mesh_handle::<RealFamily>(ScalarMesh::from_native(mesh));
++            let mut output = CsgrsGraphicsMeshReal {
++                vertices: ptr::null_mut(),
++                vertex_len: 17,
++                indices: ptr::null_mut(),
++                index_len: 19,
++            };
++            unsafe {
++                assert_eq!(
++                    csgrs_triangle_mesh_real_graphics_mesh(&handle, &mut output),
++                    expected
++                );
++                assert!(output.vertices.is_null() && output.indices.is_null());
++                assert_eq!((output.vertex_len, output.index_len), (17, 19));
++                assert_eq!(
++                    CStr::from_ptr(csgrs_last_error_message()).to_str().unwrap(),
++                    "triangle 0 has no certifiable unit normal"
++                );
++            }
++        }
++        let empty =
++            triangle_mesh_handle::<RealFamily>(ScalarMesh::from_native(csgrs::solid::empty()));
++        let mut output = CsgrsGraphicsMeshReal {
++            vertices: ptr::null_mut(),
++            vertex_len: 17,
++            indices: ptr::null_mut(),
++            index_len: 19,
++        };
++        unsafe {
++            assert_eq!(
++                csgrs_triangle_mesh_real_graphics_mesh(&empty, &mut output),
++                CsgrsStatus::Ok
++            );
++            assert_eq!((output.vertex_len, output.index_len), (0, 0));
++            assert!(CStr::from_ptr(csgrs_last_error_message()).is_empty());
++            csgrs_graphics_mesh_real_free(output);
++        }
++    }
++
++    #[test]
++    fn undecided_polyhedron_does_not_publish_a_model_handle() {
++        let sine = Real::e().sin();
++        let cosine = Real::e().cos();
++        let zero = CsgrsReal {
++            inner: Real::zero(),
++        };
++        let one = CsgrsReal { inner: Real::one() };
++        let two = CsgrsReal { inner: 2.into() };
++        let uncertain = CsgrsReal {
++            inner: &sine * &sine + &cosine * &cosine - Real::one(),
++        };
++        let (z, o, t, u) = (
++            ptr::from_ref(&zero).cast_mut(),
++            ptr::from_ref(&one).cast_mut(),
++            ptr::from_ref(&two).cast_mut(),
++            ptr::from_ref(&uncertain).cast_mut(),
++        );
++        let points = [
++            CsgrsVec3Real { x: z, y: z, z },
++            CsgrsVec3Real { x: o, y: z, z },
++            CsgrsVec3Real { x: t, y: u, z },
++        ];
++        let indices = [0, 1, 2];
++        let offsets = [0, 3];
++        let mut output = ptr::null_mut();
++        unsafe {
++            assert_eq!(
++                csgrs_triangle_mesh_real_polyhedron(
++                    points.as_ptr(),
++                    points.len(),
++                    indices.as_ptr(),
++                    indices.len(),
++                    offsets.as_ptr(),
++                    offsets.len(),
++                    &mut output
++                ),
++                CsgrsStatus::PredicateUndecided
++            );
++            assert!(output.is_null());
++            assert!(
++                CStr::from_ptr(csgrs_last_error_message())
++                    .to_str()
++                    .unwrap()
++                    .contains("3D triangle degeneracy")
++            );
++        }
++    }
++
+     #[test]
+     fn undecided_revolve_preserves_status_and_output_ownership() {
+         let sine = Real::e().sin();
+diff --git a/crates/hypermesh/README.md b/crates/hypermesh/README.md
+index 714226eea..e09d35014 100644
+--- a/crates/hypermesh/README.md
++++ b/crates/hypermesh/README.md
+@@ -10,6 +10,15 @@ File formats and solid-modeling grammar belong in adapters such as CSGRS.
+ 
+ This README describes crate version `0.1.0`.
+ 
++Exact GPU export now distinguishes proven degenerate triangles
++(`GpuMeshError::TriangleNormalUnavailable`) from normals whose nonzero length
++is undecided (`TriangleNormalUndecided`). `TriangleNormalFailed` retains a
++scalar arithmetic error, available through `std::error::Error::source`.
++Update exhaustive matches for these new variants. Successful exact rows and
++the strict certification policy are unchanged; a failed export publishes no
++partial buffer. `GpuMeshError` retains `Eq`, using the additive `Eq` implementation
++on `hyperreal::Problem`.
++
+ ## Exactness and policy
+ 
+ Extensions follow the stack-wide [admission protocol](../../docs/admission.md),
+diff --git a/crates/hypermesh/src/gpu.rs b/crates/hypermesh/src/gpu.rs
+index d17ca3717..5938e0a11 100644
+--- a/crates/hypermesh/src/gpu.rs
++++ b/crates/hypermesh/src/gpu.rs
+@@ -173,11 +173,23 @@ pub enum GpuMeshError {
+         /// Number of available source vertices.
+         vertex_count: usize,
+     },
+-    /// An exact triangle has no certifiable finite unit normal.
++    /// An exact triangle is degenerate and has no unit normal.
+     TriangleNormalUnavailable {
+         /// Offset of the triangle in the source mesh.
+         triangle: usize,
+     },
++    /// The normal's nonzero length could not be certified under strict policy.
++    TriangleNormalUndecided {
++        /// Offset of the triangle in the source mesh.
++        triangle: usize,
++    },
++    /// Scalar arithmetic failed while constructing a triangle's unit normal.
++    TriangleNormalFailed {
++        /// Offset of the triangle in the source mesh.
++        triangle: usize,
++        /// Original scalar failure, including resource exhaustion.
++        source: hyperreal::Problem,
++    },
+     /// An exact attribute could not be approximated as a finite floating-point row.
+     AttributeApproximationFailed {
+         /// Vertex containing the attribute.
+@@ -214,12 +226,19 @@ impl fmt::Display for GpuMeshError {
+                 formatter,
+                 "triangle {triangle} corner {corner} references source vertex {index}, but only {vertex_count} vertices exist"
+             ),
+-            Self::TriangleNormalUnavailable { triangle } => {
++            Self::TriangleNormalUnavailable { triangle }
++            | Self::TriangleNormalUndecided { triangle } => {
+                 write!(
+                     formatter,
+                     "triangle {triangle} has no certifiable unit normal"
+                 )
+             }
++            Self::TriangleNormalFailed { triangle, source } => {
++                write!(
++                    formatter,
++                    "triangle {triangle} normal construction failed: {source}"
++                )
++            }
+             Self::AttributeApproximationFailed { vertex, attribute } => {
+                 write!(
+                     formatter,
+@@ -230,7 +249,14 @@ impl fmt::Display for GpuMeshError {
+     }
+ }
+ 
+-impl Error for GpuMeshError {}
++impl Error for GpuMeshError {
++    fn source(&self) -> Option<&(dyn Error + 'static)> {
++        match self {
++            Self::TriangleNormalFailed { source, .. } => Some(source),
++            _ => None,
++        }
++    }
++}
+ 
+ /// Approximates exact render rows into backend-neutral GPU buffers.
+ pub fn approximate_gpu_mesh_f32(
+@@ -387,22 +413,29 @@ fn exact_gpu_triangle(
+     let cross = (&b - &a).cross(&(&c - &a));
+     let normal = match cross.normalize_checked() {
+         Ok(normal) => normal,
++        Err(hyperreal::Problem::DivideByZero) => {
++            return Err(GpuMeshError::TriangleNormalUnavailable { triangle });
++        }
+         // Structural facts cannot show that trigonometric or other computable
+         // coordinates are nonzero, so certify the squared length by bounded
+-        // exact refinement before normalizing. A degenerate or undecided
+-        // triangle still has no normal.
+-        Err(_) => match hyperlimit::compare_reals(
+-            &cross.dot(&cross),
+-            &Real::zero(),
+-            hyperlimit::PredicatePolicy::STRICT,
+-        )
+-        .value()
+-        {
+-            Some(std::cmp::Ordering::Greater) => cross
+-                .normalize()
+-                .map_err(|_| GpuMeshError::TriangleNormalUnavailable { triangle })?,
+-            _ => return Err(GpuMeshError::TriangleNormalUnavailable { triangle }),
+-        },
++        // exact refinement before normalizing. A degenerate
++        // triangle must remain distinguishable from an undecided one.
++        Err(hyperreal::Problem::UnknownZero | hyperreal::Problem::UnknownCertificate) => {
++            match hyperlimit::compare_reals(
++                &cross.dot(&cross),
++                &Real::zero(),
++                hyperlimit::PredicatePolicy::STRICT,
++            )
++            .value()
++            {
++                Some(std::cmp::Ordering::Greater) => cross
++                    .normalize()
++                    .map_err(|source| GpuMeshError::TriangleNormalFailed { triangle, source })?,
++                Some(_) => return Err(GpuMeshError::TriangleNormalUnavailable { triangle }),
++                None => return Err(GpuMeshError::TriangleNormalUndecided { triangle }),
++            }
++        }
++        Err(source) => return Err(GpuMeshError::TriangleNormalFailed { triangle, source }),
+     };
+     let normal = [
+         normal.0[0].clone(),
+@@ -666,6 +699,30 @@ mod tests {
+         assert_eq!(gpu.indices, [0, 1, 2]);
+     }
+ 
++    #[test]
++    fn exact_gpu_exports_keep_undecided_normals_distinct_from_degeneracy() {
++        let sine = Real::e().sin();
++        let cosine = Real::e().cos();
++        let zero = &sine * &sine + &cosine * &cosine - Real::one();
++        let positions = vec![
++            Point3::origin(),
++            Point3::new(1.into(), 0.into(), 0.into()),
++            Point3::new(0.into(), zero, 0.into()),
++        ];
++        let mesh = TriangleMesh::new(positions.clone(), vec![Triangle::new(0, 1, 2)]);
++        let result = BooleanMeshResult {
++            triangles: vec![[0, 1, 2]],
++            sources: Vec::new(),
++            exterior_inside: false,
++        };
++        for error in [
++            mesh.to_exact_gpu_mesh_buffers().unwrap_err(),
++            result.to_exact_gpu_mesh_buffers(&positions).unwrap_err(),
++        ] {
++            assert_eq!(error, GpuMeshError::TriangleNormalUndecided { triangle: 0 });
++        }
++    }
++
+     #[test]
+     fn exact_gpu_exports_reject_degenerate_triangle_normals() {
+         let positions = vec![
+diff --git a/crates/hyperreal/src/problem.rs b/crates/hyperreal/src/problem.rs
+index 7cbee555a..bd67a0e11 100644
+--- a/crates/hyperreal/src/problem.rs
++++ b/crates/hyperreal/src/problem.rs
+@@ -5,7 +5,7 @@ use crate::{Rational, Real};
+ /// Problems when either parsing or attempting Arithmetic with [`Real`] numbers
+ /// or when trying to make or convert to a [`Rational`].
+ 
+-#[derive(Copy, Clone, Debug, PartialEq)]
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+ #[non_exhaustive]
+ pub enum Problem {
+     /// Unspecified problem while parsing an expression
+diff --git a/src/adapter/mesh.rs b/src/adapter/mesh.rs
+index d75e4cedf..f4ab85f09 100644
+--- a/src/adapter/mesh.rs
++++ b/src/adapter/mesh.rs
+@@ -47,6 +47,9 @@ pub type TriangleMeshI128 = ScalarMesh<I128>;
+ /// error's [`kind`](crate::errors::ValidationError::kind) or follow
+ /// [`std::error::Error::source`] to distinguish invalid input from an undecided
+ /// predicate. This replaces text-only [`AdapterError::Validation`] failures.
++/// Polyhedron and graphics construction also retain native causes; graphics
++/// errors use [`crate::errors::ValidationError::Gpu`]. Point transforms retain
++/// scalar arithmetic failures through [`AdapterError::Hyperreal`].
+ #[derive(Clone, Debug)]
+ pub struct ScalarMesh<A>
+ where
+@@ -123,7 +126,7 @@ where
+             .collect::<AdapterResult<Vec<_>>>()?;
+         solid::polyhedron(&points, faces)
+             .map(Self::from_native)
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn union(&self, other: &Self) -> AdapterResult<Self> {
+@@ -377,7 +380,7 @@ where
+             .collect::<AdapterResult<Vec<_>>>()?;
+         solid::polyhedron_with_context(&points, faces, context)
+             .map(|outcome| outcome.map(Self::from_native))
+-            .map_err(|error| AdapterError::Validation(error.to_string()))
++            .map_err(AdapterError::from)
+     }
+ 
+     pub fn graphics_mesh(&self) -> AdapterResult<GraphicsMesh<A::Scalar>> {
+@@ -402,7 +405,7 @@ where
+         let mesh = self
+             .inner
+             .to_exact_gpu_mesh_buffers()
+-            .map_err(|error| AdapterError::Validation(error.to_string()))?;
++            .map_err(AdapterError::from)?;
+         let vertices = mesh
+             .vertices
+             .iter()
+@@ -465,7 +468,7 @@ where
+                 let [x, y, z] = point?;
+                 let transformed = matrix
+                     .transform_point3(&Point3::new(x, y, z))
+-                    .map_err(|error| AdapterError::Validation(error.to_string()))?;
++                    .map_err(AdapterError::from)?;
+                 point3_to_scalar::<A>(&transformed)
+             })
+             .collect()
+diff --git a/src/adapter/scalar.rs b/src/adapter/scalar.rs
+index 1accca6e4..54743de87 100644
+--- a/src/adapter/scalar.rs
++++ b/src/adapter/scalar.rs
+@@ -52,6 +52,12 @@ impl From<hypermesh::HypermeshError> for AdapterError {
+     }
+ }
+ 
++impl From<hypermesh::GpuMeshError> for AdapterError {
++    fn from(value: hypermesh::GpuMeshError) -> Self {
++        Self::from(crate::errors::ValidationError::from(value))
++    }
++}
++
+ #[cfg(feature = "curve")]
+ impl From<hypercurve::ExactCurveError> for AdapterError {
+     fn from(value: hypercurve::ExactCurveError) -> Self {
+diff --git a/src/attributed.rs b/src/attributed.rs
+index 41db7228d..f594c5e9b 100644
+--- a/src/attributed.rs
++++ b/src/attributed.rs
+@@ -39,7 +39,7 @@ pub struct AttributedMesh<M> {
+     geometry: TriangleMesh,
+     face_metadata: Vec<M>,
+     authored_normals: Option<Vec<Vector3>>,
+-    exact_gpu: Arc<OnceLock<Result<hypermesh::ExactGpuMeshBuffers, hypermesh::GpuMeshError>>>,
++    exact_gpu: Arc<OnceLock<hypermesh::ExactGpuMeshBuffers>>,
+ }
+ 
+ impl<M: PartialEq> PartialEq for AttributedMesh<M> {
+@@ -121,48 +121,63 @@ impl<M> AttributedMesh<M> {
+     ///
+     /// This is an interchange/rendering boundary only. Native geometry does
+     /// not absorb authored normals or depend on them for modeling predicates.
++    /// Successful buffers are shared by clones and metadata mappings for their
++    /// lifetime. Failures are returned by value and retried on the next call,
++    /// so stronger scalar evidence can make a formerly undecided export succeed.
++    /// Concurrent callers may compute the same exact rows before sharing the
++    /// first success. This cache retains one buffer, without a heap-byte limit.
++    ///
++    /// Migration: the error type is now owned `GpuMeshError`, replacing
++    /// `&GpuMeshError`; callers that previously cloned the error can remove that
++    /// conversion. Successful buffers are still borrowed from this sidecar.
+     pub fn exact_gpu_mesh_buffers(
+         &self,
+-    ) -> Result<&hypermesh::ExactGpuMeshBuffers, &hypermesh::GpuMeshError> {
+-        self.exact_gpu
+-            .get_or_init(|| {
+-                let Some(normals) = &self.authored_normals else {
+-                    return self.geometry.to_exact_gpu_mesh_buffers();
+-                };
+-                for (triangle_offset, triangle) in self.geometry.triangles.iter().enumerate() {
+-                    for (corner, index) in triangle.indices().into_iter().enumerate() {
+-                        if index >= self.geometry.positions.len() {
+-                            return Err(
+-                                hypermesh::GpuMeshError::SourceTriangleIndexOutOfBounds {
+-                                    triangle: triangle_offset,
+-                                    corner,
+-                                    index,
+-                                    vertex_count: self.geometry.positions.len(),
+-                                },
+-                            );
+-                        }
+-                    }
++    ) -> Result<&hypermesh::ExactGpuMeshBuffers, hypermesh::GpuMeshError> {
++        if let Some(buffers) = self.exact_gpu.get() {
++            return Ok(buffers);
++        }
++        match self.build_exact_gpu_mesh_buffers() {
++            Ok(buffers) => Ok(self.exact_gpu.get_or_init(|| buffers)),
++            Err(error) => self.exact_gpu.get().ok_or(error),
++        }
++    }
++
++    fn build_exact_gpu_mesh_buffers(
++        &self,
++    ) -> Result<hypermesh::ExactGpuMeshBuffers, hypermesh::GpuMeshError> {
++        let Some(normals) = &self.authored_normals else {
++            return self.geometry.to_exact_gpu_mesh_buffers();
++        };
++        for (triangle_offset, triangle) in self.geometry.triangles.iter().enumerate() {
++            for (corner, index) in triangle.indices().into_iter().enumerate() {
++                if index >= self.geometry.positions.len() {
++                    return Err(hypermesh::GpuMeshError::SourceTriangleIndexOutOfBounds {
++                        triangle: triangle_offset,
++                        corner,
++                        index,
++                        vertex_count: self.geometry.positions.len(),
++                    });
+                 }
+-                let rows = self.geometry.triangles.iter().map(|triangle| {
+-                    triangle.indices().map(|index| {
+-                        let point = &self.geometry.positions[index];
+-                        let normal = &normals[index];
+-                        (
+-                            [point.x.clone(), point.y.clone(), point.z.clone()],
+-                            [
+-                                normal.0[0].clone(),
+-                                normal.0[1].clone(),
+-                                normal.0[2].clone(),
+-                            ],
+-                        )
+-                    })
+-                });
+-                hypermesh::ExactGpuMeshBuffers::from_triangles_with_capacity(
+-                    self.geometry.triangles.len(),
+-                    rows,
++            }
++        }
++        let rows = self.geometry.triangles.iter().map(|triangle| {
++            triangle.indices().map(|index| {
++                let point = &self.geometry.positions[index];
++                let normal = &normals[index];
++                (
++                    [point.x.clone(), point.y.clone(), point.z.clone()],
++                    [
++                        normal.0[0].clone(),
++                        normal.0[1].clone(),
++                        normal.0[2].clone(),
++                    ],
+                 )
+             })
+-            .as_ref()
++        });
++        hypermesh::ExactGpuMeshBuffers::from_triangles_with_capacity(
++            self.geometry.triangles.len(),
++            rows,
++        )
+     }
+ }
+ 
+diff --git a/src/curve/native.rs b/src/curve/native.rs
+index d05a4d916..fb3193cfb 100644
+--- a/src/curve/native.rs
++++ b/src/curve/native.rs
+@@ -2463,7 +2463,7 @@ fn validate_surface_mesh(
+ ) -> Result<TriangleMesh, ValidationError> {
+     let valid = decisions.consume_mesh(
+         mesh.has_unique_nondegenerate_triangles(decisions.mesh_context())
+-            .map_err(|error| ValidationError::Geometry(error.to_string()))?,
++            .map_err(ValidationError::from)?,
+     );
+     if valid {
+         Ok(decisions.qualify_mesh(mesh))
+@@ -2484,7 +2484,7 @@ fn validate_closed_mesh(
+     }
+     let closed = decisions.consume_mesh(
+         mesh.is_closed_manifold_geometry(decisions.mesh_context())
+-            .map_err(|error| ValidationError::Geometry(error.to_string()))?,
++            .map_err(ValidationError::from)?,
+     );
+     if closed {
+         Ok(decisions.qualify_mesh(mesh))
+@@ -4324,3 +4324,90 @@ mod tests {
+         assert_eq!(right.end(), &Point2::new(Real::from(4_u8), Real::from(-4_i8)));
+     }
+ }
++
++#[cfg(test)]
++mod native_boundary_source_probe {
++    use super::*;
++    use crate::errors::ValidationErrorKind;
++    use hypermesh::Triangle;
++    use std::error::Error;
++
++    fn check(mesh: TriangleMesh, kind: ValidationErrorKind) {
++        let context = GeometryContext::STRICT;
++        let native = [
++            mesh.has_unique_nondegenerate_triangles(&context.mesh_context())
++                .unwrap_err(),
++            mesh.is_closed_manifold_geometry(&context.mesh_context())
++                .unwrap_err(),
++        ];
++        let decisions = GeometryDecisions::new(&context);
++        let modeled = [
++            validate_surface_mesh(mesh.clone(), &decisions).unwrap_err(),
++            validate_closed_mesh(mesh, false, &decisions).unwrap_err(),
++        ];
++        let mut retained = 0;
++        for (native, modeled) in native.into_iter().zip(modeled) {
++            let expected = ValidationError::from(native);
++            assert_eq!(expected.kind(), kind);
++            assert_eq!(modeled.to_string(), expected.to_string());
++            println!(
++                "native={expected:?}; modeled={modeled:?}; source={}",
++                modeled.source().is_some()
++            );
++            retained += usize::from(modeled == expected && modeled.source().is_some());
++        }
++        assert_eq!(
++            retained, 2,
++            "both validation helpers must preserve native causes"
++        );
++    }
++
++    #[test]
++    fn invalid_indices_remain_a_definite_failed_output_validation() {
++        let mesh = TriangleMesh::new(Vec::new(), vec![Triangle::new(0, 1, 2)]);
++        let context = GeometryContext::STRICT;
++        assert!(
++            !mesh
++                .has_unique_nondegenerate_triangles(&context.mesh_context())
++                .unwrap()
++                .value
++        );
++        assert!(
++            !mesh
++                .is_closed_manifold_geometry(&context.mesh_context())
++                .unwrap()
++                .value
++        );
++        let decisions = GeometryDecisions::new(&context);
++        for error in [
++            validate_surface_mesh(mesh.clone(), &decisions).unwrap_err(),
++            validate_closed_mesh(mesh, false, &decisions).unwrap_err(),
++        ] {
++            assert!(matches!(error, ValidationError::Geometry(_)));
++        }
++    }
++
++    #[test]
++    fn undecided_geometry_keeps_the_native_mesh_cause() {
++        let sine = Real::e().sin();
++        let cosine = Real::e().cos();
++        let zero = &sine * &sine + &cosine * &cosine - Real::one();
++        check(
++            TriangleMesh::new(
++                vec![
++                    Point3::origin(),
++                    Point3::new(1.into(), 0.into(), 0.into()),
++                    Point3::new(0.into(), 1.into(), 0.into()),
++                    Point3::new(0.into(), 0.into(), zero),
++                ],
++                vec![
++                    Triangle::new(0, 2, 1),
++                    Triangle::new(0, 1, 3),
++                    Triangle::new(0, 3, 2),
++                    Triangle::new(1, 2, 3),
++                ],
++            ),
++            ValidationErrorKind::Undecided,
++        );
++    }
++}
+diff --git a/src/errors.rs b/src/errors.rs
+index 9717e25cf..9d2857a48 100644
+--- a/src/errors.rs
++++ b/src/errors.rs
+@@ -63,6 +63,9 @@ pub enum ValidationError {
+     /// A native mesh operation failed, retaining its typed cause.
+     #[error("{0}")]
+     Mesh(#[from] hypermesh::HypermeshError),
++    /// Native graphics-buffer construction failed, retaining its typed cause.
++    #[error("{0}")]
++    Gpu(#[from] hypermesh::GpuMeshError),
+     /// A native exact curve operation failed, retaining its context and cause.
+     #[error("{0}")]
+     ExactCurve(#[from] ExactCurveError),
+@@ -177,6 +180,24 @@ const fn curve_error_kind(source: &CurveError) -> ValidationErrorKind {
+ impl ValidationError {
+     pub const fn kind(&self) -> ValidationErrorKind {
+         match self {
++            Self::Gpu(error) => match error {
++                hypermesh::GpuMeshError::TriangleNormalUndecided { .. }
++                | hypermesh::GpuMeshError::TriangleNormalFailed {
++                    source:
++                        hyperreal::Problem::UnknownZero | hyperreal::Problem::UnknownCertificate,
++                    ..
++                } => ValidationErrorKind::Undecided,
++                hypermesh::GpuMeshError::VertexCountExceededU32
++                | hypermesh::GpuMeshError::TriangleNormalFailed {
++                    source: hyperreal::Problem::Exhausted,
++                    ..
++                } => ValidationErrorKind::ResourceExhausted,
++                hypermesh::GpuMeshError::TriangleNormalFailed { .. }
++                | hypermesh::GpuMeshError::AttributeApproximationFailed { .. } => {
++                    ValidationErrorKind::Geometry
++                },
++                _ => ValidationErrorKind::InvalidInput,
++            },
+             Self::Curve(source) => curve_error_kind(source),
+             #[cfg(feature = "truetype-text")]
+             Self::MissingFontGlyph { .. } => ValidationErrorKind::Unsupported,
+diff --git a/tests/ffi/native_boundary_failures.c b/tests/ffi/native_boundary_failures.c
+new file mode 100644
+index 000000000..1b2aa2d87
+--- /dev/null
++++ b/tests/ffi/native_boundary_failures.c
+@@ -0,0 +1,37 @@
++#include "csgrs.h"
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++int main(void) {
++  const csgrs_vec3_f64_t crossed[] = {{0,0,0}, {3,3,0}, {0,2,0}, {2,0,0}};
++  const size_t indices[] = {0,1,2,3}, offsets[] = {0,4};
++  csgrs_triangle_mesh_t *output = NULL;
++  assert(csgrs_triangle_mesh_f64_polyhedron(crossed, 4, indices, 4, offsets, 2, &output) == CSGRS_STATUS_VALIDATION_FAILED);
++  assert(output == NULL);
++  assert(strstr(csgrs_last_error_message(), "simple ring edges cross") != NULL);
++
++  const csgrs_vec3_f64_t points[] = {{0,0,0}, {1,0,0}, {0,3,4}};
++  const size_t face[] = {0,1,2}, bounds[] = {0,3};
++  assert(csgrs_triangle_mesh_f64_polyhedron(points, 3, face, 3, bounds, 2, &output) == CSGRS_STATUS_OK);
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    csgrs_graphics_mesh_f64_t graphics = {NULL, 17, NULL, 19};
++    assert(csgrs_triangle_mesh_f64_graphics_mesh(output, &graphics) == CSGRS_STATUS_OK);
++    assert(graphics.vertex_len == 3 && graphics.index_len == 3);
++    for (size_t i = 0; i < 3; ++i) {
++      assert(graphics.vertices[i].normal.x == 0);
++      assert(graphics.vertices[i].normal.y == -0.8);
++      assert(graphics.vertices[i].normal.z == 0.6);
++    }
++    csgrs_graphics_mesh_f64_free(graphics);
++  }
++  csgrs_triangle_mesh_free(output);
++  output = NULL;
++  assert(csgrs_triangle_mesh_f64_cube(0, &output) == CSGRS_STATUS_OK);
++  csgrs_graphics_mesh_f64_t empty = {NULL, 17, NULL, 19};
++  assert(csgrs_triangle_mesh_f64_graphics_mesh(output, &empty) == CSGRS_STATUS_OK);
++  assert(empty.vertex_len == 0 && empty.index_len == 0 && csgrs_last_error_message()[0] == '\0');
++  csgrs_graphics_mesh_f64_free(empty);
++  csgrs_triangle_mesh_free(output);
++  puts("C polyhedron diagnostics, normal values, repeated export and empty recovery passed");
++}
+diff --git a/tests/ffi/native_boundary_failures.cpp b/tests/ffi/native_boundary_failures.cpp
+new file mode 100644
+index 000000000..0266d1589
+--- /dev/null
++++ b/tests/ffi/native_boundary_failures.cpp
+@@ -0,0 +1,28 @@
++#include "csgrs.hpp"
++#include <cassert>
++#include <string>
++
++int main() {
++  using Mesh = csgrs::TriangleMesh<csgrs::F64>;
++  try {
++    Mesh::polyhedron({{0,0,0}, {3,3,0}, {0,2,0}, {2,0,0}}, {0,1,2,3}, {0,4});
++    assert(false);
++  } catch (const csgrs::error &error) {
++    assert(error.status() == CSGRS_STATUS_VALIDATION_FAILED);
++    assert(std::string(error.what()).find("simple ring edges cross") != std::string::npos);
++  }
++  const auto mesh = Mesh::polyhedron({{0,0,0}, {1,0,0}, {0,3,4}}, {0,1,2}, {0,3});
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    auto graphics = mesh.graphics_mesh();
++    assert(graphics.vertex_len == 3 && graphics.index_len == 3);
++    for (size_t i = 0; i < 3; ++i) {
++      assert(graphics.vertices[i].normal.x == 0);
++      assert(graphics.vertices[i].normal.y == -0.8);
++      assert(graphics.vertices[i].normal.z == 0.6);
++    }
++    csgrs_graphics_mesh_f64_free(graphics);
++  }
++  auto empty = Mesh::cube(0).graphics_mesh();
++  assert(empty.vertex_len == 0 && empty.index_len == 0);
++  csgrs_graphics_mesh_f64_free(empty);
++}
+diff --git a/tests/ffi/native_boundary_failures.py b/tests/ffi/native_boundary_failures.py
+new file mode 100644
+index 000000000..f472cbf90
+--- /dev/null
++++ b/tests/ffi/native_boundary_failures.py
+@@ -0,0 +1,35 @@
++"""Real consumer of polyhedron diagnostics and explicit graphics projection."""
++from pathlib import Path
++import sys
++
++sys.dont_write_bytecode = True
++sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'bindings/python'))
++import csgrs
++
++Mesh = csgrs.TriangleMeshF64
++try:
++    Mesh.polyhedron([(0,0,0), (3,3,0), (0,2,0), (2,0,0)], [[0,1,2,3]])
++except csgrs.CsgrsError as error:
++    assert error.status == 4 and 'simple ring edges cross' in str(error)
++else:
++    raise AssertionError('malformed ring published a model')
++
++mesh = Mesh.polyhedron([(0,0,0), (1,0,0), (0,3,4)], [[0,1,2]])
++for _ in range(2):
++    graphics = mesh.graphics_mesh()
++    assert graphics.raw.vertex_len == graphics.raw.index_len == 3
++    for index in range(3):
++        normal = graphics.raw.vertices[index].normal
++        assert (normal.x, normal.y, normal.z) == (0, -0.8, 0.6)
++    del graphics
++
++for exponent in [100, 400, 1000, 1074]:
++    thin = Mesh.polyhedron([(0,0,0), (1,0,0), (0,2.0**-exponent,0)], [[0,1,2]])
++    graphics = thin.rotate(0, 0, 13).graphics_mesh()
++    assert graphics.raw.vertex_len == graphics.raw.index_len == 3
++    del graphics, thin
++
++empty = Mesh.cube(0).graphics_mesh()
++assert empty.raw.vertex_len == empty.raw.index_len == 0
++del empty, mesh
++print('Python polyhedron diagnostics, normal values, thin rotated surfaces and empty recovery passed')
+diff --git a/tests/native_boundary_failures.rs b/tests/native_boundary_failures.rs
+new file mode 100644
+index 000000000..ec251b503
+--- /dev/null
++++ b/tests/native_boundary_failures.rs
+@@ -0,0 +1,369 @@
++use csgrs::adapter::{AdapterError, F32, F64, I128, RawReal, ScalarAdapter, ScalarMesh};
++use csgrs::errors::{ValidationError, ValidationErrorKind};
++use csgrs::{GeometryContext, Real, TriangleMesh, solid};
++use hyperlattice::{Matrix4, Point3};
++use hypermesh::{BooleanMeshResult, GpuMeshError, Triangle};
++use hyperreal::Problem;
++use std::error::Error;
++
++fn unresolved_zero() -> Real {
++    let sine = Real::e().sin();
++    let cosine = Real::e().cos();
++    &sine * &sine + &cosine * &cosine - Real::one()
++}
++
++fn triangle(height: Real) -> TriangleMesh {
++    TriangleMesh::new(
++        vec![
++            Point3::origin(),
++            Point3::new(1.into(), 0.into(), 0.into()),
++            Point3::new(0.into(), height, 0.into()),
++        ],
++        vec![Triangle::new(0, 1, 2)],
++    )
++}
++
++fn assert_validation(error: AdapterError, native: ValidationError, kind: ValidationErrorKind) {
++    assert_eq!(native.kind(), kind);
++    assert_eq!(error.to_string(), native.to_string());
++    assert_eq!(error, AdapterError::Construction(native.clone()));
++    assert_eq!(
++        error.source().unwrap().downcast_ref::<ValidationError>(),
++        Some(&native)
++    );
++}
++
++fn polyhedron_failure<A: ScalarAdapter>() {
++    let native_points =
++        [[0, 0, 0], [3, 3, 0], [0, 2, 0], [2, 0, 0]].map(|row| row.map(Real::from));
++    let points = native_points
++        .clone()
++        .map(|row| row.map(|value| A::from_real(&value).unwrap()));
++    let faces: &[&[usize]] = &[&[0, 1, 2, 3]];
++    assert_validation(
++        ScalarMesh::<A>::polyhedron(&points, faces).err().unwrap(),
++        solid::polyhedron(&native_points, faces).unwrap_err(),
++        ValidationErrorKind::InvalidInput,
++    );
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        assert_validation(
++            ScalarMesh::<A>::polyhedron_with_context(&points, faces, &context)
++                .err()
++                .unwrap(),
++            solid::polyhedron_with_context(&native_points, faces, &context).unwrap_err(),
++            ValidationErrorKind::InvalidInput,
++        );
++    }
++}
++
++#[test]
++fn polyhedron_failures_keep_native_causes_and_policy() {
++    polyhedron_failure::<RawReal>();
++    polyhedron_failure::<F32>();
++    polyhedron_failure::<F64>();
++    polyhedron_failure::<I128>();
++    let points = [
++        [0, 0, 0].map(Real::from),
++        [1, 0, 0].map(Real::from),
++        [2.into(), unresolved_zero(), 0.into()],
++    ];
++    let faces: &[&[usize]] = &[&[0, 1, 2]];
++    assert_validation(
++        ScalarMesh::<RawReal>::polyhedron(&points, faces)
++            .err()
++            .unwrap(),
++        solid::polyhedron(&points, faces).unwrap_err(),
++        ValidationErrorKind::Undecided,
++    );
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let native = solid::polyhedron_with_context(&points, faces, &context).unwrap_err();
++        let kind = native.kind();
++        assert_validation(
++            ScalarMesh::<RawReal>::polyhedron_with_context(&points, faces, &context)
++                .err()
++                .unwrap(),
++            native,
++            kind,
++        );
++    }
++}
++
++fn point_failures<A: ScalarAdapter>() {
++    let point = [1, 2, 3].map(|v| A::from_real(&v.into()).unwrap());
++    for (w, expected) in [
++        (Real::zero(), Problem::DivideByZero),
++        (unresolved_zero(), Problem::UnknownZero),
++    ] {
++        let matrix = Matrix4::new([
++            [1.into(), 0.into(), 0.into(), 0.into()],
++            [0.into(), 1.into(), 0.into(), 0.into()],
++            [0.into(), 0.into(), 1.into(), 0.into()],
++            [0.into(), 0.into(), 0.into(), w],
++        ]);
++        assert_eq!(
++            matrix.transform_point3(&Point3::new(1.into(), 2.into(), 3.into())),
++            Err(expected)
++        );
++        let error =
++            ScalarMesh::<A>::transform_adapter_points(std::slice::from_ref(&point), &matrix)
++                .unwrap_err();
++        assert_eq!(error, AdapterError::Hyperreal(expected));
++        assert_eq!(
++            error.source().unwrap().downcast_ref::<Problem>(),
++            Some(&expected)
++        );
++    }
++    let matrix = Matrix4::new([
++        [1.into(), 0.into(), 0.into(), 4.into()],
++        [0.into(), 1.into(), 0.into(), 5.into()],
++        [0.into(), 0.into(), 1.into(), 6.into()],
++        [0.into(), 0.into(), 0.into(), 1.into()],
++    ]);
++    assert_eq!(
++        ScalarMesh::<A>::transform_adapter_points(&[point], &matrix).unwrap(),
++        vec![[5, 7, 9].map(|v| A::from_real(&v.into()).unwrap())]
++    );
++}
++
++#[test]
++fn point_transforms_keep_scalar_domain_and_undecided_causes() {
++    point_failures::<RawReal>();
++    point_failures::<F32>();
++    point_failures::<F64>();
++    point_failures::<I128>();
++}
++
++fn graphics_failures<A: ScalarAdapter>() {
++    for (mesh, kind) in [
++        (
++            TriangleMesh::new(vec![], vec![Triangle::new(0, 1, 2)]),
++            ValidationErrorKind::InvalidInput,
++        ),
++        (triangle(Real::zero()), ValidationErrorKind::InvalidInput),
++        (triangle(unresolved_zero()), ValidationErrorKind::Undecided),
++    ] {
++        let native = mesh.to_exact_gpu_mesh_buffers().unwrap_err();
++        let adapter = ScalarMesh::<A>::from_native(mesh);
++        for _ in 0..2 {
++            let error = adapter.graphics_mesh().err().unwrap();
++            assert_eq!(error.to_string(), native.to_string());
++            let cause = error.source().expect("graphics source survives adapter");
++            let validation = cause.downcast_ref::<ValidationError>().unwrap();
++            assert_eq!(validation.kind(), kind);
++            assert_eq!(
++                cause.source().unwrap().downcast_ref::<GpuMeshError>(),
++                Some(&native)
++            );
++        }
++    }
++    let empty = ScalarMesh::<A>::from_native(TriangleMesh::new(vec![], vec![]));
++    for _ in 0..2 {
++        let graphics = empty.graphics_mesh().unwrap();
++        assert!(graphics.vertices.is_empty() && graphics.indices.is_empty());
++    }
++    let good = ScalarMesh::<A>::from_native(triangle(2.into()));
++    let expected = [0, 0, 1].map(|v| A::from_real(&v.into()).unwrap());
++    for _ in 0..2 {
++        let graphics = good.graphics_mesh().unwrap();
++        assert_eq!(&*graphics.indices, [0, 1, 2]);
++        for (_, normal) in graphics.vertices.iter() {
++            assert_eq!(normal, &expected);
++        }
++    }
++}
++
++#[test]
++fn graphics_failures_keep_native_categories_in_every_scalar_family() {
++    graphics_failures::<RawReal>();
++    graphics_failures::<F32>();
++    graphics_failures::<F64>();
++    graphics_failures::<I128>();
++}
++
++#[test]
++fn native_export_distinguishes_zero_from_unproved_zero_in_both_carriers() {
++    let degenerate = triangle(Real::zero());
++    let undecided = triangle(unresolved_zero());
++    let zero = degenerate.to_exact_gpu_mesh_buffers().unwrap_err();
++    let unknown = undecided.to_exact_gpu_mesh_buffers().unwrap_err();
++    assert_ne!(zero, unknown, "lack of a proof is not degeneracy");
++    let result = BooleanMeshResult {
++        triangles: vec![[0, 1, 2]],
++        sources: vec![],
++        exterior_inside: false,
++    };
++    assert_eq!(
++        result
++            .to_exact_gpu_mesh_buffers(&degenerate.positions)
++            .unwrap_err(),
++        zero
++    );
++    assert_eq!(
++        result
++            .to_exact_gpu_mesh_buffers(&undecided.positions)
++            .unwrap_err(),
++        unknown
++    );
++}
++
++#[test]
++fn exact_normal_values_and_integer_projection_contract_survive() {
++    let mesh = TriangleMesh::new(
++        vec![
++            Point3::origin(),
++            Point3::new(1.into(), 0.into(), 0.into()),
++            Point3::new(0.into(), 3.into(), 4.into()),
++        ],
++        vec![Triangle::new(0, 1, 2)],
++    );
++    let graphics = ScalarMesh::<RawReal>::from_native(mesh.clone())
++        .graphics_mesh()
++        .unwrap();
++    let expected = [
++        Real::zero(),
++        (Real::from(-4) / Real::from(5)).unwrap(),
++        (Real::from(3) / Real::from(5)).unwrap(),
++    ];
++    assert_eq!(&*graphics.indices, [0, 1, 2]);
++    for (index, (position, normal)) in graphics.vertices.iter().enumerate() {
++        let point = &mesh.positions[index];
++        assert_eq!(position, &[point.x.clone(), point.y.clone(), point.z.clone()]);
++        assert_eq!(normal, &expected);
++    }
++    assert_eq!(
++        ScalarMesh::<I128>::from_native(mesh)
++            .graphics_mesh()
++            .unwrap_err(),
++        AdapterError::Hyperreal(Problem::NotAnInteger)
++    );
++}
++
++#[test]
++#[cfg(feature = "attributed")]
++fn stronger_proof_recovers_attributed_exports_and_shared_metadata_cache() {
++    use csgrs::AttributedMesh;
++    use hyperreal::RealSign;
++    let pi = Real::pi();
++    let lower = pi.certified_rational_interval(-1024).unwrap()[0].clone();
++    let width = &pi - Real::from(lower);
++    let mesh = triangle(width.clone());
++    let attributed = AttributedMesh::from_uniform(mesh.clone(), "source");
++    let mapped = attributed.clone().map_metadata(|_| "mapped");
++    // A prior strict proof may already permit cold success. A cold failure may
++    // not survive a stronger proof that makes the same native mesh consumable.
++    let _ = attributed.exact_gpu_mesh_buffers();
++    assert_eq!(
++        width.certified_sign_until(-1100).sign(),
++        Some(RealSign::Positive)
++    );
++    let expected = mesh.to_exact_gpu_mesh_buffers().unwrap();
++    assert_eq!(attributed.exact_gpu_mesh_buffers().unwrap(), &expected);
++    assert_eq!(mapped.exact_gpu_mesh_buffers().unwrap(), &expected);
++    assert!(std::ptr::eq(
++        attributed.exact_gpu_mesh_buffers().unwrap(),
++        mapped.exact_gpu_mesh_buffers().unwrap()
++    ));
++    assert_eq!(attributed.geometry(), &mesh);
++}
++
++#[test]
++fn graphics_cache_keeps_source_and_returned_buffer_mutations_isolated() {
++    use std::sync::Arc;
++    let mut mesh = triangle(2.into());
++    let original = ScalarMesh::<RawReal>::from_native(mesh.clone());
++    let expected = original.graphics_mesh().unwrap();
++    let mut returned = expected.clone();
++    Arc::make_mut(&mut returned.vertices)[0].1 = [9, 9, 9].map(Real::from);
++    assert_eq!(original.graphics_mesh().unwrap(), expected);
++
++    Arc::make_mut(&mut mesh.positions)[2] = Point3::new(0.into(), 3.into(), 4.into());
++    let changed = ScalarMesh::<RawReal>::from_native(mesh.clone())
++        .graphics_mesh()
++        .unwrap();
++    assert_eq!(changed.vertices[2].0, [0, 3, 4].map(Real::from));
++    assert_eq!(
++        changed.vertices[0].1,
++        [
++            Real::zero(),
++            (Real::from(-4) / Real::from(5)).unwrap(),
++            (Real::from(3) / Real::from(5)).unwrap()
++        ]
++    );
++    Arc::make_mut(&mut mesh.triangles)[0] = Triangle::new(0, 1, 7);
++    assert!(matches!(
++        ScalarMesh::<RawReal>::from_native(mesh).graphics_mesh(),
++        Err(AdapterError::Construction(ValidationError::Gpu(
++            GpuMeshError::SourceTriangleIndexOutOfBounds { index: 7, .. }
++        )))
++    ));
++    // The scalar adapter cache retains at most eight distinct source identities.
++    for height in 10..19 {
++        ScalarMesh::<RawReal>::from_native(triangle(height.into()))
++            .graphics_mesh()
++            .unwrap();
++    }
++    assert_eq!(original.graphics_mesh().unwrap(), expected);
++}
++
++#[test]
++#[cfg(feature = "attributed")]
++fn attributed_cache_shares_concurrent_success_without_stale_geometry() {
++    use csgrs::AttributedMesh;
++    use std::sync::{Arc, Barrier};
++    let mut geometry = triangle(2.into());
++    let sidecar = AttributedMesh::from_uniform(geometry.clone(), ());
++    let barrier = Barrier::new(4);
++    let addresses = std::thread::scope(|scope| {
++        (0..4)
++            .map(|_| {
++                scope.spawn(|| {
++                    barrier.wait();
++                    let rows = sidecar.exact_gpu_mesh_buffers().unwrap();
++                    assert_eq!(rows.vertices[2].0, [0, 2, 0].map(Real::from));
++                    assert_eq!(rows.vertices[0].1, [0, 0, 1].map(Real::from));
++                    std::ptr::from_ref(rows) as usize
++                })
++            })
++            .collect::<Vec<_>>()
++            .into_iter()
++            .map(|handle| handle.join().unwrap())
++            .collect::<Vec<_>>()
++    });
++    assert!(addresses.iter().all(|address| address == &addresses[0]));
++    Arc::make_mut(&mut geometry.positions)[2].y = 7.into();
++    let changed = AttributedMesh::from_uniform(geometry, ());
++    assert_eq!(
++        changed.exact_gpu_mesh_buffers().unwrap().vertices[2].0,
++        [0, 7, 0].map(Real::from)
++    );
++    assert_eq!(
++        sidecar.exact_gpu_mesh_buffers().unwrap().vertices[2].0,
++        [0, 2, 0].map(Real::from)
++    );
++}
++
++#[test]
++#[cfg(feature = "attributed")]
++fn authored_normal_rows_remain_explicit_boundary_attributes() {
++    use csgrs::AttributedMesh;
++    use hyperlattice::Vector3;
++    let geometry = triangle(Real::zero());
++    let normal = Vector3::from_xyz(2.into(), 3.into(), 4.into());
++    let sidecar = AttributedMesh::with_authored_normals(
++        geometry.clone(),
++        vec![()],
++        Some(vec![normal; 3]),
++    )
++    .unwrap();
++    for _ in 0..2 {
++        let rows = sidecar.exact_gpu_mesh_buffers().unwrap();
++        for (_, normal) in &rows.vertices {
++            assert_eq!(normal, &[2, 3, 4].map(Real::from));
++        }
++    }
++    assert_eq!(sidecar.geometry(), &geometry);
++    assert!(matches!(
++        sidecar.geometry().to_exact_gpu_mesh_buffers(),
++        Err(GpuMeshError::TriangleNormalUnavailable { .. })
++    ));
++}
