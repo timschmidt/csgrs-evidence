@@ -1,0 +1,1230 @@
+diff --git a/docs/workflow-corpus.md b/docs/workflow-corpus.md
+index a783ca058..abb10d489 100644
+--- a/docs/workflow-corpus.md
++++ b/docs/workflow-corpus.md
+@@ -68,6 +68,20 @@ approximate construction intent.
+ 
+ ## Scope and resource limits
+ 
++The format-boundary workflow in
++[`tests/gltf_empty_composition.rs`](../tests/gltf_empty_composition.rs) runs
++under `gltf-io`: empty JSON/GLB scenes and named or mixed empty objects continue
++through import, transform, strict Boolean identities, complete subtraction,
++and export. Exact box boundary planes and signed volume supply independent
++geometry expectations; closed-PWN and manifold checks remain separate.
++Missing source history survives subsequent local certification. The suite
++also preserves exact rows for implicit and unsigned indices, interleaved and
++sparse positions, nested transforms, scene selection, and the original
++10,000-node chain. Malformed accessor and graph fixtures must return errors,
++including when no triangles could otherwise be published. Serialized byte
++stability and independent format validation are recorded separately by the
++change's admission evidence.
++
+ The strict success gates remain required successes. An undecided predicate,
+ unsupported representation, invalid input, resource exhaustion or incorrect
+ result is a separate outcome, never a substitute passing status. Approximate
+diff --git a/readme.md b/readme.md
+index bc691e901..b5f4a1b2a 100644
+--- a/readme.md
++++ b/readme.md
+@@ -777,6 +777,31 @@ strings; the entry limit is not a heap-byte bound, and no reset/disable API is
+ provided. Export remains a format projection, with topology validation and
+ source-geometry fidelity requiring their own checks.
+ 
++glTF supports canonical empty meshes, named empty scene objects, and scenes
++with no objects. Empty objects become named nodes without meshes; a scene
++with no objects omits its node list. No zero-count accessors or empty buffers
++are emitted. Self-contained JSON and GLB imports accept these scenes as
++canonical empty geometry, which can continue through transforms and Booleans.
++Positions without triangles remain invalid export input. Duplicate object
++names and native geometry failures still fail before writing output.
++
++Migration: empty glTF operations that previously returned `Geometry` now
++succeed. A document without a scene remains rejected, as `Unsupported` rather
++than `MalformedInput`: a glTF library asset can be valid without a scene to
++flatten. Invalid node forests, zero-count accessors, invalid references, and
++unreadable or mistyped triangle indices return errors before traversal or
++reading; indices are never silently replaced. Valid scene traversal is
++iterative, including deep hierarchies. This does not establish internal total
++work, allocation, or cancellation bounds, or full glTF conformance.
++
++Import still flattens node transforms in binary64 from glTF binary32 inputs,
++then promotes the resulting coordinates to exact scalars. The imported mesh
++records missing source history and, when coordinates were consumed, coordinate
++projection. An empty import consumes no coordinates. A later strict proof
++establishes facts about the imported set; glTF carries no receipt certifying
++the source construction or preservation of its exact geometry. Nonempty
++export bytes and existing format projection semantics remain unchanged.
++
+ ## Boundary adapters
+ 
+ `csgrs::adapter` provides opt-in primitive-scalar wrappers over native
+diff --git a/src/io/gltf.rs b/src/io/gltf.rs
+index 6b5a3abfb..40a2e5767 100644
+--- a/src/io/gltf.rs
++++ b/src/io/gltf.rs
+@@ -7,6 +7,7 @@ use hashbrown::{HashMap, HashSet};
+ use hyperlattice::{Point3, Real, Vector3};
+ use hypermesh::{Triangle, TriangleMesh};
+ use serde_json::json;
++use std::borrow::Cow;
+ use std::cell::RefCell;
+ use std::io::Write;
+ use std::sync::Arc;
+@@ -33,6 +34,12 @@ struct IndexedTriangleMesh3D {
+ }
+ 
+ fn indexed_geometry(mesh: &TriangleMesh) -> Result<IndexedTriangleMesh3D, IoError> {
++    if mesh.triangles.is_empty() && !mesh.positions.is_empty() {
++        return Err(IoError::Geometry {
++            format: "glTF",
++            detail: "positions without triangles are not canonical empty geometry".into(),
++        });
++    }
+     let buffers = mesh
+         .to_exact_gpu_mesh_buffers()
+         .map_err(|error| IoError::Construction {
+@@ -100,36 +107,42 @@ pub struct GltfMeshImport {
+ /// policy. Node transforms are flattened into positions before exact promotion.
+ /// Skins, morph targets, and non-triangle primitives fail explicitly instead
+ /// of being silently ignored.
++/// Scenes without mesh instances import as canonical empty geometry. Missing
++/// source history remains explicit, including after subsequent certified work.
+ pub fn from_gltf(bytes: &[u8]) -> Result<GltfMeshImport, IoError> {
+-    let asset = gltf::Gltf::from_slice(bytes).map_err(|error| {
+-        IoError::MalformedInput(format!("glTF document validation failed: {error}"))
+-    })?;
++    let asset = parse_gltf(bytes)?;
++    validate_node_forest(&asset)?;
+     let buffers = gltf_buffers(&asset)?;
+     let scene = asset
+         .default_scene()
+         .or_else(|| asset.scenes().next())
+-        .ok_or_else(|| IoError::MalformedInput("glTF document has no scene".into()))?;
++        .ok_or_else(|| IoError::Unsupported {
++            format: "glTF",
++            detail: "document has no scene to flatten".into(),
++        })?;
+     let scene_index = scene.index();
+     let mut positions = Vec::new();
+     let mut triangles = Vec::new();
+     let mut mesh_node_count = 0usize;
+     let mut primitive_count = 0usize;
+-    for node in scene.nodes() {
+-        import_gltf_node(
+-            node,
+-            &identity_matrix(),
++    let mut pending = scene
++        .nodes()
++        .map(|node| (node, identity_matrix()))
++        .collect::<Vec<_>>();
++    pending.reverse();
++    while let Some((node, parent)) = pending.pop() {
++        let transform = import_gltf_node(
++            node.clone(),
++            &parent,
+             &buffers,
+             &mut positions,
+             &mut triangles,
+             &mut mesh_node_count,
+             &mut primitive_count,
+         )?;
+-    }
+-    if triangles.is_empty() {
+-        return Err(IoError::Geometry {
+-            format: "glTF",
+-            detail: "selected scene contains no triangle primitives".into(),
+-        });
++        let first_child = pending.len();
++        pending.extend(node.children().map(|child| (child, transform)));
++        pending[first_child..].reverse();
+     }
+ 
+     let mut native_triangles = Vec::with_capacity(triangles.len());
+@@ -146,9 +159,13 @@ pub fn from_gltf(bytes: &[u8]) -> Result<GltfMeshImport, IoError> {
+         let _ = normal;
+         native_triangles.push(Triangle::new(a, b, c));
+     }
+-    let mesh = TriangleMesh::new(positions, native_triangles).with_inherited_construction(
+-        hypermesh::ConstructionEvidence::UNTRACKED.with_coordinate_projection(),
+-    );
++    let evidence = if positions.is_empty() {
++        hypermesh::ConstructionEvidence::UNTRACKED
++    } else {
++        hypermesh::ConstructionEvidence::UNTRACKED.with_coordinate_projection()
++    };
++    let mesh =
++        TriangleMesh::new(positions, native_triangles).with_inherited_construction(evidence);
+ 
+     Ok(GltfMeshImport {
+         mesh,
+@@ -158,6 +175,171 @@ pub fn from_gltf(bytes: &[u8]) -> Result<GltfMeshImport, IoError> {
+     })
+ }
+ 
++fn gltf_document_error(error: impl std::fmt::Display) -> IoError {
++    IoError::MalformedInput(format!("glTF document validation failed: {error}"))
++}
++
++/// Bridge the parser's required Scene.nodes field to glTF's optional property,
++/// then retain its native document validation. Never serialize the internal
++/// empty array: a present scene.nodes array must contain at least one entry.
++fn parse_gltf(bytes: &[u8]) -> Result<gltf::Gltf, IoError> {
++    let (json_bytes, blob) = if bytes.starts_with(b"glTF") {
++        let glb = gltf::binary::Glb::from_slice(bytes).map_err(gltf_document_error)?;
++        (glb.json, glb.bin.map(Cow::into_owned))
++    } else {
++        (Cow::Borrowed(bytes), None)
++    };
++    let mut value: serde_json::Value =
++        serde_json::from_slice(&json_bytes).map_err(gltf_document_error)?;
++    for field in [
++        "scenes",
++        "nodes",
++        "meshes",
++        "accessors",
++        "buffers",
++        "bufferViews",
++    ] {
++        if value
++            .get(field)
++            .and_then(serde_json::Value::as_array)
++            .is_some_and(Vec::is_empty)
++        {
++            return Err(gltf_document_error(format!(
++                "{field} must be omitted or nonempty"
++            )));
++        }
++    }
++    if let Some(scenes) = value
++        .get_mut("scenes")
++        .and_then(serde_json::Value::as_array_mut)
++    {
++        for scene in scenes {
++            if let Some(object) = scene.as_object_mut() {
++                if object
++                    .get("nodes")
++                    .and_then(serde_json::Value::as_array)
++                    .is_some_and(Vec::is_empty)
++                {
++                    return Err(gltf_document_error(
++                        "scene.nodes must be omitted or nonempty",
++                    ));
++                }
++                object.entry("nodes").or_insert_with(|| json!([]));
++            }
++        }
++    }
++    let root: gltf::json::Root = serde_json::from_value(value).map_err(gltf_document_error)?;
++    // The dependency's primitive validation hook dereferences POSITION before
++    // returning index-validation errors. Check that precondition first.
++    for (mesh_index, mesh) in root.meshes.iter().enumerate() {
++        if mesh.primitives.is_empty() {
++            return Err(gltf_document_error(format!(
++                "mesh {mesh_index} has no primitives"
++            )));
++        }
++        for primitive in &mesh.primitives {
++            for index in primitive.attributes.values() {
++                if index.value() >= root.accessors.len() {
++                    return Err(gltf_document_error(format!(
++                        "mesh {mesh_index} references missing accessor {}",
++                        index.value()
++                    )));
++                }
++            }
++        }
++    }
++    for accessor in &root.accessors {
++        if accessor.count.0 == 0 {
++            return Err(gltf_document_error("accessor count must be positive"));
++        }
++        platform_size(accessor.count.0)?;
++        platform_size(accessor.byte_offset.map_or(0, |value| value.0))?;
++        if let Some(sparse) = &accessor.sparse {
++            if sparse.count.0 == 0 || sparse.count.0 > accessor.count.0 {
++                return Err(gltf_document_error(
++                    "sparse count must be positive and no greater than accessor count",
++                ));
++            }
++            platform_size(sparse.count.0)?;
++            platform_size(sparse.indices.byte_offset.0)?;
++            platform_size(sparse.values.byte_offset.0)?;
++        }
++    }
++    for buffer in &root.buffers {
++        if buffer.byte_length.0 == 0 {
++            return Err(gltf_document_error("buffer byteLength must be positive"));
++        }
++        platform_size(buffer.byte_length.0)?;
++    }
++    for view in &root.buffer_views {
++        if view.byte_length.0 == 0 {
++            return Err(gltf_document_error("bufferView byteLength must be positive"));
++        }
++        platform_size(view.byte_length.0)?;
++        platform_size(view.byte_offset.map_or(0, |value| value.0))?;
++    }
++    Ok(gltf::Gltf {
++        document: gltf::Document::from_json(root).map_err(gltf_document_error)?,
++        blob,
++    })
++}
++
++fn platform_size(value: u64) -> Result<usize, IoError> {
++    usize::try_from(value).map_err(|_| IoError::SizeOverflow {
++        format: "glTF",
++        limit: "platform buffer/accessor size",
++    })
++}
++
++/// Validate the document's forest without recursive calls or repeated traversal
++/// of shared subtrees. The same root may appear in different scenes.
++fn validate_node_forest(asset: &gltf::Gltf) -> Result<(), IoError> {
++    let mut parents = vec![None; asset.nodes().len()];
++    for node in asset.nodes() {
++        for child in node.children() {
++            if parents[child.index()].replace(node.index()).is_some() {
++                return Err(gltf_document_error(format!(
++                    "node {} has multiple parent references",
++                    child.index()
++                )));
++            }
++        }
++    }
++    let mut pending = parents
++        .iter()
++        .enumerate()
++        .filter_map(|(index, parent)| parent.is_none().then_some(index))
++        .collect::<Vec<_>>();
++    let mut visited = 0;
++    while let Some(index) = pending.pop() {
++        visited += 1;
++        pending.extend(
++            asset
++                .nodes()
++                .nth(index)
++                .expect("validated node index")
++                .children()
++                .map(|child| child.index()),
++        );
++    }
++    if visited != parents.len() {
++        return Err(gltf_document_error("node hierarchy contains a cycle"));
++    }
++    for scene in asset.scenes() {
++        let mut roots = HashSet::new();
++        for node in scene.nodes() {
++            if parents[node.index()].is_some() || !roots.insert(node.index()) {
++                return Err(gltf_document_error(format!(
++                    "scene {} contains a duplicate or non-root node {}",
++                    scene.index(),
++                    node.index()
++                )));
++            }
++        }
++    }
++    Ok(())
++}
++
+ fn gltf_buffers(asset: &gltf::Gltf) -> Result<Vec<Vec<u8>>, IoError> {
+     asset
+         .buffers()
+@@ -205,6 +387,113 @@ fn decode_gltf_data_uri(uri: &str) -> Result<Vec<u8>, IoError> {
+     })
+ }
+ 
++fn validate_accessor_layout(
++    accessor: &gltf::Accessor<'_>,
++    buffers: &[Vec<u8>],
++    item_size: usize,
++    alignment: usize,
++) -> Result<(), IoError> {
++    if let Some(view) = accessor.view() {
++        validate_view_layout(
++            &view,
++            accessor.offset(),
++            accessor.count(),
++            item_size,
++            alignment,
++        )?;
++    }
++    if let Some(sparse) = accessor.sparse() {
++        let indices = sparse.indices();
++        let index_view = indices.view();
++        let index_size = indices.index_type().size();
++        let values = sparse.values();
++        if index_view.stride().is_some() || values.view().stride().is_some() {
++            return Err(gltf_document_error(
++                "sparse buffer views must not specify byteStride",
++            ));
++        }
++        validate_view_layout(
++            &index_view,
++            indices.offset(),
++            sparse.count(),
++            index_size,
++            index_size,
++        )?;
++        validate_view_layout(
++            &values.view(),
++            values.offset(),
++            sparse.count(),
++            item_size,
++            alignment,
++        )?;
++        let start = index_view.offset() + indices.offset();
++        let bytes = &buffers[index_view.buffer().index()];
++        let mut previous = None;
++        for slot in 0..sparse.count() {
++            let offset = start + slot * index_size;
++            let index = match indices.index_type() {
++                gltf::accessor::sparse::IndexType::U8 => u32::from(bytes[offset]),
++                gltf::accessor::sparse::IndexType::U16 => u32::from(u16::from_le_bytes(
++                    bytes[offset..offset + 2]
++                        .try_into()
++                        .expect("validated sparse index width"),
++                )),
++                gltf::accessor::sparse::IndexType::U32 => u32::from_le_bytes(
++                    bytes[offset..offset + 4]
++                        .try_into()
++                        .expect("validated sparse index width"),
++                ),
++            };
++            if index as usize >= accessor.count() || previous.is_some_and(|last| index <= last)
++            {
++                return Err(gltf_document_error(
++                    "sparse indices must increase strictly within accessor bounds",
++                ));
++            }
++            previous = Some(index);
++        }
++    }
++    Ok(())
++}
++
++fn validate_view_layout(
++    view: &gltf::buffer::View<'_>,
++    offset: usize,
++    count: usize,
++    item_size: usize,
++    alignment: usize,
++) -> Result<(), IoError> {
++    let overflow = || IoError::SizeOverflow {
++        format: "glTF",
++        limit: "buffer-view/accessor byte range",
++    };
++    let view_end = view
++        .offset()
++        .checked_add(view.length())
++        .ok_or_else(overflow)?;
++    let stride = view.stride().unwrap_or(item_size);
++    let end = count
++        .checked_sub(1)
++        .and_then(|last| last.checked_mul(stride))
++        .and_then(|last| last.checked_add(offset))
++        .and_then(|last| last.checked_add(item_size))
++        .ok_or_else(overflow)?;
++    let absolute_offset = view.offset().checked_add(offset).ok_or_else(overflow)?;
++    if view_end > view.buffer().length()
++        || end > view.length()
++        || stride < item_size
++        || !stride.is_multiple_of(alignment)
++        || !offset.is_multiple_of(alignment)
++        || !absolute_offset.is_multiple_of(alignment)
++    {
++        return Err(gltf_document_error(format!(
++            "buffer view {} does not contain the aligned accessor range",
++            view.index()
++        )));
++    }
++    Ok(())
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn import_gltf_node(
+     node: gltf::Node<'_>,
+@@ -214,7 +503,7 @@ fn import_gltf_node(
+     triangles: &mut Vec<[usize; 3]>,
+     mesh_node_count: &mut usize,
+     primitive_count: &mut usize,
+-) -> Result<(), IoError> {
++) -> Result<Matrix4, IoError> {
+     if node.skin().is_some() {
+         return Err(IoError::Unsupported {
+             format: "glTF",
+@@ -223,6 +512,19 @@ fn import_gltf_node(
+     }
+     let local = f32_matrix_to_f64(node.transform().matrix())?;
+     let transform = multiply_matrix(parent, &local);
++    if !transform.iter().flatten().all(|value| value.is_finite())
++        || [
++            transform[0][3],
++            transform[1][3],
++            transform[2][3],
++            transform[3][3],
++        ] != [0.0, 0.0, 0.0, 1.0]
++    {
++        return Err(IoError::Unsupported {
++            format: "glTF",
++            detail: "node transform is non-finite or non-affine".into(),
++        });
++    }
+     if let Some(mesh) = node.mesh() {
+         *mesh_node_count = (*mesh_node_count)
+             .checked_add(1)
+@@ -254,6 +556,25 @@ fn import_gltf_node(
+             }
+             let reader =
+                 primitive.reader(|buffer| buffers.get(buffer.index()).map(Vec::as_slice));
++            let position_accessor =
++                primitive.get(&gltf::Semantic::Positions).ok_or_else(|| {
++                    gltf_document_error("triangle primitive has no POSITION attribute")
++                })?;
++            if position_accessor.dimensions() != gltf::accessor::Dimensions::Vec3 {
++                return Err(gltf_document_error("POSITION accessor must have VEC3 type"));
++            }
++            if position_accessor.data_type() != gltf::accessor::DataType::F32 {
++                return Err(IoError::Unsupported {
++                    format: "glTF",
++                    detail: "only FLOAT POSITION accessors are supported".into(),
++                });
++            }
++            if position_accessor.normalized() {
++                return Err(gltf_document_error(
++                    "FLOAT POSITION accessors must not be normalized",
++                ));
++            }
++            validate_accessor_layout(&position_accessor, buffers, 12, 4)?;
+             let source_positions = reader.read_positions().ok_or_else(|| {
+                 IoError::MalformedInput(format!(
+                     "mesh {} primitive {} has no POSITION attribute",
+@@ -266,14 +587,39 @@ fn import_gltf_node(
+                 positions.push(transform_gltf_position(&transform, position)?);
+             }
+             let vertex_count = positions.len() - base;
+-            let indices = reader
+-                .read_indices()
+-                .map(|indices| indices.into_u32().collect::<Vec<_>>())
+-                .unwrap_or_else(|| {
+-                    (0..vertex_count)
+-                        .map_while(|index| u32::try_from(index).ok())
+-                        .collect()
+-                });
++            let indices = if let Some(accessor) = primitive.indices() {
++                if accessor.dimensions() != gltf::accessor::Dimensions::Scalar
++                    || !matches!(
++                        accessor.data_type(),
++                        gltf::accessor::DataType::U8
++                            | gltf::accessor::DataType::U16
++                            | gltf::accessor::DataType::U32
++                    )
++                    || accessor.normalized()
++                {
++                    return Err(gltf_document_error(
++                        "triangle indices must be non-normalized unsigned SCALAR values",
++                    ));
++                }
++                if accessor.view().is_some_and(|view| view.stride().is_some()) {
++                    return Err(gltf_document_error(
++                        "index buffer view must not specify byteStride",
++                    ));
++                }
++                let size = accessor.data_type().size();
++                validate_accessor_layout(&accessor, buffers, size, size)?;
++                reader
++                    .read_indices()
++                    .ok_or_else(|| {
++                        gltf_document_error("triangle index accessor cannot be read")
++                    })?
++                    .into_u32()
++                    .collect::<Vec<_>>()
++            } else {
++                (0..vertex_count)
++                    .map_while(|index| u32::try_from(index).ok())
++                    .collect()
++            };
+             if indices.len() != vertex_count && primitive.indices().is_none() {
+                 return Err(IoError::SizeOverflow {
+                     format: "glTF",
+@@ -319,18 +665,7 @@ fn import_gltf_node(
+                     })?;
+         }
+     }
+-    for child in node.children() {
+-        import_gltf_node(
+-            child,
+-            &transform,
+-            buffers,
+-            positions,
+-            triangles,
+-            mesh_node_count,
+-            primitive_count,
+-        )?;
+-    }
+-    Ok(())
++    Ok(transform)
+ }
+ 
+ const fn identity_matrix() -> Matrix4 {
+@@ -402,6 +737,8 @@ fn exact_gltf_real(value: f64, field: &'static str) -> Result<Real, IoError> {
+ /// Native index and normal failures retain their category and cause through
+ /// [`IoError::Construction`]. Only successful output is cached, allowing retry
+ /// after an undecided normal gains stronger scalar evidence.
++/// Canonical empty geometry exports as a named node without a mesh. Positions
++/// without triangles remain invalid input, rather than becoming an empty node.
+ pub fn to_gltf(mesh: &TriangleMesh, object_name: &str) -> Result<String, IoError> {
+     if let Some(output) = GLTF_CACHE.with_borrow(|entries| {
+         entries
+@@ -453,18 +790,12 @@ impl GltfSceneObject {
+ }
+ 
+ /// Serializes multiple independently named geometry objects into one glTF 2.0
+-/// scene with an embedded binary buffer.
++/// scene with an embedded binary buffer when geometry is present. Empty objects
++/// retain their names as meshless nodes; a scene with no objects omits its nodes.
+ pub fn to_gltf_scene(
+     scene_name: &str,
+     objects: &[GltfSceneObject],
+ ) -> Result<String, IoError> {
+-    if objects.is_empty() {
+-        return Err(IoError::Geometry {
+-            format: "glTF",
+-            detail: "cannot export an empty scene".into(),
+-        });
+-    }
+-
+     let mut buffer = Vec::new();
+     let mut buffer_views = Vec::with_capacity(objects.len() * 3);
+     let mut accessors = Vec::with_capacity(objects.len() * 3);
+@@ -482,10 +813,10 @@ pub fn to_gltf_scene(
+         }
+         let indexed = &object.indexed;
+         if indexed.faces.is_empty() {
+-            return Err(IoError::Geometry {
+-                format: "glTF",
+-                detail: format!("cannot export empty scene object {:?}", object.name),
+-            });
++            let node_index = checked_u32(nodes.len(), "u32 node index")?;
++            nodes.push(json!({"name": object.name}));
++            scene_nodes.push(node_index);
++            continue;
+         }
+ 
+         let mut vertices = Vec::<([f32; 3], [f32; 3])>::new();
+@@ -638,22 +969,26 @@ pub fn to_gltf_scene(
+         scene_nodes.push(node_index);
+     }
+ 
+-    let byte_length = checked_u32(buffer.len(), "u32 buffer length")?;
+-    let uri = format!(
+-        "data:application/octet-stream;base64,{}",
+-        BASE64_ENGINE.encode(buffer)
+-    );
+-
+-    let document = json!({
++    let mut document = json!({
+         "asset": {"version": "2.0", "generator": "csgrs"},
+-        "buffers": [{"byteLength": byte_length, "uri": uri}],
+-        "bufferViews": buffer_views,
+-        "accessors": accessors,
+-        "meshes": meshes,
+-        "nodes": nodes,
+-        "scenes": [{"name": scene_name, "nodes": scene_nodes}],
++        "scenes": [{"name": scene_name}],
+         "scene": 0
+     });
++    if !nodes.is_empty() {
++        document["nodes"] = json!(nodes);
++        document["scenes"][0]["nodes"] = json!(scene_nodes);
++    }
++    if !buffer.is_empty() {
++        let byte_length = checked_u32(buffer.len(), "u32 buffer length")?;
++        let uri = format!(
++            "data:application/octet-stream;base64,{}",
++            BASE64_ENGINE.encode(buffer)
++        );
++        document["buffers"] = json!([{"byteLength": byte_length, "uri": uri}]);
++        document["bufferViews"] = json!(buffer_views);
++        document["accessors"] = json!(accessors);
++        document["meshes"] = json!(meshes);
++    }
+     serde_json::to_string_pretty(&document).map_err(|error| IoError::Geometry {
+         format: "glTF",
+         detail: error.to_string(),
+diff --git a/tests/gltf_empty_composition.rs b/tests/gltf_empty_composition.rs
+new file mode 100644
+index 000000000..0ff7e3f8a
+--- /dev/null
++++ b/tests/gltf_empty_composition.rs
+@@ -0,0 +1,570 @@
++//! Format-valid empty scenes, hostile input, and continued exact modeling.
++#![cfg(feature = "gltf-io")]
++
++use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
++use csgrs::{
++    GeometryCertainty, GeometryContext, Real, TriangleMesh,
++    io::{IoError, gltf::*},
++    solid::{self, SolidExt},
++};
++use hyperlattice::Point3;
++use hypermesh::{BooleanOp, MeshCertainty, Triangle};
++use serde_json::{Value, json};
++
++fn import(value: &Value) -> Result<GltfMeshImport, IoError> {
++    from_gltf(&serde_json::to_vec(value).unwrap())
++}
++
++fn assert_empty(mesh: &TriangleMesh) {
++    assert!(mesh.positions.is_empty() && mesh.triangles.is_empty());
++    assert!(!solid::contains_point(mesh, &Point3::origin()).unwrap());
++}
++
++// Exact boundary planes and signed volume, independent of importer/exporter
++// agreement. Closed-manifold and PWN validation establish separate claims.
++fn assert_box(mesh: &TriangleMesh, min: [i32; 3], max: [i32; 3]) {
++    let lower = min.map(Real::from);
++    let upper = max.map(Real::from);
++    let mut six_volume = Real::zero();
++    for triangle in mesh.triangles.iter() {
++        let points = triangle.indices().map(|index| &mesh.positions[index]);
++        let coordinates = points.map(|point| [&point.x, &point.y, &point.z]);
++        for point in coordinates {
++            for axis in 0..3 {
++                assert!(point[axis] >= &lower[axis] && point[axis] <= &upper[axis]);
++            }
++        }
++        assert!((0..3).any(|axis| {
++            coordinates.iter().all(|p| p[axis] == &lower[axis])
++                || coordinates.iter().all(|p| p[axis] == &upper[axis])
++        }));
++        let [a, b, c] = points.map(|point| point.to_vector());
++        six_volume += a.dot(&b.cross(&c));
++    }
++    assert_eq!(
++        six_volume,
++        Real::from(6 * (max[0] - min[0]) * (max[1] - min[1]) * (max[2] - min[2]))
++    );
++    let context = GeometryContext::STRICT.mesh_context();
++    let manifold = mesh.is_closed_manifold_geometry(&context).unwrap();
++    assert!(manifold.value);
++    assert_eq!(manifold.certainty, MeshCertainty::Certified);
++    assert_eq!(
++        mesh.validate_closed_pwn(&context).unwrap().certainty,
++        MeshCertainty::Certified
++    );
++}
++
++fn glb(mut value: Value, binary: bool) -> Vec<u8> {
++    let bin = binary.then(|| {
++        let uri = value["buffers"][0]
++            .as_object_mut()
++            .unwrap()
++            .remove("uri")
++            .unwrap();
++        BASE64
++            .decode(uri.as_str().unwrap().split_once(',').unwrap().1)
++            .unwrap()
++    });
++    let mut json = serde_json::to_vec(&value).unwrap();
++    while !json.len().is_multiple_of(4) {
++        json.push(b' ');
++    }
++    let mut chunks = Vec::new();
++    chunks.extend_from_slice(&u32::try_from(json.len()).unwrap().to_le_bytes());
++    chunks.extend_from_slice(b"JSON");
++    chunks.extend_from_slice(&json);
++    if let Some(mut bytes) = bin {
++        while !bytes.len().is_multiple_of(4) {
++            bytes.push(0);
++        }
++        chunks.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
++        chunks.extend_from_slice(b"BIN\0");
++        chunks.extend_from_slice(&bytes);
++    }
++    let mut bytes = b"glTF".to_vec();
++    bytes.extend_from_slice(&2u32.to_le_bytes());
++    bytes.extend_from_slice(&u32::try_from(12 + chunks.len()).unwrap().to_le_bytes());
++    bytes.extend_from_slice(&chunks);
++    bytes
++}
++
++#[test]
++fn schema_valid_empty_json_and_json_only_glb_import_as_canonical_empty() {
++    for value in [
++        json!({"asset":{"version":"2.0"},"scenes":[{}],"scene":0}),
++        json!({"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],
++            "nodes":[{"name":"empty","translation":[2,3,4]}]}),
++    ] {
++        for bytes in [
++            serde_json::to_vec(&value).unwrap(),
++            glb(value.clone(), false),
++        ] {
++            let result = from_gltf(&bytes).unwrap();
++            assert_empty(&result.mesh);
++            assert_eq!(
++                (
++                    result.scene_index,
++                    result.mesh_node_count,
++                    result.primitive_count
++                ),
++                (0, 0, 0)
++            );
++            let evidence = result.mesh.construction_evidence();
++            assert!(evidence.source_history_missing());
++            assert!(!evidence.coordinates_projected());
++            assert_eq!(evidence.predicate_certainty(), None);
++        }
++    }
++}
++
++#[test]
++fn empty_scene_and_named_empty_objects_omit_geometry_without_losing_names() {
++    let empty = solid::empty();
++    let scene: Value = serde_json::from_str(&to_gltf_scene("nothing", &[]).unwrap()).unwrap();
++    assert_eq!(scene["scenes"][0], json!({"name":"nothing"}));
++    assert!(scene.get("nodes").is_none());
++    assert_empty(&import(&scene).unwrap().mesh);
++    for text in [
++        to_gltf(&empty, "empty").unwrap(),
++        to_gltf_scene(
++            "empties",
++            &[
++                GltfSceneObject::new("first", &empty).unwrap(),
++                GltfSceneObject::new("second", &empty).unwrap(),
++            ],
++        )
++        .unwrap(),
++    ] {
++        let value: Value = serde_json::from_str(&text).unwrap();
++        for field in ["meshes", "buffers", "bufferViews", "accessors"] {
++            assert!(value.get(field).is_none(), "{field}");
++        }
++        let names: Vec<_> = value["nodes"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|node| {
++                assert!(node.get("mesh").is_none());
++                node["name"].as_str().unwrap()
++            })
++            .collect();
++        assert!(names == ["empty"] || names == ["first", "second"]);
++        assert_empty(&from_gltf(text.as_bytes()).unwrap().mesh);
++    }
++}
++
++#[test]
++fn mixed_scene_preserves_node_and_mesh_indices_and_continues_modeling() {
++    let cube = solid::cube(1.into()).unwrap();
++    let moved = cube.translated(3.into(), 2.into(), 1.into()).unwrap();
++    let empty = solid::empty();
++    let text = to_gltf_scene(
++        "mixed",
++        &[
++            GltfSceneObject::new("before", &empty).unwrap(),
++            GltfSceneObject::new("cube", &cube).unwrap(),
++            GltfSceneObject::new("between", &empty).unwrap(),
++            GltfSceneObject::new("moved", &moved).unwrap(),
++            GltfSceneObject::new("after", &empty).unwrap(),
++        ],
++    )
++    .unwrap();
++    let value: Value = serde_json::from_str(&text).unwrap();
++    assert_eq!(
++        value["nodes"],
++        json!([
++            {"name":"before"},{"name":"cube","mesh":0},{"name":"between"},
++            {"name":"moved","mesh":1},{"name":"after"}
++        ])
++    );
++    assert_eq!(value["scenes"][0]["nodes"], json!([0, 1, 2, 3, 4]));
++    for bytes in [text.into_bytes(), glb(value, true)] {
++        let imported = from_gltf(&bytes).unwrap();
++        assert_eq!((imported.mesh_node_count, imported.primitive_count), (2, 2));
++        imported
++            .mesh
++            .validate_closed_pwn(&GeometryContext::STRICT.mesh_context())
++            .unwrap();
++        let mut assigned = 0;
++        for (min, max) in [([0; 3], [1; 3]), ([3, 2, 1], [4, 3, 2])] {
++            let triangles: Vec<_> = imported
++                .mesh
++                .triangles
++                .iter()
++                .copied()
++                .filter(|triangle| {
++                    triangle.indices().iter().all(|&index| {
++                        let point = &imported.mesh.positions[index];
++                        [&point.x, &point.y, &point.z].iter().enumerate().all(
++                            |(axis, value)| {
++                                **value >= Real::from(min[axis])
++                                    && **value <= Real::from(max[axis])
++                            },
++                        )
++                    })
++                })
++                .collect();
++            assigned += triangles.len();
++            assert_box(
++                &TriangleMesh::new(imported.mesh.positions.to_vec(), triangles),
++                min,
++                max,
++            );
++        }
++        assert_eq!(assigned, imported.mesh.triangles.len());
++        let remainder = imported.mesh.try_difference(&cube).unwrap();
++        assert_box(&remainder, [3, 2, 1], [4, 3, 2]);
++        let removed = remainder.try_difference(&moved).unwrap();
++        assert_empty(&removed);
++        assert_box(&removed.try_union(&cube).unwrap(), [0; 3], [1; 3]);
++    }
++}
++
++#[test]
++fn empty_roundtrip_preserves_qualified_history_through_strict_identities() {
++    let cube = solid::cube(1.into()).unwrap();
++    let sine = Real::e().sin();
++    let cosine = Real::e().cos();
++    let mut points = cube.positions.to_vec();
++    points.push(Point3::new(
++        &sine * &sine + &cosine * &cosine - Real::one(),
++        0.into(),
++        0.into(),
++    ));
++    let approximate =
++        hypermesh::convex_hull(&GeometryContext::APPROXIMATE_512.mesh_context(), &points)
++            .unwrap();
++    assert_eq!(approximate.certainty, MeshCertainty::Approximate512Consumed);
++    let removed = approximate.value.try_difference(&cube).unwrap();
++    assert_empty(&removed);
++    assert!(removed.construction_evidence().approximate_512_consumed());
++    let serialized = to_gltf(&removed, "removed").unwrap();
++    let imported = from_gltf(serialized.as_bytes()).unwrap().mesh;
++    // glTF has no source receipt. Import explicitly reports missing history;
++    // later local proofs cannot certify the original construction's intent.
++    assert!(imported.construction_evidence().source_history_missing());
++    assert_eq!(imported.construction_evidence().predicate_certainty(), None);
++    let transformed = solid::try_scale(&imported, 2.into(), 3.into(), 4.into()).unwrap();
++    for (left, right, operation, nonempty) in [
++        (&cube, &transformed, BooleanOp::Union, true),
++        (&transformed, &cube, BooleanOp::Union, true),
++        (&cube, &transformed, BooleanOp::Intersection, false),
++        (&cube, &transformed, BooleanOp::Difference, true),
++        (&transformed, &cube, BooleanOp::Difference, false),
++    ] {
++        let result =
++            solid::boolean_with_context(left, right, operation, &GeometryContext::STRICT)
++                .unwrap();
++        assert_eq!(result.certainty, GeometryCertainty::Certified);
++        assert!(result.value.construction_evidence().source_history_missing());
++        if nonempty {
++            assert_box(&result.value, [0; 3], [1; 3]);
++        } else {
++            assert_empty(&result.value);
++        }
++        let next = from_gltf(to_gltf(&result.value, "next").unwrap().as_bytes())
++            .unwrap()
++            .mesh;
++        assert!(next.construction_evidence().source_history_missing());
++        if nonempty {
++            assert_box(&next, [0; 3], [1; 3]);
++        } else {
++            assert_empty(&next);
++        }
++    }
++}
++
++fn triangle_document(component: Option<u32>, interleaved: bool, sparse: bool) -> Value {
++    let positions = [[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]];
++    let mut bytes = Vec::new();
++    let mut views = Vec::new();
++    let position_accessor = if sparse {
++        bytes.extend_from_slice(&[1, 2, 0, 0]);
++        for point in &positions[1..] {
++            for value in point {
++                bytes.extend_from_slice(&value.to_le_bytes());
++            }
++        }
++        views.push(json!({"buffer":0,"byteOffset":0,"byteLength":2}));
++        views.push(json!({"buffer":0,"byteOffset":4,"byteLength":24}));
++        json!({"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0],
++            "sparse":{"count":2,"indices":{"bufferView":0,"componentType":5121},"values":{"bufferView":1}}})
++    } else {
++        for point in positions {
++            for value in point {
++                bytes.extend_from_slice(&value.to_le_bytes());
++            }
++            if interleaved {
++                bytes.extend_from_slice(&999f32.to_le_bytes());
++            }
++        }
++        let mut view = json!({"buffer":0,"byteLength":bytes.len(),"target":34962});
++        if interleaved {
++            view["byteStride"] = json!(16);
++        }
++        views.push(view);
++        json!({"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]})
++    };
++    let mut accessors = vec![position_accessor];
++    let mut primitive = json!({"attributes":{"POSITION":0}});
++    if let Some(component) = component {
++        let offset = bytes.len();
++        for index in [2u32, 0, 1] {
++            let encoded = index.to_le_bytes();
++            bytes.extend_from_slice(
++                &encoded[..match component {
++                    5121 => 1,
++                    5123 => 2,
++                    5125 => 4,
++                    _ => unreachable!(),
++                }],
++            );
++        }
++        accessors.push(json!({"bufferView":views.len(),"componentType":component,"count":3,"type":"SCALAR"}));
++        views.push(json!({"buffer":0,"byteOffset":offset,"byteLength":bytes.len()-offset,"target":34963}));
++        primitive["indices"] = json!(1);
++    }
++    json!({"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],
++        "meshes":[{"primitives":[primitive]}],"accessors":accessors,"bufferViews":views,
++        "buffers":[{"byteLength":bytes.len(),"uri":format!("data:application/octet-stream;base64,{}",BASE64.encode(bytes))}]})
++}
++
++#[test]
++fn valid_unsigned_implicit_interleaved_and_sparse_accessors_keep_exact_rows() {
++    for component in [None, Some(5121), Some(5123), Some(5125)] {
++        for (interleaved, sparse) in [(false, false), (true, false), (false, true)] {
++            let value = triangle_document(component, interleaved, sparse);
++            for bytes in [serde_json::to_vec(&value).unwrap(), glb(value, true)] {
++                let result = from_gltf(&bytes).unwrap();
++                assert_eq!(
++                    &*result.mesh.positions,
++                    &[
++                        Point3::origin(),
++                        Point3::new(1.into(), 0.into(), 0.into()),
++                        Point3::new(0.into(), 1.into(), 0.into())
++                    ]
++                );
++                let expected = if component.is_some() {
++                    [2, 0, 1]
++                } else {
++                    [0, 1, 2]
++                };
++                assert_eq!(result.mesh.triangles[0].indices(), expected);
++                assert_eq!((result.mesh_node_count, result.primitive_count), (1, 1));
++                assert!(result.mesh.construction_evidence().coordinates_projected());
++            }
++        }
++    }
++}
++
++#[test]
++fn malformed_accessor_counts_types_references_and_ranges_return_errors() {
++    let fixture = triangle_document(Some(5125), false, false);
++    for (pointer, replacement) in [
++        ("/meshes/0/primitives", json!([])),
++        ("/meshes/0/primitives/0/attributes/POSITION", json!(999)),
++        ("/accessors/0/count", json!(0)),
++        ("/accessors/1/count", json!(0)),
++        ("/accessors/1/componentType", json!(5126)),
++        ("/accessors/1/type", json!("VEC2")),
++        ("/accessors/0/type", json!("VEC2")),
++        ("/bufferViews/1/byteLength", json!(1)),
++        ("/bufferViews/1/byteOffset", json!(1_000_000)),
++        ("/buffers/0/byteLength", json!(1)),
++    ] {
++        let mut value = fixture.clone();
++        *value.pointer_mut(pointer).unwrap() = replacement;
++        assert!(
++            matches!(import(&value), Err(IoError::MalformedInput(_))),
++            "{pointer}"
++        );
++    }
++    for (accessor, field, value) in [
++        (0, "normalized", json!(true)),
++        (1, "normalized", json!(true)),
++        (1, "byteOffset", json!(1_000_000)),
++        (0, "byteOffset", json!(1)),
++    ] {
++        let mut document = fixture.clone();
++        document["accessors"][accessor][field] = value;
++        assert!(matches!(import(&document), Err(IoError::MalformedInput(_))));
++    }
++    let mut overflow = fixture.clone();
++    overflow["bufferViews"][1]["byteOffset"] = json!(u64::MAX);
++    assert!(matches!(
++        import(&overflow),
++        Err(IoError::SizeOverflow { format: "glTF", .. })
++    ));
++    assert!(
++        import(&fixture).is_ok(),
++        "invalid reads must not poison a later import"
++    );
++}
++
++#[test]
++fn sparse_counts_order_and_ranges_are_checked_before_reading() {
++    let fixture = triangle_document(None, false, true);
++    for (pointer, value) in [
++        ("/accessors/0/sparse/count", json!(0)),
++        ("/accessors/0/sparse/count", json!(4)),
++        ("/bufferViews/0/byteLength", json!(1)),
++        ("/bufferViews/1/byteLength", json!(12)),
++    ] {
++        let mut document = fixture.clone();
++        *document.pointer_mut(pointer).unwrap() = value;
++        assert!(matches!(import(&document), Err(IoError::MalformedInput(_))));
++    }
++    for indices in [[2, 1], [1, 1], [1, 3]] {
++        let mut document = fixture.clone();
++        let uri = document["buffers"][0]["uri"].as_str().unwrap();
++        let mut bytes = BASE64.decode(uri.split_once(',').unwrap().1).unwrap();
++        bytes[..2].copy_from_slice(&indices);
++        document["buffers"][0]["uri"] = json!(format!(
++            "data:application/octet-stream;base64,{}",
++            BASE64.encode(bytes)
++        ));
++        assert!(matches!(import(&document), Err(IoError::MalformedInput(_))));
++    }
++}
++
++#[test]
++fn malformed_graphs_and_present_empty_arrays_cannot_masquerade_as_empty() {
++    for (nodes, roots) in [
++        (json!([{"children":[0]}]), json!([0])),
++        (json!([{"children":[1]},{"children":[0]}]), json!([0])),
++        (json!([{"children":[2]},{"children":[2]},{}]), json!([0, 1])),
++        (json!([{"children":[1,1]},{}]), json!([0])),
++        (json!([{"children":[1]},{}]), json!([1])),
++        (json!([{}]), json!([0, 0])),
++        (json!([{"children":[9]}]), json!([0])),
++    ] {
++        let value =
++            json!({"asset":{"version":"2.0"},"nodes":nodes,"scenes":[{"nodes":roots}]});
++        assert!(matches!(import(&value), Err(IoError::MalformedInput(_))));
++    }
++    for field in [
++        "scenes",
++        "nodes",
++        "meshes",
++        "accessors",
++        "buffers",
++        "bufferViews",
++    ] {
++        let mut value = json!({"asset":{"version":"2.0"},"scenes":[{}]});
++        value[field] = json!([]);
++        assert!(matches!(import(&value), Err(IoError::MalformedInput(_))));
++    }
++    assert!(matches!(
++        import(&json!({"asset":{"version":"2.0"},"scenes":[{"nodes":[]}]})),
++        Err(IoError::MalformedInput(_))
++    ));
++    assert!(matches!(
++        import(&json!({"asset":{"version":"2.0"}})),
++        Err(IoError::Unsupported { format: "glTF", .. })
++    ));
++    let invalid_matrix = json!({"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],
++        "nodes":[{"matrix":[1,0,0,1,0,1,0,0,0,0,1,0,0,0,0,1]}]});
++    assert!(matches!(
++        import(&invalid_matrix),
++        Err(IoError::Unsupported { format: "glTF", .. })
++    ));
++    assert!(from_gltf(b"glTF").is_err());
++}
++
++#[test]
++fn full_ten_thousand_node_chain_completes_without_recursive_traversal() {
++    let count = 10_000;
++    let nodes: Vec<_> = (0..count)
++        .map(|index| {
++            if index + 1 == count {
++                json!({})
++            } else {
++                json!({"children":[index+1]})
++            }
++        })
++        .collect();
++    let document = json!({"asset":{"version":"2.0"},"scenes":[{"nodes":[0]}],"nodes":nodes});
++    assert_empty(&import(&document).unwrap().mesh);
++}
++
++#[test]
++fn default_scene_and_nested_transform_order_remain_explicit() {
++    let mut value = triangle_document(None, false, false);
++    value["nodes"] = json!([
++        {"children":[1],"scale":[2,3,4]}, {"mesh":0,"translation":[5,6,7]},
++        {"name":"empty"}
++    ]);
++    value["scenes"] = json!([{"nodes":[2]},{"nodes":[0]},{"nodes":[0]}]);
++    assert_empty(&import(&value).unwrap().mesh);
++    value["scene"] = json!(2);
++    let result = import(&value).unwrap();
++    assert_eq!(result.scene_index, 2);
++    assert_eq!(
++        &*result.mesh.positions,
++        &[[10, 18, 28], [12, 18, 28], [10, 21, 28]].map(|[x, y, z]| Point3::new(
++            x.into(),
++            y.into(),
++            z.into()
++        ))
++    );
++}
++
++#[test]
++fn empty_cache_eviction_mutation_and_concurrent_exports_agree() {
++    let empty = solid::empty();
++    let expected = to_gltf(&empty, "empty").unwrap();
++    let mut owned = to_gltf(&empty, "empty").unwrap();
++    owned.clear();
++    assert_eq!(to_gltf(&empty, "empty").unwrap(), expected);
++    for index in 0..5 {
++        to_gltf(&empty, &format!("evict-{index}")).unwrap();
++    }
++    assert_eq!(to_gltf(&empty, "empty").unwrap(), expected);
++    let mut changed = empty.clone();
++    changed.positions = vec![Point3::origin()].into();
++    assert!(matches!(
++        to_gltf(&changed, "empty"),
++        Err(IoError::Geometry { format: "glTF", .. })
++    ));
++    let mut changed = empty.clone();
++    changed.triangles = vec![Triangle::new(0, 1, 2)].into();
++    assert!(matches!(
++        to_gltf(&changed, "empty"),
++        Err(IoError::Construction { format: "glTF", .. })
++    ));
++    std::thread::scope(|scope| {
++        for _ in 0..4 {
++            scope.spawn(|| {
++                assert_eq!(to_gltf(&empty, "empty").unwrap(), expected);
++                assert_empty(&from_gltf(expected.as_bytes()).unwrap().mesh);
++            });
++        }
++    });
++}
++
++#[test]
++fn invalid_geometry_and_duplicate_empty_names_leave_writers_untouched() {
++    let empty = solid::empty();
++    let duplicate = [
++        GltfSceneObject::new("same", &empty).unwrap(),
++        GltfSceneObject::new("same", &empty).unwrap(),
++    ];
++    let mut sink = b"unchanged".to_vec();
++    assert!(matches!(
++        write_gltf_scene(&mut sink, "scene", &duplicate),
++        Err(IoError::Geometry { format: "glTF", .. })
++    ));
++    assert_eq!(sink, b"unchanged");
++    for invalid in [
++        TriangleMesh::new(vec![Point3::origin()], vec![]),
++        TriangleMesh::new(vec![], vec![Triangle::new(0, 1, 2)]),
++    ] {
++        assert!(GltfSceneObject::new("bad", &invalid).is_err());
++        assert!(write_gltf(&invalid, &mut sink, "bad").is_err());
++        assert_eq!(sink, b"unchanged");
++    }
++    let mut output = Vec::new();
++    write_gltf(&empty, &mut output, "empty").unwrap();
++    assert_empty(&from_gltf(&output).unwrap().mesh);
++}
