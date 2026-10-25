@@ -1,0 +1,252 @@
+--- a/crates/hypercurve/src/curve_subdivision.rs
++++ b/crates/hypercurve/src/curve_subdivision.rs
+@@ -371,6 +371,11 @@
+         if cuts.is_empty() {
+             return Ok(vec![(domain.clone(), self.clone())]);
+         }
++        if let Some(branch) = self.polynomial_branch() {
++            return branch
++                .split_at_sorted_parameters(&cuts, policy)
++                .map_err(|error| error.with_operation(CurveOperation2::Subdivision));
++        }
+         let mut pieces = Vec::with_capacity(cuts.len() + 1);
+         let mut start = domain.start().clone();
+         for end in cuts
+@@ -420,6 +425,16 @@
+             || compare(&parameter, domain.end(), family, policy)? != Ordering::Less
+         {
+             return Err(subdivision_error(family, CurveError::InvalidCurveParameter));
++        }
++        if let Some(branch) = self.polynomial_branch() {
++            let mut pieces = branch
++                .split_at_sorted_parameters(std::slice::from_ref(&parameter), policy)
++                .map_err(|error| error.with_operation(CurveOperation2::Subdivision))?;
++            // One strictly interior cut creates exactly two pieces, already
++            // ordered by traversal by the branch producer.
++            let (_, second) = pieces.pop().expect("one cut creates two pieces");
++            let (_, first) = pieces.pop().expect("one cut creates two pieces");
++            return Ok((first, second));
+         }
+         let lower =
+             self.subcurve_at_parameters(domain.start().clone(), parameter.clone(), policy)?;
+@@ -858,6 +873,220 @@
+         let equality = actual.coincides_with_with_policy(expected, policy);
+         assert_eq!(equality.certainty, CurveCertainty::Certified);
+         assert_eq!(equality.value, Classification::Decided(true));
++    }
++
++    fn quintic_branch() -> (hypersolve::BivariatePolynomial, Curve2) {
++        use hypersolve::bivariate_topology::{
++            BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++        };
++        let equation = hypersolve::BivariatePolynomial::new(vec![
++            vec![5.into(), 5.into(), 0.into(), 0.into(), 0.into(), 1.into()],
++            vec![(-1).into()],
++        ]);
++        let topology = decompose_bivariate_curve(
++            &equation,
++            &BivariateCurveDomain {
++                first: [(-1).into(), 1.into()],
++                second: [(-2).into(), 2.into()],
++            },
++            BivariateTopologyConfig::default(),
++        )
++        .unwrap();
++        let set = crate::PolynomialCurveSet2::from_topology(
++            topology,
++            hypersolve::AlgebraicFiberRootIsolationConfig::default(),
++        )
++        .unwrap();
++        let original = set.curves()[0].clone();
++        drop(set);
++        (equation, original)
++    }
++
++    #[test]
++    fn polynomial_subdivision_shares_selected_cut_authority() {
++        let (equation, original) = quintic_branch();
++        for reversed in [false, true] {
++            let curve = if reversed {
++                original.reversed().unwrap()
++            } else {
++                original.clone()
++            };
++            for policy in [CurveContext::STRICT, CurveContext::APPROXIMATE_512] {
++                // Duplicates and active endpoints must not make empty pieces.
++                let cuts = [
++                    Real::zero(),
++                    q(-1, 2),
++                    q(1, 2),
++                    Real::zero(),
++                    (-1).into(),
++                    1.into(),
++                ];
++                let pieces = curve
++                    .split_at_parameters(cuts.into_iter().map(Into::into), &policy)
++                    .unwrap();
++                assert_eq!(pieces.len(), 4);
++                for pair in pieces.windows(2) {
++                    let end = pair[0].1.end();
++                    let start = pair[1].1.start();
++                    assert!(
++                        end.shares_storage(&start),
++                        "adjacent pieces must reuse one selected fiber point"
++                    );
++                    assert_same(&end, &start, &policy);
++                    let residual = end
++                        .rational_form(
++                            equation.clone(),
++                            hypersolve::BivariatePolynomial::new(vec![vec![Real::one()]]),
++                        )
++                        .unwrap();
++                    assert_eq!(
++                        residual.compare_to_real(&Real::zero()).unwrap(),
++                        Ordering::Equal
++                    );
++                }
++                let (first, second) = curve.split_at(Real::zero().into()).unwrap();
++                assert!(
++                    first.end().shares_storage(&second.start()),
++                    "the public one-cut split must share the same authority"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn polynomial_cut_authority_survives_selected_maps_and_source_drop() {
++        use hypersolve::BivariatePolynomial;
++        let selected = BezierParameter2::Algebraic(
++            crate::BezierAlgebraicParameter2::try_isolate(
++                crate::BezierParameterPolynomial::try_new_power_basis(vec![
++                    (-1).into(),
++                    0.into(),
++                    2.into(),
++                ])
++                .unwrap(),
++                crate::BezierParameterInterval::try_new(0.into(), 1.into()).unwrap(),
++            )
++            .unwrap(),
++        );
++        let map = crate::RationalMap2::new(
++            [
++                BivariatePolynomial::new(vec![vec![], vec![1.into()]]),
++                BivariatePolynomial::new(vec![vec![0.into(), 1.into()]]),
++            ],
++            BivariatePolynomial::new(vec![vec![2.into()], vec![1.into()]]),
++        );
++        let transform = Similarity2::try_from_real_affine(
++            1.into(),
++            0.into(),
++            0.into(),
++            1.into(),
++            3.into(),
++            4.into(),
++        )
++        .unwrap();
++        for mapped in [false, true] {
++            for reversed in [false, true] {
++                for policy in [
++                    crate::PredicatePolicy::STRICT,
++                    crate::PredicatePolicy::APPROXIMATE_512,
++                    crate::PredicatePolicy::STRICT,
++                ] {
++                    let outcome = crate::evaluate_under(policy, || {
++                        let (equation, original) = quintic_branch();
++                        let curve = if mapped {
++                            original.rational_image(&map).unwrap()
++                        } else {
++                            original.clone()
++                        };
++                        let curve = curve.transform_similarity(&transform).unwrap();
++                        let curve = if reversed {
++                            curve.reversed().unwrap()
++                        } else {
++                            curve
++                        };
++                        let (first, second) = curve.split_at(selected.clone().into()).unwrap();
++                        for piece in [&first, &second] {
++                            assert!(
++                                piece
++                                    .polynomial_branch()
++                                    .unwrap()
++                                    .shares_source(original.polynomial_branch().unwrap())
++                            );
++                        }
++                        (equation, first, second)
++                    });
++                    let (equation, first, second) = outcome.certified().unwrap();
++                    // The original set and all unsplit images have been dropped.
++                    let cut = first.end();
++                    assert!(cut.shares_storage(&second.start()));
++                    let replay = cut.definition().unwrap().into_point().unwrap();
++                    assert!(replay.coincides_with(&cut).unwrap());
++                    let mut source = cut;
++                    loop {
++                        match source.definition().unwrap() {
++                            crate::CurvePointDefinition2::Similarity { source: inner, .. }
++                            | crate::CurvePointDefinition2::RationalImage {
++                                source: inner, ..
++                            } => source = inner,
++                            crate::CurvePointDefinition2::PolynomialFiber { parameter, .. } => {
++                                assert_eq!(
++                                    CurveParameter2::from(parameter)
++                                        .compare(&selected.clone().into())
++                                        .unwrap(),
++                                    Ordering::Equal
++                                );
++                                break;
++                            }
++                            other => panic!("lost selected fiber: {other:?}"),
++                        }
++                    }
++                    assert_eq!(
++                        source
++                            .rational_form(
++                                equation,
++                                BivariatePolynomial::new(vec![vec![Real::one()]]),
++                            )
++                            .unwrap()
++                            .compare_to_real(&Real::zero())
++                            .unwrap(),
++                        Ordering::Equal
++                    );
++                    let lower = if reversed { second } else { first };
++                    let (a, b) = lower.split_at(Real::zero().into()).unwrap();
++                    assert!(a.end().shares_storage(&b.start()));
++                    assert!(
++                        a.reversed()
++                            .unwrap()
++                            .start()
++                            .coincides_with(&b.start())
++                            .unwrap()
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn polynomial_split_rejects_invalid_cuts_and_recovers_after_exhaustion() {
++        let (_, curve) = quintic_branch();
++        for parameter in [-2, -1, 1, 2] {
++            assert!(matches!(
++                curve.split_at(Real::from(parameter).into()),
++                Err(ExactCurveError::Invalid { .. })
++            ));
++        }
++        let denied =
++            hypersolve::work_budget::with_budget(hypersolve::work_budget::WorkBudget::ZERO, || {
++                curve.split_at(Real::zero().into())
++            });
++        assert!(denied.result.is_err());
++        let (first, second) = curve.split_at(Real::zero().into()).unwrap();
++        assert!(first.end().shares_storage(&second.start()));
++        assert_eq!(
++            curve.parameter_domain().start().scalar(),
++            Some(&(-1).into())
++        );
++        assert_eq!(curve.parameter_domain().end().scalar(), Some(&1.into()));
+     }
+ 
+     #[test]
