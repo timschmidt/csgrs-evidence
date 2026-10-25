@@ -1,0 +1,74 @@
+--- /tmp/csgrs-research-2026-10-25/r28/baseline-bezier_fit.rs	2026-10-25 14:26:47.398604836 -0400
++++ /tmp/csgrs-r28-candidate/crates/hypercurve/src/bezier_fit.rs	2026-10-25 14:26:51.445555353 -0400
+@@ -523,7 +523,17 @@
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<BezierLineImageFitRelation>> {
+         match weights_known_same_nonzero_sign(self.weights().as_slice(), policy) {
+-            Some(true) => fit_control_polygon_line_image(&self.control_points(), policy),
++            Some(true) => {
++                if certified_nonlinear_circle_image(
++                    self.retained_circular_conic(),
++                    self.start(),
++                    self.end(),
++                    policy,
++                ) {
++                    return Ok(Classification::Decided(BezierLineImageFitRelation::NotLine));
++                }
++                fit_control_polygon_line_image(&self.control_points(), policy)
++            }
+             Some(false) => Ok(Classification::Uncertain(UncertaintyReason::Unsupported)),
+             None => Ok(Classification::Uncertain(UncertaintyReason::RealSign)),
+         }
+@@ -570,6 +580,20 @@
+                 },
+             )));
+         }
++        if self.retained_circular_conic().is_some()
++            && matches!(
++                self.control_weight_sign(),
++                Classification::Decided(RealSign::Positive | RealSign::Negative)
++            )
++            && certified_nonlinear_circle_image(
++                self.retained_circular_conic(),
++                self.start(),
++                self.end(),
++                policy,
++            )
++        {
++            return Ok(Classification::Decided(BezierLineImageFitRelation::NotLine));
++        }
+         let weights = self.weights().iter().collect::<Vec<_>>();
+         match weights_known_same_nonzero_sign(&weights, policy) {
+             Some(true) => {
+@@ -698,6 +722,31 @@
+     }
+ }
+ 
++/// The caller has established one nonzero sign for the Bernstein weights.
++/// This makes the active image finite and connected. Distinct points on a
++/// positive-radius circle make it nonconstant, so it cannot lie on one line.
++/// A support tag or a declined comparison alone does not establish that claim.
++fn certified_nonlinear_circle_image(
++    circle: Option<&std::sync::Arc<crate::rational_bezier::RationalQuadraticCircle2>>,
++    start: &Point2,
++    end: &Point2,
++    policy: &CurveContext,
++) -> bool {
++    let Some(circle) = circle else {
++        return false;
++    };
++    let strict = policy.strict_counterpart();
++    real_sign(&circle.radius_squared, &strict) == Some(RealSign::Positive)
++        && [(start.x(), end.x()), (start.y(), end.y())]
++            .into_iter()
++            .any(|(first, second)| {
++                matches!(
++                    crate::classify::compare_reals(first, second, &strict),
++                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Greater)
++                )
++            })
++}
++
+ fn weights_known_same_nonzero_sign(weights: &[&Real], policy: &CurveContext) -> Option<bool> {
+     let mut expected = None;
+     for weight in weights {
