@@ -1,0 +1,52 @@
+import subprocess, json, os, time, sys, signal, hashlib
+from pathlib import Path
+root=Path('/home/tim/Documents/GitHub/workspace/csgrs')
+record=Path(__file__).resolve().parent / ('final-retained-validation-'+str(time.time_ns()))
+record.mkdir(exist_ok=True)
+env=os.environ.copy()
+env['CSGRS_LIBRARY']=str(root/'target/release/libcsgrs_ffi.so')
+env['WASM_BINDGEN']='/tmp/claude-1000/-home-tim-Documents-GitHub-workspace-csgrs/1dd6969b-b3fa-493b-8161-505ab6355a7e/scratchpad/wasm-bindgen-0.2.126/bin/wasm-bindgen'
+env['PROPTEST_RNG_SEED']='20261025'
+env['CARGO_TARGET_DIR']='/tmp/csgrs-r04-primary-only-target'
+env['CCACHE_DIR']='/tmp/csgrs-r04-primary-ccache'
+env['CCACHE_TEMPDIR']='/tmp/csgrs-r04-primary-ccache/tmp'
+Path(env['CCACHE_TEMPDIR']).mkdir(parents=True,exist_ok=True)
+(record/'build-environment.json').write_text(json.dumps({key:env[key] for key in ['CARGO_TARGET_DIR','CCACHE_DIR','CCACHE_TEMPDIR','PROPTEST_RNG_SEED']},indent=2)+'\n')
+env['CSGRS_LIBRARY']='/tmp/csgrs-r04-primary-only-target/release/libcsgrs_ffi.so'
+patch=subprocess.check_output(['git','diff','--binary'],cwd=root);(record/'source.patch').write_bytes(patch)
+test=root/'crates/hypercurve/tests/modeling_sampling.rs';(record/'modeling_sampling.rs').write_bytes(test.read_bytes())
+(record/'source.json').write_text(json.dumps({'head':subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),'patch_sha256':hashlib.sha256(patch).hexdigest(),'sampling_test_sha256':hashlib.sha256(test.read_bytes()).hexdigest(),'compiler':subprocess.check_output(['rustc','-Vv'],text=True),'seed':env['PROPTEST_RNG_SEED']},indent=2)+'\n')
+tests=['crates/hyperlimit/tests/repeated_symbolic_products.rs','crates/hypercurve/tests/tangent_relations.rs','crates/hypercurve/tests/modeling_sampling.rs','tests/mixed_modeling_profiles.rs']
+for relative in tests:
+ destination=record/'tests'/relative;destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes((root/relative).read_bytes())
+untracked=subprocess.check_output(['git','ls-files','--others','--exclude-standard','--','src','crates','tests','benchmarks','scripts'],cwd=root,text=True).splitlines()
+for relative in untracked:
+ source=root/relative
+ if source.is_file():
+  destination=record/'untracked'/relative;destination.parent.mkdir(parents=True,exist_ok=True);destination.write_bytes(source.read_bytes())
+def compiled_sources():
+ paths=subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard','--','src','crates','tests','benchmarks','scripts','Cargo.toml','Cargo.lock','build.rs'],cwd=root,text=True).splitlines()
+ return {relative:hashlib.sha256((root/relative).read_bytes()).hexdigest() for relative in paths if (root/relative).is_file() and (relative.endswith('.rs') or Path(relative).name in ['Cargo.toml','Cargo.lock'])}
+source_inventory=compiled_sources();(record/'compiled-sources-before.json').write_text(json.dumps(source_inventory,indent=2)+'\n')
+checks=[('fmt', ['cargo', 'fmt', '--all', '--', '--check'], 300), ('determinant-regression', ['cargo', 'test', '--locked', '--release', '-p', 'hyperlimit', '--all-features', '--test', 'repeated_symbolic_products'], 600), ('bridge-regression', ['cargo', 'test', '--locked', '--release', '-p', 'hypertri', '--all-features', '--lib', 'unresolved_bridge_priority_preserves_exact_triangulation'], 600), ('downstream-profiles', ['cargo', 'test', '--locked', '--release', '-p', 'csgrs', '--all-features', '--test', 'downstream_profiles'], 600), ('predicate-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hyperlimit', '--all-features', '--', '--test-threads=2'], 1500), ('triangulation-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hypertri', '--all-features', '--', '--test-threads=2'], 1500), ('mesh-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hypermesh', '--all-features', '--', '--test-threads=2'], 1800), ('clippy-owners', ['cargo', 'clippy', '--locked', '-p', 'hyperlimit', '-p', 'hypertri', '-p', 'hypermesh', '--all-features', '--all-targets', '--', '-D', 'warnings'], 900), ('clippy-root', ['cargo', 'clippy', '--locked', '--all-targets', '--all-features', '--', '-D', 'warnings'], 900), ('clippy-hypercurve', ['cargo', 'clippy', '--locked', '-p', 'hypercurve', '--all-targets', '--all-features', '--', '-D', 'warnings'], 900), ('hypercurve-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hypercurve', '--all-features', '--no-fail-fast', '--', '--test-threads=2'], 3600), ('modeling-suite', ['cargo', 'test', '--locked', '--release', '-p', 'csgrs', '--all-features', '--no-fail-fast', '--', '--test-threads=2'], 5400), ('brep-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hyperbrep', '--all-features', '--no-fail-fast', '--', '--test-threads=2'], 5400), ('pcb-suite', ['cargo', 'test', '--locked', '--release', '-p', 'hypercircuit', '--all-features', '--no-fail-fast', '--', '--test-threads=2'], 1800), ('clippy-downstream', ['cargo', 'clippy', '--locked', '-p', 'hyperbrep', '-p', 'hypercircuit', '--all-features', '--all-targets', '--', '-D', 'warnings'], 900), ('successive-continuation', ['cargo', 'test', '--locked', '--release', '--no-default-features', '--features', 'curve,stl-io,obj-io', '--test', 'successive_operations', '--', '--include-ignored'], 900), ('ffi-tests', ['cargo', 'test', '--locked', '--release', '-p', 'csgrs-ffi'], 1200), ('ffi-build', ['cargo', 'build', '--locked', '--release', '-p', 'csgrs-ffi'], 1200), ('exact_linear_modeling-c-build', ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', 'tests/ffi/exact_linear_modeling.c', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/exact_linear_modeling-c'], 300), ('exact_linear_modeling-c', ['/tmp/csgrs-research-2026-10-25/r04-followup/exact_linear_modeling-c'], 300), ('exact_linear_modeling-cpp-build', ['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', '-I', 'bindings/cpp', 'tests/ffi/exact_linear_modeling.cpp', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/exact_linear_modeling-cpp'], 300), ('exact_linear_modeling-cpp', ['/tmp/csgrs-research-2026-10-25/r04-followup/exact_linear_modeling-cpp'], 300), ('exact_linear_modeling-python', ['python3', 'tests/ffi/exact_linear_modeling.py'], 300), ('curve_operation_failures-c-build', ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', 'tests/ffi/curve_operation_failures.c', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/curve_operation_failures-c'], 300), ('curve_operation_failures-c', ['/tmp/csgrs-research-2026-10-25/r04-followup/curve_operation_failures-c'], 300), ('curve_operation_failures-cpp-build', ['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', '-I', 'bindings/cpp', 'tests/ffi/curve_operation_failures.cpp', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/curve_operation_failures-cpp'], 300), ('curve_operation_failures-cpp', ['/tmp/csgrs-research-2026-10-25/r04-followup/curve_operation_failures-cpp'], 300), ('curve_operation_failures-python', ['python3', 'tests/ffi/curve_operation_failures.py'], 300), ('construction_evidence-c-build', ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', 'tests/ffi/construction_evidence.c', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/construction_evidence-c'], 300), ('construction_evidence-c', ['/tmp/csgrs-research-2026-10-25/r04-followup/construction_evidence-c'], 300), ('construction_evidence-cpp-build', ['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-I', 'crates/csgrs-ffi/include', '-I', 'bindings/cpp', 'tests/ffi/construction_evidence.cpp', '-L', '/tmp/csgrs-r04-primary-only-target/release', '-lcsgrs_ffi', '-Wl,-rpath,/tmp/csgrs-r04-primary-only-target/release', '-o', '/tmp/csgrs-research-2026-10-25/r04-followup/construction_evidence-cpp'], 300), ('construction_evidence-cpp', ['/tmp/csgrs-research-2026-10-25/r04-followup/construction_evidence-cpp'], 300), ('construction_evidence-python', ['python3', 'tests/ffi/construction_evidence.py'], 300), ('docs-root', ['env', 'RUSTDOCFLAGS=-D warnings', 'cargo', 'doc', '--locked', '--no-default-features', '--features', 'curve', '--no-deps'], 600), ('docs-hypercurve', ['env', 'RUSTDOCFLAGS=-D warnings', 'cargo', 'doc', '--locked', '-p', 'hypercurve', '--all-features', '--no-deps'], 600), ('docs-owners', ['env', 'RUSTDOCFLAGS=-D warnings', 'cargo', 'doc', '--locked', '-p', 'hyperlimit', '-p', 'hypertri', '-p', 'hypermesh', '-p', 'hyperbrep', '-p', 'hypercircuit', '--all-features', '--no-deps'], 900), ('wasm', ['bash', 'scripts/test-wasm-bindings.sh'], 1800), ('repository-budget', ['bash', 'scripts/check-repository-budget.sh'], 300), ('diff-check', ['git', 'diff', '--check'], 300)]
+if len(sys.argv)>1:
+ checks=checks[next(i for i,(name,_,_) in enumerate(checks) if name==sys.argv[1]):]
+with (record/'checks.jsonl').open('a',buffering=1) as journal:
+ for name,cmd,limit in checks:
+  print('START',name,flush=True)
+  start=time.time()
+  journal.write(json.dumps({'event':'start','name':name,'command':cmd,'utc_epoch':start,'cwd':str(root),'timeout_seconds':limit})+'\n')
+  with (record/(name+'.log')).open('w') as log:
+   try:
+    proc=subprocess.Popen(cmd,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+    status=proc.wait(timeout=limit)
+   except subprocess.TimeoutExpired:
+    os.killpg(proc.pid,signal.SIGKILL);proc.wait();status='timeout'
+  journal.write(json.dumps({'event':'finish','name':name,'exit_code':status,'elapsed_seconds':time.time()-start})+'\n')
+  print('FINISH',name,status,flush=True)
+  if status!=0: raise SystemExit(1)
+
+after_inventory=compiled_sources()
+(record/'compiled-sources-after.json').write_text(json.dumps(after_inventory,indent=2)+'\n')
+assert source_inventory==after_inventory,'Compiled source changed during validation'
+print('Complete validation source inventory unchanged',flush=True)
