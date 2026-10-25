@@ -1,0 +1,61 @@
+diff --git a/crates/hypercurve/src/bezier_offset/fiber_sign.rs b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+index 2d209aeb59..49e22c0bc9 100644
+--- a/crates/hypercurve/src/bezier_offset/fiber_sign.rs
++++ b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+@@ -1911,6 +1911,7 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+     let mut latest = root.clone();
+     let mut refinement_steps = 0_usize;
+     let mut exact_nonzero = false;
++    let mut tried_quotient_zero = false;
+     let next_refinement_steps = |steps: usize| {
+         if steps == 0 {
+             Ok(2)
+@@ -1983,6 +1984,41 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+         // common-root certificate before spending more on interval refinement;
+         // once nonzero is proved, retain that fact while refining its sign.
+         if !exact_nonzero {
++            if !tried_quotient_zero {
++                tried_quotient_zero = true;
++                // This authority already owns a root of its incidence. An exact
++                // zero throughout the specialized quotient therefore suffices;
++                // no new root count or global parameter projection is needed.
++                let reduction = policy.strict_predicate_pass(|| {
++                    hypersolve::reduce_bivariate_rational_function_at_algebraic_parameter(
++                        incidence,
++                        predicate,
++                        &BivariatePolynomial::new(vec![vec![Real::one()]]),
++                        CurveResultantParameter::First,
++                        &retained_root,
++                        hypersolve::PredicatePolicy::STRICT,
++                    )
++                });
++                if reduction.certainty == PredicateCertainty::Exact
++                    && reduction.status
++                        == hypersolve::AlgebraicFiberRationalReductionStatus::ReducedToRetainedField
++                    && !reduction.numerator_coefficients.is_empty()
++                    && reduction.numerator_coefficients.iter().all(|coefficient| {
++                        coefficient
++                            .exact_rational_ref()
++                            .is_some_and(|value| value.is_zero())
++                    })
++                {
++                    #[cfg(feature = "dispatch-trace")]
++                    hyperreal::dispatch_trace::record(
++                        "hypercurve",
++                        "selected-fiber-predicate-sign",
++                        "complete-quotient-zero",
++                    );
++                    return Ok(Classification::Decided(RealSign::Zero));
++                }
++            }
++
+             let predicate_policy = if refinement_steps == 512 && policy.permits_approximate_512() {
+                 policy.predicate_policy()
+             } else {
+@@ -3466,3 +3502,6 @@ pub(super) fn algebraic_cusp_independent_radical_sum_sign(
+         Classification::Uncertain(reason) => Classification::Uncertain(reason),
+     })
+ }
++
++#[cfg(test)]
++mod tests;
