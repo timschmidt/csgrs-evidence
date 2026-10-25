@@ -1,0 +1,1337 @@
+diff --git a/crates/hypercurve/src/bezier_offset/cusp_semicircle/parallel_kernel.rs b/crates/hypercurve/src/bezier_offset/cusp_semicircle/parallel_kernel.rs
+index 7de67bafdd..0721b23b05 100644
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/parallel_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/parallel_kernel.rs
+@@ -1295,6 +1295,31 @@ impl BezierAlgebraicCuspSemicircle2 {
+         range: &CurveParameterRange2,
+         incident: Option<&BezierParallelIncidentDomain2>,
+         policy: &CurveContext,
++    ) -> CurveResult<Classification<BezierAlgebraicCuspSemicircleParallelIntersections2>> {
++        // TEMPORARY H15 PROBE (not for commit).
++        let start = std::time::Instant::now();
++        let result =
++            self.selected_parallel_normal_parallel_intersections_inner(other, range, incident, policy);
++        if std::env::var_os("HYPERCURVE_PROBE_H15").is_some() {
++            eprintln!(
++                "H15PROBE selected_parallel_normal_parallel_intersections {:?} -> {}",
++                start.elapsed(),
++                match &result {
++                    Ok(Classification::Decided(_)) => "decided",
++                    Ok(Classification::Uncertain(_)) => "uncertain",
++                    Err(_) => "error",
++                }
++            );
++        }
++        result
++    }
++
++    fn selected_parallel_normal_parallel_intersections_inner(
++        &self,
++        other: &BezierParallel2,
++        range: &CurveParameterRange2,
++        incident: Option<&BezierParallelIncidentDomain2>,
++        policy: &CurveContext,
+     ) -> CurveResult<Classification<BezierAlgebraicCuspSemicircleParallelIntersections2>> {
+         let frame_parameter = self.selected_frame_parameter().ok_or_else(|| {
+             CurveError::Topology(
+@@ -1341,6 +1366,81 @@ impl BezierAlgebraicCuspSemicircle2 {
+                 }
+             }
+         };
++        if let Some(path) = std::env::var_os("HYPERCURVE_PROBE_H15") {
++            // TEMPORARY H15 PROBE (not for commit).
++            let polynomial = center_parameter.polynomial().coefficients();
++            if polynomial.len() > 100 {
++                let format_real = |value: &Real| {
++                    value.exact_rational_ref().map_or_else(
++                        || format!("NONRATIONAL {value:?}"),
++                        |rational| {
++                            format!(
++                                "{}{}/{}",
++                                if rational.is_negative() { "-" } else { "" },
++                                rational.numerator(),
++                                rational.denominator()
++                            )
++                        },
++                    )
++                };
++                let mut text = String::new();
++                text.push_str(&format!("degree {}\n", polynomial.len() - 1));
++                text.push_str(&format!(
++                    "interval {} {}\n",
++                    format_real(center_parameter.interval().start()),
++                    format_real(center_parameter.interval().end())
++                ));
++                for coefficient in polynomial {
++                    text.push_str(&format_real(coefficient));
++                    text.push('\n');
++                }
++                let mut file = std::path::PathBuf::from(path);
++                file.push(format!("center_{}.txt", polynomial.len() - 1));
++                let _ = std::fs::write(file, text);
++            }
++        }
++        let center_parameter = match std::env::var_os("HYPERCURVE_PROBE_H15_FACTOR") {
++            // TEMPORARY H15 EXPERIMENT (not for commit): replace the
++            // degree-214 centre polynomial by its selected factor, read from
++            // a file of ascending integer coefficients, on the same interval.
++            Some(path) if center_parameter.polynomial().coefficients().len() == 215 => {
++                let text = std::fs::read_to_string(path).expect("factor file");
++                let coefficients: Vec<Real> = text
++                    .split_whitespace()
++                    .map(|value| {
++                        Real::new(hyperreal::Rational::from_bigint(
++                            value.parse::<num::BigInt>().expect("integer coefficient"),
++                        ))
++                    })
++                    .collect();
++                let polynomial = match BezierParameterPolynomial::try_new_power_basis_with_policy(
++                    coefficients,
++                    &CurveContext::STRICT,
++                )? {
++                    Classification::Decided(polynomial) => polynomial,
++                    Classification::Uncertain(reason) => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                };
++                match BezierAlgebraicParameter2::try_isolate_with_policy(
++                    polynomial,
++                    center_parameter.interval().clone(),
++                    &CurveContext::STRICT,
++                )? {
++                    Classification::Decided(parameter) => {
++                        eprintln!(
++                            "H15PROBE centre replaced by its degree-{} factor",
++                            parameter.polynomial().coefficients().len() - 1
++                        );
++                        parameter
++                    }
++                    Classification::Uncertain(reason) => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                }
++            }
++            _ => center_parameter,
++        };
+         let BezierSelectedParallelNormalCircleParallelSystem2 {
+             incidence,
+             squared_branch,
+diff --git a/crates/hypercurve/src/bezier_offset/recursive_field.rs b/crates/hypercurve/src/bezier_offset/recursive_field.rs
+index fcedba6bf7..1cc6fb4835 100644
+--- a/crates/hypercurve/src/bezier_offset/recursive_field.rs
++++ b/crates/hypercurve/src/bezier_offset/recursive_field.rs
+@@ -1694,13 +1694,24 @@ impl BezierRecursivePolynomialParameterAuthority2 {
+                 field: self.field.clone(),
+                 policy: *policy,
+             };
+-            match policy.bounded_exact_predicate_pass(|| {
++            let probe_start = std::time::Instant::now();
++            let probe_result = policy.bounded_exact_predicate_pass(|| {
+                 hypersolve::ordered_field_polynomial_sign_remainder(
+                     coefficients,
+                     &self.coefficients,
+                     &mut context,
+                 )
+-            }) {
++            });
++            if std::env::var_os("HYPERCURVE_PROBE_H14").is_some() {
++                h14_probe_report(
++                    probe_start.elapsed(),
++                    &self.field,
++                    &self.coefficients,
++                    coefficients,
++                    probe_result.as_ref().ok().and_then(|r| r.as_deref()),
++                );
++            }
++            match probe_result {
+                 Ok(Some(remainder)) => {
+                     #[cfg(feature = "dispatch-trace")]
+                     hyperreal::dispatch_trace::record(
+@@ -6209,3 +6220,81 @@ pub(super) fn projective_scalar_merged_projective_difference(
+     });
+     Ok(Classification::Decided(difference))
+ }
++
++// TEMPORARY H14 PROBE (not for commit).
++fn h14_value_size(value: &RecursiveQuadraticValue) -> (usize, u64, u64) {
++    use hypersolve::recursive_quadratic_field::RecursiveQuadraticValueData;
++    match value.data.as_ref() {
++        RecursiveQuadraticValueData::Base { expression, .. } => {
++            let mut terms = 0;
++            let mut max_bits = 0;
++            let mut total_bits = 0;
++            for polynomial in [
++                &expression.rational,
++                &expression.first,
++                &expression.second,
++                &expression.product,
++            ] {
++                for coefficient in polynomial.coefficients() {
++                    let bits = coefficient.exact_rational_ref().map_or(1_000_000, |r| {
++                        r.numerator().bits() + r.denominator().bits()
++                    });
++                    if bits > 1 {
++                        terms += 1;
++                    }
++                    max_bits = max_bits.max(bits);
++                    total_bits += bits;
++                }
++            }
++            (terms, max_bits, total_bits)
++        }
++        RecursiveQuadraticValueData::Extension {
++            retained, radical, ..
++        } => {
++            let a = h14_value_size(retained);
++            let b = h14_value_size(radical);
++            (a.0 + b.0, a.1.max(b.1), a.2 + b.2)
++        }
++    }
++}
++
++fn h14_probe_report(
++    elapsed: std::time::Duration,
++    field: &RecursiveQuadraticField,
++    defining: &[RecursiveQuadraticValue],
++    query: &[RecursiveQuadraticValue],
++    remainder: Option<&[RecursiveQuadraticValue]>,
++) {
++    if elapsed.as_millis() < 200 {
++        return;
++    }
++    let (base, extensions) = field.base_and_extension_path();
++    let sources: Vec<usize> = base
++        .sources
++        .iter()
++        .map(|s| s.polynomial_coefficients.len().saturating_sub(1))
++        .collect();
++    let speeds = (
++        base.first_speed_squared.dimensions().to_vec(),
++        base.second_speed_squared.dimensions().to_vec(),
++    );
++    let sizes = |values: &[RecursiveQuadraticValue]| -> (usize, u64, u64) {
++        values.iter().map(h14_value_size).fold((0, 0, 0), |a, b| {
++            (a.0 + b.0, a.1.max(b.1), a.2 + b.2)
++        })
++    };
++    let rem_zero = remainder.map(|r| r.iter().all(|c| c.is_structurally_zero()));
++    eprintln!(
++        "H14PROBE remainder {:?}: defining deg {} size {:?}; query deg {} size {:?}; sources {:?}; speeds {:?}; extensions {}; remainder size {:?} structurally zero {:?}",
++        elapsed,
++        defining.len() - 1,
++        sizes(defining),
++        query.len() - 1,
++        sizes(query),
++        sources,
++        speeds,
++        extensions.len(),
++        remainder.map(sizes),
++        rem_zero
++    );
++}
+diff --git a/crates/hypercurve/src/bezier_parameter.rs b/crates/hypercurve/src/bezier_parameter.rs
+index 7e0aa0aa28..396a42f04d 100644
+--- a/crates/hypercurve/src/bezier_parameter.rs
++++ b/crates/hypercurve/src/bezier_parameter.rs
+@@ -2916,6 +2916,73 @@ pub(crate) fn signed_coefficients_at_parameter(
+     coefficients: &[Real],
+     parameter: &BezierParameter2,
+     policy: &CurveContext,
++) -> CurveResult<Classification<RealSign>> {
++    let probe_start = std::time::Instant::now();
++    let result = signed_coefficients_at_parameter_inner(coefficients, parameter, policy);
++    h13_probe_report(probe_start.elapsed(), coefficients, parameter, &result);
++    result
++}
++
++// TEMPORARY H13 PROBE (not for commit).
++fn h13_probe_report(
++    elapsed: std::time::Duration,
++    coefficients: &[Real],
++    parameter: &BezierParameter2,
++    result: &CurveResult<Classification<RealSign>>,
++) {
++    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
++    static COUNTER: AtomicUsize = AtomicUsize::new(0);
++    let Some(path) = std::env::var_os("HYPERCURVE_PROBE_H13") else {
++        return;
++    };
++    if elapsed.as_millis() < 500 {
++        return;
++    }
++    let BezierParameter2::Algebraic(algebraic) = parameter else {
++        return;
++    };
++    let format_real = |value: &Real| {
++        value.exact_rational_ref().map_or_else(
++            || "NONRATIONAL".to_string(),
++            |rational| {
++                format!(
++                    "{}{}/{}",
++                    if rational.is_negative() { "-" } else { "" },
++                    rational.numerator(),
++                    rational.denominator()
++                )
++            },
++        )
++    };
++    let index = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
++    let mut text = format!(
++        "elapsed_ms {}\nresult {:?}\nfilter_degree {}\ndefining_degree {}\ninterval {} {}\n",
++        elapsed.as_millis(),
++        result.as_ref().ok(),
++        coefficients.len().saturating_sub(1),
++        algebraic.polynomial().coefficients().len() - 1,
++        format_real(algebraic.interval().start()),
++        format_real(algebraic.interval().end()),
++    );
++    text.push_str("filter\n");
++    for coefficient in coefficients {
++        text.push_str(&format_real(coefficient));
++        text.push('\n');
++    }
++    text.push_str("defining\n");
++    for coefficient in algebraic.polynomial().coefficients() {
++        text.push_str(&format_real(coefficient));
++        text.push('\n');
++    }
++    let mut file = std::path::PathBuf::from(path);
++    file.push(format!("leaf_{index:04}.txt"));
++    let _ = std::fs::write(file, text);
++}
++
++fn signed_coefficients_at_parameter_inner(
++    coefficients: &[Real],
++    parameter: &BezierParameter2,
++    policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
+     let strict_policy = policy.strict_counterpart();
+     if let Some(sign) =
+@@ -3027,10 +3094,7 @@ fn coprime_filter_sign_by_bisection(
+         if let Some(sign) = rational_horner_interval_strict_sign(coefficients, lower, upper) {
+             return Ok(Some(sign));
+         }
+-        univariate_unit_interval_strict_bernstein_sign(
+-            &polynomial_restrict_to_interval(coefficients, lower, upper),
+-            policy,
+-        )
++        interval_strict_bernstein_sign(coefficients, lower, upper, policy)
+     };
+     let mut completed = 0_usize;
+     let mut target = 8_usize;
+@@ -3379,9 +3443,160 @@ pub(crate) fn strict_coefficients_sign_on_parameter_interval(
+     {
+         return Ok(Some(sign));
+     }
+-    let restricted =
+-        polynomial_restrict_to_interval(coefficients, interval.start(), interval.end());
+-    univariate_unit_interval_strict_bernstein_sign(&restricted, policy)
++    interval_strict_bernstein_sign(coefficients, interval.start(), interval.end(), policy)
++}
++
++/// The strict sign of a polynomial on `[lower, upper]` from its Bernstein
++/// coefficients there: every coefficient strictly positive or every one
++/// strictly negative. `None` when a coefficient is zero or the signs mix.
++fn interval_strict_bernstein_sign(
++    coefficients: &[Real],
++    lower: &Real,
++    upper: &Real,
++    policy: &CurveContext,
++) -> CurveResult<Option<RealSign>> {
++    if !h13_experiment_rational_bernstein_disabled()
++        && let Some(decision) =
++            rational_interval_strict_bernstein_sign(coefficients, lower, upper)
++    {
++        return Ok(decision);
++    }
++    univariate_unit_interval_strict_bernstein_sign(
++        &polynomial_restrict_to_interval(coefficients, lower, upper),
++        policy,
++    )
++}
++
++// TEMPORARY H13 EXPERIMENT TOGGLE (not for commit).
++fn h13_experiment_rational_bernstein_disabled() -> bool {
++    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *DISABLED.get_or_init(|| std::env::var_os("H13_EXPERIMENT_EXACT_BERNSTEIN").is_some())
++}
++
++/// [`interval_strict_bernstein_sign`] for exact rational coefficients and
++/// endpoints, in integer arithmetic.
++///
++/// Write `f(x) = sum c_i x^i` of nominal degree `n`, `D` for the common
++/// denominator of the `c_i`, and `lower = p/q`, `upper = r/q` over a common
++/// positive denominator. With `g(t) = f(lower + (upper - lower) t)`, the
++/// Bernstein coefficients `b_k` of `g` on `[0, 1]` satisfy
++/// `(1 + x)^n g(x / (1 + x)) = sum_k b_k binom(n, k) x^k`, and
++/// `D q^n (1 + x)^n g(x / (1 + x)) = sum_i (D c_i) (p + r x)^i (q + q x)^(n - i)`,
++/// an integer polynomial evaluated by homogeneous Horner. Its coefficients are
++/// positive multiples of the `b_k`, so they decide exactly as the Bernstein
++/// coefficients do, without normalizing a rational at every step of the basis
++/// change. `None` when an input is not an exact rational.
++fn rational_interval_strict_bernstein_sign(
++    coefficients: &[Real],
++    lower: &Real,
++    upper: &Real,
++) -> Option<Option<RealSign>> {
++    use num::{BigInt, One, Zero};
++    let form = IntegerBracketPolynomial::new(coefficients, lower, upper)?;
++    let degree = form.coefficients.len() - 1;
++    // powers[m] holds (q + q x)^m.
++    let mut powers: Vec<Vec<BigInt>> = vec![vec![BigInt::one()]];
++    for _ in 0..degree {
++        let previous = powers.last().expect("the zeroth power is present");
++        let mut next = vec![BigInt::zero(); previous.len() + 1];
++        for (power, value) in previous.iter().enumerate() {
++            let scaled = value * &form.scale;
++            next[power] += &scaled;
++            next[power + 1] += scaled;
++        }
++        powers.push(next);
++    }
++    let (leading, rest) = form
++        .coefficients
++        .split_last()
++        .expect("a nominal polynomial has a leading coefficient");
++    let mut value = vec![leading.clone()];
++    for (index, coefficient) in rest.iter().enumerate().rev() {
++        let mut next = vec![BigInt::zero(); value.len() + 1];
++        for (power, entry) in value.iter().enumerate() {
++            next[power] += entry * &form.start;
++            next[power + 1] += entry * &form.end;
++        }
++        if !coefficient.is_zero() {
++            for (power, entry) in powers[degree - index].iter().enumerate() {
++                next[power] += coefficient * entry;
++            }
++        }
++        value = next;
++    }
++    Some(strict_common_sign(&value))
++}
++
++/// An exact rational polynomial and bracket over common denominators:
++/// `coefficients[i] = D c_i`, `lower = start / scale` and
++/// `upper = end / scale`, with `D` and `scale` positive integers. Positive
++/// scalings preserve every enclosure sign, so the integer forms decide as
++/// the rational ones do without normalizing a fraction at each operation.
++struct IntegerBracketPolynomial {
++    coefficients: Vec<num::BigInt>,
++    start: num::BigInt,
++    end: num::BigInt,
++    scale: num::BigInt,
++}
++
++impl IntegerBracketPolynomial {
++    fn new(coefficients: &[Real], lower: &Real, upper: &Real) -> Option<Self> {
++        use num::{BigInt, BigUint, Integer, One};
++        let rationals = coefficients
++            .iter()
++            .map(Real::exact_rational_ref)
++            .collect::<Option<Vec<_>>>()?;
++        if rationals.is_empty() {
++            return None;
++        }
++        let (lower, upper) = (lower.exact_rational_ref()?, upper.exact_rational_ref()?);
++        let integer = |value: &HyperRational, scale: &BigUint| {
++            let magnitude = BigInt::from(value.numerator() * (scale / value.denominator()));
++            if value.is_negative() {
++                -magnitude
++            } else {
++                magnitude
++            }
++        };
++        let mut common = BigUint::one();
++        for value in &rationals {
++            if !value.denominator().is_one() {
++                common = common.lcm(value.denominator());
++            }
++        }
++        let scale = lower.denominator().lcm(upper.denominator());
++        Some(Self {
++            coefficients: rationals
++                .iter()
++                .map(|value| integer(value, &common))
++                .collect(),
++            start: integer(lower, &scale),
++            end: integer(upper, &scale),
++            scale: BigInt::from(scale),
++        })
++    }
++}
++
++/// The sign shared by every entry, or `None` when an entry is zero or the
++/// signs differ.
++fn strict_common_sign(values: &[num::BigInt]) -> Option<RealSign> {
++    use num::Signed;
++    let mut strict_sign = None;
++    for entry in values {
++        let sign = if entry.is_positive() {
++            RealSign::Positive
++        } else if entry.is_negative() {
++            RealSign::Negative
++        } else {
++            return None;
++        };
++        match strict_sign {
++            Some(previous) if previous != sign => return None,
++            Some(_) => {}
++            None => strict_sign = Some(sign),
++        }
++    }
++    strict_sign
+ }
+ 
+ /// A strict sign of a rational polynomial over a rational interval from an
+@@ -3389,11 +3604,35 @@ pub(crate) fn strict_coefficients_sign_on_parameter_interval(
+ /// needs no basis change, so it settles comfortably separated values without
+ /// restricting wide coefficients to the interval. `None` when the enclosure
+ /// meets zero or an input is not an exact rational.
++///
++/// With the integer form of [`IntegerBracketPolynomial`], the running
++/// enclosure after the coefficient of `x^i` is `D q^(n - i)` times the
++/// rational one: each step multiplies by `[p, r] = q [lower, upper]` and adds
++/// `(D c_i) q^(n - i)`, so both decide alike.
+ fn rational_horner_interval_strict_sign(
+     coefficients: &[Real],
+     lower: &Real,
+     upper: &Real,
+ ) -> Option<RealSign> {
++    if !h13_experiment_rational_bernstein_disabled() {
++        let form = IntegerBracketPolynomial::new(coefficients, lower, upper)?;
++        let (leading, rest) = form.coefficients.split_last()?;
++        let (mut low, mut high) = (leading.clone(), leading.clone());
++        let mut power = num::BigInt::from(1_u8);
++        for coefficient in rest.iter().rev() {
++            power *= &form.scale;
++            let products = [
++                &low * &form.start,
++                &low * &form.end,
++                &high * &form.start,
++                &high * &form.end,
++            ];
++            let term = coefficient * &power;
++            low = products.iter().min().expect("four products") + &term;
++            high = products.iter().max().expect("four products") + &term;
++        }
++        return strict_common_sign(&[low, high]);
++    }
+     let lower = lower.exact_rational_ref()?;
+     let upper = upper.exact_rational_ref()?;
+     let (leading, rest) = coefficients.split_last()?;
+@@ -8360,3 +8599,151 @@ mod finite_interval_import_regression {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod rational_bernstein_sign_regression {
++    use super::*;
++
++    fn fraction(numerator: i64, denominator: i64) -> Real {
++        (Real::from(numerator) / Real::from(denominator)).unwrap()
++    }
++
++    /// The Bernstein decision through the exact rational basis change.
++    fn reference(coefficients: &[Real], lower: &Real, upper: &Real) -> Option<RealSign> {
++        univariate_unit_interval_strict_bernstein_sign(
++            &polynomial_restrict_to_interval(coefficients, lower, upper),
++            &CurveContext::STRICT,
++        )
++        .unwrap()
++    }
++
++    /// Interval Horner in exact `Real` arithmetic.
++    fn horner_reference(coefficients: &[Real], lower: &Real, upper: &Real) -> Option<RealSign> {
++        let (leading, rest) = coefficients.split_last()?;
++        let (mut low, mut high) = (leading.clone(), leading.clone());
++        let strict = |left: &Real, right: &Real| {
++            compare_reals(left, right, &CurveContext::STRICT).expect("exact rationals")
++        };
++        for coefficient in rest.iter().rev() {
++            let products = [&low * lower, &low * upper, &high * lower, &high * upper];
++            let mut minimum = products[0].clone();
++            let mut maximum = products[0].clone();
++            for product in &products[1..] {
++                if strict(product, &minimum) == Ordering::Less {
++                    minimum = product.clone();
++                }
++                if strict(product, &maximum) == Ordering::Greater {
++                    maximum = product.clone();
++                }
++            }
++            low = minimum + coefficient;
++            high = maximum + coefficient;
++        }
++        if strict(&low, &Real::zero()) == Ordering::Greater {
++            Some(RealSign::Positive)
++        } else if strict(&high, &Real::zero()) == Ordering::Less {
++            Some(RealSign::Negative)
++        } else {
++            None
++        }
++    }
++
++    #[test]
++    fn integer_bernstein_sign_decides_as_the_rational_basis_change() {
++        // Small rational polynomials, including zero and vanishing leading
++        // coefficients, on wide, narrow, negative and root-containing
++        // brackets with unrelated denominators.
++        let brackets = [
++            (fraction(-3, 2), fraction(5, 3)),
++            (fraction(0, 1), fraction(1, 1)),
++            (fraction(1, 3), fraction(1, 2)),
++            (fraction(-7, 5), fraction(-1, 7)),
++            (fraction(63, 64), fraction(127, 128)),
++            (fraction(1_000_001, 1_000_000), fraction(1_000_003, 1_000_000)),
++        ];
++        let mut decided = [0_usize; 2];
++        let mut horner_decided = [0_usize; 2];
++        for degree in 0..=7_i64 {
++            for salt in 0..24_i64 {
++                let coefficients: Vec<_> = (0..=degree)
++                    .map(|index| {
++                        let numerator = ((index * 7 + salt * 5 + 3) % 13) - 6;
++                        if (index + salt) % 5 == 0 {
++                            Real::zero()
++                        } else {
++                            fraction(numerator, (index + salt) % 4 + 1)
++                        }
++                    })
++                    .collect();
++                for (lower, upper) in &brackets {
++                    let expected = reference(&coefficients, lower, upper);
++                    let actual =
++                        rational_interval_strict_bernstein_sign(&coefficients, lower, upper)
++                            .expect("rational inputs take the integer route");
++                    assert_eq!(actual, expected, "{coefficients:?} on [{lower}, {upper}]");
++                    decided[usize::from(actual.is_some())] += 1;
++                    let horner = rational_horner_interval_strict_sign(&coefficients, lower, upper);
++                    assert_eq!(
++                        horner,
++                        horner_reference(&coefficients, lower, upper),
++                        "Horner {coefficients:?} on [{lower}, {upper}]"
++                    );
++                    horner_decided[usize::from(horner.is_some())] += 1;
++                }
++            }
++        }
++        // Both outcomes are exercised.
++        assert!(decided[0] > 0 && decided[1] > 0, "{decided:?}");
++        assert!(
++            horner_decided[0] > 0 && horner_decided[1] > 0,
++            "{horner_decided:?}"
++        );
++        // (x - 1/3)^2 + 2^-200 is positive near 1/3, but only a narrow bracket
++        // separates it; the zero polynomial never has a strict sign.
++        let tiny = Real::from(2_i8).powi_i64(-200).unwrap();
++        let near_square = [
++            &fraction(1, 9) + &tiny,
++            fraction(-2, 3),
++            Real::one(),
++        ];
++        for (lower, upper) in [
++            (fraction(0, 1), fraction(1, 1)),
++            (fraction(1, 3) - &tiny, fraction(1, 3) + &tiny),
++        ] {
++            assert_eq!(
++                rational_interval_strict_bernstein_sign(&near_square, &lower, &upper),
++                Some(reference(&near_square, &lower, &upper)),
++            );
++        }
++        assert_eq!(
++            rational_interval_strict_bernstein_sign(&near_square, &fraction(1, 3), &fraction(1, 3)),
++            Some(Some(RealSign::Positive)),
++        );
++        assert_eq!(
++            rational_interval_strict_bernstein_sign(
++                &[Real::zero(), Real::zero()],
++                &fraction(0, 1),
++                &fraction(1, 1)
++            ),
++            Some(None),
++        );
++        // Nonrational inputs decline to the exact basis change.
++        let root = Real::from(2_i8).sqrt().unwrap();
++        assert_eq!(
++            rational_interval_strict_bernstein_sign(
++                &[root.clone(), Real::one()],
++                &fraction(0, 1),
++                &fraction(1, 1)
++            ),
++            None,
++        );
++        assert_eq!(
++            rational_interval_strict_bernstein_sign(
++                &[Real::one(), Real::one()],
++                &fraction(0, 1),
++                &root
++            ),
++            None,
++        );
++    }
++}
+diff --git a/crates/hypercurve/src/rational_bezier_general.rs b/crates/hypercurve/src/rational_bezier_general.rs
+index aa8b9891a7..aeb6aa1497 100644
+--- a/crates/hypercurve/src/rational_bezier_general.rs
++++ b/crates/hypercurve/src/rational_bezier_general.rs
+@@ -5946,7 +5946,8 @@ pub(crate) fn resultant_parameter_projection(
+                             Classification::Decided(Some(value)) => BezierParameter2::Exact(value),
+                             Classification::Decided(None) => BezierParameter2::Algebraic(
+                                 BezierAlgebraicParameter2::from_certified_singleton(
+-                                    polynomial.clone(),
++                                    h15_source_factor(&polynomial, root.interval())
++                                        .unwrap_or_else(|| polynomial.clone()),
+                                     root.interval().clone(),
+                                 ),
+                             ),
+@@ -5970,6 +5971,49 @@ pub(crate) fn resultant_parameter_projection(
+     extend_resultant_parameter_projection(&polynomial, parameters, domain, policy)
+ }
+ 
++// TEMPORARY H15 EXPERIMENT (not for commit): a resultant root of the captured
++// degree-214 fillet-centre polynomial takes a factor read from a file when
++// that factor changes sign across the root's isolating interval. The factor
++// divides the polynomial exactly (checked offline), and the interval isolates
++// one simple root of the square-free product, so it isolates the same root of
++// the factor.
++fn h15_source_factor(
++    polynomial: &crate::BezierParameterPolynomial,
++    interval: &crate::BezierParameterInterval,
++) -> Option<crate::BezierParameterPolynomial> {
++    let path = std::env::var_os("HYPERCURVE_PROBE_H15_SOURCE_FACTOR")?;
++    if polynomial.coefficients().len() != 215 {
++        return None;
++    }
++    let text = std::fs::read_to_string(path).ok()?;
++    let coefficients: Vec<Real> = text
++        .split_whitespace()
++        .map(|value| {
++            value
++                .parse::<num::BigInt>()
++                .ok()
++                .map(|value| Real::new(HyperRational::from_bigint(value)))
++        })
++        .collect::<Option<Vec<_>>>()?;
++    let factor = crate::BezierParameterPolynomial::try_new_power_basis_with_policy(
++        coefficients,
++        &CurveContext::STRICT,
++    )
++    .ok()?;
++    let Classification::Decided(factor) = factor else {
++        return None;
++    };
++    let lower = real_sign(&factor.evaluate(interval.start()), &CurveContext::STRICT)?;
++    let upper = real_sign(&factor.evaluate(interval.end()), &CurveContext::STRICT)?;
++    let changes = lower != RealSign::Zero && upper != RealSign::Zero && lower != upper;
++    eprintln!(
++        "H15PROBE resultant root {} the degree-{} factor",
++        if changes { "uses" } else { "keeps the product, not" },
++        factor.coefficients().len() - 1
++    );
++    changes.then_some(factor)
++}
++
+ /// Returns the exact square-free part of an exactly rational polynomial.
+ fn rational_square_free_polynomial(
+     polynomial: &BezierParameterPolynomial,
+diff --git a/crates/hypersolve/benches/certification.rs b/crates/hypersolve/benches/certification.rs
+index 9e49e4040d..75faafef52 100644
+--- a/crates/hypersolve/benches/certification.rs
++++ b/crates/hypersolve/benches/certification.rs
+@@ -4752,6 +4752,32 @@ fn certification(c: &mut Criterion) {
+             })
+         },
+     );
++    // A product of two reduced field elements over a quartic source: axis
++    // degree 6 by 4, with rational coefficients of about 4,000 bits, as in
++    // the recursive-tower products of a long selected-root remainder.
++    let wide_axis_reduction = DenseTensorPolynomial::try_new(
++        vec![7, 4],
++        (0..28_i64)
++            .map(|index| {
++                let numerator = Real::from(2_i8)
++                    .powi_i64(4000 + 13 * index)
++                    .expect("a positive power of two")
++                    + r(index + 1);
++                (numerator / r(3 * index + 7)).expect("a nonzero denominator")
++            })
++            .collect(),
++    )
++    .unwrap();
++    let quartic_constraint = [r(1), r(0), r(-10), r(0), r(1)];
++    c.bench_function("dense_tensor_reduce_axis_modulo/wide_7x4", |b| {
++        b.iter(|| {
++            wide_axis_reduction.reduce_axis_modulo(
++                0,
++                &quartic_constraint,
++                hyperlimit::PredicatePolicy::STRICT,
++            )
++        })
++    });
+     let selected_sum_sources = [2_i64, 3, 5, 7].map(selected_square_root);
+     let selected_sum_relation = selected_sum_tensor(selected_sum_sources.len());
+     let selected_sum_interval = IsolatedRootInterval {
+diff --git a/crates/hypersolve/src/algebraic_fiber.rs b/crates/hypersolve/src/algebraic_fiber.rs
+index 0369cce17a..397a636827 100644
+--- a/crates/hypersolve/src/algebraic_fiber.rs
++++ b/crates/hypersolve/src/algebraic_fiber.rs
+@@ -4606,6 +4606,17 @@ impl LocalAlgebraicField {
+         if polynomial.len() < self.modulus().len() {
+             return Ok(polynomial);
+         }
++        // The remainder over Q is unique. Exact rational inputs reach it by
++        // integer pseudo-division, without normalizing a fraction at every
++        // elimination; it is returned trimmed, as the field division below.
++        if !crate::integer_interpolation::h14_experiment("H14_EXPERIMENT_LOCAL_FIELD_DIVISION")
++            && let Some(remainder) = crate::integer_interpolation::rational_polynomial_remainder_modulo(
++                &polynomial,
++                self.modulus(),
++            )
++        {
++            return Ok(remainder);
++        }
+         polynomial_div_rem(polynomial, self.modulus(), self.policy)
+             .map(|(_, remainder)| remainder)
+             .ok_or(LocalFieldError::Undecided)
+diff --git a/crates/hypersolve/src/integer_interpolation.rs b/crates/hypersolve/src/integer_interpolation.rs
+index 3bda805202..2d873b05bd 100644
+--- a/crates/hypersolve/src/integer_interpolation.rs
++++ b/crates/hypersolve/src/integer_interpolation.rs
+@@ -4,6 +4,22 @@ pub(crate) use bivariate::rational_fiber_subresultants;
+ use hyperreal::{Rational, Real};
+ use num::{BigInt, Integer, One, Signed, Zero};
+ 
++// TEMPORARY H14 EXPERIMENT TOGGLES (not for commit).
++pub(crate) fn h14_experiment(name: &'static str) -> bool {
++    use std::sync::OnceLock;
++    static NO_HORNER: OnceLock<bool> = OnceLock::new();
++    static KEEP_CONTENT: OnceLock<bool> = OnceLock::new();
++    static LOCAL_FIELD_DIVISION: OnceLock<bool> = OnceLock::new();
++    let cell = if name == "H14_EXPERIMENT_NO_HORNER" {
++        &NO_HORNER
++    } else if name == "H14_EXPERIMENT_LOCAL_FIELD_DIVISION" {
++        &LOCAL_FIELD_DIVISION
++    } else {
++        &KEEP_CONTENT
++    };
++    *cell.get_or_init(|| std::env::var_os(name).is_some())
++}
++
+ pub(crate) fn primitive_integer_polynomial(polynomial: &[Real]) -> Option<Vec<Real>> {
+     let rationals = polynomial
+         .iter()
+@@ -121,7 +137,11 @@ pub(crate) fn rational_polynomial_remainder_modulo(
+     if polynomial.is_empty() {
+         return None;
+     }
+-    let primitive = primitive_integer_coefficients(polynomial)?;
++    let primitive = if !h14_experiment("H14_EXPERIMENT_KEEP_CONTENT") {
++        integer_coefficients_over_common_denominator(polynomial)?
++    } else {
++        primitive_integer_coefficients(polynomial)?
++    };
+     let modulus = primitive_integer_coefficients(modulus)?;
+     if modulus.len() < 2 {
+         return None;
+@@ -787,6 +807,36 @@ fn is_prime(candidate: u64) -> bool {
+ /// Hyperreal already certifies primitive integer content; only canonical
+ /// degree and zero shape remain to be prepared here. Positive-leading GCD
+ /// output normalization belongs to `primitive_integer_part` instead.
++fn integer_coefficients_over_common_denominator(polynomial: &[Real]) -> Option<Vec<BigInt>> {
++    let rationals = polynomial
++        .iter()
++        .map(Real::exact_rational_ref)
++        .collect::<Option<Vec<_>>>()?;
++    let mut common = num::BigUint::one();
++    for value in &rationals {
++        let denominator = value.denominator();
++        if denominator.is_one() || *denominator == common {
++            continue;
++        }
++        let divisor = Rational::gcd_magnitudes(&common, denominator);
++        common = (common / divisor) * denominator;
++    }
++    Some(trim_integer_polynomial(
++        rationals
++            .iter()
++            .map(|value| {
++                let magnitude = value.numerator() * (&common / value.denominator());
++                let magnitude = BigInt::from(magnitude);
++                if value.is_negative() {
++                    -magnitude
++                } else {
++                    magnitude
++                }
++            })
++            .collect(),
++    ))
++}
++
+ fn primitive_integer_coefficients(polynomial: &[Real]) -> Option<Vec<BigInt>> {
+     let rationals = polynomial
+         .iter()
+@@ -1005,6 +1055,39 @@ mod tests {
+                 Some(ordinary_product_remainder(&left, &right, &modulus)),
+             );
+         }
++
++        #[test]
++        fn rational_remainder_modulo_matches_field_division_with_any_content(
++            polynomial in prop::collection::vec((-20_i64..=20, 1_u64..=17), 1..14),
++            modulus in prop::collection::vec((-20_i64..=20, 1_u64..=17), 2..7),
++            content_exponent in 0_u32..=300,
++        ) {
++            // The remainder is unique over Q, so a dividend that shares a
++            // large integer content must reduce exactly as field division
++            // does, whether or not that content is removed first.
++            prop_assume!(modulus.last().unwrap().0 != 0);
++            let values = |coefficients: Vec<(i64, u64)>| coefficients.into_iter()
++                .map(|(numerator, denominator)| rational(numerator, denominator)).collect::<Vec<_>>();
++            let content = Real::from(Rational::from_bigint(BigInt::from(6_u8).pow(content_exponent)));
++            let polynomial: Vec<_> = values(polynomial)
++                .into_iter()
++                .map(|coefficient| coefficient * &content)
++                .collect();
++            let modulus = values(modulus);
++            // Field division returns the trimmed remainder, with `[0]` for
++            // zero; local-field reduction relies on the same storage.
++            let expected = crate::root_isolation::polynomial_div_rem(
++                polynomial.clone(),
++                &modulus,
++                crate::PredicatePolicy::STRICT,
++            )
++            .unwrap()
++            .1;
++            prop_assert_eq!(
++                rational_polynomial_remainder_modulo(&polynomial, &modulus),
++                Some(expected),
++            );
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/hypersolve/src/ordered_field_roots.rs b/crates/hypersolve/src/ordered_field_roots.rs
+index 42fd5e6c24..4d39c7d22b 100644
+--- a/crates/hypersolve/src/ordered_field_roots.rs
++++ b/crates/hypersolve/src/ordered_field_roots.rs
+@@ -222,6 +222,40 @@ pub fn ordered_field_polynomial_sign_remainder<C: Clone, F: OrderedFieldPolynomi
+     } else {
+         modulus[degree].clone()
+     };
++    let schedule = if degree > 0
++        && polynomial.len().saturating_sub(degree) >= HORNER_REMAINDER_ELIMINATIONS
++        && !crate::integer_interpolation::h14_experiment("H14_EXPERIMENT_NO_HORNER")
++    {
++        horner_sign_remainder
++    } else {
++        eliminating_sign_remainder
++    };
++    schedule(
++        polynomial,
++        &modulus[..degree],
++        &positive_leading,
++        leading_sign,
++        field,
++    )
++    .map(Some)
++}
++
++/// The sign-preserving pseudo-remainder of `polynomial` by `modulus`,
++/// eliminating the dividend's leading term at each step.
++///
++/// `lower_modulus` holds the modulus coefficients below its leading one, and
++/// `positive_leading` is the absolute leading coefficient, whose sign is
++/// `leading_sign`. Each elimination multiplies every remaining coefficient by
++/// `positive_leading`.
++fn eliminating_sign_remainder<C: Clone, F: OrderedFieldPolynomialContext<C>>(
++    polynomial: &[C],
++    lower_modulus: &[C],
++    positive_leading: &C,
++    leading_sign: Ordering,
++    field: &mut F,
++) -> Result<Vec<C>, F::Error> {
++    let degree = lower_modulus.len();
++    let negative_one = Real::from(-1_i8);
+     let mut remainder = polynomial.to_vec();
+     while remainder.len() > degree {
+         let leading = remainder.pop().expect("an elimination has a leading term");
+@@ -232,16 +266,82 @@ pub fn ordered_field_polynomial_sign_remainder<C: Clone, F: OrderedFieldPolynomi
+             leading
+         };
+         for (power, coefficient) in remainder.iter_mut().enumerate() {
+-            let scaled = field.multiply(coefficient, &positive_leading)?;
++            let scaled = field.multiply(coefficient, positive_leading)?;
+             *coefficient = if power >= shift {
+-                let term = field.multiply(&subtract_leading, &modulus[power - shift])?;
++                let term = field.multiply(&subtract_leading, &lower_modulus[power - shift])?;
+                 field.add(&scaled, &term)?
+             } else {
+                 scaled
+             };
+         }
+     }
+-    Ok(Some(remainder))
++    Ok(remainder)
++}
++
++/// Eliminations from which [`ordered_field_polynomial_sign_remainder`]
++/// reduces the dividend's Horner sequence instead of scaling the whole
++/// dividend. With `k` eliminations by a modulus of degree `n`, scaling the
++/// dividend costs `2kn + k(k-1)/2` field products and the Horner schedule
++/// `k(2n+1)`; they agree at `k = 3`.
++const HORNER_REMAINDER_ELIMINATIONS: usize = 4;
++
++/// The sign-preserving pseudo-remainder of `polynomial` by `modulus`,
++/// computed along the dividend's Horner sequence.
++///
++/// `lower_modulus` holds the modulus coefficients below its leading one, and
++/// `positive_leading` is the absolute leading coefficient. Elimination by
++/// scaling the whole dividend multiplies every lower coefficient by
++/// `positive_leading` at each of its `k` steps. Here only `degree` running
++/// coefficients and one shared power `positive_leading^e` are kept: each
++/// step multiplies the running remainder by `x`, cancels its new leading
++/// term against the modulus, and adds the next dividend coefficient times
++/// the current power.
++///
++/// Both schedules are the same polynomial expression in the coefficients:
++/// in the generic coefficient ring, an integral domain, each equals the
++/// unique remainder of `positive_leading^k * polynomial` modulo the sign-
++/// adjusted modulus, so they agree after any specialization. A coefficient
++/// context whose ring operations return canonical normal forms therefore
++/// receives an identical remainder; any other context receives an equal one.
++fn horner_sign_remainder<C: Clone, F: OrderedFieldPolynomialContext<C>>(
++    polynomial: &[C],
++    lower_modulus: &[C],
++    positive_leading: &C,
++    leading_sign: Ordering,
++    field: &mut F,
++) -> Result<Vec<C>, F::Error> {
++    let degree = lower_modulus.len();
++    let negative_one = Real::from(-1_i8);
++    let reduced = polynomial.len() - degree;
++    let mut remainder = polynomial[reduced..].to_vec();
++    let mut power: Option<C> = None;
++    for coefficient in polynomial[..reduced].iter().rev() {
++        let leading = remainder
++            .last()
++            .expect("the running remainder has the modulus degree")
++            .clone();
++        let subtract_leading = if leading_sign == Ordering::Greater {
++            field.scale(&leading, &negative_one)?
++        } else {
++            leading
++        };
++        for index in (1..degree).rev() {
++            let scaled = field.multiply(&remainder[index - 1], positive_leading)?;
++            let term = field.multiply(&subtract_leading, &lower_modulus[index])?;
++            remainder[index] = field.add(&scaled, &term)?;
++        }
++        remainder[0] = field.multiply(&subtract_leading, &lower_modulus[0])?;
++        let power = match power.as_mut() {
++            Some(power) => {
++                *power = field.multiply(power, positive_leading)?;
++                power
++            }
++            None => power.insert(positive_leading.clone()),
++        };
++        let term = field.multiply(coefficient, power)?;
++        remainder[0] = field.add(&remainder[0], &term)?;
++    }
++    Ok(remainder)
+ }
+ 
+ /// Returns a greatest common divisor in the caller's exact coefficient field.
+@@ -913,6 +1013,173 @@ mod tests {
+         }
+     }
+ 
++    /// Exact rationals with a small deterministic spread of signs, sizes and
++    /// denominators.
++    fn sample(index: usize, salt: usize) -> Real {
++        let numerator = ((index * 7 + salt * 13 + 3) % 23) as i64 - 11;
++        fraction(numerator, (index % 3 + 1) as i64)
++    }
++
++    fn sample_modulus(degree: usize, gauge: i64) -> Vec<Real> {
++        let mut modulus: Vec<_> = (0..degree).map(|index| sample(index, 5)).collect();
++        modulus.push(fraction(gauge * (degree as i64 + 2), 3));
++        modulus
++    }
++
++    fn exact(values: &[Real]) -> Vec<hyperreal::Rational> {
++        values
++            .iter()
++            .map(|value| {
++                value
++                    .exact_rational_normal_form()
++                    .expect("rational arithmetic stays rational")
++            })
++            .collect()
++    }
++
++    #[test]
++    fn sign_remainder_schedules_return_the_same_coefficients() {
++        // Both schedules equal positive_leading^k * polynomial modulo the
++        // sign-adjusted modulus as polynomial expressions, so exact rational
++        // coefficients, whose forms are canonical, agree coefficientwise.
++        for degree in 1..=6 {
++            for gauge in [1, -1] {
++                let modulus = sample_modulus(degree, gauge);
++                let leading_sign = if gauge > 0 {
++                    Ordering::Greater
++                } else {
++                    Ordering::Less
++                };
++                let positive_leading = &modulus[degree] * Real::from(gauge);
++                for length in degree + 1..=degree + 16 {
++                    let mut polynomial: Vec<_> =
++                        (0..length).map(|index| sample(index, length)).collect();
++                    for trailing_zeros in [0, 2] {
++                        polynomial.extend((0..trailing_zeros).map(|_| Real::zero()));
++                        let arguments = (&modulus[..degree], &positive_leading, leading_sign);
++                        let horner = horner_sign_remainder(
++                            &polynomial,
++                            arguments.0,
++                            arguments.1,
++                            arguments.2,
++                            &mut RealContext,
++                        )
++                        .unwrap();
++                        let eliminating = eliminating_sign_remainder(
++                            &polynomial,
++                            arguments.0,
++                            arguments.1,
++                            arguments.2,
++                            &mut RealContext,
++                        )
++                        .unwrap();
++                        assert_eq!(horner.len(), degree);
++                        assert_eq!(exact(&horner), exact(&eliminating));
++                        let dispatched = ordered_field_polynomial_sign_remainder(
++                            &polynomial,
++                            &modulus,
++                            &mut RealContext,
++                        )
++                        .unwrap()
++                        .unwrap();
++                        assert_eq!(exact(&dispatched), exact(&eliminating));
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn horner_sign_remainder_proves_divisibility_of_a_long_dividend() {
++        // modulus * cofactor, with a nonmonic modulus of either sign, has the
++        // zero remainder; a unit residual keeps the remainder's sign at every
++        // root of the modulus, so its constant term has the residual's sign.
++        for gauge in [1, -1] {
++            let modulus = sample_modulus(3, gauge);
++            let cofactor: Vec<_> = (0..12).map(|index| sample(index, 2)).collect();
++            let mut product = vec![Real::zero(); modulus.len() + cofactor.len() - 1];
++            for (left_power, left) in modulus.iter().enumerate() {
++                for (right_power, right) in cofactor.iter().enumerate() {
++                    product[left_power + right_power] += left * right;
++                }
++            }
++            let remainder =
++                ordered_field_polynomial_sign_remainder(&product, &modulus, &mut RealContext)
++                    .unwrap()
++                    .unwrap();
++            assert_eq!(remainder.len(), 3);
++            assert!(exact(&remainder).iter().all(|value| value.is_zero()));
++            for residual in [1_i8, -1] {
++                let mut shifted = product.clone();
++                shifted[0] += Real::from(residual);
++                let remainder =
++                    ordered_field_polynomial_sign_remainder(&shifted, &modulus, &mut RealContext)
++                        .unwrap()
++                        .unwrap();
++                assert!(remainder[1..].iter().all(|value| value.definitely_zero()));
++                assert_eq!(
++                    remainder[0].partial_cmp(&Real::zero()),
++                    Real::from(residual).partial_cmp(&Real::zero())
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn long_dividend_sign_remainder_keeps_only_the_modulus_degree_running() {
++        // The degree-192 rational dividend and degree-6 modulus of the
++        // chamfered bevel stroke's endpoint equality: k = 187 eliminations.
++        // Scaling the whole dividend at each one costs 2kn + k(k-1)/2 =
++        // 19,635 field products; the Horner schedule costs k(2n+1) - 1.
++        #[derive(Default)]
++        struct CountingContext {
++            products: usize,
++        }
++        impl OrderedFieldPolynomialContext<Real> for CountingContext {
++            type Error = ();
++            fn constant(&mut self, value: &Real) -> Result<Real, ()> {
++                Ok(value.clone())
++            }
++            fn add(&mut self, left: &Real, right: &Real) -> Result<Real, ()> {
++                Ok(left + right)
++            }
++            fn multiply(&mut self, left: &Real, right: &Real) -> Result<Real, ()> {
++                self.products += 1;
++                Ok(left * right)
++            }
++            fn scale(&mut self, value: &Real, scale: &Real) -> Result<Real, ()> {
++                Ok(value * scale)
++            }
++            fn normalize_positive_scale(&mut self, _: &mut [Real]) {}
++            fn sign(&mut self, value: &Real) -> Result<Ordering, ()> {
++                value.partial_cmp(&Real::zero()).ok_or(())
++            }
++            fn sign_if_separated(&mut self, value: &Real) -> Result<Option<Ordering>, ()> {
++                self.sign(value).map(Some)
++            }
++        }
++        let modulus = sample_modulus(6, -1);
++        let polynomial: Vec<_> = (0..=192).map(|index| sample(index, 1)).collect();
++        let mut counting = CountingContext::default();
++        let remainder =
++            ordered_field_polynomial_sign_remainder(&polynomial, &modulus, &mut counting)
++                .unwrap()
++                .unwrap();
++        assert_eq!(remainder.len(), 6);
++        assert_eq!(counting.products, 187 * 13 - 1);
++        let mut eliminating = CountingContext::default();
++        let expected = eliminating_sign_remainder(
++            &polynomial,
++            &modulus[..6],
++            &(&modulus[6] * Real::from(-1)),
++            Ordering::Less,
++            &mut eliminating,
++        )
++        .unwrap();
++        assert_eq!(eliminating.products, 2 * 187 * 6 + 187 * 186 / 2);
++        assert_eq!(exact(&remainder), exact(&expected));
++    }
++
+     #[test]
+     fn sign_remainder_preserves_nonmonic_relations_without_division() {
+         let radical = Real::from(2_i8).sqrt().unwrap();
+diff --git a/crates/hypersolve/src/represented_root.rs b/crates/hypersolve/src/represented_root.rs
+index bd95aa0dd3..7bf8244963 100644
+--- a/crates/hypersolve/src/represented_root.rs
++++ b/crates/hypersolve/src/represented_root.rs
+@@ -2230,20 +2230,25 @@ pub fn dense_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+         );
+         return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+     };
++    let probe_sign_start = std::time::Instant::now();
+     let rational_sign = dense_polynomial_tuple_sign(&rational, sources, policy)?;
+     let radical_sign = dense_polynomial_tuple_sign(&radical, sources, policy)?;
++    h13_probe::add(&h13_probe::SIGN_NS, probe_sign_start);
+     if let (Classification::Decided(rational_sign), Classification::Decided(radical_sign)) =
+         (&rational_sign, &radical_sign)
+         && let Some(sign) = same_positive_root_sheet_signs(*rational_sign, *radical_sign)
+     {
+         return Ok(Classification::Decided(sign));
+     }
+-    let Some(magnitude) = (|| {
++    let probe_expansion_start = std::time::Instant::now();
++    let magnitude = (|| {
+         let rational_squared = reduce(rational.multiply(&rational)?)?;
+         let radical_squared = reduce(radical.multiply(&radical)?)?;
+         let radical_squared = reduce(radical_squared.multiply(&radicand)?)?;
+         reduce(rational_squared.subtract(&radical_squared)?)
+-    })() else {
++    })();
++    h13_probe::add(&h13_probe::EXPANSION_NS, probe_expansion_start);
++    let Some(magnitude) = magnitude else {
+         #[cfg(feature = "dispatch-trace")]
+         hyperreal::dispatch_trace::record(
+             "hypersolve",
+@@ -2252,7 +2257,10 @@ pub fn dense_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+         );
+         return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+     };
++    let probe_sign_start = std::time::Instant::now();
+     let magnitude_sign = dense_polynomial_tuple_sign(&magnitude, sources, policy)?;
++    h13_probe::add(&h13_probe::SIGN_NS, probe_sign_start);
++    h13_probe::report();
+     Ok(positive_root_sum_sign_from_components(
+         rational_sign,
+         radical_sign,
+@@ -2317,7 +2325,8 @@ pub fn dense_two_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+     {
+         return Ok(Classification::Decided(sign));
+     }
+-    let Some(norm_rational) = (|| {
++    let probe_two_start = std::time::Instant::now();
++    let norm_rational = (|| {
+         let rational_squared = reduce(expression.rational.multiply(&expression.rational)?)?;
+         let first_squared = reduce(expression.first.multiply(&expression.first)?)?;
+         let first_squared = reduce(first_squared.multiply(&first_speed_squared)?)?;
+@@ -2328,7 +2337,8 @@ pub fn dense_two_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+         let candidate_squared = reduce(second_squared.add(&product_squared)?)?;
+         let candidate_squared = reduce(candidate_squared.multiply(&second_speed_squared)?)?;
+         reduce(retained_squared.subtract(&candidate_squared)?)
+-    })() else {
++    })();
++    let Some(norm_rational) = norm_rational else {
+         #[cfg(feature = "dispatch-trace")]
+         hyperreal::dispatch_trace::record(
+             "hypersolve",
+@@ -2337,7 +2347,7 @@ pub fn dense_two_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+         );
+         return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+     };
+-    let Some(norm_radical) = (|| {
++    let norm_radical = (|| {
+         let retained_product = reduce(expression.rational.multiply(&expression.first)?)?;
+         let candidate_product = reduce(expression.second.multiply(&expression.product)?)?;
+         let candidate_product = reduce(candidate_product.multiply(&second_speed_squared)?)?;
+@@ -2346,7 +2356,9 @@ pub fn dense_two_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+                 .subtract(&candidate_product)?
+                 .scale(&Real::from(2_i8))?,
+         )
+-    })() else {
++    })();
++    h13_probe::add(&h13_probe::TWO_ROOT_EXPANSION_NS, probe_two_start);
++    let Some(norm_radical) = norm_radical else {
+         #[cfg(feature = "dispatch-trace")]
+         hyperreal::dispatch_trace::record(
+             "hypersolve",
+@@ -2498,3 +2510,35 @@ pub fn dense_two_positive_square_root_sum_sign_at_projected_zero<C: SelectedAlge
+         RealSign::Zero => RealSign::Zero,
+     }))
+ }
++
++// TEMPORARY H13 PROBE (not for commit).
++pub(crate) mod h13_probe {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    pub(crate) static SIGN_NS: AtomicU64 = AtomicU64::new(0);
++    pub(crate) static EXPANSION_NS: AtomicU64 = AtomicU64::new(0);
++    pub(crate) static TWO_ROOT_EXPANSION_NS: AtomicU64 = AtomicU64::new(0);
++    static LAST_REPORT_NS: AtomicU64 = AtomicU64::new(0);
++    pub(crate) fn add(counter: &AtomicU64, start: std::time::Instant) {
++        counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
++    }
++    pub(crate) fn report() {
++        if std::env::var_os("HYPERSOLVE_PROBE_H13").is_none() {
++            return;
++        }
++        let sign = SIGN_NS.load(Ordering::Relaxed);
++        let expansion = EXPANSION_NS.load(Ordering::Relaxed);
++        let two = TWO_ROOT_EXPANSION_NS.load(Ordering::Relaxed);
++        let total = sign + expansion + two;
++        let last = LAST_REPORT_NS.load(Ordering::Relaxed);
++        if total.saturating_sub(last) < 5_000_000_000 {
++            return;
++        }
++        LAST_REPORT_NS.store(total, Ordering::Relaxed);
++        eprintln!(
++            "H13PROBE cumulative: leaf signs {:.1} s, one-radical magnitude expansion {:.1} s, two-radical norm expansion {:.1} s",
++            sign as f64 * 1e-9,
++            expansion as f64 * 1e-9,
++            two as f64 * 1e-9
++        );
++    }
++}

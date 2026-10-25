@@ -1,0 +1,53 @@
+diff --git a/tests/exact_profile_sweeps.rs b/tests/exact_profile_sweeps.rs
+index 7cf37fe24f..6a0233b8c9 100644
+--- a/tests/exact_profile_sweeps.rs
++++ b/tests/exact_profile_sweeps.rs
+@@ -417,6 +417,48 @@ fn partial_revolution_at_negative_radius_is_outward_oriented() {
+     }
+ }
+ 
++/// A disjoint positive-radius component cannot change the negative component's
++/// angular lattice. For three slices the negative outer triangle reaches x=-2,
++/// while the reflected positive triangle reaches only x=-1. Thus (-3/2,1/2,0)
++/// is an independent interior witness for the authored negative meridian.
++#[test]
++fn full_revolution_preserves_each_disjoint_components_authored_meridian() {
++    let negative = rectangle(&int(-2), &int(0), &int(-1), &int(1));
++    let positive = rectangle(&int(1), &int(2), &int(2), &int(3));
++    for segments in [3, 5, 6] {
++        for reversed in [false, true] {
++            let (alone, _) = exact_solid(
++                curve::revolve(
++                    &region(std::slice::from_ref(&negative), &[], reversed),
++                    int(360),
++                    segments,
++                    &GeometryContext::STRICT,
++                ),
++                "negative component alone",
++            );
++            let (combined, _) = exact_solid(
++                curve::revolve(
++                    &region(&[negative.clone(), positive.clone()], &[], reversed),
++                    int(360),
++                    segments,
++                    &GeometryContext::STRICT,
++                ),
++                "disjoint signed components",
++            );
++            let witness = Point3::new(q(-3, 2), q(1, 2), Real::zero());
++            for mesh in [&alone, &combined] {
++                let contained = mesh.contains_point(&STRICT_MESH, &witness).unwrap();
++                assert_eq!(contained.certainty, MeshCertainty::Certified);
++                assert!(contained.value, "lost negative meridian at N={segments}");
++            }
++            assert!(
++                alone.positions.iter().all(|point| contains_point(&combined, point)),
++                "unrelated component changed the angular lattice at N={segments}"
++            );
++        }
++    }
++}
++
+ #[test]
+ fn revolution_profile_crossing_the_axis_is_invalid_input() {
+     let points = rectangle(&q(-1, 3), &Real::zero(), &q(1, 3), &Real::one());
