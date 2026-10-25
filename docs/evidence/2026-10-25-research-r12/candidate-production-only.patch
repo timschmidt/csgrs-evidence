@@ -1,0 +1,104 @@
+--- a/crates/hypercurve/src/bezier_region/offset_joins.rs
++++ b/crates/hypercurve/src/bezier_region/offset_joins.rs
+@@ -179,17 +179,12 @@
+     else {
+         return Ok(Classification::Decided(false));
+     };
+-    match curve_tangent_cross_sign(previous_tangent, next_tangent, policy) {
+-        Classification::Decided(RealSign::Positive | RealSign::Negative) => {
+-            Ok(Classification::Decided(false))
+-        }
+-        Classification::Decided(RealSign::Zero) => Ok(curve_tangents_are_opposite(
+-            previous_tangent,
+-            next_tangent,
+-            policy,
+-        )),
+-        Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+-    }
++    // The opposition query already rejects a nonzero or unresolved cross.
++    Ok(curve_tangents_are_opposite(
++        previous_tangent,
++        next_tangent,
++        policy,
++    ))
+ }
+ 
+ pub(super) fn exact_offset_band_connector(
+@@ -3296,6 +3291,39 @@
+     second: &CurveTangent2,
+     policy: &CurveContext,
+ ) -> Classification<bool> {
++    if let (
++        CurveTangent2::RetainedParallel {
++            parallel,
++            parameter,
++            source_direction,
++            ..
++        },
++        CurveTangent2::RepresentedDirection(vector),
++    )
++    | (
++        CurveTangent2::RepresentedDirection(vector),
++        CurveTangent2::RetainedParallel {
++            parallel,
++            parameter,
++            source_direction,
++            ..
++        },
++    ) = (first, second)
++    {
++        // This pair kernel inherently produces cross and dot together.
++        // Oppositeness needs only whether cross is zero, so swapping the
++        // normalized pair order leaves this decision unchanged.
++        let relation = exact_retained_parallel_tangent_cross_and_dot_vector(
++            parallel,
++            parameter,
++            *source_direction,
++            vector,
++            policy,
++        );
++        return exact_offset_tangent_relation_is_opposite(
++            relation.map(|(cross, dot)| (cross, Some(dot))),
++        );
++    }
+     match curve_tangent_cross_sign(first, second, policy) {
+         Classification::Decided(RealSign::Negative | RealSign::Positive) => {
+             return Classification::Decided(false);
+@@ -3319,37 +3347,6 @@
+                 None => Classification::Uncertain(UncertaintyReason::RealSign),
+             }
+         }
+-        (
+-            CurveTangent2::RetainedParallel {
+-                parallel,
+-                parameter,
+-                source_direction,
+-                ..
+-            },
+-            CurveTangent2::RepresentedDirection(vector),
+-        )
+-        | (
+-            CurveTangent2::RepresentedDirection(vector),
+-            CurveTangent2::RetainedParallel {
+-                parallel,
+-                parameter,
+-                source_direction,
+-                ..
+-            },
+-        ) => match exact_retained_parallel_tangent_cross_and_dot_vector(
+-            parallel,
+-            parameter,
+-            *source_direction,
+-            vector,
+-            policy,
+-        ) {
+-            Classification::Decided((_, RealSign::Negative)) => Classification::Decided(true),
+-            Classification::Decided((_, RealSign::Positive)) => Classification::Decided(false),
+-            Classification::Decided((_, RealSign::Zero)) => {
+-                Classification::Uncertain(UncertaintyReason::Boundary)
+-            }
+-            Classification::Uncertain(reason) => Classification::Uncertain(reason),
+-        },
+         (
+             CurveTangent2::RetainedParallel {
+                 parallel: first_parallel,
