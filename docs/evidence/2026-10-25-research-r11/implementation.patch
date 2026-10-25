@@ -1,0 +1,256 @@
+diff --git a/crates/hypercurve/src/bezier_region.rs b/crates/hypercurve/src/bezier_region.rs
+index 486f01f78f..2108b788af 100644
+--- a/crates/hypercurve/src/bezier_region.rs
++++ b/crates/hypercurve/src/bezier_region.rs
+@@ -2959,6 +2959,63 @@ impl CurveRegion2 {
+         Ok(self)
+     }
+ 
++    /// Replace each loop by a proved equivalent directed boundary image.
++    ///
++    /// The producer must certify every local rewrite (including forward
++    /// direction, not just collinearity) and preserve cyclic connectivity.
++    /// Source indices make the one-to-one, order-preserving correspondence
++    /// explicit: removing or reordering a loop needs a different proof.
++    /// Only strict source topology and strict rewrites transport cached roles;
++    /// a terminal-dependent rewrite retains the existing uncached result path.
++    pub(crate) fn with_rewritten_loop_images(
++        &self,
++        replacements: impl ExactSizeIterator<Item = (usize, CurveRegionBoundaryLoop2)>,
++        policy: &CurveContext,
++    ) -> CurveResult<Self> {
++        if replacements.len() != self.len() {
++            return Err(CurveError::Topology(
++                "loop-image rewrite must preserve every source loop index".into(),
++            ));
++        }
++        let mut preserves_indices = true;
++        // An enumerated boundary Vec can reuse its allocation while making
++        // the correspondence explicit; no parallel copy of all loops is needed.
++        let boundaries = replacements
++            .enumerate()
++            .map(|(index, (source, boundary))| {
++                preserves_indices &= index == source;
++                boundary
++            })
++            .collect();
++        if !preserves_indices {
++            return Err(CurveError::Topology(
++                "loop-image rewrite must preserve every source loop index".into(),
++            ));
++        }
++        // Replay the source dependency before publishing new normalization.
++        // In particular, a qualified source cannot become strict merely
++        // because the local line merges needed no additional predicates.
++        if !self.has_regularized_filled_left_topology(policy) {
++            return Err(CurveError::Topology(
++                "loop-image rewrite requires admissible normalized source topology".into(),
++            ));
++        }
++        let strict = !policy.is_edge_preview()
++            && policy.retained_object_policy() == policy.strict_counterpart()
++            && self.data.normalized_policy() == Some(policy.strict_counterpart());
++        let mut rewritten = Self::new(boundaries)?.with_regularized_filled_left_topology(policy)?;
++        if strict && let Some(roles) = &self.data.certified_loop_roles {
++            rewritten.data_mut_for_construction().certified_loop_roles = Some(roles.clone());
++            #[cfg(feature = "dispatch-trace")]
++            hyperreal::dispatch_trace::record(
++                "hypercurve",
++                "curve-region-loop-role-transport",
++                "strict-directed-images",
++            );
++        }
++        Ok(rewritten)
++    }
++
+     /// Publishes all-material roles when conservative loop boxes prove that
+     /// no retained boundary can nest another one.
+     ///
+diff --git a/crates/hypercurve/src/bezier_region/tests.rs b/crates/hypercurve/src/bezier_region/tests.rs
+index ad4b3defd5..67dc7a968f 100644
+--- a/crates/hypercurve/src/bezier_region/tests.rs
++++ b/crates/hypercurve/src/bezier_region/tests.rs
+@@ -14222,6 +14222,168 @@ fn retained_parallel_offset_preserves_algebraic_cusp_partition() {
+     }
+ }
+ 
++fn loop_rewrite_fixture() -> CurveRegion2 {
++    let policy = CurveContext::STRICT;
++    let boundaries = [0, 10]
++        .into_iter()
++        .enumerate()
++        .map(|(loop_index, x)| {
++            let points = [p(x, 0), p(x + 2, 0), p(x + 2, 2), p(x, 2)];
++            let fragments = points
++                .iter()
++                .zip(points.iter().cycle().skip(1))
++                .map(|(start, end)| BezierSplitFragment2::Materialized {
++                    start: BezierParameter2::Exact(Real::zero()),
++                    end: BezierParameter2::Exact(Real::one()),
++                    curve: BezierSubcurve2::Quadratic(QuadraticBezier2::from_line_segment(
++                        LineSeg2::try_new(start.clone(), end.clone()).unwrap(),
++                    )),
++                })
++                .collect();
++            CurveRegionBoundaryLoop2::try_new_from_certified_arrangement_chain(
++                fragments,
++                (0..4)
++                    .map(|index| {
++                        let source = 4 * loop_index + index;
++                        CurveRegionFragmentSource2::new(source, source, index)
++                    })
++                    .collect(),
++                &policy,
++            )
++            .unwrap()
++        })
++        .collect();
++    // Two independently specified, disjoint counterclockwise squares.
++    CurveRegion2::new(boundaries)
++        .unwrap()
++        .with_regularized_filled_left_topology(&policy)
++        .unwrap()
++        .with_certified_all_material_loop_roles(2)
++        .unwrap()
++}
++
++#[test]
++fn loop_image_rewrite_rejects_removed_or_reordered_correspondence() {
++    let source = loop_rewrite_fixture();
++    let boundaries = source.boundary_loops();
++    for replacement in [
++        vec![(0, boundaries[0].clone())],
++        vec![(1, boundaries[1].clone()), (0, boundaries[0].clone())],
++        vec![(0, boundaries[0].clone()), (0, boundaries[1].clone())],
++    ] {
++        assert!(matches!(
++            source.with_rewritten_loop_images(replacement.into_iter(), &CurveContext::STRICT),
++            Err(CurveError::Topology(_))
++        ));
++    }
++    assert_eq!(source.loop_role_counts().unwrap(), (2, 0));
++    assert_eq!(source.filled_area().unwrap(), Some(Real::from(8)));
++}
++
++#[test]
++fn loop_image_rewrite_keeps_strict_proofs_under_both_policies() {
++    let source = loop_rewrite_fixture();
++    for policy in [
++        CurveContext::STRICT,
++        CurveContext::APPROXIMATE_512,
++        CurveContext::STRICT,
++    ] {
++        let outcome = resolve_certified_operation(&policy, |attempt| {
++            source.with_rewritten_loop_images(
++                source.boundary_loops().to_vec().into_iter().enumerate(),
++                attempt,
++            )
++        })
++        .unwrap();
++        assert_eq!(outcome.certainty, CurveCertainty::Certified);
++        let rewritten = outcome.value;
++        assert_eq!(
++            rewritten.data.normalized_policy(),
++            Some(CurveContext::STRICT)
++        );
++        assert!(Arc::ptr_eq(
++            source.data.certified_loop_roles.as_ref().unwrap(),
++            rewritten.data.certified_loop_roles.as_ref().unwrap(),
++        ));
++        assert_eq!(rewritten.loop_role_counts().unwrap(), (2, 0));
++        assert_eq!(rewritten.filled_area().unwrap(), Some(Real::from(8)));
++        for (before, after) in source
++            .boundary_loops()
++            .iter()
++            .zip(rewritten.boundary_loops())
++        {
++            assert_eq!(before.arrangement_sources(), after.arrangement_sources());
++            assert_eq!(before.fragments(), after.fragments());
++        }
++    }
++}
++
++#[test]
++fn loop_image_rewrite_cannot_upgrade_source_or_rewrite_dependencies() {
++    let source = loop_rewrite_fixture();
++    let approximate = CurveContext::APPROXIMATE_512;
++    let qualified = resolve_certified_operation(&approximate, |attempt| {
++        // Inject a consumed terminal to isolate the transport's dependency
++        // contract; public Boolean tests exercise actual terminal predicates.
++        attempt.observe_approximate_512();
++        source.with_rewritten_loop_images(
++            source.boundary_loops().to_vec().into_iter().enumerate(),
++            attempt,
++        )
++    })
++    .unwrap();
++    assert_eq!(qualified.certainty, CurveCertainty::Approximate512Consumed);
++    assert!(qualified.value.data.certified_loop_roles.is_none());
++    assert_eq!(qualified.value.data.normalized_policy(), Some(approximate));
++    for _ in 0..2 {
++        let replay = resolve_certified_operation(&approximate, |attempt| {
++            qualified.value.with_rewritten_loop_images(
++                qualified
++                    .value
++                    .boundary_loops()
++                    .to_vec()
++                    .into_iter()
++                    .enumerate(),
++                attempt,
++            )
++        })
++        .unwrap();
++        assert_eq!(replay.certainty, CurveCertainty::Approximate512Consumed);
++        assert!(replay.value.data.certified_loop_roles.is_none());
++        assert_eq!(replay.value.data.normalized_policy(), Some(approximate));
++        assert!(
++            qualified
++                .value
++                .with_rewritten_loop_images(
++                    qualified
++                        .value
++                        .boundary_loops()
++                        .to_vec()
++                        .into_iter()
++                        .enumerate(),
++                    &CurveContext::STRICT,
++                )
++                .is_err()
++        );
++    }
++    let raw = CurveRegion2::new(source.boundary_loops().to_vec()).unwrap();
++    assert!(
++        raw.with_rewritten_loop_images(
++            raw.boundary_loops().to_vec().into_iter().enumerate(),
++            &CurveContext::STRICT,
++        )
++        .is_err()
++    );
++    assert!(
++        source
++            .with_rewritten_loop_images(
++                source.boundary_loops().to_vec().into_iter().enumerate(),
++                &CurveContext::STRICT,
++            )
++            .is_ok()
++    );
++}
++
+ #[test]
+ fn regularized_analytic_loop_roles_follow_exact_nesting() {
+     fn analytic_loop(
+diff --git a/crates/hypercurve/src/curve_region_boolean.rs b/crates/hypercurve/src/curve_region_boolean.rs
+index fae571afc5..c7fb28f42d 100644
+--- a/crates/hypercurve/src/curve_region_boolean.rs
++++ b/crates/hypercurve/src/curve_region_boolean.rs
+@@ -3809,8 +3809,8 @@ impl<'a> CurveRegionBooleanContext<'a> {
+         if !changed {
+             return Ok(region);
+         }
+-        CurveRegion2::new(boundaries)
+-            .and_then(|region| region.with_regularized_filled_left_topology(&self.data.policy))
++        region
++            .with_rewritten_loop_images(boundaries.into_iter().enumerate(), &self.data.policy)
+             .map_err(|cause| self.invalid(0, cause))
+     }
+ 
