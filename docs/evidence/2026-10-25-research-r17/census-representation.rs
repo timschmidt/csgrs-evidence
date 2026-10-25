@@ -1,0 +1,1151 @@
+/// Computable approximation of a Real number.
+///
+/// This is a demand-driven exact-real representation: every node can produce an
+/// integer approximation at a requested binary precision, and caches store only
+/// approximations and exact reductions proven for that node.
+///
+/// With `serde`, decoding rejects out-of-domain exact rational arguments to
+/// partial functions and known violations of stored kernel parameter ranges.
+/// This includes defined rational arithmetic recognized by the bounded shared
+/// evaluator, and symbolic identities that contradict a required domain.
+/// Conditional identities can reject a graph but never certify its value.
+/// An inconclusive proof leaves the domain unproved; decoding does not validate
+/// arbitrary expression domains or refine an operand to decide them, matching
+/// the unchecked native constructors. Valid expression graphs are preserved.
+/// A [`Real`](crate::Real) is the checked carrier: its import also proves
+/// every operand domain, as described at [`Real::from_json`](crate::Real::from_json).
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg(not(verus_keep_ghost))]
+pub struct Computable {
+    pub(super) internal: Arc<Node>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) signal: Option<Signal>,
+}
+
+/// Immutable expression and its shared, synchronized accelerator state.
+/// Keeping these in one allocation makes a `Computable` clone one pointer and
+/// one atomic reference-count update instead of two of each.
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize), serde(transparent))]
+#[cfg(not(verus_keep_ghost))]
+pub(super) struct Node {
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    facts: AtomicFacts,
+    approximation: Approximation,
+    #[cfg_attr(feature = "serde", serde(skip, default))]
+    cache: EvaluationCache,
+}
+
+#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Preserve the transparent wire representation and default cache state.
+        // Replay this bounded proof from the expression itself so a subsequent
+        // bounded reducer can consume it without first warming a numeric cache.
+        let approximation = Approximation::deserialize(deserializer)?;
+        Self::check_serialized_rational_domain(&approximation).map_err(serde::de::Error::custom)?;
+        Self::check_serialized_kernel_parameters(&approximation)
+            .map_err(serde::de::Error::custom)?;
+        let facts = AtomicFacts::default();
+        if let Approximation::PrescaledSin(argument) | Approximation::PrescaledTan(argument) =
+            &approximation
+            && let Some(sign) = argument.reduced_pi_multiple_sign()
+        {
+            facts.replace_exact_sign(ExactSignCache::Valid(sign));
+        }
+        Ok(Self {
+            facts,
+            approximation,
+            cache: EvaluationCache::default(),
+        })
+    }
+}
+
+#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+impl Node {
+    fn serialized_argument_violates(
+        value: &Computable,
+        invalid: impl Fn(&Rational) -> bool,
+    ) -> bool {
+        // Preserve existing exact proofs, including large rational leaves.
+        // The bounded fallback checks every operand and inverse denominator;
+        // unlike general algebraic cancellation, it never erases an opaque
+        // child's unresolved domain obligation, even under a zero factor.
+        if let Some(rational) = value
+            .exact_rational()
+            .or_else(|| value.bounded_defined_rational())
+        {
+            return invalid(&rational);
+        }
+        // For rejection only, assume opaque dependencies denote reals and
+        // ask whether the existing quotient proof contradicts the domain.
+        // No conditional value/sign is published, including when it happens
+        // to satisfy this domain: that does not prove its dependencies valid.
+        value.bounded_domain_contradiction(invalid)
+    }
+
+    fn check_serialized_kernel_parameters(
+        approximation: &Approximation,
+    ) -> Result<(), &'static str> {
+        // These variants store a reduced argument, not an arbitrary argument
+        // to the corresponding total trigonometric function. Reuse the native
+        // constructor's classification before accepting its range-dependent
+        // sign facts and approximation bounds. Preserve the supplied graph.
+        let invalid = match approximation {
+            Approximation::PrescaledCosRational(r)
+            | Approximation::PrescaledSinRational(r)
+            | Approximation::PrescaledTanRational(r) => r.msd_exact().is_some_and(|msd| msd >= 0),
+            Approximation::PrescaledCosHalfPiMinusRational(r)
+            | Approximation::PrescaledSinHalfPiMinusRational(r)
+            | Approximation::PrescaledCotHalfPiMinusRational(r) => {
+                r.sign() != Sign::Plus
+                    || Computable::exact_rational_half_pi_shortcut_magnitude(r).is_none()
+            }
+            Approximation::SincSmall(argument) | Approximation::CoscSmall(argument) => {
+                if Self::serialized_argument_violates(argument, |rational| {
+                    let limit = Rational::fraction(3, 4).expect("nonzero constant denominator");
+                    rational.compare_magnitude(&limit) == Ordering::Greater
+                }) {
+                    true
+                } else if let Approximation::Constant(constant) = &argument.internal.approximation {
+                    // A certified MSD >= 0 proves |x| >= 1 > 3/4. Inspect only
+                    // these trusted constants; do not refine an untrusted
+                    // expression or mistake a planning estimate for a proof.
+                    constant
+                        .bound_info()
+                        .known_msd()
+                        .flatten()
+                        .is_some_and(|msd| msd >= 0)
+                } else {
+                    // General expression domain/range admission remains open.
+                    false
+                }
+            }
+            _ => false,
+        };
+        if invalid {
+            Err("Computable argument violates its stored kernel range")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_serialized_rational_domain(approximation: &Approximation) -> Result<(), &'static str> {
+        // Children have already passed the same check while decoding. Reject
+        // an undefined child before a parent can hide it with multiplication
+        // by zero, cancellation, or an outer Real scale. An inconclusive
+        // bounded rational proof must not reject a valid graph.
+        let outside_closed_unit = |r: &Rational| r < &-Rational::one() || r > &Rational::one();
+        let outside_open_unit = |r: &Rational| r <= &-Rational::one() || r >= &Rational::one();
+        let outside_positive_unit = |r: &Rational| r.sign() == Sign::Minus || r > &Rational::one();
+        let invalid = match approximation {
+            Approximation::Inverse(value) | Approximation::PrescaledCot(value) => {
+                Self::serialized_argument_violates(value, |r| r.sign() == Sign::NoSign)
+            }
+            Approximation::Sqrt(value) | Approximation::NthRoot(value, _) => {
+                Self::serialized_argument_violates(value, |r| r.sign() == Sign::Minus)
+            }
+            Approximation::PrescaledLn(value) => {
+                Self::serialized_argument_violates(value, |r| r <= &-Rational::one())
+            }
+            // These variants store x for ln(1+x), not the logarithm's input.
+            Approximation::PrescaledLnRational(r)
+            | Approximation::BinaryScaledLnRational { residual: r, .. } => r <= &-Rational::one(),
+            Approximation::IntegralAtan(denominator) => denominator.is_zero(),
+            Approximation::AsinRational(r) => outside_closed_unit(r),
+            Approximation::PrescaledAsin(value) | Approximation::AsinDeferred(value) => {
+                Self::serialized_argument_violates(value, outside_closed_unit)
+            }
+            // Both rational endpoint variants store an absolute argument.
+            Approximation::AcosPositiveRational(r) | Approximation::AcosNegativeRational(r) => {
+                outside_positive_unit(r)
+            }
+            Approximation::AcosPositive(value) => {
+                Self::serialized_argument_violates(value, outside_positive_unit)
+            }
+            Approximation::AtanhRational(r) => outside_open_unit(r),
+            Approximation::PrescaledAtanh(value) | Approximation::AtanhDirect(value) => {
+                Self::serialized_argument_violates(value, outside_open_unit)
+            }
+            Approximation::AcoshNearOne(value) | Approximation::AcoshDirect(value) => {
+                Self::serialized_argument_violates(value, |r| r < &Rational::one())
+            }
+            Approximation::NormalQuantile(data) => {
+                Self::serialized_argument_violates(&data.p, |r| {
+                    r.sign() != Sign::Plus || r >= &Rational::one()
+                })
+            }
+            _ => false,
+        };
+        if invalid {
+            Err("Computable argument is outside its real-valued domain")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+impl Binary64Interval {
+    /// `Some(true)` proves and `Some(false)` refutes a condition on a value
+    /// enclosed by this interval; `None` leaves it to the exact routes.
+    fn decide_imported_domain_condition(&self, condition: &ImportedDomainCondition) -> Option<bool> {
+        let (lower, upper) = (self.lower, self.upper);
+        let (endpoint, inclusive, above) = match condition {
+            ImportedDomainCondition::NonZero => {
+                return if lower > 0.0 || upper < 0.0 {
+                    Some(true)
+                } else if lower == 0.0 && upper == 0.0 {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            // 3/2 < pi/2 and 3 < pi, so these windows contain no pole.
+            ImportedDomainCondition::TrigNonZero(true) => {
+                return (lower > -1.5 && upper < 1.5).then_some(true);
+            }
+            ImportedDomainCondition::TrigNonZero(false) => {
+                return ((lower > 0.0 && upper < 3.0) || (lower > -3.0 && upper < 0.0))
+                    .then_some(true);
+            }
+            ImportedDomainCondition::Above(endpoint, inclusive) => (endpoint, *inclusive, true),
+            ImportedDomainCondition::Below(endpoint, inclusive) => (endpoint, *inclusive, false),
+        };
+        // Compare with an enclosure of the endpoint; ties fall through.
+        let endpoint = Self::from_rational(endpoint)?;
+        let (near, far) = if above {
+            (lower, upper)
+        } else {
+            (-upper, -lower)
+        };
+        let (endpoint_low, endpoint_high) = if above {
+            (endpoint.lower, endpoint.upper)
+        } else {
+            (-endpoint.upper, -endpoint.lower)
+        };
+        if near > endpoint_high || (inclusive && near >= endpoint_high) {
+            Some(true)
+        } else if far < endpoint_low || (!inclusive && far <= endpoint_low) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
+/// One sign condition on the operand of a partial operation.
+#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+enum ImportedDomainCondition {
+    NonZero,
+    /// `operand - endpoint` is nonnegative (`true`) or positive (`false`).
+    Above(Rational, bool),
+    /// `endpoint - operand` is nonnegative (`true`) or positive (`false`).
+    Below(Rational, bool),
+    /// The cosine (`true`) or sine (`false`) of the operand is nonzero.
+    TrigNonZero(bool),
+}
+
+#[cfg(all(feature = "serde", not(verus_keep_ghost)))]
+impl Computable {
+    /// Prove the real domain of every partial operation in an imported graph.
+    ///
+    /// Node decoding only rejects domains that bounded rational admission
+    /// refutes, matching the unchecked native `Computable` constructors. A
+    /// `Real` is the checked carrier: native `Real` operations prove each
+    /// operand domain before building a partial node, so `Real` import must too.
+    /// Operands are proved first, so every query refines only graphs whose
+    /// partial operations are already proved defined. A refuted condition is
+    /// `ParseError`. An undecided one is `UnknownCertificate` and stops the
+    /// walk before an ancestor could refine the unproved operation.
+    pub(crate) fn prove_imported_domains(&self) -> Result<(), crate::Problem> {
+        // Decoding builds a tree: serde copies the value behind every shared
+        // pointer, so the walk needs no visited set. Iterate in post-order so
+        // deep payloads do not use the call stack.
+        let mut stack = InlineStack::<(&Self, bool), 32>::new();
+        stack.push((self, false));
+        while let Some((value, expanded)) = stack.pop() {
+            if expanded {
+                value.prove_imported_operation_domain()?;
+                continue;
+            }
+            stack.push((value, true));
+            value
+                .internal
+                .approximation
+                .for_each_operand(|operand| stack.push((operand, false)));
+        }
+        Ok(())
+    }
+
+    fn prove_imported_operation_domain(&self) -> Result<(), crate::Problem> {
+        use ImportedDomainCondition::{Above, Below, NonZero, TrigNonZero};
+        let one = Rational::one;
+        let small = || Rational::fraction(3, 4).expect("nonzero constant denominator");
+        let (operand, conditions) = match &self.internal.approximation {
+            Approximation::Inverse(x) => (x, [Some(NonZero), None]),
+            // The quotient kernels need a nonzero denominator; tan(x) and
+            // cot(x) have poles where cos(x) or sin(x) vanishes.
+            Approximation::PrescaledTan(x) => (x, [Some(TrigNonZero(true)), None]),
+            Approximation::PrescaledCot(x) => (x, [Some(TrigNonZero(false)), None]),
+            // x^2 >= 0 for every defined x. Real::abs builds sqrt(x^2) when
+            // the sign of x is unresolved, possibly because x is zero.
+            Approximation::Sqrt(x) | Approximation::NthRoot(x, _)
+                if matches!(x.internal.approximation, Approximation::Square(_)) =>
+            {
+                return Ok(());
+            }
+            Approximation::Sqrt(x) | Approximation::NthRoot(x, _) => {
+                (x, [Some(Above(Rational::zero(), true)), None])
+            }
+            // Stores x for ln(1+x).
+            Approximation::PrescaledLn(x) => (x, [Some(Above(-one(), false)), None]),
+            Approximation::PrescaledAsin(x) | Approximation::AsinDeferred(x) => (
+                x,
+                [Some(Above(-one(), true)), Some(Below(one(), true))],
+            ),
+            Approximation::AcosPositive(x) => (
+                x,
+                [Some(Above(Rational::zero(), true)), Some(Below(one(), true))],
+            ),
+            Approximation::AcoshNearOne(x) | Approximation::AcoshDirect(x) => {
+                (x, [Some(Above(one(), true)), None])
+            }
+            Approximation::PrescaledAtanh(x) | Approximation::AtanhDirect(x) => (
+                x,
+                [Some(Above(-one(), false)), Some(Below(one(), false))],
+            ),
+            Approximation::NormalQuantile(data) => (
+                &data.p,
+                [Some(Above(Rational::zero(), false)), Some(Below(one(), false))],
+            ),
+            // The removable small-angle kernels evaluate their analytic
+            // continuations only on the constructor-certified |x| <= 3/4.
+            Approximation::SincSmall(x) | Approximation::CoscSmall(x) => (
+                x,
+                [Some(Above(-small(), true)), Some(Below(small(), true))],
+            ),
+            _ => return Ok(()),
+        };
+        // A defined exact identity of the node itself proves its domain without
+        // refinement: quantile(Phi(r)) = r needs 0 < Phi(r) < 1 for rational r,
+        // which refinement cannot separate from 1 when r is large.
+        if self.exact_rational().is_some() {
+            return Ok(());
+        }
+        // The existing outward-rounded 32-node filter decides most separated
+        // operands without refinement or symbolic expansion.
+        let interval = operand.binary64_filter_interval(&mut 32);
+        let mut undecided = false;
+        for condition in conditions.into_iter().flatten() {
+            let decided = interval
+                .as_ref()
+                .and_then(|interval| interval.decide_imported_domain_condition(&condition));
+            match decided.or_else(|| operand.imported_domain_condition(condition)) {
+                Some(true) => {}
+                Some(false) => return Err(crate::Problem::ParseError),
+                None => undecided = true,
+            }
+        }
+        if undecided {
+            Err(crate::Problem::UnknownCertificate)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `Some(true)` proves the condition and `Some(false)` refutes it.
+    fn imported_domain_condition(&self, condition: ImportedDomainCondition) -> Option<bool> {
+        // Native Real partial operations certify operand signs at this floor.
+        let floor = crate::Real::PARTIAL_CMP_MIN_PRECISION;
+        let (endpoint, inclusive, above) = match condition {
+            ImportedDomainCondition::NonZero => {
+                return self.sign_until(floor).map(|sign| sign != RealSign::Zero);
+            }
+            ImportedDomainCondition::TrigNonZero(cosine) => {
+                // Bounded refinement cannot prove a transcendental zero, so
+                // read the exact pi-Laurent normal form first. Since pi is
+                // transcendental, an algebraic x has cos(x) != 0 and has
+                // sin(x) = 0 only at x = 0. For x = q*pi, sin(x) = 0 iff q is
+                // an integer and cos(x) = 0 iff q + 1/2 is, as in Real::tan.
+                if let Some(polynomial) = self.pi_laurent_polynomial(48) {
+                    let terms = polynomial.terms.as_slice();
+                    if terms
+                        .iter()
+                        .all(|(power, coefficient)| *power == 0 && coefficient.atoms.is_empty())
+                    {
+                        return if cosine {
+                            Some(true)
+                        } else {
+                            self.sign_until(floor).map(|sign| sign != RealSign::Zero)
+                        };
+                    }
+                    if let [(1, coefficient)] = terms
+                        && coefficient.radicals.is_empty()
+                        && coefficient.atoms.is_empty()
+                    {
+                        let half = Rational::fraction(1, 2).expect("nonzero constant denominator");
+                        let shifted = if cosine {
+                            coefficient.rational.clone() + half
+                        } else {
+                            coefficient.rational.clone()
+                        };
+                        return Some(!shifted.is_integer());
+                    }
+                }
+                let image = if cosine {
+                    self.clone().cos()
+                } else {
+                    self.clone().sin()
+                };
+                return image.sign_until(floor).map(|sign| sign != RealSign::Zero);
+            }
+            ImportedDomainCondition::Above(endpoint, inclusive) => (endpoint, inclusive, true),
+            ImportedDomainCondition::Below(endpoint, inclusive) => (endpoint, inclusive, false),
+        };
+        let difference = match self.exact_rational() {
+            Some(value) => match value.partial_cmp(&endpoint)? {
+                Ordering::Less => RealSign::Negative,
+                Ordering::Equal => RealSign::Zero,
+                Ordering::Greater => RealSign::Positive,
+            },
+            None if endpoint.is_zero() => self.sign_until(floor)?,
+            None => self
+                .clone()
+                .add(Self::rational(-endpoint))
+                .sign_until(floor)?,
+        };
+        Some(match (difference, above) {
+            (RealSign::Zero, _) => inclusive,
+            (RealSign::Positive, true) | (RealSign::Negative, false) => true,
+            (RealSign::Positive, false) | (RealSign::Negative, true) => false,
+        })
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl Node {
+    pub(crate) fn new(
+        approximation: Approximation,
+        bound: BoundCache,
+        exact_sign: ExactSignCache,
+    ) -> Self {
+        let (contains_inverse_trig_or_pi, linear_demand) = match &approximation {
+            Approximation::Add(left, right) => {
+                let (left_inverse, left_demand) = left.internal.construction_hints();
+                let (right_inverse, right_demand) = right.internal.construction_hints();
+                (
+                    left_inverse || right_inverse,
+                    left_demand.max(right_demand).saturating_add(2),
+                )
+            }
+            Approximation::Negate(child) => child.internal.construction_hints(),
+            Approximation::Offset(child, shift) => {
+                let (inverse, demand) = child.internal.construction_hints();
+                let demand = i32::from(demand)
+                    .saturating_add(*shift)
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+                (inverse, demand as i16)
+            }
+            _ => (
+                Self::approximation_contains_inverse_trig_or_pi(&approximation),
+                0,
+            ),
+        };
+        Self {
+            facts: AtomicFacts::new(
+                bound,
+                exact_sign,
+                contains_inverse_trig_or_pi,
+                linear_demand,
+            ),
+            approximation,
+            cache: EvaluationCache::new(),
+        }
+    }
+
+    fn construction_hints(&self) -> (bool, i16) {
+        // Read both retained hints in the same atomic snapshot. The inverse
+        // trig flag already needs this load during Add construction.
+        let bits = self.facts.0.load(std::sync::atomic::Ordering::Relaxed);
+        let contains_inverse_trig_or_pi = if bits & AtomicFacts::INVERSE_TRIG_OR_PI_KNOWN != 0 {
+            bits & AtomicFacts::CONTAINS_INVERSE_TRIG_OR_PI != 0
+        } else {
+            self.contains_inverse_trig_or_pi()
+        };
+        let demand = ((bits & AtomicFacts::LINEAR_DEMAND_MASK) >> AtomicFacts::LINEAR_DEMAND_SHIFT)
+            as u16 as i16;
+        (contains_inverse_trig_or_pi, demand)
+    }
+
+    fn approximation_contains_inverse_trig_or_pi(approximation: &Approximation) -> bool {
+        match approximation {
+            Approximation::Constant(SharedConstant::Pi)
+            | Approximation::AtanRational(_)
+            | Approximation::IntegralAtan(_)
+            | Approximation::PrescaledAtan(_)
+            | Approximation::AtanDeferred(_)
+            | Approximation::InverseIsometricLatitude { .. }
+            | Approximation::JacobiAmplitude(_)
+            | Approximation::InverseEllipticE(_)
+            | Approximation::AcosPositive(_)
+            | Approximation::AcosPositiveRational(_)
+            | Approximation::AcosNegativeRational(_) => true,
+            Approximation::Negate(child)
+            | Approximation::Offset(child, _)
+            | Approximation::SincSmall(child)
+            | Approximation::CoscSmall(child) => child.internal.contains_inverse_trig_or_pi(),
+            Approximation::Add(left, right) | Approximation::Multiply(left, right) => {
+                left.internal.contains_inverse_trig_or_pi()
+                    || right.internal.contains_inverse_trig_or_pi()
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn contains_inverse_trig_or_pi(&self) -> bool {
+        if let Some(value) = self.facts.contains_inverse_trig_or_pi() {
+            return value;
+        }
+        let value = Self::approximation_contains_inverse_trig_or_pi(&self.approximation);
+        self.facts.store_contains_inverse_trig_or_pi(value);
+        value
+    }
+
+    pub(crate) fn cached_at_precision(&self, p: Precision) -> Option<BigInt> {
+        self.cache.at_precision(p)
+    }
+
+    pub(crate) fn cached_value(&self) -> Option<(Precision, BigInt)> {
+        self.cache.get()
+    }
+
+    pub(crate) fn store_cache_value(&self, p: Precision, value: BigInt) {
+        self.cache.store(p, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_snapshot(&self) -> Option<(Precision, BigInt)> {
+        self.cache.get()
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+struct CachedApproximation {
+    precision: Precision,
+    value: BigInt,
+}
+
+#[derive(Default)]
+#[cfg(not(verus_keep_ghost))]
+struct CachedEvaluation {
+    approximation: Option<CachedApproximation>,
+    quadratic_tower: Option<Box<Tower>>,
+    /// The iterated radical-tower sign reduction declined this root.
+    radical_tower_declined: bool,
+}
+
+/// Lazily allocated synchronized evaluation cache. Approximation-only nodes
+/// pay for one optional pointer, not an inline algebraic normal form. A retained
+/// tower contains only rational coefficients and never keeps an expression
+/// graph alive. Readers clone under the lock; no guard escapes into evaluation.
+#[cfg(not(verus_keep_ghost))]
+struct EvaluationCache(std::sync::atomic::AtomicPtr<std::sync::RwLock<CachedEvaluation>>);
+
+#[cfg(not(verus_keep_ghost))]
+impl EvaluationCache {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+    }
+
+    fn cell(&self) -> Option<&std::sync::RwLock<CachedEvaluation>> {
+        let pointer = self.0.load(std::sync::atomic::Ordering::Acquire);
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: the pointed-to cell is installed once and remains alive
+            // until the enclosing Node is exclusively dropped.
+            Some(unsafe { &*pointer })
+        }
+    }
+
+    fn cell_or_init(&self) -> &std::sync::RwLock<CachedEvaluation> {
+        if let Some(cell) = self.cell() {
+            return cell;
+        }
+
+        let allocated = Box::into_raw(Box::new(
+            std::sync::RwLock::new(CachedEvaluation::default()),
+        ));
+        R17_CACHE_STATES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pointer = match self.0.compare_exchange(
+            std::ptr::null_mut(),
+            allocated,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => allocated,
+            Err(installed) => {
+                // SAFETY: this allocation lost the installation race and was
+                // never published.
+                R17_CACHE_STATES[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                unsafe { drop(Box::from_raw(allocated)) };
+                installed
+            }
+        };
+        // SAFETY: the winning pointer remains installed until Node::drop.
+        unsafe { &*pointer }
+    }
+
+    fn get(&self) -> Option<(Precision, BigInt)> {
+        let guard = self
+            .cell()?
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let cached = guard.approximation.as_ref()?;
+        Some((cached.precision, cached.value.clone()))
+    }
+
+    fn at_precision(&self, p: Precision) -> Option<BigInt> {
+        let guard = self
+            .cell()?
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        Self::value_at_precision(guard.approximation.as_ref()?, p)
+    }
+
+    #[inline(always)]
+    fn value_at_precision(cached: &CachedApproximation, p: Precision) -> Option<BigInt> {
+        if p < cached.precision {
+            None
+        } else if p == cached.precision {
+            Some(cached.value.clone())
+        } else {
+            // The positive gap can exceed i32::MAX even for valid precisions.
+            let gap = p.abs_diff(cached.precision);
+            let value = if gap == 1 {
+                // Preserve scale's direct-clone path for a zero initial shift.
+                cached.value.clone()
+            } else if u64::from(gap) > cached.value.bits() {
+                return Some(BigInt::zero());
+            } else {
+                &cached.value >> (gap - 1)
+            };
+            // Nearest integer, with halfway values rounded toward +infinity.
+            Some((value + signed::ONE.deref()) >> 1)
+        }
+    }
+
+    fn store(&self, p: Precision, value: BigInt) {
+        let mut guard = self
+            .cell_or_init()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        // Concurrent evaluations may finish out of order. Never let a coarser
+        // result evict a finer result already published.
+        if guard
+            .approximation
+            .as_ref()
+            .is_none_or(|cached| p < cached.precision)
+        {
+            let previous = guard.r17_state();
+            guard.approximation = Some(CachedApproximation {
+                precision: p,
+                value,
+            });
+            r17_cache_transition(previous, guard.r17_state());
+        }
+    }
+
+    fn quadratic_tower(&self) -> Option<Tower> {
+        let guard = self
+            .cell()?
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.quadratic_tower.as_deref().cloned()
+    }
+
+    fn radical_tower_declined(&self) -> bool {
+        self.cell().is_some_and(|cell| {
+            cell.read()
+                .unwrap_or_else(|error| error.into_inner())
+                .radical_tower_declined
+        })
+    }
+
+    fn mark_radical_tower_declined(&self) {
+        let mut guard = self.cell_or_init().write().unwrap_or_else(|error| error.into_inner());
+        let previous = guard.r17_state();
+        guard.radical_tower_declined = true;
+        r17_cache_transition(previous, guard.r17_state());
+    }
+
+    fn store_quadratic_tower(&self, tower: &Tower) {
+        let mut guard = self
+            .cell_or_init()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if guard.quadratic_tower.is_none() {
+            let previous = guard.r17_state();
+            guard.quadratic_tower = Some(Box::new(tower.clone()));
+            r17_cache_transition(previous, guard.r17_state());
+        }
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl Default for EvaluationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl std::fmt::Debug for EvaluationCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(formatter)
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl Drop for EvaluationCache {
+    fn drop(&mut self) {
+        let pointer = *self.0.get_mut();
+        if !pointer.is_null() {
+            // SAFETY: dropping the enclosing Node proves exclusive access and
+            // no guard can still borrow this cell.
+            let mut cell = unsafe { Box::from_raw(pointer) };
+            let state = cell.get_mut().unwrap_or_else(|error| error.into_inner()).r17_state();
+            R17_CACHE_STATES[state].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            drop(cell);
+        }
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+impl Deref for Node {
+    type Target = Approximation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.approximation
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+struct AtomicFacts(std::sync::atomic::AtomicU64);
+
+#[cfg(not(verus_keep_ghost))]
+impl Default for AtomicFacts {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+}
+
+impl AtomicFacts {
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const TAG_INVALID: u64 = 0;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const TAG_UNKNOWN: u64 = 1;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const TAG_ZERO: u64 = 2;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const TAG_NONZERO: u64 = 3;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const SIGN_SHIFT: u32 = 2;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const MSD_PRESENT: u64 = 1 << 4;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const EXACT_MSD: u64 = 1 << 5;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const EXACT_SIGN_SHIFT: u32 = 6;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const EXACT_SIGN_MASK: u64 = 0b111 << Self::EXACT_SIGN_SHIFT;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const INVERSE_TRIG_OR_PI_KNOWN: u64 = 1 << 9;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const CONTAINS_INVERSE_TRIG_OR_PI: u64 = 1 << 10;
+    // Signed saturated precision decrement along Add/Negate/Offset paths.
+    // Used only for child ordering, never as a numerical bound. Deserialized
+    // nodes default to zero and retain ordinary evaluation order.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const LINEAR_DEMAND_SHIFT: u32 = 16;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const LINEAR_DEMAND_MASK: u64 = (u16::MAX as u64) << Self::LINEAR_DEMAND_SHIFT;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const NON_BOUND_MASK: u64 = Self::EXACT_SIGN_MASK
+        | Self::INVERSE_TRIG_OR_PI_KNOWN
+        | Self::CONTAINS_INVERSE_TRIG_OR_PI
+        | Self::LINEAR_DEMAND_MASK;
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const MSD_SHIFT: u32 = 32;
+
+    #[cfg(not(verus_keep_ghost))]
+    fn new(
+        bound: BoundCache,
+        exact_sign: ExactSignCache,
+        contains_inverse_trig_or_pi: bool,
+        linear_demand: i16,
+    ) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(
+            Self::encode_bound(bound)
+                | Self::encode_exact_sign(exact_sign)
+                | ((linear_demand as u16 as u64) << Self::LINEAR_DEMAND_SHIFT)
+                | Self::INVERSE_TRIG_OR_PI_KNOWN
+                | if contains_inverse_trig_or_pi {
+                    Self::CONTAINS_INVERSE_TRIG_OR_PI
+                } else {
+                    0
+                },
+        ))
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn linear_demand(&self) -> i16 {
+        ((self.0.load(std::sync::atomic::Ordering::Relaxed) & Self::LINEAR_DEMAND_MASK)
+            >> Self::LINEAR_DEMAND_SHIFT) as u16 as i16
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn contains_inverse_trig_or_pi(&self) -> Option<bool> {
+        let bits = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        (bits & Self::INVERSE_TRIG_OR_PI_KNOWN != 0)
+            .then_some(bits & Self::CONTAINS_INVERSE_TRIG_OR_PI != 0)
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn store_contains_inverse_trig_or_pi(&self, value: bool) {
+        let bits = Self::INVERSE_TRIG_OR_PI_KNOWN
+            | if value {
+                Self::CONTAINS_INVERSE_TRIG_OR_PI
+            } else {
+                0
+            };
+        self.0.fetch_or(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg_attr(verus_keep_ghost, allow(unused, verus_impl_method_marker))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(result =>
+        ensures result == encoded_bound_bits(value),
+    ))]
+    fn encode_bound(value: BoundCache) -> u64 {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(Self::MSD_PRESENT == 16u64) by (bit_vector);
+            assert(Self::EXACT_MSD == 32u64) by (bit_vector);
+        }
+        match value {
+            BoundCache::Invalid => Self::TAG_INVALID,
+            BoundCache::Valid(BoundInfo::Unknown) => Self::TAG_UNKNOWN,
+            BoundCache::Valid(BoundInfo::Zero) => Self::TAG_ZERO,
+            BoundCache::Valid(BoundInfo::NonZero {
+                sign,
+                msd,
+                exact_msd,
+            }) => {
+                let sign = match sign {
+                    None => 0,
+                    Some(Sign::Plus) => 1,
+                    Some(Sign::Minus) => 2,
+                    Some(Sign::NoSign) => 3,
+                };
+                let mut encoded = Self::TAG_NONZERO | ((sign as u64) << Self::SIGN_SHIFT);
+                if let Some(msd) = msd {
+                    encoded |= Self::MSD_PRESENT | ((msd as u32 as u64) << Self::MSD_SHIFT);
+                }
+                if exact_msd {
+                    encoded |= Self::EXACT_MSD;
+                }
+                encoded
+            }
+        }
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn decode_bound(value: u64) -> BoundCache {
+        match value & 0b11 {
+            Self::TAG_INVALID => BoundCache::Invalid,
+            Self::TAG_UNKNOWN => BoundCache::Valid(BoundInfo::Unknown),
+            Self::TAG_ZERO => BoundCache::Valid(BoundInfo::Zero),
+            Self::TAG_NONZERO => {
+                let sign = match (value >> Self::SIGN_SHIFT) & 0b11 {
+                    0 => None,
+                    1 => Some(Sign::Plus),
+                    2 => Some(Sign::Minus),
+                    3 => Some(Sign::NoSign),
+                    _ => unreachable!(),
+                };
+                let msd = (value & Self::MSD_PRESENT != 0)
+                    .then_some(((value >> Self::MSD_SHIFT) as u32) as i32);
+                BoundCache::Valid(BoundInfo::NonZero {
+                    sign,
+                    msd,
+                    exact_msd: value & Self::EXACT_MSD != 0,
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn bound(&self) -> BoundCache {
+        Self::decode_bound(
+            self.0.load(std::sync::atomic::Ordering::Relaxed) & !Self::EXACT_SIGN_MASK,
+        )
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn snapshot(&self) -> (BoundCache, ExactSignCache) {
+        let encoded = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        (
+            Self::decode_bound(encoded & !Self::EXACT_SIGN_MASK),
+            Self::decode_exact_sign(encoded),
+        )
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn set_bound(&self, value: BoundCache) {
+        let encoded = Self::encode_bound(value);
+        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let updated = (current & Self::NON_BOUND_MASK) | encoded;
+            match self.0.compare_exchange_weak(
+                current,
+                updated,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn set_bound_if_invalid(&self, value: BoundCache) {
+        let encoded = Self::encode_bound(value);
+        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if current & 0b11 != Self::TAG_INVALID {
+                return;
+            }
+            let updated = (current & Self::NON_BOUND_MASK) | encoded;
+            match self.0.compare_exchange_weak(
+                current,
+                updated,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn set_bound_if_unresolved(&self, value: BoundCache) {
+        let encoded = Self::encode_bound(value);
+        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let tag = current & 0b11;
+            if tag != Self::TAG_INVALID && tag != Self::TAG_UNKNOWN {
+                return;
+            }
+            let updated = (current & Self::NON_BOUND_MASK) | encoded;
+            match self.0.compare_exchange_weak(
+                current,
+                updated,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    #[cfg_attr(verus_keep_ghost, allow(unused, verus_impl_method_marker))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(result =>
+        ensures exact_sign_denotation(result) == value,
+            result & !0x1c0u64 == 0,
+            ((result >> 6) & 7) <= 4,
+    ))]
+    fn encode_exact_sign(value: ExactSignCache) -> u64 {
+        let encoded = match value {
+            ExactSignCache::Invalid => 0,
+            ExactSignCache::Unknown => 1,
+            ExactSignCache::Valid(Sign::Minus) => 2,
+            ExactSignCache::Valid(Sign::NoSign) => 3,
+            ExactSignCache::Valid(Sign::Plus) => 4,
+        };
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert((((encoded as u64) << 6u32) >> 6u32) & 7u64 == encoded) by (bit_vector)
+                requires encoded <= 4u64;
+            assert(((encoded as u64) << 6u32) & !0x1c0u64 == 0u64) by (bit_vector)
+                requires encoded <= 4u64;
+        }
+        encoded << Self::EXACT_SIGN_SHIFT
+    }
+
+    #[cfg_attr(verus_keep_ghost, allow(unused, verus_impl_method_marker))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(result =>
+        requires ((value >> 6) & 7) <= 4,
+        ensures result == exact_sign_denotation(value),
+    ))]
+    fn decode_exact_sign(value: u64) -> ExactSignCache {
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(Self::EXACT_SIGN_MASK == 0x1c0u64) by (bit_vector);
+            assert((value & 0x1c0u64) >> 6u32 == (value >> 6u32) & 7u64) by (bit_vector);
+        }
+        match (value & Self::EXACT_SIGN_MASK) >> Self::EXACT_SIGN_SHIFT {
+            0 => ExactSignCache::Invalid,
+            1 => ExactSignCache::Unknown,
+            2 => ExactSignCache::Valid(Sign::Minus),
+            3 => ExactSignCache::Valid(Sign::NoSign),
+            4 => ExactSignCache::Valid(Sign::Plus),
+            _ => unreachable!("invalid atomic exact-sign cache state"),
+        }
+    }
+
+    #[cfg(not(verus_keep_ghost))]
+    fn exact_sign(&self) -> ExactSignCache {
+        Self::decode_exact_sign(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Publish a sign proof without erasing a certificate from another traversal.
+    /// Exact proofs for this immutable node must agree; unresolved work cannot
+    /// invalidate them. Recheck this invariant after every failed CAS.
+    #[cfg(not(verus_keep_ghost))]
+    fn replace_exact_sign(&self, value: ExactSignCache) -> ExactSignCache {
+        let encoded = Self::encode_exact_sign(value);
+        let mut current = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let previous = Self::decode_exact_sign(current);
+            if let ExactSignCache::Valid(sign) = previous {
+                debug_assert!(
+                    !matches!(value, ExactSignCache::Valid(other) if other != sign),
+                    "inconsistent exact signs for an immutable expression",
+                );
+                return previous;
+            }
+            let updated = (current & !Self::EXACT_SIGN_MASK) | encoded;
+            match self.0.compare_exchange_weak(
+                current,
+                updated,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return previous,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+#[cfg(not(verus_keep_ghost))]
+pub(crate) mod signed {
+    use num::{BigInt, One};
+    use std::sync::LazyLock;
+
+    // Use the narrow primitive that holds each literal so `BigInt::from`
+    // dispatches directly instead of routing through the `ToBigInt` helper.
+    pub(crate) static MINUS_ONE: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(-1));
+    pub(crate) static ONE: LazyLock<BigInt> = LazyLock::new(BigInt::one);
+    pub(crate) static TWO: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(2_u8));
+    pub(crate) static FOUR: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(4_u8));
+    pub(crate) static SIX: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(6_u8));
+    pub(crate) static EIGHT: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(8_u8));
+    pub(crate) static SIXTEEN: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(16_u8));
+    pub(crate) static TWENTY_FOUR: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(24_u8));
+    pub(crate) static SIXTY_FOUR: LazyLock<BigInt> = LazyLock::new(|| BigInt::from(64_u8));
+}
+
+#[cfg(not(verus_keep_ghost))]
+pub(crate) mod unsigned {
+    use num::{BigUint, One};
+    use std::sync::LazyLock;
+
+    // These are small non-negative constants, so `u8` is the exact source type
+    // and avoids the extra conversion trait path used before the bigint audit.
+    pub(crate) static ONE: LazyLock<BigUint> = LazyLock::new(BigUint::one);
+    pub(crate) static TWO: LazyLock<BigUint> = LazyLock::new(|| BigUint::from(2_u8));
+    pub(crate) static TEN: LazyLock<BigUint> = LazyLock::new(|| BigUint::from(10_u8));
+    pub(crate) static FIVE: LazyLock<BigUint> = LazyLock::new(|| BigUint::from(5_u8));
+    pub(crate) static SIX: LazyLock<BigUint> = LazyLock::new(|| BigUint::from(6_u8));
+}
+
+#[cfg(not(verus_keep_ghost))]
+static HALF_PI_SHORTCUT_RATIONAL_LIMIT: LazyLock<Rational> =
+    LazyLock::new(|| Rational::fraction(3, 2).unwrap());
+#[cfg(not(verus_keep_ghost))]
+static NEAR_LARGE_RATIONAL_TRIG_THRESHOLD: LazyLock<Rational> =
+    LazyLock::new(|| Rational::fraction(7, 2).unwrap());
+#[cfg(not(verus_keep_ghost))]
+static INVERSE_ENDPOINT_RATIONAL_THRESHOLD: LazyLock<Rational> =
+    LazyLock::new(|| Rational::fraction(7, 8).unwrap());
+#[cfg(not(verus_keep_ghost))]
+static THREE_HALVES_RATIONAL: LazyLock<Rational> =
+    LazyLock::new(|| Rational::fraction(3, 2).unwrap());
+#[cfg(not(verus_keep_ghost))]
+static HALF_RATIONAL: LazyLock<Rational> = LazyLock::new(|| Rational::fraction(1, 2).unwrap());
+
+static R17_CACHE_STATES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+impl CachedEvaluation {
+    fn r17_state(&self) -> usize {
+        usize::from(self.approximation.is_some())
+            | (usize::from(self.quadratic_tower.is_some()) << 1)
+            | (usize::from(self.radical_tower_declined) << 2)
+    }
+}
+
+fn r17_cache_transition(before: usize, after: usize) {
+    if before != after {
+        R17_CACHE_STATES[after].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        R17_CACHE_STATES[before].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Computable {
+    #[doc(hidden)]
+    pub fn r17_diagnostic_cache_census() -> ([u64; 8], usize) {
+        (
+            std::array::from_fn(|index| {
+                R17_CACHE_STATES[index].load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            std::mem::size_of::<std::sync::RwLock<CachedEvaluation>>(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn r17_diagnostic_cache_check() {
+        let (before, _) = Self::r17_diagnostic_cache_census();
+        for mask in 0..8 {
+            let cache = EvaluationCache::new();
+            let _ = cache.cell_or_init();
+            if mask & 1 != 0 {
+                cache.store(-64, BigInt::from(17));
+            }
+            if mask & 2 != 0 {
+                cache.store_quadratic_tower(&Tower::rational(
+                    Rational::fraction(7, 3).unwrap(),
+                ));
+            }
+            if mask & 4 != 0 {
+                cache.mark_radical_tower_declined();
+            }
+            let mut expected = before;
+            expected[mask] += 1;
+            assert_eq!(Self::r17_diagnostic_cache_census().0, expected);
+            drop(cache);
+            assert_eq!(Self::r17_diagnostic_cache_census().0, before);
+        }
+    }
+}

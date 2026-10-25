@@ -1,0 +1,325 @@
+diff --git a/crates/hypercircuit/benches/easyduino_full_pipeline.rs b/crates/hypercircuit/benches/easyduino_full_pipeline.rs
+index f13f594eba..1629334e28 100644
+--- a/crates/hypercircuit/benches/easyduino_full_pipeline.rs
++++ b/crates/hypercircuit/benches/easyduino_full_pipeline.rs
+@@ -41,7 +41,7 @@ const BOARDS: &[(&str, &str)] = &[
+     ),
+ ];
+ 
+-fn main() {
++fn r17_original_main() {
+     let suite_started = Instant::now();
+     let requested_board = std::env::var("EASYDUINO_BOARD").ok();
+     let requested_check = std::env::var("EASYDUINO_CHECK").ok();
+@@ -60,6 +60,7 @@ fn main() {
+         let document = SemanticDocument::from_json(source)
+             .unwrap_or_else(|error| panic!("decode Easyduino {slug}: {error}"));
+         println!("easyduino-full-pipeline/{slug}: starting");
++        r17_snapshot("decoded");
+         let started = Instant::now();
+         if profile_stages || profile_cam {
+             let options = ReleaseOptions::default();
+@@ -87,6 +88,7 @@ fn main() {
+                 "easyduino-full-pipeline/{slug}: materialization {:?}",
+                 stage.elapsed()
+             );
++            r17_snapshot("materialized");
+             if profile_stages {
+                 let stage = Instant::now();
+                 let handoff = HyperDrcHandoff::from_materialization_with_context(
+@@ -151,6 +153,7 @@ fn main() {
+                             .sum::<usize>(),
+                     );
+                 }
++                r17_snapshot("report-projected");
+                 let mut drc_findings = 0;
+                 for check in hyperdrc::default_checks().iter().filter(|check| {
+                     requested_check
+@@ -175,7 +178,9 @@ fn main() {
+                     "easyduino-full-pipeline/{slug}: HyperDRC total {:?} ({drc_findings} findings)",
+                     stage.elapsed(),
+                 );
++                r17_snapshot("drc-complete");
+             }
++            r17_snapshot("handoff-dropped");
+             let stage = Instant::now();
+             let fabrication = FabricationPackage::from_materialization_with_options(
+                 &layout,
+@@ -202,6 +207,7 @@ fn main() {
+                 stage.elapsed(),
+                 assembly_audit.issues.len()
+             );
++            r17_snapshot("fabrication-cam-assembly-complete");
+             completed += 1;
+             continue;
+         }
+@@ -330,3 +336,140 @@ fn main() {
+         }
+     }
+ }
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::sync::atomic::{AtomicU64, Ordering};
++
++struct R17Allocator;
++static R17_REQUESTED: AtomicU64 = AtomicU64::new(0);
++static R17_LIVE: AtomicU64 = AtomicU64::new(0);
++static R17_PEAK: AtomicU64 = AtomicU64::new(0);
++static R17_ALLOCS: AtomicU64 = AtomicU64::new(0);
++static R17_REALLOCS: AtomicU64 = AtomicU64::new(0);
++static R17_FREES: AtomicU64 = AtomicU64::new(0);
++
++fn r17_grow(bytes: usize) {
++    let live = R17_LIVE.fetch_add(bytes as u64, Ordering::Relaxed) + bytes as u64;
++    R17_PEAK.fetch_max(live, Ordering::Relaxed);
++}
++
++unsafe impl GlobalAlloc for R17Allocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        let pointer = unsafe { System.alloc(layout) };
++        if !pointer.is_null() {
++            R17_REQUESTED.fetch_add(layout.size() as u64, Ordering::Relaxed);
++            R17_ALLOCS.fetch_add(1, Ordering::Relaxed);
++            r17_grow(layout.size());
++        }
++        pointer
++    }
++
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        let pointer = unsafe { System.alloc_zeroed(layout) };
++        if !pointer.is_null() {
++            R17_REQUESTED.fetch_add(layout.size() as u64, Ordering::Relaxed);
++            R17_ALLOCS.fetch_add(1, Ordering::Relaxed);
++            r17_grow(layout.size());
++        }
++        pointer
++    }
++
++    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
++        R17_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
++        R17_FREES.fetch_add(1, Ordering::Relaxed);
++        unsafe { System.dealloc(pointer, layout) };
++    }
++
++    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        let result = unsafe { System.realloc(pointer, layout, new_size) };
++        if !result.is_null() {
++            R17_REQUESTED.fetch_add(new_size as u64, Ordering::Relaxed);
++            R17_REALLOCS.fetch_add(1, Ordering::Relaxed);
++            if new_size >= layout.size() {
++                r17_grow(new_size - layout.size());
++            } else {
++                R17_LIVE.fetch_sub((layout.size() - new_size) as u64, Ordering::Relaxed);
++            }
++        }
++        result
++    }
++}
++
++#[global_allocator]
++static R17_GLOBAL_ALLOCATOR: R17Allocator = R17Allocator;
++
++fn r17_snapshot(stage: &str) {
++    let requested = R17_REQUESTED.load(Ordering::Relaxed);
++    let live = R17_LIVE.load(Ordering::Relaxed);
++    let peak = R17_PEAK.load(Ordering::Relaxed);
++    let allocs = R17_ALLOCS.load(Ordering::Relaxed);
++    let reallocs = R17_REALLOCS.load(Ordering::Relaxed);
++    let frees = R17_FREES.load(Ordering::Relaxed);
++    eprintln!(
++        "R17_MEMORY {{\"stage\":\"{stage}\",\"requested_bytes\":{requested},\"live_bytes\":{live},\"peak_bytes\":{peak},\"alloc_calls\":{allocs},\"realloc_calls\":{reallocs},\"dealloc_calls\":{frees}}}"
++    );
++    let (states, cell_bytes) = hyperreal::Computable::r17_diagnostic_cache_census();
++    eprintln!(
++        "R17_CENSUS {{\"stage\":\"{stage}\",\"cell_bytes\":{cell_bytes},\"states\":{states:?}}}"
++    );
++    if std::env::var("R17_STOP_STAGE").is_ok_and(|value| value == stage) {
++        // Diagnostic end-live snapshot with all current roots deliberately held.
++        // This is neither a leak test nor completion of the release pipeline.
++        std::process::exit(0);
++    }
++}
++
++fn r17_check_allocator() {
++    let live = R17_LIVE.load(Ordering::Relaxed);
++    let requested = R17_REQUESTED.load(Ordering::Relaxed);
++    let allocs = R17_ALLOCS.load(Ordering::Relaxed);
++    let reallocs = R17_REALLOCS.load(Ordering::Relaxed);
++    let frees = R17_FREES.load(Ordering::Relaxed);
++    unsafe {
++        let first = Layout::from_size_align(64, 8).unwrap();
++        let pointer = R17_GLOBAL_ALLOCATOR.alloc(first);
++        assert!(!pointer.is_null());
++        pointer.write_volatile(17);
++        let pointer = R17_GLOBAL_ALLOCATOR.realloc(pointer, first, 160);
++        assert!(!pointer.is_null());
++        assert_eq!(pointer.read_volatile(), 17);
++        let pointer =
++            R17_GLOBAL_ALLOCATOR.realloc(pointer, Layout::from_size_align(160, 8).unwrap(), 32);
++        assert!(!pointer.is_null());
++        assert_eq!(pointer.read_volatile(), 17);
++        R17_GLOBAL_ALLOCATOR.dealloc(pointer, Layout::from_size_align(32, 8).unwrap());
++        let zeroed = Layout::from_size_align(256, 8).unwrap();
++        let pointer = R17_GLOBAL_ALLOCATOR.alloc_zeroed(zeroed);
++        assert!(!pointer.is_null());
++        assert_eq!(pointer.read_volatile(), 0);
++        R17_GLOBAL_ALLOCATOR.dealloc(pointer, zeroed);
++    }
++    assert_eq!(R17_LIVE.load(Ordering::Relaxed), live);
++    assert_eq!(R17_REQUESTED.load(Ordering::Relaxed) - requested, 512);
++    assert_eq!(R17_ALLOCS.load(Ordering::Relaxed) - allocs, 2);
++    assert_eq!(R17_REALLOCS.load(Ordering::Relaxed) - reallocs, 2);
++    assert_eq!(R17_FREES.load(Ordering::Relaxed) - frees, 2);
++    println!(
++        "R17_ALLOCATOR_CHECK passed: live restored, 512 requested bytes, two allocations, two reallocations, two frees"
++    );
++}
++
++fn main() {
++    if std::env::var_os("R17_CACHE_CHECK").is_some() {
++        hyperreal::Computable::r17_diagnostic_cache_check();
++        println!("R17_CACHE_CHECK passed: all eight states and drops conserve cell counts");
++        return;
++    }
++    if std::env::var_os("R17_ALLOCATOR_CHECK").is_some() {
++        r17_check_allocator();
++        return;
++    }
++    let repeats = std::env::var("R17_REPEATS").map_or(1, |value| value.parse::<usize>().unwrap());
++    assert!((1..=3).contains(&repeats));
++    for repetition in 0..repeats {
++        eprintln!("R17_REPETITION {repetition}");
++        r17_snapshot("before-run");
++        r17_original_main();
++        r17_snapshot("after-all-drops");
++    }
++}
+diff --git a/crates/hyperreal/src/computable/node/representation.rs b/crates/hyperreal/src/computable/node/representation.rs
+index d48499fe3d..fb6344c741 100644
+--- a/crates/hyperreal/src/computable/node/representation.rs
++++ b/crates/hyperreal/src/computable/node/representation.rs
+@@ -581,6 +581,7 @@ impl EvaluationCache {
+         let allocated = Box::into_raw(Box::new(
+             std::sync::RwLock::new(CachedEvaluation::default()),
+         ));
++        R17_CACHE_STATES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         let pointer = match self.0.compare_exchange(
+             std::ptr::null_mut(),
+             allocated,
+@@ -591,6 +592,7 @@ impl EvaluationCache {
+             Err(installed) => {
+                 // SAFETY: this allocation lost the installation race and was
+                 // never published.
++                R17_CACHE_STATES[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                 unsafe { drop(Box::from_raw(allocated)) };
+                 installed
+             }
+@@ -650,10 +652,12 @@ impl EvaluationCache {
+             .as_ref()
+             .is_none_or(|cached| p < cached.precision)
+         {
++            let previous = guard.r17_state();
+             guard.approximation = Some(CachedApproximation {
+                 precision: p,
+                 value,
+             });
++            r17_cache_transition(previous, guard.r17_state());
+         }
+     }
+ 
+@@ -674,10 +678,10 @@ impl EvaluationCache {
+     }
+ 
+     fn mark_radical_tower_declined(&self) {
+-        self.cell_or_init()
+-            .write()
+-            .unwrap_or_else(|error| error.into_inner())
+-            .radical_tower_declined = true;
++        let mut guard = self.cell_or_init().write().unwrap_or_else(|error| error.into_inner());
++        let previous = guard.r17_state();
++        guard.radical_tower_declined = true;
++        r17_cache_transition(previous, guard.r17_state());
+     }
+ 
+     fn store_quadratic_tower(&self, tower: &Tower) {
+@@ -686,7 +690,9 @@ impl EvaluationCache {
+             .write()
+             .unwrap_or_else(|error| error.into_inner());
+         if guard.quadratic_tower.is_none() {
++            let previous = guard.r17_state();
+             guard.quadratic_tower = Some(Box::new(tower.clone()));
++            r17_cache_transition(previous, guard.r17_state());
+         }
+     }
+ }
+@@ -712,7 +718,10 @@ impl Drop for EvaluationCache {
+         if !pointer.is_null() {
+             // SAFETY: dropping the enclosing Node proves exclusive access and
+             // no guard can still borrow this cell.
+-            unsafe { drop(Box::from_raw(pointer)) };
++            let mut cell = unsafe { Box::from_raw(pointer) };
++            let state = cell.get_mut().unwrap_or_else(|error| error.into_inner()).r17_state();
++            R17_CACHE_STATES[state].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
++            drop(cell);
+         }
+     }
+ }
+@@ -1085,3 +1094,58 @@ static THREE_HALVES_RATIONAL: LazyLock<Rational> =
+     LazyLock::new(|| Rational::fraction(3, 2).unwrap());
+ #[cfg(not(verus_keep_ghost))]
+ static HALF_RATIONAL: LazyLock<Rational> = LazyLock::new(|| Rational::fraction(1, 2).unwrap());
++
++static R17_CACHE_STATES: [std::sync::atomic::AtomicU64; 8] =
++    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
++
++impl CachedEvaluation {
++    fn r17_state(&self) -> usize {
++        usize::from(self.approximation.is_some())
++            | (usize::from(self.quadratic_tower.is_some()) << 1)
++            | (usize::from(self.radical_tower_declined) << 2)
++    }
++}
++
++fn r17_cache_transition(before: usize, after: usize) {
++    if before != after {
++        R17_CACHE_STATES[after].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        R17_CACHE_STATES[before].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++impl Computable {
++    #[doc(hidden)]
++    pub fn r17_diagnostic_cache_census() -> ([u64; 8], usize) {
++        (
++            std::array::from_fn(|index| {
++                R17_CACHE_STATES[index].load(std::sync::atomic::Ordering::Relaxed)
++            }),
++            std::mem::size_of::<std::sync::RwLock<CachedEvaluation>>(),
++        )
++    }
++
++    #[doc(hidden)]
++    pub fn r17_diagnostic_cache_check() {
++        let (before, _) = Self::r17_diagnostic_cache_census();
++        for mask in 0..8 {
++            let cache = EvaluationCache::new();
++            let _ = cache.cell_or_init();
++            if mask & 1 != 0 {
++                cache.store(-64, BigInt::from(17));
++            }
++            if mask & 2 != 0 {
++                cache.store_quadratic_tower(&Tower::rational(
++                    Rational::fraction(7, 3).unwrap(),
++                ));
++            }
++            if mask & 4 != 0 {
++                cache.mark_radical_tower_declined();
++            }
++            let mut expected = before;
++            expected[mask] += 1;
++            assert_eq!(Self::r17_diagnostic_cache_census().0, expected);
++            drop(cache);
++            assert_eq!(Self::r17_diagnostic_cache_census().0, before);
++        }
++    }
++}

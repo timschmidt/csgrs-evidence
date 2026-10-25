@@ -1,0 +1,186 @@
+diff --git a/crates/hyperreal/src/rational/arithmetic.rs b/crates/hyperreal/src/rational/arithmetic.rs
+index 04fb53377f..4e3048ac82 100644
+--- a/crates/hyperreal/src/rational/arithmetic.rs
++++ b/crates/hyperreal/src/rational/arithmetic.rs
+@@ -25,3 +25,9 @@ include!("arithmetic/format_parse.rs");
+ include!("arithmetic/ops.rs");
+ include!("arithmetic/comparison.rs");
+ include!("arithmetic/tests.rs");
++
++#[cfg(test)]
++mod r17_retention_tests;
++
++#[cfg(test)]
++mod r17_layout_cost_tests;
+diff --git a/crates/hyperreal/src/rational/arithmetic/construction.rs b/crates/hyperreal/src/rational/arithmetic/construction.rs
+index 5a0b43e5c5..1b49f90275 100644
+--- a/crates/hyperreal/src/rational/arithmetic/construction.rs
++++ b/crates/hyperreal/src/rational/arithmetic/construction.rs
+@@ -97,7 +97,8 @@ impl Rational {
+                 _ => {}
+             }
+         }
+-        if let Some(inverse) = cached.quaternary.get() {
++        let later = cached.later.get()?;
++        if let Some(inverse) = later.quaternary.get() {
+             match inverse.kind {
+                 CachedRationalLinearKind::StrongInversePlaceholder => {
+                     return Some(inverse.result.clone());
+@@ -108,7 +109,7 @@ impl Rational {
+                 _ => {}
+             }
+         }
+-        let inverse = cached.quinary.get()?;
++        let inverse = later.quinary.get()?;
+         match inverse.kind {
+             CachedRationalLinearKind::StrongInversePlaceholder => Some(inverse.result.clone()),
+             CachedRationalLinearKind::WeakInversePlaceholder => inverse.other.upgrade().map(Self),
+@@ -134,18 +135,12 @@ impl Rational {
+                 },
+             };
+             if cached.primary.kind.is_primary_placeholder() {
+-                return cached
+-                    .quaternary
+-                    .set(entry)
+-                    .or_else(|entry| cached.quinary.set(entry))
+-                    .is_ok();
++                return cached.retain_later(entry);
+             }
+-            return cached
+-                .tertiary
+-                .set(entry)
+-                .or_else(|entry| cached.quaternary.set(entry))
+-                .or_else(|entry| cached.quinary.set(entry))
+-                .is_ok();
++            return match cached.tertiary.set(entry) {
++                Ok(()) => true,
++                Err(entry) => cached.retain_later(entry),
++            };
+         }
+ 
+         // Preserve a direct primary linear-cache load on the established
+@@ -174,8 +169,7 @@ impl Rational {
+                 },
+                 secondary: OnceLock::new(),
+                 tertiary: OnceLock::new(),
+-                quaternary: OnceLock::new(),
+-                quinary: OnceLock::new(),
++                later: CompactOnceBox::new(),
+                 square_reduction: OnceLock::new(),
+             }))
+             .is_ok()
+diff --git a/crates/hyperreal/src/rational/arithmetic/ops.rs b/crates/hyperreal/src/rational/arithmetic/ops.rs
+index c5f360db8d..11c65d8f2c 100644
+--- a/crates/hyperreal/src/rational/arithmetic/ops.rs
++++ b/crates/hyperreal/src/rational/arithmetic/ops.rs
+@@ -941,8 +941,7 @@ impl Rational {
+                 },
+                 secondary: OnceLock::new(),
+                 tertiary: OnceLock::new(),
+-                quaternary: OnceLock::new(),
+-                quinary: OnceLock::new(),
++                later: CompactOnceBox::new(),
+                 square_reduction: OnceLock::new(),
+             }))
+             .is_ok()
+@@ -1125,11 +1124,12 @@ impl Rational {
+         {
+             return Some(result);
+         }
+-        cached
++        let later = cached.later.get()?;
++        later
+             .quaternary
+             .get()
+             .and_then(Self::negation_from_entry)
+-            .or_else(|| cached.quinary.get().and_then(Self::negation_from_entry))
++            .or_else(|| later.quinary.get().and_then(Self::negation_from_entry))
+     }
+ 
+     fn retain_negation_entry(&self, negation: CachedRationalUnary) -> bool {
+@@ -1150,18 +1150,12 @@ impl Rational {
+                 },
+             };
+             if cached.primary.kind.is_primary_placeholder() {
+-                return cached
+-                    .quaternary
+-                    .set(entry)
+-                    .or_else(|entry| cached.quinary.set(entry))
+-                    .is_ok();
++                return cached.retain_later(entry);
+             }
+-            return cached
+-                .tertiary
+-                .set(entry)
+-                .or_else(|entry| cached.quaternary.set(entry))
+-                .or_else(|entry| cached.quinary.set(entry))
+-                .is_ok();
++            return match cached.tertiary.set(entry) {
++                Ok(()) => true,
++                Err(entry) => cached.retain_later(entry),
++            };
+         }
+ 
+         let (kind, other, placeholder) = match negation {
+@@ -1185,8 +1179,7 @@ impl Rational {
+                 },
+                 secondary: OnceLock::new(),
+                 tertiary: OnceLock::new(),
+-                quaternary: OnceLock::new(),
+-                quinary: OnceLock::new(),
++                later: CompactOnceBox::new(),
+                 square_reduction: OnceLock::new(),
+             }))
+             .is_ok()
+diff --git a/crates/hyperreal/src/rational/arithmetic/representation.rs b/crates/hyperreal/src/rational/arithmetic/representation.rs
+index 86a7647e5f..7e3152b688 100644
+--- a/crates/hyperreal/src/rational/arithmetic/representation.rs
++++ b/crates/hyperreal/src/rational/arithmetic/representation.rs
+@@ -176,9 +176,32 @@ struct CachedRationalArithmetic {
+     primary: CachedRationalLinearEntry,
+     secondary: OnceLock<CachedRationalLinearEntry>,
+     tertiary: OnceLock<CachedRationalLinearEntry>,
++    later: CompactOnceBox<CachedRationalLateEntries>,
++    square_reduction: OnceLock<CachedRationalSquareReduction>,
++}
++
++struct CachedRationalLateEntries {
+     quaternary: OnceLock<CachedRationalLinearEntry>,
+     quinary: OnceLock<CachedRationalLinearEntry>,
+-    square_reduction: OnceLock<CachedRationalSquareReduction>,
++}
++
++impl CachedRationalArithmetic {
++    fn retain_later(&self, entry: CachedRationalLinearEntry) -> bool {
++        if self.later.get().is_none() {
++            let _ = self.later.set(Box::new(CachedRationalLateEntries {
++                quaternary: OnceLock::new(),
++                quinary: OnceLock::new(),
++            }));
++        }
++        // Either this caller published the pair or a concurrent publisher did.
++        // The owning arithmetic record keeps the installed pair alive.
++        let later = self.later.get().expect("published rational cache slots");
++        later
++            .quaternary
++            .set(entry)
++            .or_else(|entry| later.quinary.set(entry))
++            .is_ok()
++    }
+ }
+ 
+ const RETAINED_LINEAR_REUSE_SEEN: u32 = 1 << 0;
+diff --git a/crates/hyperreal/src/rational/arithmetic/squares_powers.rs b/crates/hyperreal/src/rational/arithmetic/squares_powers.rs
+index be4120055e..5db44a981c 100644
+--- a/crates/hyperreal/src/rational/arithmetic/squares_powers.rs
++++ b/crates/hyperreal/src/rational/arithmetic/squares_powers.rs
+@@ -272,8 +272,7 @@ impl Rational {
+                 },
+                 secondary: OnceLock::new(),
+                 tertiary: OnceLock::new(),
+-                quaternary: OnceLock::new(),
+-                quinary: OnceLock::new(),
++                later: CompactOnceBox::new(),
+                 square_reduction,
+             }));
+     }
