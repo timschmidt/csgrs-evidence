@@ -1,0 +1,447 @@
+diff --git a/crates/hypercurve/src/arc_bezier.rs b/crates/hypercurve/src/arc_bezier.rs
+index 1193fe0713..93cc01bf2e 100644
+--- a/crates/hypercurve/src/arc_bezier.rs
++++ b/crates/hypercurve/src/arc_bezier.rs
+@@ -361,10 +361,12 @@ fn full_circle_quarter_points(arc: &CircularArc2) -> Vec<Point2> {
+ pub(crate) fn circular_conic_provenance(
+     arc: &CircularArc2,
+ ) -> (Arc<[Real; 6]>, Arc<RationalQuadraticCircle2>) {
+-    let circle = Arc::new(RationalQuadraticCircle2 {
+-        center: arc.center().clone(),
+-        radius_squared: arc.radius_squared_ref().clone(),
+-        tangent_contacts: None,
++    let circle = arc.retained_circular_conic().cloned().unwrap_or_else(|| {
++        Arc::new(RationalQuadraticCircle2 {
++            center: arc.center().clone(),
++            radius_squared: arc.radius_squared_ref().clone(),
++            tangent_contacts: None,
++        })
+     });
+     (circle.implicit_coefficients(), circle)
+ }
+@@ -442,7 +444,8 @@ pub(crate) fn rational_bezier_circular_arc(
+                 circle.radius_squared.clone(),
+                 clockwise,
+                 None,
+-            ),
++            )
++            .with_retained_circular_conic(Some(Arc::clone(circle))),
+         )));
+     }
+     let controls = match curve.quadratic_homogeneous_controls(policy)? {
+@@ -499,7 +502,8 @@ fn homogeneous_quadratic_circular_arc(
+                 circle.radius_squared.clone(),
+                 clockwise,
+                 None,
+-            ),
++            )
++            .with_retained_circular_conic(Some(Arc::clone(circle))),
+         )));
+     }
+ 
+diff --git a/crates/hypercurve/src/bezier_region/native_fragments.rs b/crates/hypercurve/src/bezier_region/native_fragments.rs
+index b808d6d551..80e0d206de 100644
+--- a/crates/hypercurve/src/bezier_region/native_fragments.rs
++++ b/crates/hypercurve/src/bezier_region/native_fragments.rs
+@@ -164,14 +164,17 @@ pub(crate) fn retained_native_fragment_segment(
+             };
+             Ok(Classification::Decided(match source {
+                 Segment2::Line(_) => Segment2::Line(LineSeg2::try_new(start_point, end_point)?),
+-                Segment2::Arc(arc) => Segment2::Arc(CircularArc2::new_with_certified_radius(
+-                    start_point,
+-                    end_point,
+-                    arc.center().clone(),
+-                    arc.radius_squared_ref().clone(),
+-                    arc.is_clockwise() ^ *reversed,
+-                    None,
+-                )),
++                Segment2::Arc(arc) => Segment2::Arc(
++                    CircularArc2::new_with_certified_radius(
++                        start_point,
++                        end_point,
++                        arc.center().clone(),
++                        arc.radius_squared_ref().clone(),
++                        arc.is_clockwise() ^ *reversed,
++                        None,
++                    )
++                    .with_retained_circular_conic(arc.retained_circular_conic().cloned()),
++                ),
+             }))
+         }
+         BezierSplitFragment2::AlgebraicChord(chord) => {
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index bb9412203b..e2f17670c9 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -1353,14 +1353,17 @@ impl Curve2 {
+                 } else {
+                     CircularArc2::new_unchecked_with_radius
+                 };
+-                CurveGeometry2::CircularArc(constructor(
+-                    sub_start,
+-                    sub_end,
+-                    curve.center().clone(),
+-                    curve.radius_squared(),
+-                    curve.is_clockwise(),
+-                    None,
+-                ))
++                CurveGeometry2::CircularArc(
++                    constructor(
++                        sub_start,
++                        sub_end,
++                        curve.center().clone(),
++                        curve.radius_squared(),
++                        curve.is_clockwise(),
++                        None,
++                    )
++                    .with_retained_circular_conic(curve.retained_circular_conic().cloned()),
++                )
+             }
+             Some(CurveGeometry2::QuadraticBezier(curve)) => CurveGeometry2::QuadraticBezier(
+                 curve
+diff --git a/crates/hypercurve/src/curve_corner_chain.rs b/crates/hypercurve/src/curve_corner_chain.rs
+index d9ece2d460..c23749dc88 100644
+--- a/crates/hypercurve/src/curve_corner_chain.rs
++++ b/crates/hypercurve/src/curve_corner_chain.rs
+@@ -702,7 +702,8 @@ impl<'a> CurveCornerChain2<'a> {
+                 support.radius_squared(),
+                 support.is_clockwise(),
+                 None,
+-            );
++            )
++            .with_retained_circular_conic(support.retained_circular_conic().cloned());
+             return Self::materialized_corner_arc_fragments(&arc, operation, policy);
+         }
+         let circle = CircularArc2::new_with_certified_radius(
+@@ -712,7 +713,8 @@ impl<'a> CurveCornerChain2<'a> {
+             support.radius_squared(),
+             support.is_clockwise(),
+             None,
+-        );
++        )
++        .with_retained_circular_conic(support.retained_circular_conic().cloned());
+         let decomposition = retained_corner_decision(
+             circle
+                 .rational_bezier_decomposition_raw(policy)
+@@ -3180,6 +3182,9 @@ impl<'a> CurveCornerChain2<'a> {
+                 deferred.source.support().radius_squared(),
+                 deferred.source.support().is_clockwise(),
+                 None,
++            )
++            .with_retained_circular_conic(
++                deferred.source.support().retained_circular_conic().cloned(),
+             );
+             let replacement = Some(Self::materialized_corner_arc_fragments(
+                 &retained_arc,
+diff --git a/crates/hypercurve/src/curve_corner_cuts.rs b/crates/hypercurve/src/curve_corner_cuts.rs
+index 20a9d87f24..9d07b43f73 100644
+--- a/crates/hypercurve/src/curve_corner_cuts.rs
++++ b/crates/hypercurve/src/curve_corner_cuts.rs
+@@ -1269,6 +1269,7 @@ pub(super) fn arc_extension_contains_corner(
+             None,
+         )
+     };
++    let extended = extended.with_retained_circular_conic(arc.retained_circular_conic().cloned());
+     let retained_corner = if previous { arc.end() } else { arc.start() };
+     match extended.contains_sweep_point_with_policy(retained_corner, policy) {
+         Classification::Decided(contains) => Ok(contains),
+@@ -1695,6 +1696,8 @@ pub(super) fn materialize_corner_cut(
+                         None,
+                     )
+                 };
++                let trimmed =
++                    trimmed.with_retained_circular_conic(arc.retained_circular_conic().cloned());
+                 Ok(Curve2::from_geometry_with_lineage(
+                     CurveGeometry2::CircularArc(trimmed),
+                     lineage,
+@@ -1752,6 +1755,7 @@ pub(super) fn materialize_corner_cut(
+                         arc.is_clockwise(),
+                         None,
+                     )
++                    .with_retained_circular_conic(arc.retained_circular_conic().cloned())
+                 } else {
+                     CircularArc2::new_with_certified_radius(
+                         point.clone(),
+@@ -1761,6 +1765,7 @@ pub(super) fn materialize_corner_cut(
+                         arc.is_clockwise(),
+                         None,
+                     )
++                    .with_retained_circular_conic(arc.retained_circular_conic().cloned())
+                 }))
+             } else if let Some(arc) = retained_rational_arc_support(curve, operation, policy)? {
+                 Ok(Curve2::from(if previous {
+@@ -1772,6 +1777,7 @@ pub(super) fn materialize_corner_cut(
+                         arc.is_clockwise(),
+                         None,
+                     )
++                    .with_retained_circular_conic(arc.retained_circular_conic().cloned())
+                 } else {
+                     CircularArc2::new_with_certified_radius(
+                         point.clone(),
+@@ -1781,6 +1787,7 @@ pub(super) fn materialize_corner_cut(
+                         arc.is_clockwise(),
+                         None,
+                     )
++                    .with_retained_circular_conic(arc.retained_circular_conic().cloned())
+                 }))
+             } else if let Some(parameter) = cut.exact_parameter() {
+                 let domain = curve.native_parameter_domain()?;
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index a6e7c05d99..405663dd32 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -1657,6 +1657,7 @@ fn build_native_coincident_arc_evidence(
+                 first_arc.is_clockwise(),
+                 None,
+             )
++            .with_retained_circular_conic(first_arc.retained_circular_conic().cloned())
+         };
+         for (second_span_index, second_fragment) in second_fragments.iter().enumerate() {
+             let (second_start, second_end) = second_fragment.native_curve().endpoints();
+@@ -1671,6 +1672,7 @@ fn build_native_coincident_arc_evidence(
+                     second_arc.is_clockwise(),
+                     None,
+                 )
++                .with_retained_circular_conic(second_arc.retained_circular_conic().cloned())
+             };
+             let relation = first_span
+                 .intersect_arc_with_policy(&second_span, policy)
+@@ -1946,7 +1948,8 @@ fn arc_span_indices_for_point(
+             arc.radius_squared(),
+             arc.is_clockwise(),
+             None,
+-        );
++        )
++        .with_retained_circular_conic(arc.retained_circular_conic().cloned());
+         match span.contains_sweep_point_with_policy(point, policy) {
+             Classification::Decided(true) => indices.push(span_index),
+             Classification::Decided(false) => {}
+diff --git a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+index de796d1487..a4b9a53bb6 100644
+--- a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
++++ b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+@@ -137,6 +137,129 @@ fn similarity_preserves_retained_circle_and_selected_chart() {
+     }
+ }
+ 
++#[test]
++fn native_arc_reconstruction_preserves_circle_tangent_contacts() {
++    use crate::rational_bezier::{
++        RationalQuadraticCircleTangentContact2 as Contact, RationalQuadraticParallelCircleContact2,
++    };
++    let policy = CurveContext::STRICT;
++    let center = Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap());
++    let point = center.translated(Real::one(), Real::zero());
++    let line = LineSeg2::try_new(
++        center.translated(Real::one(), -Real::one()),
++        center.translated(Real::one(), Real::one()),
++    )
++    .unwrap();
++    let parallel = crate::QuadraticBezier2::from_line_segment(line.clone())
++        .parallel_left(Real::zero())
++        .unwrap();
++    let source = circle_source(&center, -3);
++    let mut circle = source.retained_circular_conic().unwrap().as_ref().clone();
++    circle.tangent_contacts = Some(Arc::from([
++        Contact::Line {
++            line,
++            point: point.clone(),
++        },
++        Contact::Parallel(RationalQuadraticParallelCircleContact2 {
++            parallel,
++            parameter: q(1, 2),
++            point: point.clone(),
++            eliminant_root_multiplicity: 2,
++        }),
++    ]));
++    let circle = Arc::new(circle);
++    let source = RationalBezier2::try_new(
++        vec![
++            point.clone(),
++            center.translated(Real::one(), Real::one()),
++            center.translated(Real::zero(), Real::one()),
++        ],
++        vec![Real::from(-3), Real::from(-3), Real::from(-6)],
++    )
++    .unwrap()
++    .with_implicit_quadratic_conic(circle.implicit_coefficients(), Some(Arc::clone(&circle)));
++    assert_eq!(source.retained_circular_conic(), Some(&circle));
++    let Classification::Decided(Some(native)) =
++        crate::arc_bezier::rational_bezier_circular_arc(&source, &policy).unwrap()
++    else {
++        panic!("the retained circle has one native arc");
++    };
++    let (_, promoted_circle) = crate::arc_bezier::circular_conic_provenance(&native);
++    assert_eq!(
++        promoted_circle, circle,
++        "native promotion keeps both contact proofs"
++    );
++    let Classification::Decided(Some(quadratic)) = source
++        .materialized_quadratic_representative(&policy)
++        .unwrap()
++    else {
++        panic!("the rational quadratic has a native representative");
++    };
++    let Classification::Decided(Some(quadratic_arc)) =
++        crate::arc_bezier::rational_quadratic_circular_arc(&quadratic, &policy).unwrap()
++    else {
++        panic!("the quadratic retains its circle");
++    };
++    let elevated = source.elevated_to_degree(5).unwrap();
++    let Classification::Decided(Some(elevated_arc)) =
++        crate::arc_bezier::rational_bezier_circular_arc(&elevated, &policy).unwrap()
++    else {
++        panic!("degree elevation retains the selected circular chart");
++    };
++    let midpoint = q(1, 2).sqrt().unwrap();
++    let (first, second) = native
++        .split_at_retained_sweep_point(&q(1, 2), center.translated(midpoint.clone(), midpoint))
++        .unwrap();
++    for (arc, contains_contact) in [
++        (native.clone(), true),
++        (native.reversed(), true),
++        (quadratic_arc, true),
++        (elevated_arc, true),
++        (first, true),
++        (second, false),
++    ] {
++        let (_, support) = crate::arc_bezier::circular_conic_provenance(&arc);
++        assert_eq!(support, circle);
++        assert_eq!(arc.contains_point(&point).unwrap(), contains_contact);
++        for span in arc.rational_bezier_decomposition().unwrap().spans() {
++            assert_eq!(span.curve().retained_circular_conic(), Some(&circle));
++        }
++        let selected = crate::Curve2::from(arc.clone())
++            .subcurve(q(1, 4).into(), q(3, 4).into())
++            .unwrap();
++        let Some(crate::CurveGeometry2::CircularArc(selected)) = selected.geometry() else {
++            panic!("a native scalar restriction stays circular");
++        };
++        assert_eq!(selected.retained_circular_conic(), Some(&circle));
++        assert!(!selected.contains_point(&point).unwrap());
++        for entries in [[3, -4, 4, 3, 7, -2], [3, 4, 4, -3, 1, 5]] {
++            let [a, b, c, d, x, y] = entries.map(Real::from);
++            let transform = crate::Similarity2::try_from_real_affine(a, b, c, d, x, y).unwrap();
++            let image = arc.transform_similarity(&transform).unwrap();
++            assert_eq!(
++                image.is_clockwise(),
++                arc.is_clockwise() ^ transform.reverses_orientation()
++            );
++            let expected = circle.transform_similarity(&transform).unwrap();
++            let (_, image_circle) = crate::arc_bezier::circular_conic_provenance(&image);
++            assert_eq!(image_circle.as_ref(), &expected);
++            assert_eq!(
++                is_zero(
++                    &(image.radius_squared() - &expected.radius_squared),
++                    &policy
++                ),
++                Some(true)
++            );
++            assert_eq!(
++                image
++                    .contains_point(&transform.transform_point(&point))
++                    .unwrap(),
++                contains_contact
++            );
++        }
++    }
++}
++
+ #[test]
+ fn similarity_transports_circle_tangent_relations_and_invalidates_affine_metric() {
+     use crate::rational_bezier::{
+diff --git a/crates/hypercurve/src/segment.rs b/crates/hypercurve/src/segment.rs
+index 860192ae07..5f9b9c1169 100644
+--- a/crates/hypercurve/src/segment.rs
++++ b/crates/hypercurve/src/segment.rs
+@@ -524,6 +524,7 @@ pub(crate) struct CircularArcRetainedFacts2 {
+     endpoints_on_stored_circle: bool,
+     clockwise: bool,
+     source_bulge: Option<Real>,
++    circular_conic: Option<Arc<crate::rational_bezier::RationalQuadraticCircle2>>,
+     structural_facts: OnceLock<Box<crate::CircularArc2Facts>>,
+     pub(crate) sweep_kind: crate::policy::PolicyEvaluationCache<crate::arc_bezier::ArcSweepKind>,
+     pub(crate) bezier_decomposition:
+@@ -553,6 +554,7 @@ impl CircularArcRetainedFacts2 {
+             endpoints_on_stored_circle,
+             clockwise,
+             source_bulge,
++            circular_conic: None,
+             structural_facts: OnceLock::new(),
+             sweep_kind: crate::policy::PolicyEvaluationCache::new(),
+             bezier_decomposition: crate::policy::PolicyEvaluationCache::new(),
+@@ -604,6 +606,28 @@ impl CircularArc2 {
+         &self.retained_facts
+     }
+ 
++    pub(crate) fn retained_circular_conic(
++        &self,
++    ) -> Option<&Arc<crate::rational_bezier::RationalQuadraticCircle2>> {
++        self.data().circular_conic.as_ref()
++    }
++
++    /// Attaches an already proved supporting circle to a freshly constructed
++    /// arc. The caller owns equality of the center and radius; endpoint and
++    /// sweep certification remain separate. Restrictions and reversal retain
++    /// the support's contacts even when a contact lies outside the new sweep.
++    pub(crate) fn with_retained_circular_conic(
++        mut self,
++        circle: Option<Arc<crate::rational_bezier::RationalQuadraticCircle2>>,
++    ) -> Self {
++        if circle.is_some() {
++            Arc::get_mut(&mut self.retained_facts)
++                .expect("new arc retained facts are uniquely owned")
++                .circular_conic = circle;
++        }
++        self
++    }
++
+     fn from_geometry(
+         start: Point2,
+         end: Point2,
+@@ -1610,7 +1634,8 @@ impl CircularArc2 {
+             self.radius_squared(),
+             self.is_clockwise(),
+             None,
+-        );
++        )
++        .with_retained_circular_conic(self.retained_circular_conic().cloned());
+         let _ =
+             fragment
+                 .retained_facts
+@@ -1729,6 +1754,7 @@ impl CircularArc2 {
+             !self.is_clockwise(),
+             self.bulge().map(|bulge| -bulge.clone()),
+         )
++        .with_retained_circular_conic(self.retained_circular_conic().cloned())
+     }
+ }
+ 
+diff --git a/crates/hypercurve/src/transform.rs b/crates/hypercurve/src/transform.rs
+index 0d2e3e40a6..e73d6404a7 100644
+--- a/crates/hypercurve/src/transform.rs
++++ b/crates/hypercurve/src/transform.rs
+@@ -278,6 +278,23 @@ impl CircularArc2 {
+     /// clockwise state is toggled exactly when the transform reverses
+     /// orientation.
+     pub fn transform_similarity(&self, transform: &Similarity2) -> CurveResult<Self> {
++        if let Some(circle) = self.retained_circular_conic() {
++            let circle = std::sync::Arc::new(circle.transform_similarity(transform)?);
++            let constructor = if self.endpoints_on_stored_circle_are_certified() {
++                Self::new_with_certified_radius
++            } else {
++                Self::new_unchecked_with_radius
++            };
++            return Ok(constructor(
++                transform.transform_point(self.start()),
++                transform.transform_point(self.end()),
++                circle.center.clone(),
++                circle.radius_squared.clone(),
++                self.is_clockwise() ^ transform.reverses_orientation(),
++                None,
++            )
++            .with_retained_circular_conic(Some(circle)));
++        }
+         Self::try_from_center(
+             transform.transform_point(self.start()),
+             transform.transform_point(self.end()),
