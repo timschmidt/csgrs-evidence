@@ -1,0 +1,106 @@
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index 405663dd32..f4a3f53081 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -3459,6 +3459,101 @@ mod native_dispatch_tests {
+         Point2::from_values(x, y)
+     }
+ 
++    #[test]
++    fn native_contacts_retain_exact_oriented_tangent_facts() {
++        use hyperreal::RealSign;
++        let policy = CurveContext::STRICT;
++        for center in [
++            point(0, 0),
++            Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap()),
++        ] {
++            let point = |x: i8, y: i8| center.translated(Real::from(x), Real::from(y));
++            let line = |a, b| LineSeg2::try_new(a, b).unwrap();
++            let arc = CircularArc2::try_from_center(point(1, 0), point(0, 1), point(0, 0), false)
++                .unwrap();
++            let cases = [
++                (
++                    Curve2::from(line(point(-1, 0), point(0, 0))),
++                    Curve2::from(line(point(0, 0), point(0, 1))),
++                    RealSign::Positive,
++                ),
++                (
++                    Curve2::from(line(point(-1, 0), point(0, 0))),
++                    Curve2::from(line(point(0, 0), point(1, 0))),
++                    RealSign::Zero,
++                ),
++                (
++                    Curve2::from(QuadraticBezier2::from_line_segment(line(
++                        point(0, 0),
++                        point(2, 0),
++                    ))),
++                    Curve2::from(arc.clone()),
++                    RealSign::Positive,
++                ),
++                (
++                    Curve2::from(line(point(1, -1), point(1, 1))),
++                    Curve2::from(arc),
++                    RealSign::Zero,
++                ),
++            ];
++            for (first, second, expected) in cases {
++                for reversed in [false, true] {
++                    let second = if reversed {
++                        second.reversed().unwrap()
++                    } else {
++                        second.clone()
++                    };
++                    for swapped in [false, true] {
++                        let (a, b) = if swapped {
++                            (&second, &first)
++                        } else {
++                            (&first, &second)
++                        };
++                        let context = CurveIntersectionContext::try_new(a, b, &policy).unwrap();
++                        assert!(matches!(
++                            context.data.dispatch,
++                            CurveIntersectionDispatch::NativeLine(_)
++                                | CurveIntersectionDispatch::NativeLineArc { .. }
++                        ));
++                        let result = if matches!(
++                            context.data.dispatch,
++                            CurveIntersectionDispatch::NativeLine(_)
++                        ) {
++                            let attempt = crate::evaluate_with_budget(
++                                policy.predicate_policy(),
++                                crate::WorkBudget::ZERO,
++                                || context.result(),
++                            );
++                            assert_eq!(attempt.usage.refinements, 0);
++                            assert_eq!(attempt.usage.promotions, 0);
++                            attempt.result.unwrap().certified().unwrap().unwrap()
++                        } else {
++                            context.result().unwrap()
++                        };
++                        assert!(result.is_complete() && result.overlaps().is_empty());
++                        let [contact] = result.contacts() else {
++                            panic!("one finite native contact");
++                        };
++                        let expected = if reversed ^ swapped {
++                            match expected {
++                                RealSign::Positive => RealSign::Negative,
++                                RealSign::Negative => RealSign::Positive,
++                                RealSign::Zero => RealSign::Zero,
++                            }
++                        } else {
++                            expected
++                        };
++                        assert_eq!(contact.tangent_cross_sign(), Some(expected));
++                        assert_eq!(
++                            contact.is_certified_transverse(),
++                            expected != RealSign::Zero
++                        );
++                    }
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn degree_elevated_affine_lines_keep_native_pair_dispatch() {
+         let horizontal = Curve2::from(QuadraticBezier2::from_line_segment(
