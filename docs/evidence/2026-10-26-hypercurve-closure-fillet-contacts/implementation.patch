@@ -1,0 +1,1436 @@
+diff --git a/crates/hypercurve/src/bezier_offset/parallel.rs b/crates/hypercurve/src/bezier_offset/parallel.rs
+index 476f5f1b5e..3ba98a1a12 100644
+--- a/crates/hypercurve/src/bezier_offset/parallel.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel.rs
+@@ -4,10 +4,21 @@ use super::*;
+ use hypersolve::exact_factor::divide_by_linear_root;
+ use hypersolve::exact_factor::polynomial_restrict_to_interval;
+ 
++#[cfg(test)]
++mod circular_incidence_tests;
+ mod pair_kernel;
+ mod point;
+ mod rational_kernel;
+ 
++/// A circle incidence may already own a represented exact point. Keep that
++/// witness with its source parameter so consumers need not reconstruct it by
++/// evaluating a normal expression and rediscover its known circle relation.
++pub(crate) struct BezierParallelCircleIncidence2 {
++    pub(crate) parameter: BezierParameter2,
++    pub(crate) radial_crossing_sign: Option<RealSign>,
++    pub(crate) point: Option<Point2>,
++}
++
+ impl BezierParallel2 {
+     pub(crate) fn checked_native_point(
+         &self,
+@@ -3281,14 +3292,62 @@ impl BezierParallel2 {
+         certified_tangent_parameters: &[(Real, u8)],
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<Vec<(BezierParameter2, Option<RealSign>)>>> {
+-        self.circle_incidence_with_tangent_field(
+-            center,
+-            radius_squared,
+-            range,
+-            certified_tangent_parameters,
+-            None,
+-            policy,
+-        )
++        Ok(self
++            .circle_incidence_with_point_evidence(
++                center,
++                radius_squared,
++                range,
++                certified_tangent_parameters,
++                policy,
++            )?
++            .map(|contacts| {
++                contacts
++                    .into_iter()
++                    .map(|contact| (contact.parameter, contact.radial_crossing_sign))
++                    .collect()
++            }))
++    }
++
++    pub(crate) fn circle_incidence_with_point_evidence(
++        &self,
++        center: &Point2,
++        radius_squared: &Real,
++        range: &CurveParameterRange2,
++        certified_tangent_parameters: &[(Real, u8)],
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Vec<BezierParallelCircleIncidence2>>> {
++        if certified_tangent_parameters
++            .iter()
++            .any(|(_, multiplicity)| *multiplicity == 0)
++        {
++            return Ok(Classification::Uncertain(UncertaintyReason::Boundary));
++        }
++        if let Some(contacts) =
++            self.retained_circular_source_incidence(center, radius_squared, range, policy)?
++        {
++            return Ok(Classification::Decided(contacts));
++        }
++        Ok(self
++            .circle_incidence_with_tangent_field(
++                center,
++                radius_squared,
++                range,
++                certified_tangent_parameters,
++                None,
++                policy,
++            )?
++            .map(|contacts| {
++                contacts
++                    .into_iter()
++                    .map(
++                        |(parameter, radial_crossing_sign)| BezierParallelCircleIncidence2 {
++                            parameter,
++                            radial_crossing_sign,
++                            point: None,
++                        },
++                    )
++                    .collect()
++            }))
+     }
+ 
+     pub(super) fn circle_incidence_with_tangent_field(
+diff --git a/crates/hypercurve/src/bezier_offset/parallel/rational_kernel.rs b/crates/hypercurve/src/bezier_offset/parallel/rational_kernel.rs
+index baf1b20136..c1ce64fa79 100644
+--- a/crates/hypercurve/src/bezier_offset/parallel/rational_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel/rational_kernel.rs
+@@ -3,6 +3,119 @@
+ use super::*;
+ 
+ impl BezierParallel2 {
++    /// An exactly quadratic circle chart has no stationary parameter on its
++    /// pole-free unit domain. Its existing concentric parallel construction
++    /// preserves that parameter, so the shared circle relation and inverse
++    /// can decide incidence without squaring the homogeneous speed expression.
++    /// Declined recognition, extension domains, and coincident supports retain
++    /// the general incidence authority.
++    pub(super) fn retained_circular_source_incidence(
++        &self,
++        center: &Point2,
++        radius_squared: &Real,
++        range: &CurveParameterRange2,
++        policy: &CurveContext,
++    ) -> CurveResult<Option<Vec<BezierParallelCircleIncidence2>>> {
++        let Some(source) = self.rational_source() else {
++            return Ok(None);
++        };
++        if source.retained_circular_conic().is_none() {
++            return Ok(None);
++        }
++        let strict = policy.strict_counterpart();
++        if !matches!(
++            source.quadratic_homogeneous_controls(&strict)?,
++            Classification::Decided(Some(_))
++        ) || CurveParameterDomain2::new(&CurveParameterRange2::unit(), None)
++            .contains_finite_range(range, &strict)?
++            != Classification::Decided(true)
++        {
++            return Ok(None);
++        }
++        let Classification::Decided(Some(component)) =
++            self.exact_circular_parallel_component(&strict)?
++        else {
++            return Ok(None);
++        };
++        let Classification::Decided(Some(arc)) =
++            crate::arc_bezier::rational_bezier_circular_arc(&component, &strict)?
++        else {
++            return Ok(None);
++        };
++        let points = match crate::intersect::circle_relation_from_supports(
++            arc.center(),
++            arc.radius_squared_ref(),
++            center,
++            radius_squared,
++            &strict,
++        )? {
++            crate::CircleCircleRelation::Disjoint => return Ok(Some(Vec::new())),
++            crate::CircleCircleRelation::Tangent { point } => vec![(point, true)],
++            crate::CircleCircleRelation::Secant {
++                first_point,
++                second_point,
++            } => {
++                vec![(first_point, false), (second_point, false)]
++            }
++            crate::CircleCircleRelation::Coincident
++            | crate::CircleCircleRelation::Uncertain { .. } => return Ok(None),
++        };
++        let domain = CurveParameterDomain2::new(range, None);
++        let mut contacts: Vec<BezierParallelCircleIncidence2> = Vec::new();
++        for (point, tangent) in points {
++            let Classification::Decided(parameters) =
++                component.retained_circle_point_parameters(&point, &strict)?
++            else {
++                return Ok(None);
++            };
++            let crossing = if tangent {
++                RealSign::Zero
++            } else {
++                let (x, y) = point.delta_from(arc.center());
++                let (rx, ry) = point.delta_from(center);
++                let Some(sign) = real_sign(&(x * ry - y * rx), &strict) else {
++                    return Ok(None);
++                };
++                if arc.is_clockwise() {
++                    product_sign(sign, RealSign::Negative)
++                } else {
++                    sign
++                }
++            };
++            for parameter in parameters {
++                match domain.contains_finite_parameter(&parameter.clone().into(), &strict)? {
++                    Classification::Decided(true) => {
++                        let mut insert_at = contacts.len();
++                        for (index, existing) in contacts.iter().enumerate() {
++                            match parameter
++                                .cmp_by_refinement_with_policy(&existing.parameter, &strict)?
++                            {
++                                Classification::Decided(std::cmp::Ordering::Less) => {
++                                    insert_at = index;
++                                    break;
++                                }
++                                Classification::Decided(std::cmp::Ordering::Greater) => {}
++                                Classification::Decided(std::cmp::Ordering::Equal)
++                                | Classification::Uncertain(_) => return Ok(None),
++                            }
++                        }
++                        contacts.insert(
++                            insert_at,
++                            BezierParallelCircleIncidence2 {
++                                parameter,
++                                radial_crossing_sign: Some(crossing),
++                                point: Some(point.clone()),
++                            },
++                        );
++                    }
++                    Classification::Decided(false) => {}
++                    Classification::Uncertain(_) => return Ok(None),
++                }
++            }
++        }
++        Ok(Some(contacts))
++    }
++
+     #[cfg(test)]
+     /// Constructs complete parameter projections for intersections with a rational Bezier.
+     ///
+@@ -332,21 +445,10 @@ impl BezierParallel2 {
+         };
+         let certified_tangent_parameters = other
+             .retained_circular_conic()
+-            .and_then(|circle| circle.tangent_contacts.as_deref())
++            .map(|circle| circle.parallel_tangent_contacts_for(self, policy))
++            .unwrap_or_default()
+             .into_iter()
+-            .flatten()
+-            .filter_map(|contact| match contact {
+-                crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(
+-                    contact,
+-                ) if contact.parallel == *self => Some((
+-                    contact.parameter.clone(),
+-                    contact.eliminant_root_multiplicity,
+-                )),
+-                crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(_)
+-                | crate::rational_bezier::RationalQuadraticCircleTangentContact2::Line { .. } => {
+-                    None
+-                }
+-            })
++            .map(|contact| (contact.parameter, contact.eliminant_root_multiplicity))
+             .collect::<Vec<_>>();
+         let parameters = match self.circle_incidence_with_tangent_field(
+             support.center(),
+diff --git a/crates/hypercurve/src/bezier_region/offset_joins.rs b/crates/hypercurve/src/bezier_region/offset_joins.rs
+index ec8c5023dc..d264ac6808 100644
+--- a/crates/hypercurve/src/bezier_region/offset_joins.rs
++++ b/crates/hypercurve/src/bezier_region/offset_joins.rs
+@@ -1722,6 +1722,13 @@ pub(super) fn exact_offset_retained_tangent_support(
+     endpoint: &CurvePoint2,
+     policy: &CurveContext,
+ ) -> Option<CurveResult<Classification<crate::BezierAlgebraicChord2>>> {
++    if let Some(direction) = tangent.circular_represented_direction() {
++        return exact_offset_retained_tangent_support(
++            &CurveTangent2::RepresentedDirection(direction),
++            endpoint,
++            policy,
++        );
++    }
+     match tangent {
+         CurveTangent2::RepresentedDirection(vector) => Some((|| {
+             let displaced = match crate::BezierAlgebraicChord2::translated_endpoint(
+@@ -2739,6 +2746,25 @@ pub(super) fn curve_tangent_cross_sign(
+     second: &CurveTangent2,
+     policy: &CurveContext,
+ ) -> Classification<RealSign> {
++    if first.has_circle_parallel_tangent_contact(second, policy)
++        || second.has_circle_parallel_tangent_contact(first, policy)
++    {
++        return Classification::Decided(RealSign::Zero);
++    }
++    if let Some(direction) = first.circular_represented_direction() {
++        return curve_tangent_cross_sign(
++            &CurveTangent2::RepresentedDirection(direction),
++            second,
++            policy,
++        );
++    }
++    if let Some(direction) = second.circular_represented_direction() {
++        return curve_tangent_cross_sign(
++            first,
++            &CurveTangent2::RepresentedDirection(direction),
++            policy,
++        );
++    }
+     match (first, second) {
+         (
+             CurveTangent2::RepresentedDirection(first),
+@@ -3296,6 +3322,49 @@ pub(super) fn curve_tangents_are_opposite(
+     second: &CurveTangent2,
+     policy: &CurveContext,
+ ) -> Classification<bool> {
++    for (circle, other) in [(first, second), (second, first)] {
++        if circle.has_circle_parallel_tangent_contact(other, policy)
++            && let Some((x, y)) = circle.circular_represented_direction()
++            && let CurveTangent2::RetainedParallel {
++                parallel,
++                parameter,
++                source_direction,
++                ..
++            } = other
++        {
++            match parallel.vector_source_tangent_cross_dot_linear_combination_sign(
++                &CurveParameter2::from(parameter.clone()),
++                &x,
++                &y,
++                &Real::zero(),
++                &Real::one(),
++                policy,
++            ) {
++                Ok(Classification::Decided(sign)) => {
++                    return match exact_sign_product(sign, *source_direction) {
++                        RealSign::Positive => Classification::Decided(false),
++                        RealSign::Negative => Classification::Decided(true),
++                        RealSign::Zero => Classification::Uncertain(UncertaintyReason::Boundary),
++                    };
++                }
++                Ok(Classification::Uncertain(_)) | Err(_) => {}
++            }
++        }
++    }
++    if let Some(direction) = first.circular_represented_direction() {
++        return curve_tangents_are_opposite(
++            &CurveTangent2::RepresentedDirection(direction),
++            second,
++            policy,
++        );
++    }
++    if let Some(direction) = second.circular_represented_direction() {
++        return curve_tangents_are_opposite(
++            first,
++            &CurveTangent2::RepresentedDirection(direction),
++            policy,
++        );
++    }
+     match curve_tangent_cross_sign(first, second, policy) {
+         Classification::Decided(RealSign::Negative | RealSign::Positive) => {
+             return Classification::Decided(false);
+diff --git a/crates/hypercurve/src/bezier_region/offset_spans.rs b/crates/hypercurve/src/bezier_region/offset_spans.rs
+index 15b55b4399..ed5a3d7382 100644
+--- a/crates/hypercurve/src/bezier_region/offset_spans.rs
++++ b/crates/hypercurve/src/bezier_region/offset_spans.rs
+@@ -45,6 +45,37 @@ pub(crate) enum CurveTangent2 {
+ }
+ 
+ impl CurveTangent2 {
++    pub(super) fn circular_represented_direction(&self) -> Option<(Real, Real)> {
++        let Self::CircularPoint {
++            point,
++            circle,
++            clockwise,
++        } = self
++        else {
++            return None;
++        };
++        let (x, y) = point.coordinates()?.delta_from(&circle.center);
++        Some(if *clockwise { (y, -x) } else { (-y, x) })
++    }
++
++    pub(super) fn has_circle_parallel_tangent_contact(
++        &self,
++        other: &Self,
++        policy: &CurveContext,
++    ) -> bool {
++        match (self, other) {
++            (
++                Self::CircularPoint { point, circle, .. },
++                Self::RetainedParallel {
++                    parallel,
++                    parameter,
++                    ..
++                },
++            ) => circle.has_parallel_tangent_direction_contact(point, parallel, parameter, policy),
++            _ => false,
++        }
++    }
++
+     /// Retains a boundary's traversal direction in the same geometric chart
+     /// used by offsets. No offset construction or coordinate projection is
+     /// needed to compare endpoint directions in an arrangement.
+@@ -514,11 +545,9 @@ pub(super) fn exact_offset_spans_from_algebraic_endpoint_images(
+             + source_arc.center().y() * source_arc.center().y()
+             - &radius_squared,
+     ]);
+-    let offset_circle = Arc::new(crate::rational_bezier::RationalQuadraticCircle2 {
+-        center: source_arc.center().clone(),
+-        radius_squared,
+-        tangent_contacts: None,
+-    });
++    let offset_circle = crate::arc_bezier::circular_conic_provenance(&source_arc)
++        .1
++        .concentric_image(&radial_scale);
+     let offset_curve =
+         crate::RationalQuadraticBezier2::try_new_with_common_weight_sign_and_implicit_conic(
+             scale_point(source_curve.start()),
+@@ -1049,7 +1078,12 @@ pub(super) fn exact_offset_span_from_native_arc(
+                 arc.center().clone(),
+                 arc.is_clockwise(),
+                 arc.bulge().cloned(),
+-            )?;
++            )?
++            .with_retained_circular_conic(Some(
++                crate::arc_bezier::circular_conic_provenance(arc)
++                    .1
++                    .concentric_image(&radius_scale),
++            ));
+             exact_offset_span_from_native_segment(source, &Segment2::Arc(offset), policy)
+         }
+         None => Ok(Classification::Uncertain(UncertaintyReason::RealSign)),
+@@ -2406,13 +2440,27 @@ pub(super) fn exact_offset_span_from_native_segment(
+             )
+         }
+     };
++    let endpoint_tangent = |point: &Point2, represented| {
++        if let Segment2::Arc(arc) = offset
++            && let Some(circle) = arc.retained_circular_conic()
++            && circle.tangent_contacts.is_some()
++        {
++            CurveTangent2::CircularPoint {
++                point: point.clone().into(),
++                circle: Arc::clone(circle),
++                clockwise: arc.is_clockwise(),
++            }
++        } else {
++            CurveTangent2::RepresentedDirection(represented)
++        }
++    };
+     Ok(Classification::Decided(ExactOffsetSpan2 {
+         fragments,
+         source_end: source.end().clone().into(),
+         offset_start: offset.start().clone().into(),
+         offset_end: offset.end().clone().into(),
+-        start_tangent: Some(CurveTangent2::RepresentedDirection(start_tangent)),
+-        end_tangent: Some(CurveTangent2::RepresentedDirection(end_tangent)),
++        start_tangent: Some(endpoint_tangent(offset.start(), start_tangent)),
++        end_tangent: Some(endpoint_tangent(offset.end(), end_tangent)),
+     }))
+ }
+ 
+diff --git a/crates/hypercurve/src/bezier_region/point_location.rs b/crates/hypercurve/src/bezier_region/point_location.rs
+index 44c929688b..ec7997144b 100644
+--- a/crates/hypercurve/src/bezier_region/point_location.rs
++++ b/crates/hypercurve/src/bezier_region/point_location.rs
+@@ -1985,7 +1985,8 @@ pub(super) fn classify_point_with_retained_ray_skipping_origin(
+                     crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(_)
+                     | crate::rational_bezier::RationalQuadraticCircleTangentContact2::Line {
+                         ..
+-                    } => None,
++                    }
++                    | crate::rational_bezier::RationalQuadraticCircleTangentContact2::Concentric { .. } => None,
+                 }
+                     })
+                 });
+diff --git a/crates/hypercurve/src/bezier_region/tests.rs b/crates/hypercurve/src/bezier_region/tests.rs
+index c0acb1c697..4d3e59f006 100644
+--- a/crates/hypercurve/src/bezier_region/tests.rs
++++ b/crates/hypercurve/src/bezier_region/tests.rs
+@@ -16,6 +16,182 @@ fn q(numerator: i32, denominator: i32) -> Real {
+     (Real::from(numerator) / Real::from(denominator)).unwrap()
+ }
+ 
++#[test]
++fn concentric_circle_contacts_keep_directions_without_false_incidence() {
++    use crate::rational_bezier::{
++        RationalQuadraticCircle2, RationalQuadraticCircleTangentContact2 as Contact,
++        RationalQuadraticParallelCircleContact2,
++    };
++    // R(t) = (t, t^2), tangent to the unit circle about (0, 1) at t = 0.
++    let source = QuadraticBezier2::new(p(0, 0), Point2::new(q(1, 2), Real::zero()), p(1, 1));
++    let parallel = source.parallel_left(Real::zero()).unwrap();
++    let circle = Arc::new(RationalQuadraticCircle2 {
++        center: p(0, 1),
++        radius_squared: Real::one(),
++        tangent_contacts: Some(Arc::from([Contact::Parallel(
++            RationalQuadraticParallelCircleContact2 {
++                parallel: parallel.clone(),
++                parameter: Real::zero(),
++                point: p(0, 0),
++                eliminant_root_multiplicity: 2,
++            },
++        )])),
++    });
++    let policy = &CurveContext::STRICT;
++    for scale in [q(3, 4), q(-3, 4), Real::one()] {
++        let image = circle.concentric_image(&scale);
++        let point = Point2::new(Real::zero(), Real::one() - &scale);
++        assert_eq!(point.distance_squared(&image.center), image.radius_squared);
++        // These different parallel distances preserve direction. Their
++        // t=0 points lie off every circle image tested here.
++        // Direction evidence is relative to the source tangent on either
++        // side of a parallel's normal reversal (at q = 1/2 here).
++        for query_distance in [q(1, 8), q(3, 4)] {
++            let query = parallel.with_distance(query_distance);
++            assert_ne!(
++                query
++                    .point_at(&Real::zero())
++                    .unwrap()
++                    .distance_squared(&image.center),
++                image.radius_squared
++            );
++            assert!(
++                image
++                    .parallel_tangent_contacts_for(&query, policy)
++                    .is_empty()
++            );
++            // The concentric image is incident to the shifted parallel at
++            // q' = 1-s, including continuation across the circle center.
++            let incident = parallel.with_distance(Real::one() - &scale);
++            let contacts = image.parallel_tangent_contacts_for(&incident, policy);
++            let [contact] = contacts.as_slice() else {
++                panic!("one transported tangent incidence");
++            };
++            assert_eq!(contact.parameter, Real::zero());
++            assert_eq!(contact.point, point);
++            assert_eq!(contact.eliminant_root_multiplicity, 2);
++            assert_eq!(incident.point_at(&Real::zero()).unwrap(), point);
++            for clockwise in [false, true] {
++                let tangent = CurveTangent2::CircularPoint {
++                    point: point.clone().into(),
++                    circle: Arc::clone(&image),
++                    clockwise,
++                };
++                for direction in [RealSign::Positive, RealSign::Negative] {
++                    let other = CurveTangent2::RetainedParallel {
++                        parallel: query.clone(),
++                        source_parallel: parallel.clone(),
++                        source_range: CurveParameterRange2::unit(),
++                        parameter: BezierParameter2::Exact(Real::zero()),
++                        selected_source_parameter: None,
++                        source_direction: direction,
++                    };
++                    for (first, second) in [(&tangent, &other), (&other, &tangent)] {
++                        assert_eq!(
++                            curve_tangent_cross_sign(first, second, policy),
++                            Classification::Decided(RealSign::Zero)
++                        );
++                        let opposite =
++                            (scale == q(-3, 4)) ^ clockwise ^ (direction == RealSign::Negative);
++                        assert_eq!(
++                            curve_tangents_are_opposite(first, second, policy),
++                            Classification::Decided(opposite)
++                        );
++                    }
++                }
++            }
++            assert!(!image.has_parallel_tangent_direction_contact(
++                &point.clone().into(),
++                &query,
++                &BezierParameter2::Exact(q(1, 2)),
++                policy,
++            ));
++            let changed = QuadraticBezier2::new(p(0, 0), Point2::new(q(1, 2), q(1, 2)), p(1, 2))
++                .parallel_left(q(1, 8))
++                .unwrap();
++            assert!(!image.has_parallel_tangent_direction_contact(
++                &point.clone().into(),
++                &changed,
++                &BezierParameter2::Exact(Real::zero()),
++                policy,
++            ));
++            let distinct_point = image.center.translated(scale.clone(), Real::zero());
++            assert!(!image.has_parallel_tangent_direction_contact(
++                &distinct_point.into(),
++                &query,
++                &BezierParameter2::Exact(Real::zero()),
++                policy,
++            ));
++            for entries in [[3, -4, 4, 3, 7, -2], [3, 4, 4, -3, 1, 5]] {
++                let [a, b, c, d, x, y] = entries.map(Real::from);
++                let transform = crate::Similarity2::try_from_real_affine(a, b, c, d, x, y).unwrap();
++                let transformed = image.transform_similarity(&transform).unwrap();
++                let mapped_incident = incident.transform_similarity(&transform).unwrap();
++                let mapped_contacts =
++                    transformed.parallel_tangent_contacts_for(&mapped_incident, policy);
++                let [mapped_contact] = mapped_contacts.as_slice() else {
++                    panic!("similarity must preserve the transported tangent incidence");
++                };
++                assert_eq!(mapped_contact.point, transform.transform_point(&point));
++                assert_eq!(mapped_contact.parameter, Real::zero());
++                assert!(transformed.has_parallel_tangent_direction_contact(
++                    &transform.transform_point(&point).into(),
++                    &query.transform_similarity(&transform).unwrap(),
++                    &BezierParameter2::Exact(Real::zero()),
++                    policy,
++                ));
++            }
++        }
++    }
++    let repeated = circle
++        .concentric_image(&q(3, 4))
++        .concentric_image(&Real::from(-2));
++    let Some([Contact::Concentric { source, scale }]) = repeated.tangent_contacts.as_deref() else {
++        panic!("one normalized concentric construction edge");
++    };
++    assert!(Arc::ptr_eq(source, &circle));
++    assert_eq!(scale, &q(-3, 2));
++    assert!(repeated.has_parallel_tangent_direction_contact(
++        &Point2::new(Real::zero(), q(5, 2)).into(),
++        &parallel,
++        &BezierParameter2::Exact(Real::zero()),
++        policy,
++    ));
++
++    let arc = CircularArc2::new_with_certified_radius(
++        p(0, 0),
++        p(1, 1),
++        p(0, 1),
++        Real::one(),
++        false,
++        None,
++    )
++    .with_retained_circular_conic(Some(circle));
++    let source = BezierSubcurve2::RationalQuadratic(
++        arc.rational_bezier_decomposition().unwrap().spans()[0]
++            .curve()
++            .clone(),
++    );
++    let Classification::Decided(offset) =
++        exact_offset_span_from_native_arc(&source, &arc, &q(1, 4), policy).unwrap()
++    else {
++        panic!("native circle offset");
++    };
++    let Some(CurveTangent2::CircularPoint { point, circle, .. }) = offset.start_tangent else {
++        panic!("native offset must retain its circle contact");
++    };
++    assert_eq!(
++        point.coordinates(),
++        Some(&Point2::new(Real::zero(), q(1, 4)))
++    );
++    assert!(circle.has_parallel_tangent_direction_contact(
++        &point,
++        &parallel,
++        &BezierParameter2::Exact(Real::zero()),
++        policy
++    ));
++}
++
+ fn terminally_unresolved_zero() -> Real {
+     let sine = Real::e().sin();
+     let cosine = Real::e().cos();
+@@ -15570,11 +15746,9 @@ fn ordered_tangent_families_preserve_opposition_frontier() {
+                 });
+                 assert_eq!(outcome.certainty, CurveCertainty::Certified);
+                 let cross = ax * by - ay * bx;
+-                let expected = if matches!(
+-                    (a, b),
+-                    (1, 5) | (5, 1) | (1, 3) | (3, 1) | (3, 3) | (3, 4) | (4, 3) | (3, 5) | (5, 3)
+-                ) || ((*a == 3 || *b == 3) && cross == 0)
+-                {
++                // Represented circular tangents now use their exact radial
++                // rotation; their cardinal expectations require a decision.
++                let expected = if matches!((a, b), (1, 5) | (5, 1)) {
+                     Classification::Uncertain(UncertaintyReason::Unsupported)
+                 } else if *a == 5 && *b == 5 && cross != 0 {
+                     Classification::Uncertain(UncertaintyReason::Boundary)
+diff --git a/crates/hypercurve/src/curve_corner_chain.rs b/crates/hypercurve/src/curve_corner_chain.rs
+index c23749dc88..fa6f1add23 100644
+--- a/crates/hypercurve/src/curve_corner_chain.rs
++++ b/crates/hypercurve/src/curve_corner_chain.rs
+@@ -3043,6 +3043,41 @@ impl<'a> CurveCornerChain2<'a> {
+             .collect())
+     }
+ 
++    fn represented_fillet_tangent_contact(
++        fragment: &BezierSplitFragment2,
++        cut: &CornerTrimCut2,
++        point: &Point2,
++    ) -> CurveResult<Option<crate::rational_bezier::RationalQuadraticCircleTangentContact2>> {
++        let Some(parameter) = cut.parameter.scalar() else {
++            return Ok(None);
++        };
++        // A replacement owns the cut's chart after extension or reparameterization.
++        let fragment = cut.replacement.as_deref().unwrap_or(fragment);
++        let parallel = match fragment {
++            BezierSplitFragment2::Materialized { curve, .. }
++            | BezierSplitFragment2::RetainedBezier {
++                source_curve: curve,
++                ..
++            } => RationalBezier2::try_from_subcurve(curve)?.parallel_left(Real::zero())?,
++            BezierSplitFragment2::AnalyticParallel(fragment) => fragment.parallel().clone(),
++            // Selected fibers can own a separately regularized tangent field.
++            // A bare parallel record does not carry that field's branch proof.
++            BezierSplitFragment2::SelectedFiber(_)
++            | BezierSplitFragment2::AlgebraicChord(_)
++            | BezierSplitFragment2::AlgebraicCuspSemicircle(_) => return Ok(None),
++        };
++        Ok(Some(
++            crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(
++                crate::rational_bezier::RationalQuadraticParallelCircleContact2 {
++                    parallel,
++                    parameter: parameter.clone(),
++                    point: point.clone(),
++                    eliminant_root_multiplicity: 2,
++                },
++            ),
++        ))
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn retained_fillet_fragments(
+         sources: [(&[BezierSplitFragment2], usize); 2],
+@@ -3210,6 +3245,25 @@ impl<'a> CurveCornerChain2<'a> {
+                 represented_center.as_ref(),
+             )
+         {
++            let contacts = [
++                Self::represented_fillet_tangent_contact(
++                    previous_fragment,
++                    previous_cut,
++                    previous_point,
++                ),
++                Self::represented_fillet_tangent_contact(next_fragment, next_cut, next_point),
++            ]
++            .into_iter()
++            .collect::<CurveResult<Vec<_>>>()
++            .map_err(|cause| curve_region_edit_error(CurveOperation2::Fillet, cause))?
++            .into_iter()
++            .flatten()
++            .collect::<Vec<_>>();
++            let circle = Arc::new(crate::rational_bezier::RationalQuadraticCircle2 {
++                center: center.clone(),
++                radius_squared: radius * radius,
++                tangent_contacts: (!contacts.is_empty()).then(|| Arc::from(contacts)),
++            });
+             let arc = CircularArc2::new_with_certified_radius(
+                 previous_point.clone(),
+                 next_point.clone(),
+@@ -3217,7 +3271,8 @@ impl<'a> CurveCornerChain2<'a> {
+                 radius * radius,
+                 clockwise,
+                 None,
+-            );
++            )
++            .with_retained_circular_conic(Some(circle));
+             return Self::materialized_corner_arc_fragments(&arc, CurveOperation2::Fillet, policy);
+         }
+ 
+diff --git a/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs b/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs
+index aae2982df9..09747b8e3b 100644
+--- a/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs
++++ b/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs
+@@ -295,19 +295,8 @@ impl<'a> CurveRegionBooleanContext<'a> {
+             BezierSubcurve2::Rational(curve) => curve.retained_circular_conic(),
+             BezierSubcurve2::Quadratic(_) | BezierSubcurve2::Cubic(_) => None,
+         }
+-        .and_then(|circle| circle.tangent_contacts.as_deref())
+-        .into_iter()
+-        .flatten()
+-        .filter_map(|contact| match contact {
+-            crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(contact)
+-                if contact.parallel == *parallel =>
+-            {
+-                Some(contact)
+-            }
+-            crate::rational_bezier::RationalQuadraticCircleTangentContact2::Parallel(_)
+-            | crate::rational_bezier::RationalQuadraticCircleTangentContact2::Line { .. } => None,
+-        })
+-        .collect::<Vec<_>>();
++        .map(|circle| circle.parallel_tangent_contacts_for(parallel, &self.data.policy))
++        .unwrap_or_default();
+         let certified_tangent_parameters = certified_tangent_contacts
+             .iter()
+             .map(|contact| {
+@@ -318,7 +307,7 @@ impl<'a> CurveRegionBooleanContext<'a> {
+             })
+             .collect::<Vec<_>>();
+         let incidence = match parallel
+-            .circle_incidence(
++            .circle_incidence_with_point_evidence(
+                 arc.center(),
+                 arc.radius_squared_ref(),
+                 range,
+@@ -333,7 +322,8 @@ impl<'a> CurveRegionBooleanContext<'a> {
+             }
+         };
+         let mut parameters = Vec::with_capacity(incidence.len());
+-        for (parameter, crossing) in incidence {
++        for incidence in incidence {
++            let parameter = &incidence.parameter;
+             if let Some(contact) = parameter.scalar().and_then(|parameter| {
+                 certified_tangent_contacts
+                     .iter()
+@@ -347,7 +337,7 @@ impl<'a> CurveRegionBooleanContext<'a> {
+                 // inverse at its possible affine infinity.
+                 continue;
+             }
+-            parameters.push((parameter, crossing));
++            parameters.push(incidence);
+         }
+         // The incidence result already owns radial crossing evidence, including
+         // tangency. Use the same conic inverse for represented and selected
+@@ -361,13 +351,19 @@ impl<'a> CurveRegionBooleanContext<'a> {
+             Classification::Decided(Some(_))
+         ) {
+             let mut contacts = Vec::with_capacity(parameters.len());
+-            for (parallel_parameter, radial_crossing_sign) in &parameters {
++            for incidence in &parameters {
++                let parallel_parameter = &incidence.parameter;
++                let radial_crossing_sign = incidence.radial_crossing_sign;
+                 let certified_contact = parallel_parameter.scalar().and_then(|parameter| {
+                     certified_tangent_contacts
+                         .iter()
+                         .find(|contact| contact.parameter == *parameter)
+                 });
+-                if certified_contact.is_none()
++                let certified_point = incidence
++                    .point
++                    .as_ref()
++                    .or_else(|| certified_contact.map(|contact| &contact.point));
++                if certified_point.is_none()
+                     && let Some(exact) = parallel_parameter.scalar()
+                 {
+                     let point = parallel
+@@ -383,7 +379,7 @@ impl<'a> CurveRegionBooleanContext<'a> {
+                         continue;
+                     }
+                 }
+-                let point = certified_contact.map_or_else(
++                let point = certified_point.map_or_else(
+                     || {
+                         CurvePoint2::from(crate::BezierAnalyticParallelPoint2::new(
+                             parallel.clone(),
+@@ -391,14 +387,14 @@ impl<'a> CurveRegionBooleanContext<'a> {
+                             &self.data.policy,
+                         ))
+                     },
+-                    |contact| CurvePoint2::from(contact.point.clone()),
++                    |point| CurvePoint2::from(point.clone()),
+                 );
+-                let other_parameter = if let Some(contact) = certified_contact
+-                    && contact.point == *rational.start()
++                let other_parameter = if let Some(point) = certified_point
++                    && *point == *rational.start()
+                 {
+                     CurveParameter2::from(Real::zero())
+-                } else if let Some(contact) = certified_contact
+-                    && contact.point == *rational.end()
++                } else if let Some(point) = certified_point
++                    && *point == *rational.end()
+                 {
+                     CurveParameter2::from(Real::one())
+                 } else {
+@@ -455,7 +451,8 @@ impl<'a> CurveRegionBooleanContext<'a> {
+             })));
+         }
+         let mut retained_parameters = Vec::with_capacity(parameters.len());
+-        for (parameter, _) in parameters {
++        for incidence in parameters {
++            let parameter = incidence.parameter;
+             if let Some(contact) = parameter.scalar().and_then(|parameter| {
+                 certified_tangent_contacts
+                     .iter()
+diff --git a/crates/hypercurve/src/rational_bezier.rs b/crates/hypercurve/src/rational_bezier.rs
+index 7457f61cba..43afb441eb 100644
+--- a/crates/hypercurve/src/rational_bezier.rs
++++ b/crates/hypercurve/src/rational_bezier.rs
+@@ -70,10 +70,169 @@ pub(crate) struct RationalQuadraticParallelCircleContact2 {
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) enum RationalQuadraticCircleTangentContact2 {
+     Parallel(RationalQuadraticParallelCircleContact2),
+-    Line { line: LineSeg2, point: Point2 },
++    Line {
++        line: LineSeg2,
++        point: Point2,
++    },
++    /// A noncollapsed concentric image preserves tangent parallelism at the
++    /// image of each original contact. It does not assert incidence with the
++    /// original line or parallel, which generally remains at another distance.
++    Concentric {
++        source: Arc<RationalQuadraticCircle2>,
++        scale: Real,
++    },
+ }
+ 
+ impl RationalQuadraticCircle2 {
++    pub(crate) fn parallel_tangent_contacts_for(
++        &self,
++        parallel: &crate::BezierParallel2,
++        policy: &CurveContext,
++    ) -> Vec<RationalQuadraticParallelCircleContact2> {
++        let strict = policy.strict_counterpart();
++        let policy = &strict;
++        let Some(contacts) = self.tangent_contacts.as_deref() else {
++            return Vec::new();
++        };
++        contacts
++            .iter()
++            .flat_map(|contact| match contact {
++                RationalQuadraticCircleTangentContact2::Parallel(contact) => (contact.parallel
++                    == *parallel)
++                    .then(|| contact.clone())
++                    .into_iter()
++                    .collect(),
++                RationalQuadraticCircleTangentContact2::Line { .. } => Vec::new(),
++                RationalQuadraticCircleTangentContact2::Concentric { source, scale } => {
++                    source
++                        .tangent_contacts
++                        .as_deref()
++                        .into_iter()
++                        .flatten()
++                        .filter_map(|contact| {
++                            let RationalQuadraticCircleTangentContact2::Parallel(contact) = contact
++                            else {
++                                return None;
++                            };
++                            if !parallel
++                                .with_distance(Real::zero())
++                                .shares_parameterized_curve_evidence(
++                                    &contact.parallel.with_distance(Real::zero()),
++                                )
++                            {
++                                return None;
++                            }
++                            let Classification::Decided((tx, ty)) = parallel
++                                .source_tangent_at(&contact.parameter, policy)
++                                .ok()?
++                            else {
++                                return None;
++                            };
++                            let (rx, ry) = source.center.delta_from(&contact.point);
++                            let radius = source.radius_squared.clone().sqrt().ok()?;
++                            let center_normal_distance =
++                                match real_sign(&(&tx * ry - &ty * rx), policy)? {
++                                    RealSign::Positive => radius,
++                                    RealSign::Negative => -radius,
++                                    RealSign::Zero => return None,
++                                };
++                            // C = P_q + delta N, so C+s(P_q-C) lies on
++                            // P_(q+(1-s)delta). The unsquared normal-side sign above
++                            // selects the same sheet; squaring alone is insufficient.
++                            let distance = contact.parallel.distance()
++                                + (Real::one() - scale) * center_normal_distance;
++                            if crate::classify::compare_reals(
++                                &distance,
++                                parallel.distance(),
++                                policy,
++                            ) != Some(std::cmp::Ordering::Equal)
++                            {
++                                return None;
++                            }
++                            let (x, y) = contact.point.delta_from(&source.center);
++                            Some(RationalQuadraticParallelCircleContact2 {
++                                parallel: parallel.clone(),
++                                parameter: contact.parameter.clone(),
++                                point: source.center.translated(x * scale, y * scale),
++                                eliminant_root_multiplicity: 2,
++                            })
++                        })
++                        .collect()
++                }
++            })
++            .collect()
++    }
++
++    /// The caller has certified that `scale` is nonzero. Keep one shared
++    /// construction edge; repeated concentric maps compose their scales.
++    pub(crate) fn concentric_image(self: &Arc<Self>, scale: &Real) -> Arc<Self> {
++        if scale == &Real::one() {
++            return Arc::clone(self);
++        }
++        let tangent_contacts = self.tangent_contacts.as_ref().map(|contacts| {
++            let (source, scale) = match contacts.as_ref() {
++                [
++                    RationalQuadraticCircleTangentContact2::Concentric {
++                        source,
++                        scale: previous,
++                    },
++                ] => (Arc::clone(source), previous * scale),
++                _ => (Arc::clone(self), scale.clone()),
++            };
++            Arc::from([RationalQuadraticCircleTangentContact2::Concentric { source, scale }])
++        });
++        Arc::new(Self {
++            center: self.center.clone(),
++            radius_squared: &self.radius_squared * scale * scale,
++            tangent_contacts,
++        })
++    }
++
++    pub(crate) fn has_parallel_tangent_direction_contact(
++        &self,
++        point: &crate::CurvePoint2,
++        parallel: &crate::BezierParallel2,
++        parameter: &crate::BezierParameter2,
++        policy: &CurveContext,
++    ) -> bool {
++        let strict = policy.strict_counterpart();
++        let policy = &strict;
++        let Some(parameter) = parameter.scalar() else {
++            return false;
++        };
++        let (source, scale) = match self.tangent_contacts.as_deref() {
++            Some([RationalQuadraticCircleTangentContact2::Concentric { source, scale }]) => {
++                (source.as_ref(), Some(scale))
++            }
++            _ => (self, None),
++        };
++        source.tangent_contacts.as_deref().is_some_and(|contacts| {
++            contacts.iter().any(|contact| {
++                let RationalQuadraticCircleTangentContact2::Parallel(contact) = contact else {
++                    return false;
++                };
++                if !parallel
++                    .with_distance(Real::zero())
++                    .shares_parameterized_curve_evidence(
++                        &contact.parallel.with_distance(Real::zero()),
++                    )
++                    || crate::classify::compare_reals(parameter, &contact.parameter, policy)
++                        != Some(std::cmp::Ordering::Equal)
++                {
++                    return false;
++                }
++                let image = match scale {
++                    Some(scale) => {
++                        let (x, y) = contact.point.delta_from(&self.center);
++                        self.center.translated(x * scale, y * scale)
++                    }
++                    None => contact.point.clone(),
++                };
++                point.same_point(&image.into(), policy) == Classification::Decided(true)
++            })
++        })
++    }
++
+     pub(crate) fn implicit_coefficients(&self) -> Arc<[Real; 6]> {
+         let two = Real::from(2);
+         Arc::new([
+@@ -118,6 +277,13 @@ impl RationalQuadraticCircle2 {
+                                     },
+                                 )
+                             }
++                            RationalQuadraticCircleTangentContact2::Concentric {
++                                source,
++                                scale,
++                            } => RationalQuadraticCircleTangentContact2::Concentric {
++                                source: Arc::new(source.transform_similarity(transform)?),
++                                scale: scale.clone(),
++                            },
+                         })
+                     })
+                     .collect::<crate::CurveResult<Vec<_>>>()
+diff --git a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+index a4b9a53bb6..4bb4a85ae1 100644
+--- a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
++++ b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+@@ -332,6 +332,7 @@ fn similarity_transports_circle_tangent_relations_and_invalidates_affine_metric(
+             assert_eq!(contacts.len(), 2);
+             for contact in contacts.iter() {
+                 let (contact_point, tangent) = match contact {
++                    Contact::Concentric { .. } => panic!("this fixture has no concentric image"),
+                     Contact::Line { line, point } => {
+                         assert!(line.has_retained_support());
+                         (point, line.directed_support_delta())
+diff --git a/crates/hypercurve/src/bezier_offset/parallel/circular_incidence_tests.rs b/crates/hypercurve/src/bezier_offset/parallel/circular_incidence_tests.rs
+new file mode 100644
+index 0000000000..77ba0ea208
+--- /dev/null
++++ b/crates/hypercurve/src/bezier_offset/parallel/circular_incidence_tests.rs
+@@ -0,0 +1,375 @@
++use super::*;
++use crate::classify::is_zero;
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++
++fn circular_source(center: &Point2, weight: i32) -> RationalBezier2 {
++    let arc = crate::CircularArc2::try_from_center(
++        center.translated(Real::one(), Real::zero()),
++        center.translated(Real::zero(), Real::one()),
++        center.clone(),
++        false,
++    )
++    .unwrap();
++    let (implicit, circle) = crate::arc_bezier::circular_conic_provenance(&arc);
++    // C + ((1-t^2)/(1+t^2), 2t/(1+t^2)), with the original parameter.
++    RationalBezier2::try_new(
++        vec![
++            arc.start().clone(),
++            center.translated(Real::one(), Real::one()),
++            arc.end().clone(),
++        ],
++        vec![weight.into(), weight.into(), (2 * weight).into()],
++    )
++    .unwrap()
++    .with_implicit_quadratic_conic(implicit, Some(circle))
++}
++
++#[test]
++fn circular_parallel_incidence_keeps_points_order_and_normal_sheet() {
++    let policy = CurveContext::STRICT;
++    for center in [
++        Point2::from_values(0, 0),
++        Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap()),
++    ] {
++        for degree in [2, 5] {
++            for weight in [1, -3] {
++                let source = circular_source(&center, weight)
++                    .elevated_to_degree(degree)
++                    .unwrap();
++                for reverse in [false, true] {
++                    let source = if reverse {
++                        source.reversed()
++                    } else {
++                        source.clone()
++                    };
++                    for distance in [Real::zero(), q(1, 2), q(3, 2)] {
++                        let scale = Real::one() - &distance;
++                        let distance = if reverse { -distance } else { distance };
++                        let parallel = source.parallel_left(distance).unwrap();
++                        let query_center = center.translated(scale.clone(), scale.clone());
++                        let radius_squared = &scale * &scale;
++                        let contacts = parallel
++                            .retained_circular_source_incidence(
++                                &query_center,
++                                &radius_squared,
++                                &CurveParameterRange2::unit(),
++                                &policy,
++                            )
++                            .unwrap()
++                            .expect("the circular chart must retain its exact intersection points");
++                        assert_eq!(contacts.len(), 2);
++                        for (index, contact) in contacts.iter().enumerate() {
++                            let expected_parameter = Real::from(u8::try_from(index).unwrap());
++                            assert_eq!(
++                                contact
++                                    .parameter
++                                    .cmp_by_refinement_with_policy(
++                                        &BezierParameter2::Exact(expected_parameter),
++                                        &policy
++                                    )
++                                    .unwrap(),
++                                Classification::Decided(std::cmp::Ordering::Equal)
++                            );
++                            let at_x_axis = (index == 0) ^ reverse;
++                            let expected = if at_x_axis {
++                                center.translated(scale.clone(), Real::zero())
++                            } else {
++                                center.translated(Real::zero(), scale.clone())
++                            };
++                            assert_eq!(contact.point.as_ref(), Some(&expected));
++                            assert_eq!(
++                                is_zero(
++                                    &(expected.distance_squared(&center) - &radius_squared),
++                                    &policy
++                                ),
++                                Some(true)
++                            );
++                            assert_eq!(
++                                is_zero(
++                                    &(expected.distance_squared(&query_center) - &radius_squared),
++                                    &policy
++                                ),
++                                Some(true)
++                            );
++                            assert_eq!(
++                                contact.radial_crossing_sign,
++                                Some(if index == 0 {
++                                    RealSign::Negative
++                                } else {
++                                    RealSign::Positive
++                                })
++                            );
++                        }
++                        let trim =
++                            CurveParameterRange2::new_validated(q(1, 4).into(), q(3, 4).into());
++                        assert!(
++                            parallel
++                                .retained_circular_source_incidence(
++                                    &query_center,
++                                    &radius_squared,
++                                    &trim,
++                                    &policy
++                                )
++                                .unwrap()
++                                .unwrap()
++                                .is_empty()
++                        );
++                        let tangent_center =
++                            center.translated(Real::from(2) * &scale, Real::zero());
++                        let tangent = parallel
++                            .retained_circular_source_incidence(
++                                &tangent_center,
++                                &radius_squared,
++                                &CurveParameterRange2::unit(),
++                                &policy,
++                            )
++                            .unwrap()
++                            .unwrap();
++                        assert_eq!(tangent.len(), 1);
++                        assert_eq!(
++                            tangent[0].parameter.scalar(),
++                            Some(&Real::from(u8::from(reverse)))
++                        );
++                        assert_eq!(tangent[0].radial_crossing_sign, Some(RealSign::Zero));
++                        assert_eq!(
++                            tangent[0].point,
++                            Some(center.translated(scale.clone(), Real::zero()))
++                        );
++                        // A nearby but distinct circle is disjoint; no tolerance may merge it.
++                        let exterior = center.translated(
++                            (Real::from(2) + q(1, 1_000_000_000)) * &scale,
++                            Real::zero(),
++                        );
++                        assert!(
++                            parallel
++                                .retained_circular_source_incidence(
++                                    &exterior,
++                                    &radius_squared,
++                                    &CurveParameterRange2::unit(),
++                                    &policy
++                                )
++                                .unwrap()
++                                .unwrap()
++                                .is_empty()
++                        );
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn circular_parallel_recognition_defers_extensions_collapse_and_overlap() {
++    let center = Point2::from_values(0, 0);
++    let source = circular_source(&center, 1);
++    let parallel = source.parallel_left(q(1, 2)).unwrap();
++    let policy = CurveContext::STRICT;
++    let extension = CurveParameterRange2::new_validated(Real::from(-1).into(), Real::one().into());
++    assert!(
++        parallel
++            .retained_circular_source_incidence(
++                &Point2::from_values(1, 0),
++                &q(1, 4),
++                &extension,
++                &policy
++            )
++            .unwrap()
++            .is_none()
++    );
++    assert!(
++        parallel
++            .retained_circular_source_incidence(
++                &center,
++                &q(1, 4),
++                &CurveParameterRange2::unit(),
++                &policy
++            )
++            .unwrap()
++            .is_none()
++    );
++    assert!(
++        parallel
++            .with_distance(Real::one())
++            .retained_circular_source_incidence(
++                &Point2::from_values(1, 0),
++                &Real::one(),
++                &CurveParameterRange2::unit(),
++                &policy
++            )
++            .unwrap()
++            .is_none()
++    );
++}
++
++#[test]
++fn circular_parallel_internal_tangency_retains_the_original_parameter() {
++    // The center distance is 85/16; after a 1/16 outward offset the
++    // clockwise source radius is 94/16 = 85/16 + 9/16. The two circles
++    // therefore touch internally at (9/16)*(13/85, -84/85).
++    let center = Point2::new(q(-13, 16), q(21, 4));
++    let radius = q(93, 16);
++    let start = center.translated(radius.clone(), Real::zero());
++    let end = center.translated(Real::zero(), -&radius);
++    let arc =
++        crate::CircularArc2::try_from_center(start.clone(), end.clone(), center.clone(), true)
++            .unwrap();
++    let (implicit, circle) = crate::arc_bezier::circular_conic_provenance(&arc);
++    let source = RationalBezier2::try_new(
++        vec![start, center.translated(radius.clone(), -radius), end],
++        vec![Real::one(), Real::one(), Real::from(2)],
++    )
++    .unwrap()
++    .with_implicit_quadratic_conic(implicit, Some(circle));
++    let parallel = source.parallel_left(q(1, 16)).unwrap();
++    let Classification::Decided(contacts) = parallel
++        .circle_incidence_with_point_evidence(
++            &Point2::from_values(0, 0),
++            &q(81, 256),
++            &CurveParameterRange2::unit(),
++            &[],
++            &CurveContext::STRICT,
++        )
++        .unwrap()
++    else {
++        panic!("internal tangency must retain its represented point");
++    };
++    assert_eq!(contacts.len(), 1);
++    assert_eq!(contacts[0].parameter.scalar(), Some(&q(6, 7)));
++    assert_eq!(
++        contacts[0].point,
++        Some(Point2::new(q(117, 1360), q(-189, 340)))
++    );
++    assert_eq!(contacts[0].radial_crossing_sign, Some(RealSign::Zero));
++    assert!(matches!(
++        parallel
++            .circle_incidence_with_point_evidence(
++                &Point2::from_values(0, 0),
++                &q(81, 256),
++                &CurveParameterRange2::unit(),
++                &[(q(6, 7), 0)],
++                &CurveContext::STRICT,
++            )
++            .unwrap(),
++        Classification::Uncertain(UncertaintyReason::Boundary)
++    ));
++}
++
++#[test]
++fn circular_parallel_incidence_certifies_the_selected_trim_boundary() {
++    let parallel = circular_source(&Point2::from_values(0, 0), 1)
++        .parallel_left(q(1, 2))
++        .unwrap();
++    let parameter = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![
++                Real::from(-1),
++                Real::zero(),
++                Real::from(3),
++            ])
++            .unwrap(),
++            BezierParameterInterval::try_new(q(1, 2), q(2, 3)).unwrap(),
++        )
++        .unwrap(),
++    );
++    let range = CurveParameterRange2::new_validated(parameter.into(), Real::one().into());
++    // Two circles of radius 1/2, with centers (0,0) and (1/2,0), meet
++    // at (1/4, +/-sqrt(3)/4). The first-quadrant chart retains only the
++    // positive point, at t=1/sqrt(3), exactly the selected trim boundary.
++    for policy in [CurveContext::STRICT, CurveContext::APPROXIMATE_512] {
++        let query = || {
++            parallel
++                .circle_incidence_with_point_evidence(
++                    &Point2::new(q(1, 2), Real::zero()),
++                    &q(1, 4),
++                    &range,
++                    &[],
++                    &policy,
++                )
++                .unwrap()
++        };
++        let retry = crate::evaluate_with_budget(
++            policy.predicate_policy(),
++            crate::WorkBudget {
++                refinements: 4096,
++                promotions: 128,
++            },
++            query,
++        );
++        let Classification::Decided(contacts) = retry.result.unwrap().certified().unwrap() else {
++            panic!("the selected trim boundary must retain its exact contact");
++        };
++        assert_eq!(contacts.len(), 1);
++        let point = contacts[0].point.as_ref().unwrap();
++        assert_eq!(point.x(), &q(1, 4));
++        assert_eq!(
++            is_zero(&(point.y() * point.y() - q(3, 16)), &CurveContext::STRICT),
++            Some(true)
++        );
++        assert_eq!(
++            real_sign(point.y(), &CurveContext::STRICT),
++            Some(RealSign::Positive)
++        );
++        assert_eq!(contacts[0].radial_crossing_sign, Some(RealSign::Positive));
++    }
++}
++
++#[test]
++fn circular_parallel_incidence_retries_after_exhausted_trim_comparison() {
++    let policy = CurveContext::STRICT;
++    let parallel = circular_source(&Point2::from_values(0, 0), 1)
++        .parallel_left(q(1, 2))
++        .unwrap();
++    let parameter = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![
++                Real::from(-1),
++                Real::zero(),
++                Real::from(2),
++            ])
++            .unwrap(),
++            BezierParameterInterval::try_new(q(2, 3), q(3, 4)).unwrap(),
++        )
++        .unwrap(),
++    );
++    let range = CurveParameterRange2::new_validated(parameter.into(), Real::one().into());
++    let t = q(353_553, 500_000);
++    let square = &t * &t;
++    let point = Point2::new(
++        ((Real::one() - &square) / (Real::from(2) * (Real::one() + &square))).unwrap(),
++        (&t / (Real::one() + &square)).unwrap(),
++    );
++    let center = Point2::new(Real::from(2) * point.x(), Real::from(2) * point.y());
++    // The second radius-1/2 circle touches the parallel at this rational
++    // parameter, just before the independently isolated sqrt(1/2) trim.
++    assert_eq!(
++        real_sign(&(square - q(1, 2)), &policy),
++        Some(RealSign::Negative)
++    );
++    let query = || {
++        parallel
++            .circle_incidence_with_point_evidence(&center, &q(1, 4), &range, &[], &policy)
++            .unwrap()
++    };
++    let denied =
++        crate::evaluate_with_budget(policy.predicate_policy(), crate::WorkBudget::ZERO, query);
++    let Err(exhausted) = denied.result else {
++        panic!("the unresolved trim comparison requires a refinement");
++    };
++    assert_eq!(exhausted.kind, crate::WorkKind::RootRefinement);
++    let retry = crate::evaluate_with_budget(
++        policy.predicate_policy(),
++        crate::WorkBudget {
++            refinements: 4096,
++            promotions: 128,
++        },
++        query,
++    );
++    let Classification::Decided(contacts) = retry.result.unwrap().certified().unwrap() else {
++        panic!("an exhausted trim comparison must not poison its retry");
++    };
++    assert!(contacts.is_empty());
++}
