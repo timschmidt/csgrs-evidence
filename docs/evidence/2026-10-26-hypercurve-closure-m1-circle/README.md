@@ -1,0 +1,11 @@
+# Retained circle transforms: M1 follow-up
+
+This is a correctness and composition increment, not complete closure or pre-push validation. Base code is e002496280 plus implementation.patch. Source hashes and the compiler are in sources.json. The owning layers are Hypercurve rational circle definitions, selected parameter frames, and region transform delegation; the contracts are P12 and P17–P19.
+
+The input domain includes retained circular rational quadratics and degree-elevated general rational spans with algebraic centers, restricted domains, reversal and negative homogeneous weights. A certified similarity transports the circle, source frame/range, injectivity and tangent contacts. Reflection reverses a parallel's signed normal distance. General affine maps must invalidate a circle's metric evidence. Noncircular retained conic transform transport is still a separate gap.
+
+The new unit witness failed on the base revision because the circle definition was absent after the map. Independent rational unit-circle formulas establish exact points and their local selected parameters. Exact radius and tangent equations check metric and incidence transport. Existing repeated-visit, near-distinct, extrapolation and pole controls remain. The full public PCB cut/transform/reconstruct/XOR chain now passes in three operand orders under rotation and reflection; its set identity is A union B union (O difference B) = A union B union O. This complements, rather than substitutes for, the independent curve equations.
+
+checks.json records executed commands and outcomes. The final affected local and downstream checks pass. The complete final-source Hypercurve all-feature release suite was still running when this scoped record was assembled and is not claimed here. The preceding full suite's failure is retained separately and is not final-source evidence.
+
+The original arc-corner refillet/erosion fixture remains unchanged and still blocks at Offset/Line/RealSign. The closure plan and M1 remain open. No tolerance, sign limit, scalar fallback, or existing fixture was weakened. Earlier endpoint-clipping and native-dispatch prototypes did not solve the missing retained circle definition and were removed. No performance improvement is claimed.

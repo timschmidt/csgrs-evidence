@@ -1,0 +1,489 @@
+diff --git a/crates/hypercurve/src/arc_bezier.rs b/crates/hypercurve/src/arc_bezier.rs
+index ce1475eaae..1193fe0713 100644
+--- a/crates/hypercurve/src/arc_bezier.rs
++++ b/crates/hypercurve/src/arc_bezier.rs
+@@ -361,23 +361,12 @@ fn full_circle_quarter_points(arc: &CircularArc2) -> Vec<Point2> {
+ pub(crate) fn circular_conic_provenance(
+     arc: &CircularArc2,
+ ) -> (Arc<[Real; 6]>, Arc<RationalQuadraticCircle2>) {
+-    let two = Real::from(2_i8);
+-    (
+-        Arc::new([
+-            Real::one(),
+-            Real::zero(),
+-            Real::one(),
+-            -(&two * arc.center().x()),
+-            -(&two * arc.center().y()),
+-            arc.center().x() * arc.center().x() + arc.center().y() * arc.center().y()
+-                - arc.radius_squared_ref(),
+-        ]),
+-        Arc::new(RationalQuadraticCircle2 {
+-            center: arc.center().clone(),
+-            radius_squared: arc.radius_squared_ref().clone(),
+-            tangent_contacts: None,
+-        }),
+-    )
++    let circle = Arc::new(RationalQuadraticCircle2 {
++        center: arc.center().clone(),
++        radius_squared: arc.radius_squared_ref().clone(),
++        tangent_contacts: None,
++    });
++    (circle.implicit_coefficients(), circle)
+ }
+ 
+ pub(crate) fn rational_bezier_circular_arc(
+diff --git a/crates/hypercurve/src/bezier_region.rs b/crates/hypercurve/src/bezier_region.rs
+index 7529a60dd5..70b0a3c4b5 100644
+--- a/crates/hypercurve/src/bezier_region.rs
++++ b/crates/hypercurve/src/bezier_region.rs
+@@ -6431,19 +6431,31 @@ fn transform_region_subcurve(
+             point(curve.control2()),
+             point(curve.end()),
+         ))),
+-        BezierSubcurve2::RationalQuadratic(curve) => Ok(BezierSubcurve2::RationalQuadratic(
+-            RationalQuadraticBezier2::try_new(
+-                point(curve.start()),
+-                point(curve.control()),
+-                point(curve.end()),
+-                curve.start_weight().clone(),
+-                curve.control_weight().clone(),
+-                curve.end_weight().clone(),
+-            )
+-            .map_err(affine_region_error)?,
+-        )),
++        BezierSubcurve2::RationalQuadratic(curve) => {
++            if let Some(similarity) = similarity {
++                return curve
++                    .transform_similarity_with_retained_provenance(similarity)
++                    .map(BezierSubcurve2::RationalQuadratic)
++                    .map_err(affine_region_error);
++            }
++            Ok(BezierSubcurve2::RationalQuadratic(
++                RationalQuadraticBezier2::try_new(
++                    point(curve.start()),
++                    point(curve.control()),
++                    point(curve.end()),
++                    curve.start_weight().clone(),
++                    curve.control_weight().clone(),
++                    curve.end_weight().clone(),
++                )
++                .map_err(affine_region_error)?,
++            ))
++        }
+         BezierSubcurve2::Rational(curve) => Ok(BezierSubcurve2::Rational(
+-            curve.transformed_affine([m00, m01, m10, m11, tx, ty]),
++            if let Some(similarity) = similarity {
++                curve.transform_similarity(similarity)
++            } else {
++                curve.transformed_affine([m00, m01, m10, m11, tx, ty])
++            },
+         )),
+     }
+ }
+diff --git a/crates/hypercurve/src/rational_bezier.rs b/crates/hypercurve/src/rational_bezier.rs
+index 0fc1d18732..7457f61cba 100644
+--- a/crates/hypercurve/src/rational_bezier.rs
++++ b/crates/hypercurve/src/rational_bezier.rs
+@@ -73,6 +73,65 @@ pub(crate) enum RationalQuadraticCircleTangentContact2 {
+     Line { line: LineSeg2, point: Point2 },
+ }
+ 
++impl RationalQuadraticCircle2 {
++    pub(crate) fn implicit_coefficients(&self) -> Arc<[Real; 6]> {
++        let two = Real::from(2);
++        Arc::new([
++            Real::one(),
++            Real::zero(),
++            Real::one(),
++            -(&two * self.center.x()),
++            -(&two * self.center.y()),
++            self.center.x() * self.center.x() + self.center.y() * self.center.y()
++                - &self.radius_squared,
++        ])
++    }
++
++    pub(crate) fn transform_similarity(
++        &self,
++        transform: &crate::Similarity2,
++    ) -> crate::CurveResult<Self> {
++        let tangent_contacts = self
++            .tangent_contacts
++            .as_ref()
++            .map(|contacts| {
++                contacts
++                    .iter()
++                    .map(|contact| {
++                        Ok(match contact {
++                            RationalQuadraticCircleTangentContact2::Line { line, point } => {
++                                RationalQuadraticCircleTangentContact2::Line {
++                                    line: line.transform_similarity(transform)?,
++                                    point: transform.transform_point(point),
++                                }
++                            }
++                            RationalQuadraticCircleTangentContact2::Parallel(contact) => {
++                                RationalQuadraticCircleTangentContact2::Parallel(
++                                    RationalQuadraticParallelCircleContact2 {
++                                        parallel: contact
++                                            .parallel
++                                            .transform_similarity(transform)?,
++                                        parameter: contact.parameter.clone(),
++                                        point: transform.transform_point(&contact.point),
++                                        eliminant_root_multiplicity: contact
++                                            .eliminant_root_multiplicity,
++                                    },
++                                )
++                            }
++                        })
++                    })
++                    .collect::<crate::CurveResult<Vec<_>>>()
++                    .map(Arc::from)
++            })
++            .transpose()?;
++        Ok(Self {
++            center: transform.transform_point(&self.center),
++            radius_squared: &self.radius_squared * transform.scale() * transform.scale(),
++            tangent_contacts,
++        })
++    }
++}
++
+ impl PartialEq for RationalQuadraticBezier2 {
+     fn eq(&self, other: &Self) -> bool {
+         self.start == other.start
+@@ -85,6 +144,28 @@ impl PartialEq for RationalQuadraticBezier2 {
+ }
+ 
+ impl RationalQuadraticBezier2 {
++    pub(crate) fn transform_similarity_with_retained_provenance(
++        &self,
++        transform: &crate::Similarity2,
++    ) -> crate::CurveResult<Self> {
++        let circle = self
++            .circular_conic
++            .as_ref()
++            .map(|circle| circle.transform_similarity(transform).map(Arc::new))
++            .transpose()?;
++        Self::try_new_with_common_weight_sign_and_implicit_conic(
++            transform.transform_point(&self.start),
++            transform.transform_point(&self.control),
++            transform.transform_point(&self.end),
++            self.start_weight.clone(),
++            self.control_weight.clone(),
++            self.end_weight.clone(),
++            self.common_weight_sign,
++            circle.as_ref().map(|circle| circle.implicit_coefficients()),
++            circle,
++        )
++    }
++
+     /// Constructs a rational quadratic segment after rejecting provably zero weights.
+     pub fn try_new(
+         start: Point2,
+diff --git a/crates/hypercurve/src/rational_bezier_general.rs b/crates/hypercurve/src/rational_bezier_general.rs
+index e6dba47244..da3e43431c 100644
+--- a/crates/hypercurve/src/rational_bezier_general.rs
++++ b/crates/hypercurve/src/rational_bezier_general.rs
+@@ -3167,7 +3167,48 @@ impl RationalBezier2 {
+     /// Applies a certified similarity without projecting intermediate controls.
+     pub fn transform_similarity(&self, transform: &crate::Similarity2) -> Self {
+         let (a, b, d, e, xoff, yoff) = transform.affine_components();
+-        self.transformed_affine([a, b, d, e, xoff, yoff])
++        let mut image = self.transformed_affine([a, b, d, e, xoff, yoff]);
++        // A fresh image owns a fresh lineage. Transport the source chart along
++        // with its frame; keeping only one would misidentify restricted roots.
++        let lineage = &mut Arc::get_mut(&mut image.data)
++            .expect("new affine image has unique storage")
++            .lineage;
++        lineage.range = self.data.lineage.range.clone();
++        if let Some(injective) = self.data.lineage.root.unit_image_is_injective.get() {
++            // The certified map is invertible, so it preserves the root chart's
++            // injectivity, including when the current curve is only a subrange.
++            let _ = lineage.root.unit_image_is_injective.set(*injective);
++        }
++        if let Some(frame) = self.data.lineage.root.quadratic_conic_parameter_frame.get() {
++            let _ =
++                lineage
++                    .root
++                    .quadratic_conic_parameter_frame
++                    .set(Arc::new(std::array::from_fn(|index| {
++                        let control = &frame[index];
++                        let (x, y) = transform.transform_homogeneous_coordinates(
++                            &control.x,
++                            &control.y,
++                            &control.weight,
++                        );
++                        HomogeneousControl2::new(x, y, control.weight.clone())
++                    })));
++        }
++        if let Some(circle) = self.retained_circular_conic() {
++            // These contacts were certified when authored. An invertible
++            // similarity preserves their nonzero line spans and source weights.
++            let circle = Arc::new(
++                circle
++                    .transform_similarity(transform)
++                    .expect("a certified similarity preserves valid circle contacts"),
++            );
++            let _ = lineage
++                .root
++                .implicit_quadratic_conic
++                .set(circle.implicit_coefficients());
++            let _ = lineage.root.circular_conic.set(circle);
++        }
++        image
+     }
+ 
+     /// Returns this curve with traversal direction reversed.
+diff --git a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+index 6e156ae1ce..de796d1487 100644
+--- a/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
++++ b/crates/hypercurve/src/rational_bezier_general/circle_incidence_tests.rs
+@@ -86,6 +86,178 @@ fn parameter_equals(actual: &BezierParameter2, expected: &Real) {
+     );
+ }
+ 
++#[test]
++fn similarity_preserves_retained_circle_and_selected_chart() {
++    let center = Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap());
++    for degree in [2, 5] {
++        let source = circle_source(&center, -3)
++            .elevated_to_degree(degree)
++            .unwrap()
++            .subcurve_between_exact(&q(1, 4), &q(3, 4))
++            .unwrap();
++        for reversed in [false, true] {
++            let source = if reversed {
++                source.reversed()
++            } else {
++                source.clone()
++            };
++            for entries in [[3, -4, 4, 3, 7, -2], [3, 4, 4, -3, 1, 5]] {
++                let [a, b, c, d, x, y] = entries.map(Real::from);
++                let transform = crate::Similarity2::try_from_real_affine(a, b, c, d, x, y).unwrap();
++                let image = source.transform_similarity(&transform);
++                let circle = image
++                    .retained_circular_conic()
++                    .expect("similarity retains the circle definition");
++                assert_eq!(circle.center, transform.transform_point(&center));
++                assert_eq!(
++                    is_zero(
++                        &(&circle.radius_squared - Real::from(25)),
++                        &CurveContext::STRICT
++                    ),
++                    Some(true)
++                );
++                for t in [q(1, 4), q(1, 2), q(3, 4)] {
++                    let expected = transform.transform_point(&oracle_point(&center, &t));
++                    let local = if reversed {
++                        (q(3, 4) - &t) * Real::from(2)
++                    } else {
++                        (&t - q(1, 4)) * Real::from(2)
++                    };
++                    let found = parameters(
++                        &image,
++                        &expected,
++                        &CurveParameterRange2::unit(),
++                        &CurveContext::STRICT,
++                    );
++                    assert_eq!(found.len(), 1);
++                    parameter_equals(&found[0], &local);
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn similarity_transports_circle_tangent_relations_and_invalidates_affine_metric() {
++    use crate::rational_bezier::{
++        RationalQuadraticCircle2, RationalQuadraticCircleTangentContact2 as Contact,
++        RationalQuadraticParallelCircleContact2,
++    };
++    let center = Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap());
++    let point = center.translated(Real::one(), Real::zero());
++    let support = LineSeg2::try_new(
++        center.translated(Real::one(), Real::from(-2)),
++        center.translated(Real::one(), Real::from(2)),
++    )
++    .unwrap();
++    let line = support.fragment_between_after_distinct_endpoints(
++        center.translated(Real::one(), Real::from(-1)),
++        center.translated(Real::one(), Real::one()),
++        support.fragment_support(),
++    );
++    let source = crate::QuadraticBezier2::from_line_segment(
++        LineSeg2::try_new(
++            center.translated(Real::from(2), Real::from(-1)),
++            center.translated(Real::from(2), Real::one()),
++        )
++        .unwrap(),
++    );
++    let parallel = crate::BezierParallel2::from_source(
++        crate::BezierParallelSource2::Quadratic(source),
++        Real::one(),
++    );
++    assert_eq!(parallel.point_at(&q(1, 2)).unwrap(), point);
++    let circle = Arc::new(RationalQuadraticCircle2 {
++        center: center.clone(),
++        radius_squared: Real::one(),
++        tangent_contacts: Some(Arc::from([
++            Contact::Line {
++                line,
++                point: point.clone(),
++            },
++            Contact::Parallel(RationalQuadraticParallelCircleContact2 {
++                parallel,
++                parameter: q(1, 2),
++                point: point.clone(),
++                eliminant_root_multiplicity: 2,
++            }),
++        ])),
++    });
++    let conic = crate::RationalQuadraticBezier2::try_new(
++        point.clone(),
++        center.translated(Real::one(), Real::one()),
++        center.translated(Real::zero(), Real::one()),
++        Real::one(),
++        Real::one(),
++        Real::from(2),
++    )
++    .unwrap()
++    .with_retained_conic_provenance(Some(circle.implicit_coefficients()), Some(circle));
++    let rational = RationalBezier2::from(conic.clone());
++    for entries in [[3, -4, 4, 3, 7, -2], [3, 4, 4, -3, 1, 5]] {
++        let [a, b, c, d, x, y] = entries.map(Real::from);
++        let transform = crate::Similarity2::try_from_real_affine(a, b, c, d, x, y).unwrap();
++        let conic_image = conic
++            .transform_similarity_with_retained_provenance(&transform)
++            .unwrap();
++        let rational_image = rational.transform_similarity(&transform);
++        for circle in [
++            conic_image.retained_circular_conic().unwrap(),
++            rational_image.retained_circular_conic().unwrap(),
++        ] {
++            let contacts = circle.tangent_contacts.as_ref().unwrap();
++            assert_eq!(contacts.len(), 2);
++            for contact in contacts.iter() {
++                let (contact_point, tangent) = match contact {
++                    Contact::Line { line, point } => {
++                        assert!(line.has_retained_support());
++                        (point, line.directed_support_delta())
++                    }
++                    Contact::Parallel(contact) => {
++                        assert_eq!(contact.parameter, q(1, 2));
++                        assert_eq!(contact.eliminant_root_multiplicity, 2);
++                        let expected_distance = Real::from(if transform.reverses_orientation() {
++                            -5
++                        } else {
++                            5
++                        });
++                        assert_eq!(contact.parallel.distance(), &expected_distance);
++                        assert_eq!(
++                            contact.parallel.point_at(&contact.parameter).unwrap(),
++                            contact.point
++                        );
++                        (
++                            &contact.point,
++                            transform.transform_vector_coordinates(&Real::zero(), &Real::one()),
++                        )
++                    }
++                };
++                assert_eq!(contact_point, &transform.transform_point(&point));
++                let radial = contact_point.delta_from(&circle.center);
++                assert_eq!(
++                    is_zero(
++                        &(radial.0 * tangent.0 + radial.1 * tangent.1),
++                        &CurveContext::STRICT
++                    ),
++                    Some(true)
++                );
++                assert_eq!(
++                    is_zero(
++                        &(contact_point.distance_squared(&circle.center) - &circle.radius_squared),
++                        &CurveContext::STRICT
++                    ),
++                    Some(true)
++                );
++            }
++        }
++    }
++    // A nonuniform affine map preserves the conic but cannot retain a circle's metric.
++    let [a, b, c, d, x, y] = [2, 1, 0, 3, 0, 0].map(Real::from);
++    let sheared = rational.transformed_affine([&a, &b, &c, &d, &x, &y]);
++    assert!(sheared.retained_circular_conic().is_none());
++    assert!(sheared.retained_implicit_quadratic_conic().is_none());
++}
++
+ #[test]
+ fn circle_incidence_preserves_subranges_reversal_elevation_and_certainty() {
+     for center in [
+diff --git a/crates/hypercurve/tests/hypercurve_pcb_boolean_regressions.rs b/crates/hypercurve/tests/hypercurve_pcb_boolean_regressions.rs
+index fcecff2e38..e2533efdae 100644
+--- a/crates/hypercurve/tests/hypercurve_pcb_boolean_regressions.rs
++++ b/crates/hypercurve/tests/hypercurve_pcb_boolean_regressions.rs
+@@ -517,6 +517,66 @@ fn concurrent_circle_contacts_survive_rational_rotation_and_reflection() {
+     }
+ }
+ 
++#[test]
++fn concurrent_circle_contacts_survive_independent_maps_after_cutting() {
++    use hypercurve::{BooleanOp, CurveCertainty};
++
++    let pad = rotated_rounded_pad();
++    let route = board_route();
++    let outline = circular_zone_outline();
++    let zone = compound(&[(&outline, false), (&route, true)]).unwrap();
++    for map in [
++        [
++            ratio(3, 5),
++            ratio(-4, 5),
++            ratio(4, 5),
++            ratio(3, 5),
++            ratio(-7, 2),
++            ratio(11, 3),
++        ],
++        [
++            ratio(3, 5),
++            ratio(4, 5),
++            ratio(4, 5),
++            ratio(-3, 5),
++            Real::zero(),
++            ratio(1, 7),
++        ],
++    ] {
++        // The cut and its source are transformed separately. Their supporting
++        // lines have equal defining points but independent allocations.
++        let pad = mapped_region(&pad, &map);
++        let route = mapped_region(&route, &map);
++        let zone = mapped_region(&zone, &map);
++        let outline = mapped_region(&outline, &map);
++        let expected = crate::support::under(&PredicatePolicy::STRICT, || {
++            pad.boolean_region(&route, BooleanOp::Union)?
++                .boolean_region(&outline, BooleanOp::Union)
++        })
++        .unwrap()
++        .into_certified();
++        for order in [
++            [&pad, &route, &zone],
++            [&zone, &route, &pad],
++            [&route, &zone, &pad],
++        ] {
++            let result = crate::support::under(&PredicatePolicy::STRICT, || {
++                compound(&[(order[0], false), (order[1], false), (order[2], false)])
++            })
++            .expect("independent maps must preserve the shared support proof");
++            assert_eq!(result.certainty, CurveCertainty::Certified);
++            // Set equality, including boundary ownership, and reuse as an
++            // operand. Area and sampled membership alone are insufficient.
++            let difference = crate::support::under(&PredicatePolicy::STRICT, || {
++                result.value.boolean_region(&expected, BooleanOp::Xor)
++            })
++            .unwrap()
++            .into_certified();
++            assert!(difference.is_empty());
++        }
++    }
++}
++
+ #[test]
+ fn distinct_crossings_of_one_shared_circle_and_line_stay_distinct() {
+     // A 45-degree route whose edge `x - y = 43.66 + sqrt(2)/10` lies between
