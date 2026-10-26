@@ -1,0 +1,57 @@
+diff --git a/crates/hypercurve/tests/polynomial_curves.rs b/crates/hypercurve/tests/polynomial_curves.rs
+index 2a50b2b1f1..211d929078 100644
+--- a/crates/hypercurve/tests/polynomial_curves.rs
++++ b/crates/hypercurve/tests/polynomial_curves.rs
+@@ -60,6 +60,11 @@ fn unadmitted_polynomial_pairs_keep_typed_blockers() {
+     sections::unadmitted_polynomial_pairs_keep_typed_blockers();
+ }
+ 
++#[test]
++fn mapped_quintic_line_sections_keep_source_parameters() {
++    sections::mapped_quintic_line_sections_keep_source_parameters();
++}
++
+ #[test]
+ fn sections_survive_context_drop_budgets_and_policies() {
+     sections::sections_survive_context_drop_budgets_and_policies();
+diff --git a/crates/hypercurve/tests/support/polynomial_sections.rs b/crates/hypercurve/tests/support/polynomial_sections.rs
+index 226383067c..727773a93d 100644
+--- a/crates/hypercurve/tests/support/polynomial_sections.rs
++++ b/crates/hypercurve/tests/support/polynomial_sections.rs
+@@ -503,6 +503,36 @@ pub fn vertical_tangent_and_cusp_events_are_not_transverse() {
+     assert_disjoint(&parabola.curves()[0], &short);
+ }
+ 
++pub fn mapped_quintic_line_sections_keep_source_parameters() {
++    let quintic = set(QUINTIC);
++    let source = &quintic.curves()[0];
++    let translation = Similarity2::try_from_real_affine(
++        1.into(), 0.into(), 0.into(), 1.into(), 1.into(), 0.into(),
++    )
++    .unwrap();
++    let moved = source.transform_similarity(&translation).unwrap();
++    let line = vertical(Real::zero(), (-3).into(), 3.into());
++    // The original unsupported translated-branch fixture: the source endpoint
++    // (-1,-1) maps to (0,-1), at line parameter 1/3 and source abscissa -1.
++    for (first, second, branch_first) in [(&moved, &line, true), (&line, &moved, false)] {
++        let contact = one_contact(first, second);
++        assert!(contact.point().coincides_with(&p(0.into(), (-1).into())).unwrap());
++        let (branch_parameter, line_parameter) = if branch_first {
++            (contact.first().local_parameter(), contact.second().local_parameter())
++        } else {
++            (contact.second().local_parameter(), contact.first().local_parameter())
++        };
++        assert_eq!(branch_parameter.compare(&Real::from(-1).into()).unwrap(), Ordering::Equal);
++        assert_eq!(line_parameter.compare(&q(1, 3).into()).unwrap(), Ordering::Equal);
++        assert_line_replays(&line, line_parameter, contact.point());
++        assert_eq!(contact.tangent_cross_sign(), Some(if branch_first {
++            RealSign::Positive
++        } else {
++            RealSign::Negative
++        }));
++    }
++}
++
+ pub fn unadmitted_polynomial_pairs_keep_typed_blockers() {
+     let quintic = set(QUINTIC);
+     let curve = &quintic.curves()[0];
