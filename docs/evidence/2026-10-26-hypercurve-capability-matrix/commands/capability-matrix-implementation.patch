@@ -1,0 +1,1568 @@
+diff --git a/.github/workflows/hypercurve.yml b/.github/workflows/hypercurve.yml
+index 5a81f2ea39..16f3ddc61e 100644
+--- a/.github/workflows/hypercurve.yml
++++ b/.github/workflows/hypercurve.yml
+@@ -13,6 +13,7 @@ on:
+       - "crates/hyperreal/**"
+       - "Cargo.toml"
+       - "Cargo.lock"
++      - "scripts/successive-operations.py"
+       - ".github/workflows/hypercurve.yml"
+   pull_request:
+     paths:
+@@ -24,6 +25,7 @@ on:
+       - "crates/hyperreal/**"
+       - "Cargo.toml"
+       - "Cargo.lock"
++      - "scripts/successive-operations.py"
+       - ".github/workflows/hypercurve.yml"
+   workflow_dispatch:
+ 
+@@ -75,6 +77,20 @@ jobs:
+         # concurrent retained elimination fields to two worker threads.
+         run: cargo test --release --locked --all-features --no-fail-fast -- --test-threads=2
+ 
++      - name: Test capability evidence guards
++        run: python3 scripts/test_capability_matrix.py
++
++      - name: Qualify named closure witnesses
++        run: python3 scripts/capability_matrix.py --output "$RUNNER_TEMP/hypercurve-capabilities"
++
++      - name: Retain capability evidence
++        if: always()
++        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
++        with:
++          name: hypercurve-capabilities
++          path: ${{ runner.temp }}/hypercurve-capabilities/
++          retention-days: 30
++
+       - name: Test WASM demo crate
+         working-directory: crates/hypercurve/examples/hypercurve_ui
+         run: cargo test --locked --no-fail-fast
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index 48f3957dd7..4669a41b9f 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -6,6 +6,11 @@ The detailed chronological log, including commit hashes, timings and samples, is
+ 
+ ## Current state
+ 
++The initial [executable capability matrix](qualification/README.md) ties named
++public fixtures to separate operation stages and asserted outcomes. Its bounded
++catalog distinguishes exact successes from typed gaps and inherited qualification;
++unspecified stages and the complete algebraic target remain open.
++
+ The exact-only principal API, the `CurveRegion2` migration, and S1 (`SelectedScalar2` dispatch) are complete. S6 is partly done; the remaining sites are listed below.
+ 
+ The historical ignored composition harness (`tests/hypercurve_composed_workloads.rs` and `tests/hypercurve_open_path_compositions.rs`) records 10 of 24 cases completing under a 300 s budget:
+diff --git a/crates/hypercurve/qualification/README.md b/crates/hypercurve/qualification/README.md
+new file mode 100644
+index 0000000000..6be40bd495
+--- /dev/null
++++ b/crates/hypercurve/qualification/README.md
+@@ -0,0 +1,80 @@
++# Executable capability witnesses
++
++This is the initial bounded matrix for M0 of the
++[exact closure plan](../../../docs/research/hypercurve_exact_curve_closure_plan.txt).
++It records what named public tests assert on the source revision actually built.
++The full algebraic domain in [AGENTS.md](../../../AGENTS.md) remains the target;
++this catalog does not establish universal closure or complete M0 coverage.
++
++From the repository root, with Python 3.11 or later and the repository's Rust
++toolchain installed:
++
++```sh
++python3 crates/hypercurve/scripts/test_capability_matrix.py
++python3 crates/hypercurve/scripts/capability_matrix.py --output /tmp/hypercurve-capabilities
++```
++
++The output directory must be new and outside the source tree. `--fixture ID`
++selects one row and can be repeated. Omitting it runs all catalog rows.
++`--build-timeout SECONDS` controls build containment separately from each row's
++published timeout. Cargo uses `--locked --release --all-features`; normal Cargo
++build-cache reuse is allowed. Each fixture runs alone in a fresh test process,
++with one test thread. This is not a fresh-process archive replay guarantee.
++
++The [catalog](capabilities.json) separates authored, generated and selected
++implicit inputs. Each row names its owner, properties, scalar/input domain,
++policies, operation conventions, asserted outcomes and oracle. The source test
++remains the authority for construction and assertions. Changing a fixture's
++meaning requires reviewing its catalog row as well. These are reviewed witness
++claims, not an automatic inference of geometry semantics from a zero exit code.
++
++The report keeps separate stages for representation, evaluation, differentials,
++incidence/order, classification, region admission, Booleans, offsets, repeated
++offsets, corner edits, restriction/reconstruction, transforms, exact replay and
++resource recovery. An empty stage list means **not qualified by this witness**.
++It does not mean unsupported or successful. A report for selected IDs says
++nothing about rows that were not run.
++
++| Recorded outcome | Meaning when the witness passes |
++| --- | --- |
++| `exact_success` | The named exact assertions pass within their stated scope. |
++| `successful_empty` | The fixture explicitly asserts a successful empty result. |
++| `unsupported`, `invalid`, `exhausted` | The fixture asserts that specific public failure category. |
++| `blocked_unspecified` | The fixture asserts `Blocked` without checking its reason; no narrower cause is claimed. |
++| `qualified_approximation` | The fixture retains the consumed approximation receipt. |
++
++The schema also reserves distinct outcomes for proved no solution,
++underconstrained input, undecided predicates and unbounded output. An outcome
++not present in the catalog has no new witness here. In particular, the
++polynomial frontier test passing records an implementation gap. Authored SVG
++round trips exercise eight authored families in one process; they do not cover
++generated definitions, fresh-process native replay or later modeling operations.
++Point-definition selector rejection is distinct from native archive replay.
++Membership samples are only the finite assertions listed, not a proof of the
++entire represented set.
++
++The driver obtains executables from Cargo's artifact messages, checks exact
++registration and ignored status, and requires one successful test summary.
++Missing tests, ignored tests, zero-test passes, failing builds or tests, changed
++binaries, changed catalogs and source changes cannot publish successful claims.
++The JSON report contains separate build and fixture commands/times, compiler
++and relevant build settings, binary and log digests, the source revision,
++tracked/input hashes, dirty patch and new source inputs. It reuses the
++repository's existing source-attribution helpers. This is an attributed local
++build, not a hermetic-build claim.
++
++Timeout and interruption are incomplete external outcomes, never inferred
++`BudgetExhausted`. On timeout or SIGTERM the runner stops the owned process
++group, including descendants. This tests the qualification harness's cleanup;
++it does not establish kernel cancellation. The per-fixture 300-second allowance
++is elapsed-time containment, not a total-work or memory limit. The catalog
++states the remaining resource gaps explicitly. Timing under CI or concurrent
++work is qualification data, not a controlled performance comparison.
++
++Hypercurve CI executes the evidence-guard tests and the catalog, then retains
++its report and logs as an artifact. For a retained implementation or performance
++claim, archive the relevant raw record under the repository's
++[admission protocol](../../../docs/admission.md) and record its digest. A green
++matrix is evidence for these witnesses only; broader transforms, singularities,
++nonrational offset chains, generated replay, general algebraic regions and
++shipped consumers still require their own algorithms and acceptance evidence.
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+new file mode 100644
+index 0000000000..b1a93fd2b8
+--- /dev/null
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -0,0 +1,854 @@
++{
++  "schema_version": 1,
++  "scope": "Bounded qualification of reviewed named fixtures only. Each claim describes the assertion actually exercised; unspecified stages remain unqualified. Passing blocker fixtures do not establish operation completion.",
++  "target_domain": "The AGENTS.md algebraic closure contract and M0-M6/A1-A4 remain the target. Native and generated instances are identified independently. This catalog is an initial subset, not an exhaustive family or degeneracy inventory.",
++  "unqualified_targets": [
++    "General algebraic coefficients and arbitrary-degree implicit region admission and operations.",
++    "Generated native save/reload in a fresh process followed by another modeling operation.",
++    "Complete nonrational ellipse, parabola and PH offset chains, singular events and overlap correspondences.",
++    "Invalid operands paired with canonical empty, full disappearance chains and all hole/disconnected configurations.",
++    "Total arithmetic, coefficient/system growth, retained-memory limits and cooperative cancellation.",
++    "Published package and actual binding consumers for the complete declared domain."
++  ],
++  "fixtures": [
++    {
++      "id": "authored_svg",
++      "target": "hypercurve_svg",
++      "test": "exact_extension_round_trips_every_curve_family",
++      "owner": "Hypercurve native definitions and SVG adapter",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Eight authored finite curve families; rational controls and an algebraic-coordinate line. No selected generated carriers.",
++      "origins": [
++        "authored"
++      ],
++      "families": [
++        "Line",
++        "CircularArc",
++        "QuadraticBezier",
++        "CubicBezier",
++        "RationalQuadraticBezier",
++        "RationalBezier",
++        "PolynomialBSpline",
++        "Nurbs"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Hypercurve SVG version 3 metadata is authoritative; drawing commands are separate.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "Construct all eight authored variants."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Same-process exact SVG metadata round trip compares each authored Curve2."
++        }
++      ],
++      "oracle": "Exact Curve2 equality after import; no generated-geometry or fresh-process archive assertion.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "generated_arc_corner",
++      "target": "hypercurve_open_path_compositions",
++      "test": "round_stroke_boundary_of_a_filleted_arc_corner_refillets_and_erodes",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "The original rational arc/line corner and its generated contacts, round stroke and refillet, followed by erosion by 1/16.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "CircularArc",
++        "RationalBezier",
++        "AnalyticParallel"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "STRICT; existing round-stroke and circular-fillet selection rules in the named fixture; erosion uses its existing round convention.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "Rebuilt stroke and refillet boundaries enter CurveRegion2."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Rebuild and reverse the generated boundary."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "successful_empty",
++          "assertion": "Rebuilt XOR and final difference are empty."
++        },
++        {
++          "stage": "corner_edits",
++          "outcome": "exact_success",
++          "assertion": "Refillet the reconstructed stroke boundary."
++        },
++        {
++          "stage": "repeated_offsets",
++          "outcome": "exact_success",
++          "assertion": "Erode the refilleted result and consume its region."
++        }
++      ],
++      "oracle": "Original assertions: empty set differences/XOR, generated contact incidence and added/removed material checks.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "selected_chamfers",
++      "target": "hypercurve_path_closure",
++      "test": "selected_open_chamfers_reenter_the_public_path_api",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "One line and one quadratic open path; unit chord setbacks, then 1/4, 1/16 and 1/64 setbacks.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "QuadraticBezier"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "TrimOnly; Euclidean chord setbacks; assert Unique for every edit.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "At least one edited curve has selected storage with geometry() == None."
++        },
++        {
++          "stage": "corner_edits",
++          "outcome": "exact_success",
++          "assertion": "Three further selected-path chamfers have a unique solution."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Open path endpoints and connectivity survive the edits."
++        }
++      ],
++      "oracle": "Exact endpoint coincidence, path connectivity, selected-carrier assertion and Certified receipts.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "selected_chamfer_booleans",
++      "target": "hypercurve_path_closure",
++      "test": "selected_path_chamfers_close_through_all_region_booleans",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Closed line/quadratic path with selected chamfer and a rectangular cutter; interior and closing vertices.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "QuadraticBezier"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "TrimOnly, unique unit chord setbacks; EvenOdd; union/intersection/difference/XOR.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "Admit the selected chamfer path under EvenOdd."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "All four regularized operations complete with Certified receipts."
++        },
++        {
++          "stage": "classification",
++          "outcome": "exact_success",
++          "assertion": "Four exact query points match the fixture expectations for each result."
++        }
++      ],
++      "oracle": "Exact closure and Certified receipts; finite membership assertions qualify these witnesses, not universal set equality.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "selected_fillet_chamfer",
++      "target": "hypercurve_path_closure",
++      "test": "selected_open_fillets_accept_a_subsequent_chamfer",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Open line/quadratic path, unit-radius selected fillet, then 1/16 chord setbacks.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "QuadraticBezier",
++        "CircularArc"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "TrimOnly; assert one isolated fillet solution and one chord-setback chamfer.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "Generated CircularArc has selected storage."
++        },
++        {
++          "stage": "corner_edits",
++          "outcome": "exact_success",
++          "assertion": "The unique selected fillet accepts a unique subsequent chamfer."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Exact external endpoints and connectivity remain."
++        }
++      ],
++      "oracle": "Selected circular family, exact endpoint coincidence, path connectivity and Certified receipts.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "homogeneous_composition",
++      "target": "hypercurve_path_closure",
++      "test": "homogeneous_boundary_closes_through_boolean_corners_and_offset",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Finite semicircle with a homogeneous control at infinity, rational and NURBS forms and degree-12 elevations, plus lines.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "Nurbs"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "Explicit material/NonZero loops; TrimOnly fillet radius or chord setbacks 1/8, all returned solutions retained, round offset 1/32 and subsequent four-way Boolean batch.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "Preserve a finite curve with no affine control net."
++        },
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "Admit the homogeneous boundary."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Clip the boundary with a rectangle."
++        },
++        {
++          "stage": "corner_edits",
++          "outcome": "exact_success",
++          "assertion": "The clipped region completes the fixture corner edits."
++        },
++        {
++          "stage": "offsets",
++          "outcome": "exact_success",
++          "assertion": "The edited result completes the fixture offset."
++        }
++      ],
++      "oracle": "Exact homogeneous-source checks, boundary loop count, membership assertions and Certified receipts.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "algebraic_boolean_continuation",
++      "target": "hypercurve_curve_region_boolean",
++      "test": "algebraic_curved_region_output_can_feed_another_boolean",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Quadratic cap cut at algebraic parameters; disjoint and crossing rectangular operands.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "QuadraticBezier"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Regularized union/intersection/difference/XOR through CurveRegion2.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "The first and subsequent regions retain algebraic fragments."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Consume a selected result in disjoint union and crossing Boolean batch."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "successful_empty",
++          "assertion": "Self-XOR is empty."
++        },
++        {
++          "stage": "classification",
++          "outcome": "exact_success",
++          "assertion": "Exact query points match the specified material."
++        }
++      ],
++      "oracle": "Algebraic-carrier assertions, idempotent exact region equality, empty self-XOR and specified membership.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "native_empty_identities",
++      "target": "hypercurve_curve_region_boolean",
++      "test": "boolean_batch_short_circuits_empty_and_identical_operands",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Canonical empty CurveRegion2 and one rational square; identical square operands.",
++      "origins": [
++        "authored"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Regularized empty-set identities; this witness does not pair an invalid operand with empty.",
++      "claims": [
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Union/XOR with empty and self union/intersection retain exact region equality."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "successful_empty",
++          "assertion": "Empty intersection/difference and self difference/XOR remain empty."
++        }
++      ],
++      "oracle": "Exact CurveRegion2 equality, is_empty and zero arrangement work counters.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "generated_holes",
++      "target": "hypercurve_curve_region_boolean",
++      "test": "affine_line_batch_preserves_material_and_hole_roles",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "A square frame formed by difference, consumed by a second Boolean batch with an inset square.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Regularized difference creates the frame; subsequent intersection retains its hole.",
++      "claims": [
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Consume the generated frame in a subsequent batch."
++        },
++        {
++          "stage": "classification",
++          "outcome": "exact_success",
++          "assertion": "The retained two-loop result preserves material and hole membership."
++        }
++      ],
++      "oracle": "Two boundary loops and exact inside/outside queries at prescribed points.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "nested_islands",
++      "target": "hypercurve_curve_region_boolean",
++      "test": "curved_region_boolean_respects_nested_hole_roles",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "EvenOdd nested square loops and a disconnected island inside the hole; the test name does not imply curved supports.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "EvenOdd admission followed by regularized union and intersection.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "Admit nested loops under EvenOdd."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Union preserves ring, hole and island."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "successful_empty",
++          "assertion": "Ring/island intersection is empty."
++        },
++        {
++          "stage": "classification",
++          "outcome": "exact_success",
++          "assertion": "Three exact queries distinguish material, hole and island."
++        }
++      ],
++      "oracle": "Independent ring/hole/island membership expectations and empty intersection.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "lower_dimensional_contacts",
++      "target": "hypercurve_curve_region_boolean",
++      "test": "regularized_affine_contacts_discard_lower_dimensional_intersections",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Two rational squares touching at one point or along one edge.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "Regularization takes closure of interior; shared points/edges alone are not filled material.",
++      "claims": [
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "Complete contacts distinguish point contact from edge overlap."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "successful_empty",
++          "assertion": "Lower-dimensional intersections regularize to empty."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Point-touch union has two loops; edge-touch union has one."
++        }
++      ],
++      "oracle": "Exact contact/overlap assertions, boundary loop counts and prescribed membership.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "implicit_evaluation",
++      "target": "polynomial_curves",
++      "test": "closed_loop_evaluation_split_reverse_and_source_identity",
++      "owner": "Hypersolve topology and Hypercurve polynomial branches",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Two selected graph branches of a rational circle polynomial on the unit box.",
++      "origins": [
++        "selected_implicit"
++      ],
++      "families": [
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Source-chart restrictions remain authoritative; this does not admit a polynomial filled region.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "Branches share the exact polynomial source and selected fibers."
++        },
++        {
++          "stage": "evaluation",
++          "outcome": "exact_success",
++          "assertion": "Exact endpoint and midpoint identities are retained."
++        },
++        {
++          "stage": "differentials",
++          "outcome": "exact_success",
++          "assertion": "The regular chart derivative has the expected exact linear forms."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Splitting and reversing preserve source and endpoint identity."
++        }
++      ],
++      "oracle": "Explicit circle endpoints, selected fiber definitions and exact derivative linear forms.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "implicit_quintic_sections",
++      "target": "polynomial_curves",
++      "test": "quintic_section_splits_both_operands_and_continues",
++      "owner": "Hypercurve polynomial sections and Hypersolve selected fields",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "The fixture quintic branch and a rational vertical line; both operand orders and both reversals.",
++      "origins": [
++        "authored",
++        "selected_implicit",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "The selected fiber remains correlated; no independent coordinate materialization is required.",
++      "claims": [
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "One selected contact has exact signs and isolating bounds."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Split both operands at the correlated fiber and continue with their pieces."
++        }
++      ],
++      "oracle": "Original defining equation, rational isolating bounds, selected line parameter relation and directed tangent signs.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "implicit_frontier",
++      "target": "polynomial_curves",
++      "test": "unadmitted_polynomial_pairs_keep_typed_blockers",
++      "owner": "Hypercurve polynomial incidence and region arrangement",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Quintic versus irrational-coordinate vertical/sloped lines, translated branch versus line, branch pair, and a closed parabola-branch boundary.",
++      "origins": [
++        "authored",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "A passing frontier test records implementation gaps; it is not completed algebraic incidence or region support.",
++      "claims": [
++        {
++          "stage": "incidence_order",
++          "outcome": "unsupported",
++          "assertion": "Both operand orders reject the four unadmitted pair classes with Unsupported."
++        },
++        {
++          "stage": "region_admission",
++          "outcome": "unsupported",
++          "assertion": "Simple polynomial boundary orientation and CurveRegion2 admission return Unsupported."
++        }
++      ],
++      "oracle": "Public ExactCurveError::Blocked reasons are explicitly matched to Unsupported.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "implicit_budget_retry",
++      "target": "polynomial_curves",
++      "test": "forged_selector_rejection_and_budget_recovery",
++      "owner": "Hypersolve selected fibers and Hypercurve point definitions",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "Selected polynomial-circle fibers with zero isolation/refinement allowance and independently forged selectors.",
++      "origins": [
++        "selected_implicit",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "In-memory point-definition replay only; counted subdivision/refinement limits do not bound total work or memory.",
++      "claims": [
++        {
++          "stage": "evaluation",
++          "outcome": "exhausted",
++          "assertion": "A reached zero isolation/refinement allowance produces BudgetExhausted."
++        },
++        {
++          "stage": "resource_recovery",
++          "outcome": "exact_success",
++          "assertion": "A later ordinary-budget point query succeeds."
++        }
++      ],
++      "oracle": "Typed budget reason, selector rejection and exact recovered coordinate ordering; forged errors are only asserted as errors, not a specific Invalid variant.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "qualified_replay",
++      "target": "qualified_closure",
++      "test": "stricter_replay_of_a_qualified_loop_is_blocked_not_invalid",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "A square closed by a symbolic trigonometric identity, outside the algebraic target; both traversal directions.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "Existing symbolic support remains qualified; the blocked reason is not asserted more narrowly than the test.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "qualified_approximation",
++          "assertion": "Approximate admission carries Approximate512Consumed."
++        },
++        {
++          "stage": "classification",
++          "outcome": "blocked_unspecified",
++          "assertion": "Stricter classification is Blocked, not Invalid."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "blocked_unspecified",
++          "assertion": "Stricter intersection is Blocked."
++        },
++        {
++          "stage": "transforms",
++          "outcome": "blocked_unspecified",
++          "assertion": "Stricter affine continuation is Blocked."
++        },
++        {
++          "stage": "classification",
++          "outcome": "qualified_approximation",
++          "assertion": "Approximate retry retains its receipt and classifies the interior."
++        }
++      ],
++      "oracle": "Independent sine addition identity, explicit certainty checks and public Blocked variant assertions.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "qualified_affine",
++      "target": "qualified_closure",
++      "test": "qualified_affine_continuation_keeps_its_closure_receipt",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "The same qualified symbolic square under translation, reflection and nonsingular anisotropic scaling.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "No offset/affine commutation is claimed; symbolic approximate source fidelity remains explicit.",
++      "claims": [
++        {
++          "stage": "transforms",
++          "outcome": "qualified_approximation",
++          "assertion": "Affine continuation retains inherited Approximate512Consumed."
++        },
++        {
++          "stage": "classification",
++          "outcome": "qualified_approximation",
++          "assertion": "Transformed interior queries retain the qualification."
++        }
++      ],
++      "oracle": "Known affine images of an interior point, explicit receipts, and stricter calls remaining blocked.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "invalid_and_valid_admission",
++      "target": "qualified_closure",
++      "test": "replay_does_not_relabel_an_open_loop_or_weaken_a_strict_square",
++      "owner": "Hypercurve",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "An open rational square with gap 1/100 paired with an exactly closed square under both policies.",
++      "origins": [
++        "authored"
++      ],
++      "families": [
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "Selecting an approximate policy alone does not make a certified result approximate.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "invalid",
++          "assertion": "The open loop returns ExactCurveError::Invalid under both policies."
++        },
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "The closed square remains Certified under both policies."
++        }
++      ],
++      "oracle": "Explicit Invalid variant and certified successful closed-region assertions.",
++      "timeout_seconds": 300
++    }
++  ]
++}
+diff --git a/crates/hypercurve/scripts/capability_matrix.py b/crates/hypercurve/scripts/capability_matrix.py
+new file mode 100644
+index 0000000000..d795df4b3a
+--- /dev/null
++++ b/crates/hypercurve/scripts/capability_matrix.py
+@@ -0,0 +1,334 @@
++#!/usr/bin/env python3
++"""Run the reviewed Hypercurve capability witnesses, preserving typed gaps.
++
++Each row names one ordinary integration test. A passing blocker assertion is
++reported as that blocker, never as geometric completion. Output must be new and
++outside the source tree. This Unix driver uses only Python's standard library.
++"""
++
++import argparse
++import importlib.util
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import signal
++import subprocess
++import sys
++import time
++
++sys.dont_write_bytecode = True
++ROOT = Path(__file__).resolve().parents[3]
++DEFAULT_CATALOG = ROOT / "crates/hypercurve/qualification/capabilities.json"
++STAGES = (
++    "representation", "evaluation", "differentials", "incidence_order",
++    "classification", "region_admission", "booleans", "offsets", "repeated_offsets",
++    "corner_edits", "restriction_reconstruction", "transforms", "exact_replay",
++    "resource_recovery",
++)
++OUTCOMES = {
++    "exact_success", "successful_empty", "proved_no_solution", "invalid",
++    "underconstrained", "unsupported", "undecided", "exhausted", "unbounded",
++    "qualified_approximation", "blocked_unspecified",
++}
++FAMILIES = {
++    "Line", "CircularArc", "QuadraticBezier", "CubicBezier",
++    "RationalQuadraticBezier", "RationalBezier", "PolynomialBSpline", "Nurbs",
++    "AnalyticParallel", "ImplicitPolynomial",
++}
++FIELDS = {
++    "id", "target", "test", "owner", "properties", "domain", "origins",
++    "families", "policies", "semantics", "claims", "oracle", "timeout_seconds",
++}
++SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
++SUMMARY = re.compile(
++    r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
++    r"\d+ filtered out; finished in .+$", re.MULTILINE,
++)
++spec = importlib.util.spec_from_file_location(
++    "successive_evidence", ROOT / "scripts/successive-operations.py"
++)
++evidence = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(evidence)
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def nonempty(value):
++    return isinstance(value, str) and bool(value.strip())
++
++
++def strings(value):
++    return isinstance(value, list) and bool(value) and all(map(nonempty, value))
++
++
++def unique_keys(pairs):
++    result = {}
++    for key, value in pairs:
++        require(key not in result, f"duplicate JSON key: {key}")
++        result[key] = value
++    return result
++
++
++def load_catalog(path):
++    catalog = json.loads(path.read_text(), object_pairs_hook=unique_keys)
++    require(isinstance(catalog, dict) and set(catalog) == {
++        "schema_version", "scope", "target_domain", "unqualified_targets", "fixtures",
++    }, "unexpected catalog fields")
++    require(type(catalog["schema_version"]) is int and catalog["schema_version"] == 1,
++            "unsupported catalog schema")
++    for key in ["scope", "target_domain"]:
++        require(nonempty(catalog[key]), f"missing {key}")
++    require(strings(catalog["unqualified_targets"]), "unqualified targets must be explicit")
++    require(isinstance(catalog["fixtures"], list) and catalog["fixtures"], "empty catalog")
++    ids, tests = set(), set()
++    for row in catalog["fixtures"]:
++        require(isinstance(row, dict) and set(row) == FIELDS, "unexpected fixture fields")
++        for key in ["id", "target"]:
++            require(isinstance(row[key], str) and SAFE_NAME.fullmatch(row[key]), f"invalid {key}")
++        for key in ["test", "owner", "domain", "semantics", "oracle"]:
++            require(nonempty(row[key]), f"missing {key} in {row['id']}")
++        require(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:]*", row["test"]), "invalid test name")
++        for key in ["properties", "origins", "families", "policies"]:
++            require(strings(row[key]), f"missing {key} in {row['id']}")
++        require(set(row["origins"]) <= {"authored", "generated", "selected_implicit"},
++                "unknown origin")
++        require(set(row["policies"]) <= {"STRICT", "APPROXIMATE_512"}, "unknown policy")
++        require(set(row["families"]) <= FAMILIES, "unknown curve family")
++        require(all(re.fullmatch(r"P(?:[1-9]|[12][0-9]|3[0-9])", p)
++                    for p in row["properties"]), "unknown property")
++        require(type(row["timeout_seconds"]) is int and row["timeout_seconds"] > 0,
++                "fixture timeout must be a positive integer")
++        require(row["id"] not in ids, "duplicate fixture id")
++        require((row["target"], row["test"]) not in tests, "duplicate test witness")
++        ids.add(row["id"]); tests.add((row["target"], row["test"]))
++        require(isinstance(row["claims"], list) and row["claims"], "empty claims")
++        for claim in row["claims"]:
++            require(isinstance(claim, dict) and set(claim) == {"stage", "outcome", "assertion"},
++                    "unexpected claim fields")
++            require(isinstance(claim["stage"], str) and claim["stage"] in STAGES, "unknown stage")
++            require(isinstance(claim["outcome"], str) and claim["outcome"] in OUTCOMES,
++                    "unknown geometric outcome")
++            require(nonempty(claim["assertion"]), "missing assertion scope")
++    return catalog
++
++
++def command_run(command, log_path, timeout, environment):
++    """Contain a process group; timeout/interruption never implies exhaustion."""
++    start = time.monotonic()
++    with log_path.open("w") as log:
++        process = subprocess.Popen(command, cwd=ROOT, env=environment, stdout=log,
++                                   stderr=subprocess.STDOUT, start_new_session=True)
++        status = "exited"
++        try:
++            code = process.wait(timeout=timeout)
++        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
++            status = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "interrupted"
++            try:
++                os.killpg(process.pid, signal.SIGTERM)
++            except ProcessLookupError:
++                pass
++            try:
++                code = process.wait(timeout=5)
++            except subprocess.TimeoutExpired:
++                os.killpg(process.pid, signal.SIGKILL)
++                code = process.wait()
++            # A child can outlive a leader that exited on SIGTERM.
++            try:
++                os.killpg(process.pid, signal.SIGKILL)
++            except ProcessLookupError:
++                pass
++            if status == "interrupted":
++                raise
++    return {"command": command, "status": status, "returncode": code,
++            "elapsed_seconds": time.monotonic() - start, "log": log_path.name,
++            "log_sha256": evidence.digest_file(log_path)}
++
++
++def registered_tests(text):
++    return {line.removesuffix(": test") for line in text.splitlines() if line.endswith(": test")}
++
++
++def witness_passed(result, output):
++    # A misspelled --exact filter exits zero with zero tests. Require one test,
++    # one summary and no ignored test, independently of the process exit code.
++    summaries = [line for line in output.splitlines() if line.startswith("test result:")]
++    return (result["status"] == "exited" and result["returncode"] == 0
++            and len(summaries) == 1 and bool(SUMMARY.fullmatch(summaries[0])))
++
++
++def build_binaries(rows, output, environment, timeout):
++    targets = sorted({row["target"] for row in rows})
++    command = ["cargo", "test", "--locked", "-p", "hypercurve", "--release",
++               "--all-features", "--no-run", "--message-format=json"]
++    for target in targets:
++        command += ["--test", target]
++    result = command_run(command, output / "build.log", timeout, environment)
++    binaries = {}
++    if result["status"] == "exited" and result["returncode"] == 0:
++        with (output / "build.log").open() as log:
++            for line in log:
++                try:
++                    message = json.loads(line)
++                except json.JSONDecodeError:
++                    continue
++                if message.get("reason") != "compiler-artifact" or not message.get("executable"):
++                    continue
++                target = message["target"]
++                if target["name"] not in targets or target["kind"] != ["test"]:
++                    continue
++                path = Path(message["executable"]).resolve()
++                require(target["name"] not in binaries or binaries[target["name"]] == path,
++                        "ambiguous Cargo test artifact")
++                binaries[target["name"]] = path
++    result["all_requested_artifacts"] = set(binaries) == set(targets)
++    return result, binaries
++
++
++def run_fixture(row, binary, registered, ignored, output, environment, expected_digest):
++    result = {"id": row["id"], "status": "unregistered", "witness": row}
++    if row["test"] not in registered:
++        return result
++    if row["test"] in ignored:
++        result["status"] = "ignored"
++        return result
++    before = evidence.digest_file(binary)
++    if before != expected_digest:
++        result["status"] = "binary_changed"
++        return result
++    run = command_run([str(binary), row["test"], "--exact", "--nocapture", "--test-threads=1"],
++                      output / (row["id"] + ".log"), row["timeout_seconds"], environment)
++    result.update(run=run, binary_sha256=before)
++    if not binary.exists() or evidence.digest_file(binary) != before:
++        result["status"] = "binary_changed"
++    elif run["status"] != "exited":
++        result["status"] = run["status"]
++    else:
++        result["status"] = ("witness_passed" if witness_passed(
++            run, (output / run["log"]).read_text()) else "test_failed")
++    return result
++
++
++def stage_matrix(results, stable):
++    return [{"id": row["id"], "stages": {
++        stage: ([claim for claim in row["witness"]["claims"] if claim["stage"] == stage]
++                if stable and row["status"] == "witness_passed" else [])
++        for stage in STAGES
++    }} for row in results]
++
++
++def run(args):
++    catalog_path = args.catalog.resolve()
++    catalog = load_catalog(catalog_path)
++    rows = catalog["fixtures"]
++    if args.fixture:
++        require(set(args.fixture) <= {row["id"] for row in rows}, "unknown requested fixture")
++        rows = [row for row in rows if row["id"] in args.fixture]
++    output = evidence.new_output(args.output)
++    before, files, patch = evidence.source_snapshot()
++    evidence.save_json(output / "source-files.json", files)
++    (output / "dirty.patch").write_bytes(patch)
++    for relative in before["untracked_inputs"]:
++        source = ROOT / relative
++        destination = output / "untracked" / relative
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        if source.is_symlink():
++            destination.symlink_to(os.readlink(source))
++        else:
++            shutil.copy2(source, destination)
++    catalog_digest = evidence.digest_file(catalog_path)
++    (output / "catalog.json").write_bytes(catalog_path.read_bytes())
++    environment = {**os.environ, "RUST_TEST_THREADS": "1", "CARGO_TERM_COLOR": "never"}
++    report = {
++        "schema_version": 1, "status": "running", "source_before": before,
++        "catalog_sha256": catalog_digest, "selected_ids": [row["id"] for row in rows],
++        "scope": catalog["scope"], "target_domain": catalog["target_domain"],
++        "unqualified_targets": catalog["unqualified_targets"], "fixtures": [],
++        "compiler": subprocess.check_output(["rustc", "-Vv"], env=environment, text=True),
++        "environment": {name: environment[name] for name in [
++            "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC",
++            "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS",
++            "RUST_TEST_THREADS", "CARGO_TERM_COLOR",
++        ] if name in environment},
++        "resource_contract": "External per-process elapsed-time containment; no total work or memory bound. Timeout is incomplete, not typed geometric exhaustion.",
++    }
++    evidence.save_json(output / "report.json", report)
++    binaries, binary_digests = {}, {}
++    try:
++        build, binaries = build_binaries(rows, output, environment, args.build_timeout)
++        report["build"] = build
++        require(build["all_requested_artifacts"], "build did not produce every requested test binary")
++        listings = {}
++        for target, binary in binaries.items():
++            digest = evidence.digest_file(binary)
++            binary_digests[target] = digest
++            names = []
++            for suffix, options in [("registered", []), ("ignored", ["--ignored"])]:
++                log = output / f"{target}-{suffix}.log"
++                result = command_run([str(binary), "--list", "--format", "terse", *options],
++                                     log, 30, environment)
++                require(result["status"] == "exited" and result["returncode"] == 0,
++                        "failed test discovery")
++                names.append(registered_tests(log.read_text()))
++            require(evidence.digest_file(binary) == digest, "binary changed during discovery")
++            listings[target] = names
++        report["binaries"] = {target: {"path": str(binary), "sha256": binary_digests[target]}
++                              for target, binary in binaries.items()}
++        for row in rows:
++            report["active_fixture"] = row["id"]
++            evidence.save_json(output / "report.json", report)
++            registered, ignored = listings[row["target"]]
++            result = run_fixture(row, binaries[row["target"]], registered, ignored, output,
++                                 environment, binary_digests[row["target"]])
++            report["fixtures"].append(result)
++            report.pop("active_fixture")
++            evidence.save_json(output / "report.json", report)
++            print(row["id"], result["status"], flush=True)
++        report["status"] = ("witnesses_passed" if all(
++            row["status"] == "witness_passed" for row in report["fixtures"]
++        ) else "witness_failures")
++    except KeyboardInterrupt:
++        report["status"] = "interrupted"
++    except (OSError, ValueError, subprocess.SubprocessError) as error:
++        report["status"] = "driver_failed"
++        report["error"] = str(error)
++    finally:
++        after, _, _ = evidence.source_snapshot()
++        stable = (before == after and catalog_path.exists()
++                  and evidence.digest_file(catalog_path) == catalog_digest
++                  and all(binaries[target].exists()
++                          and evidence.digest_file(binaries[target]) == digest
++                          for target, digest in binary_digests.items()))
++        report["source_after"] = after
++        report["evidence_inputs_stable"] = stable
++        report["matrix"] = stage_matrix(report["fixtures"], stable)
++        if not stable:
++            report["status"] = "evidence_inputs_changed"
++        evidence.save_json(output / "report.json", report)
++    return 0 if report["status"] == "witnesses_passed" else 1
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--fixture", action="append")
++    parser.add_argument("--build-timeout", type=int, default=1800)
++    args = parser.parse_args()
++    require(args.build_timeout > 0, "build timeout must be positive")
++    def interrupt(*_):
++        raise KeyboardInterrupt
++    signal.signal(signal.SIGTERM, interrupt)
++    try:
++        return run(args)
++    except (OSError, ValueError, subprocess.SubprocessError) as error:
++        print(str(error), file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/crates/hypercurve/scripts/test_capability_matrix.py b/crates/hypercurve/scripts/test_capability_matrix.py
+new file mode 100644
+index 0000000000..6f59d5d3e0
+--- /dev/null
++++ b/crates/hypercurve/scripts/test_capability_matrix.py
+@@ -0,0 +1,219 @@
++#!/usr/bin/env python3
++"""Regression tests for admitting evidence, independent of geometry algorithms."""
++
++import copy
++import importlib.util
++import json
++import os
++from pathlib import Path
++import signal
++import subprocess
++import sys
++import tempfile
++import time
++import unittest
++
++sys.dont_write_bytecode = True
++DRIVER = Path(__file__).with_name("capability_matrix.py")
++spec = importlib.util.spec_from_file_location("capability_matrix", DRIVER)
++matrix = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(matrix)
++
++
++class MatrixEvidenceTests(unittest.TestCase):
++    def setUp(self):
++        self.temporary = tempfile.TemporaryDirectory(prefix="hypercurve-matrix-test-")
++        self.addCleanup(self.temporary.cleanup)
++        self.root = Path(self.temporary.name)
++        catalog = matrix.load_catalog(matrix.DEFAULT_CATALOG)
++        self.catalog = {**catalog, "fixtures": [copy.deepcopy(catalog["fixtures"][0])]}
++        row = self.catalog["fixtures"][0]
++        row.update(id="witness", target="fixture", test="witness", timeout_seconds=1)
++        self.path = self.root / "catalog.json"
++        self.path.write_text(json.dumps(self.catalog))
++
++    def reject(self, change):
++        change(self.catalog)
++        self.path.write_text(json.dumps(self.catalog))
++        with self.assertRaises(ValueError):
++            matrix.load_catalog(self.path)
++
++    def test_catalog_rejects_unknown_claims(self):
++        for key, value in [("stage", "almost_exact"), ("outcome", "completed"), ("stage", [])]:
++            with self.subTest(key=key, value=value):
++                original = copy.deepcopy(self.catalog)
++                self.reject(lambda c: c["fixtures"][0]["claims"][0].update({key: value}))
++                self.catalog = original
++
++    def test_catalog_rejects_ambiguous_witnesses(self):
++        self.reject(lambda c: c["fixtures"].append(copy.deepcopy(c["fixtures"][0])))
++
++    def test_catalog_rejects_missing_scope_and_bad_limits(self):
++        for key, value in [("domain", ""), ("timeout_seconds", True), ("timeout_seconds", 0),
++                           ("policies", ["DEFAULT"]), ("families", ["AllCurves"])]:
++            with self.subTest(key=key):
++                original = copy.deepcopy(self.catalog)
++                self.reject(lambda c: c["fixtures"][0].update({key: value}))
++                self.catalog = original
++
++    def test_duplicate_json_keys_are_rejected(self):
++        self.path.write_text('{"scope": "exact", "scope": "unsupported"}')
++        with self.assertRaisesRegex(ValueError, "duplicate JSON key"):
++            matrix.load_catalog(self.path)
++
++    def test_zero_tests_or_ignored_tests_are_not_success(self):
++        result = {"status": "exited", "returncode": 0}
++        for summary in [
++            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0s",
++            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0s",
++            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s",
++        ]:
++            with self.subTest(summary=summary):
++                self.assertFalse(matrix.witness_passed(result, summary))
++
++    def test_blocker_witness_does_not_become_completed_geometry(self):
++        witness = copy.deepcopy(self.catalog["fixtures"][0])
++        witness["claims"] = [{"stage": "region_admission", "outcome": "unsupported",
++                              "assertion": "Public Unsupported reason"}]
++        records = [{"id": "witness", "status": "witness_passed", "witness": witness}]
++        stages = matrix.stage_matrix(records, True)[0]["stages"]
++        self.assertEqual(stages["region_admission"], witness["claims"])
++        self.assertEqual(stages["exact_replay"], [])
++        self.assertTrue(all(not claims for claims in matrix.stage_matrix(records, False)[0]["stages"].values()))
++        records[0]["status"] = "test_failed"
++        self.assertTrue(all(not claims for claims in matrix.stage_matrix(records, True)[0]["stages"].values()))
++
++    def fake_tools(self, mode):
++        tools = self.root / "tools"
++        tools.mkdir()
++        binary = self.root / "fixture"
++        binary.write_text(f"#!{sys.executable}\n" + '''
++import os, signal, subprocess, sys, time
++from pathlib import Path
++mode = os.environ['FIXTURE_MODE']
++if '--list' in sys.argv:
++    if '--ignored' not in sys.argv or mode == 'ignored':
++        print(('different' if mode == 'missing' else 'witness') + ': test')
++    sys.exit(0)
++if mode == 'timeout':
++    child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)'])
++    Path(os.environ['FIXTURE_PID']).write_text(str(child.pid))
++    time.sleep(30)
++if mode == 'binary_changed':
++    with Path(__file__).open('a') as stream:
++        stream.write('\\n# changed after build\\n')
++if mode == 'catalog_changed':
++    with Path(os.environ['FIXTURE_CATALOG']).open('a') as stream:
++        stream.write('\\n')
++passed = 0 if mode == 'zero' else 1
++print(f'test result: ok. {passed} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s')
++sys.exit(2 if mode == 'failed' else 0)
++''')
++        binary.chmod(0o755)
++        cargo = tools / "cargo"
++        cargo.write_text(f"#!{sys.executable}\n" + '''
++import json, os, sys
++if os.environ['FIXTURE_MODE'] == 'build_failed':
++    sys.exit(17)
++print(json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'fixture', 'kind': ['test']}, 'executable': os.environ['FIXTURE_BINARY']}))
++''')
++        cargo.chmod(0o755)
++        rustc = tools / "rustc"
++        rustc.write_text(f"#!{sys.executable}\nprint('controlled test compiler')\n")
++        rustc.chmod(0o755)
++        return {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"],
++                "FIXTURE_MODE": mode, "FIXTURE_BINARY": str(binary),
++                "FIXTURE_CATALOG": str(self.path), "FIXTURE_PID": str(self.root / "child.pid"),
++                "PYTHONDONTWRITEBYTECODE": "1"}
++
++    def invoke(self, mode):
++        result = subprocess.run([sys.executable, str(DRIVER), "--catalog", str(self.path),
++                                 "--output", str(self.root / "report")],
++                                env=self.fake_tools(mode), capture_output=True, text=True, timeout=30)
++        report = json.loads((self.root / "report/report.json").read_text())
++        return result, report
++
++    def test_one_registered_success_is_admitted(self):
++        result, report = self.invoke("pass")
++        self.assertEqual(result.returncode, 0, result.stderr)
++        self.assertEqual(report["status"], "witnesses_passed")
++        self.assertTrue(report["evidence_inputs_stable"])
++        self.assertEqual(report["fixtures"][0]["status"], "witness_passed")
++        self.assertIn("--locked", report["build"]["command"])
++        self.assertIn("--release", report["build"]["command"])
++        self.assertIn("--all-features", report["build"]["command"])
++        self.assertTrue(report["binaries"]["fixture"]["sha256"])
++
++    def check_failure(self, mode, expected):
++        result, report = self.invoke(mode)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(report["fixtures"][0]["status"], expected)
++        self.assertTrue(all(not claims for claims in report["matrix"][0]["stages"].values()))
++        return report
++
++    def test_missing_registration_is_rejected(self):
++        self.check_failure("missing", "unregistered")
++
++    def test_ignored_registration_is_rejected(self):
++        self.check_failure("ignored", "ignored")
++
++    def test_zero_test_success_is_rejected(self):
++        self.check_failure("zero", "test_failed")
++
++    def test_nonzero_exit_is_rejected_even_with_success_summary(self):
++        self.check_failure("failed", "test_failed")
++
++    def test_changed_binary_is_rejected(self):
++        report = self.check_failure("binary_changed", "binary_changed")
++        self.assertFalse(report["evidence_inputs_stable"])
++
++    def test_changed_catalog_invalidates_claims(self):
++        result, report = self.invoke("catalog_changed")
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(report["status"], "evidence_inputs_changed")
++        self.assertTrue(all(not claims for claims in report["matrix"][0]["stages"].values()))
++
++    def test_failed_build_cannot_admit_a_fixture(self):
++        result, report = self.invoke("build_failed")
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(report["status"], "driver_failed")
++        self.assertEqual(report["fixtures"], [])
++        self.assertEqual(report["build"]["returncode"], 17)
++
++    def test_timeout_is_incomplete_and_cleans_descendants(self):
++        report = self.check_failure("timeout", "timeout")
++        self.assertEqual(report["fixtures"][0]["run"]["status"], "timeout")
++        self.assert_child_stopped()
++
++    def assert_child_stopped(self):
++        pid = (self.root / "child.pid").read_text()
++        state = Path('/proc') / pid / 'stat'
++        if state.exists():
++            self.assertIn(state.read_text().split()[2], ['Z', 'X'])
++
++    def test_interrupted_driver_cleans_descendants(self):
++        environment = self.fake_tools("timeout")
++        with (self.root / "driver.log").open("w") as log:
++            driver = subprocess.Popen([sys.executable, str(DRIVER), "--catalog", str(self.path),
++                                       "--output", str(self.root / "report")],
++                                      env=environment, stdout=log, stderr=subprocess.STDOUT)
++            try:
++                deadline = time.monotonic() + 15
++                while not (self.root / "child.pid").exists():
++                    self.assertIsNone(driver.poll(), "driver ended before interruption")
++                    self.assertLess(time.monotonic(), deadline)
++                    time.sleep(0.01)
++                driver.send_signal(signal.SIGTERM)
++                self.assertNotEqual(driver.wait(timeout=15), 0)
++            finally:
++                if driver.poll() is None:
++                    driver.kill()
++                    driver.wait()
++        report = json.loads((self.root / "report/report.json").read_text())
++        self.assertEqual(report["status"], "interrupted")
++        self.assertEqual(report["matrix"], [])
++        self.assert_child_stopped()
++
++
++if __name__ == "__main__":
++    unittest.main()
