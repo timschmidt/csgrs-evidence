@@ -1,0 +1,279 @@
+diff --git a/crates/hypercurve/src/bezier.rs b/crates/hypercurve/src/bezier.rs
+index 27a789bc05..fdf7bd2573 100644
+--- a/crates/hypercurve/src/bezier.rs
++++ b/crates/hypercurve/src/bezier.rs
+@@ -297,12 +297,23 @@ impl QuadraticBezier2 {
+             .iter()
+             .map(|contact| contact.transform_similarity(transform))
+             .collect::<CurveResult<Vec<_>>>()?;
+-        Self::with_retained_exact_line_provenance(
+-            points[0].clone(),
+-            points[1].clone(),
+-            points[2].clone(),
+-            contacts,
+-        )
++        // Map the retained line itself. Reconstructing it from the trimmed
++        // endpoints discards the source support and its exact direction.
++        let line =
++            evidence
++                .line
++                .map_points_between(points[0].clone(), points[2].clone(), |point| {
++                    transform.transform_point(point)
++                })?;
++        Ok(Self {
++            start: points[0].clone(),
++            control: points[1].clone(),
++            end: points[2].clone(),
++            exact_line_image: Some(Arc::new(ExactQuadraticLineImage2 {
++                line,
++                parallel_tangent_contacts: (!contacts.is_empty()).then(|| Arc::from(contacts)),
++            })),
++        })
+     }
+ 
+     /// Applies an exact planar affine transform while retaining a certified
+@@ -329,7 +340,12 @@ impl QuadraticBezier2 {
+         let exact_line_image = self
+             .exact_line_image
+             .as_ref()
+-            .and_then(|_| LineSeg2::try_new(start.clone(), end.clone()).ok())
++            .and_then(|evidence| {
++                evidence
++                    .line
++                    .map_points_between(start.clone(), end.clone(), point)
++                    .ok()
++            })
+             .map(|line| {
+                 Arc::new(ExactQuadraticLineImage2 {
+                     line,
+@@ -776,6 +792,72 @@ fn quadratic_interpolation_parameter_blocker(
+ mod reversal_tests {
+     use super::*;
+ 
++    #[test]
++    fn transforming_a_straight_fragment_keeps_its_exact_line_support() {
++        let point = |x: i64, y: i64| Point2::new(Real::from(x), Real::from(y));
++        let source = LineSeg2::try_new(point(0, 0), point(6, 6)).unwrap();
++        let a = Real::from(2).sqrt().unwrap();
++        let b = Real::from(3).sqrt().unwrap();
++        let fragment = source.fragment_between_after_distinct_endpoints(
++            Point2::new(a.clone(), a),
++            Point2::new(b.clone(), b),
++            source.fragment_support(),
++        );
++        let curve = QuadraticBezier2::from_line_segment(fragment);
++        for entries in [
++            [3, -4, 4, 3, 7, -2],
++            [3, 4, 4, -3, 0, 1],
++            [2, 1, 0, 3, 5, 7],
++        ] {
++            let [a, b, c, d, x, y] = entries.map(Real::from);
++            for reversed in [false, true] {
++                let curve = if reversed {
++                    curve.reversed_with_retained_provenance().unwrap()
++                } else {
++                    curve.clone()
++                };
++                let mut images = vec![curve.transform_affine(&a, &b, &c, &d, &x, &y)];
++                let rational = crate::RationalBezier2::try_from_subcurve(
++                    &crate::BezierSubcurve2::Quadratic(curve.clone()),
++                )
++                .unwrap();
++                let mut rational_images =
++                    vec![rational.transformed_affine([&a, &b, &c, &d, &x, &y])];
++                if let Ok(transform) = Similarity2::try_from_real_affine(
++                    a.clone(),
++                    b.clone(),
++                    c.clone(),
++                    d.clone(),
++                    x.clone(),
++                    y.clone(),
++                ) {
++                    images.push(
++                        curve
++                            .transform_similarity_with_retained_provenance(&transform)
++                            .unwrap(),
++                    );
++                    rational_images.push(rational.transform_similarity(&transform));
++                }
++                for line in images
++                    .iter()
++                    .map(|image| image.retained_exact_line_image().unwrap())
++                    .chain(
++                        rational_images
++                            .iter()
++                            .map(|image| image.retained_exact_line_image().unwrap()),
++                    )
++                {
++                    assert!(line.has_retained_support());
++                    let scale = Real::from(if reversed { -6 } else { 6 });
++                    assert_eq!(
++                        line.directed_support_delta(),
++                        (&scale * (&a + &b), &scale * (&c + &d))
++                    );
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn reversing_a_straight_fragment_keeps_its_exact_line_support() {
+         // A fragment cut from a longer line keeps that line as its exact
+diff --git a/crates/hypercurve/src/bezier_region.rs b/crates/hypercurve/src/bezier_region.rs
+index 6d456e5047..7529a60dd5 100644
+--- a/crates/hypercurve/src/bezier_region.rs
++++ b/crates/hypercurve/src/bezier_region.rs
+@@ -6421,16 +6421,9 @@ fn transform_region_subcurve(
+                     .map(BezierSubcurve2::Quadratic)
+                     .map_err(affine_region_error);
+             }
+-            let start = point(curve.start());
+-            let control = point(curve.control());
+-            let end = point(curve.end());
+-            let transformed = if curve.retained_exact_line_image().is_some() {
+-                QuadraticBezier2::with_retained_exact_line_image(start, control, end)
+-                    .map_err(affine_region_error)?
+-            } else {
+-                QuadraticBezier2::new(start, control, end)
+-            };
+-            Ok(BezierSubcurve2::Quadratic(transformed))
++            Ok(BezierSubcurve2::Quadratic(
++                curve.transform_affine(m00, m01, m10, m11, tx, ty),
++            ))
+         }
+         BezierSubcurve2::Cubic(curve) => Ok(BezierSubcurve2::Cubic(CubicBezier2::new(
+             point(curve.start()),
+diff --git a/crates/hypercurve/src/curve_region_boolean.rs b/crates/hypercurve/src/curve_region_boolean.rs
+index fae571afc5..16d36b9480 100644
+--- a/crates/hypercurve/src/curve_region_boolean.rs
++++ b/crates/hypercurve/src/curve_region_boolean.rs
+@@ -7713,9 +7713,10 @@ fn contacts_decided_same_from_circular_carriers(
+ /// Incidence is supplied by the topology, not by coordinates. Each contact
+ /// lies on both of its carriers. The circles are shared through one carrier
+ /// or one retained circle, and the lines through one carrier or one retained
+-/// support allocation. Separate storage proves nothing, so such pairs stay
+-/// with the other matchers. Both signs are exact predicates; either one left
+-/// undecided keeps the match uncertain.
++/// support definition. Independent transforms may allocate equal exact line
++/// definitions separately. Unrecognized support equality stays with the
++/// other matchers. Both signs are exact predicates; either one left undecided
++/// keeps the match uncertain.
+ fn contacts_decided_same_from_shared_circle_and_line(
+     existing: &ContactVertex,
+     point: &CurvePoint2,
+diff --git a/crates/hypercurve/src/rational_bezier_general.rs b/crates/hypercurve/src/rational_bezier_general.rs
+index 66137e040e..e6dba47244 100644
+--- a/crates/hypercurve/src/rational_bezier_general.rs
++++ b/crates/hypercurve/src/rational_bezier_general.rs
+@@ -3133,11 +3133,10 @@ impl RationalBezier2 {
+             )
+         };
+         let endpoints = [point(self.start()), point(self.end())];
+-        let exact_line_image = self
+-            .data
+-            .exact_line_image
+-            .as_ref()
+-            .and_then(|_| LineSeg2::try_new(endpoints[0].clone(), endpoints[1].clone()).ok());
++        let exact_line_image = self.data.exact_line_image.as_ref().and_then(|line| {
++            line.map_points_between(endpoints[0].clone(), endpoints[1].clone(), point)
++                .ok()
++        });
+         let curve = Self::from_validated_homogeneous(
+             self.homogeneous_controls()
+                 .iter()
+diff --git a/crates/hypercurve/src/segment.rs b/crates/hypercurve/src/segment.rs
+index 66d3065462..860192ae07 100644
+--- a/crates/hypercurve/src/segment.rs
++++ b/crates/hypercurve/src/segment.rs
+@@ -170,19 +170,37 @@ impl LineSeg2 {
+         self.endpoints_decided_distinct
+     }
+ 
+-    /// Returns whether both segments borrow one support-line allocation.
++    /// Proves that both segments have the same supporting line.
+     ///
+     /// A shared allocation is a positive proof that both segments lie on the
+     /// line through that support's endpoints: a segment either created the
+     /// support from its own endpoints, was cut from it at certified points,
+     /// or was mapped together with it by one affine transform, which gives
+-    /// the image its own allocation. Separate allocations prove nothing about
+-    /// the two lines.
++    /// the image its own allocation. Independent images can also retain equal
++    /// defining endpoints, in either order. Compare those exact values, not
++    /// the trimmed segment endpoints; separate allocations alone say nothing
++    /// about the lines. Failure to recognize this witness is not distinctness.
+     pub(crate) fn shares_support_line(&self, other: &Self) -> bool {
+-        matches!(
++        if matches!(
+             (self.support.get(), other.support.get()),
+             (Some(first), Some(second)) if Arc::ptr_eq(first, second)
+-        )
++        ) {
++            return true;
++        }
++        let (first_start, first_end) = self
++            .support
++            .get()
++            .map_or((&self.start, &self.end), |support| {
++                (&support.start, &support.end)
++            });
++        let (second_start, second_end) = other
++            .support
++            .get()
++            .map_or((&other.start, &other.end), |support| {
++                (&support.start, &support.end)
++            });
++        (first_start == second_start && first_end == second_end)
++            || (first_start == second_end && first_end == second_start)
+     }
+ 
+     pub(crate) fn support_start(&self) -> &Point2 {
+@@ -2004,6 +2022,48 @@ mod policy_cache_tests {
+         Point2::new(Real::from(x), Real::from(y))
+     }
+ 
++    #[test]
++    fn support_line_identity_survives_independent_maps_and_reversal() {
++        let source = LineSeg2::try_new(point(0, 0), point(4, 0)).unwrap();
++        let cut = source.fragment_between_after_distinct_endpoints(
++            point(1, 0),
++            point(2, 0),
++            source.fragment_support(),
++        );
++        let map = |p: &Point2| {
++            Point2::new(
++                Real::from(3) * p.x() - Real::from(4) * p.y() + Real::from(7),
++                Real::from(4) * p.x() + Real::from(3) * p.y() - Real::from(2),
++            )
++        };
++        let image = source.map_points(map).unwrap();
++        let cut_image = cut.map_points(map).unwrap();
++        assert!(!Arc::ptr_eq(
++            &image.fragment_support(),
++            &cut_image.fragment_support()
++        ));
++        for first in [&image, &image.reversed()] {
++            for second in [&cut_image, &cut_image.reversed()] {
++                assert!(first.shares_support_line(second));
++                assert!(second.shares_support_line(first));
++            }
++        }
++        let separation = (Real::one() / Real::from(1_000_000_000_000_i64)).unwrap();
++        let shifted = cut_image
++            .map_points(|p| p.translated(Real::zero(), separation.clone()))
++            .unwrap();
++        assert!(!image.shares_support_line(&shifted));
++        let uncertain = cut_image
++            .map_points(|p| {
++                p.translated(
++                    Real::zero(),
++                    crate::test_support::terminally_unresolved_zero(),
++                )
++            })
++            .unwrap();
++        assert!(!image.shares_support_line(&uncertain));
++    }
++
+     #[test]
+     fn sweep_membership_uses_a_decisive_half_plane() {
+         let sine = Real::e().sin();
