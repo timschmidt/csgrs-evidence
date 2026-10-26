@@ -1,0 +1,97 @@
+//! Core computable expression graph.
+//!
+//! This facade keeps the shared imports and includes semantic implementation
+//! slices. The included files remain in one module so private graph/cache
+//! invariants and hot constructor rewrites keep their original visibility.
+
+use crate::computable::approximation::{
+    Approximation, LinearCombination3, NormalQuantileData, SharedConstant,
+};
+use crate::{
+    MagnitudeBits, Rational, RealSign, RealStructuralFacts, RepresentationSize, ZeroKnowledge,
+};
+use core::cmp::Ordering;
+use num::Signed;
+use num::{BigInt, BigUint, bigint::Sign};
+use num::{One, Zero};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    ops::{Deref, Neg},
+    sync::{Arc, LazyLock},
+};
+
+include!("node/bounds.rs");
+include!("node/representation.rs");
+include!("node/primitive_constructors.rs");
+include!("node/structural_analysis.rs");
+include!("node/representation_size.rs");
+include!("node/exp_relation.rs");
+include!("node/exp_relation_reuse.rs");
+include!("node/atan_pi_anchors.rs");
+include!("node/exp_trig.rs");
+include!("node/logarithms.rs");
+include!("node/log_argument.rs");
+include!("node/roots_inverse_hyperbolic.rs");
+include!("node/elliptic_integrals.rs");
+include!("node/legendre_integrals.rs");
+include!("node/inverse_legendre.rs");
+include!("node/jacobi.rs");
+include!("node/jacobi_tests.rs");
+include!("node/range_reduction_tests.rs");
+include!("node/algebra.rs");
+include!("node/shared_square_quotient.rs");
+include!("node/shared_square_quotient_tests.rs");
+include!("node/ring_polynomial.rs");
+include!("node/ring_polynomial_tests.rs");
+include!("node/ring_quotient.rs");
+include!("node/ring_native_relations.rs");
+include!("node/ring_native_reduction.rs");
+include!("node/ring_native_projection.rs");
+include!("node/ring_native_domain.rs");
+include!("node/ring_native_sign_tests.rs");
+include!("node/ring_parameter_atoms.rs");
+include!("node/ring_jacobi_relations_tests.rs");
+include!("node/ring_quotient_reduction.rs");
+include!("node/ring_native_division.rs");
+include!("node/ring_native_division_tests.rs");
+include!("node/ring_product_sum.rs");
+include!("node/ring_quotient_tests.rs");
+include!("node/ring_quotient_reduction_tests.rs");
+include!("node/ring_product_sum_tests.rs");
+include!("node/ring_root_square_tests.rs");
+include!("node/ring_trig_congruence.rs");
+include!("node/ring_trig_congruence_tests.rs");
+include!("node/ring_relations.rs");
+include!("node/ring_relations_tests.rs");
+include!("node/ring_trig_relations.rs");
+include!("node/ring_trig_relations_tests.rs");
+include!("node/cyclotomic_zero.rs");
+include!("node/cyclotomic_zero_tests.rs");
+include!("node/quadratic_tower.rs");
+include!("node/radical_tower.rs");
+include!("node/radical_eighth_angle_tests.rs");
+include!("node/approximation_queries.rs");
+include!("node/scale.rs");
+include!("node/tests.rs");
+include!("node/exp_relation_tests.rs");
+include!("node/exp_relation_reuse_tests.rs");
+include!("node/linear_demand_tests.rs");
+include!("node/fractional_separation_tests.rs");
+include!("node/cache_rescale_tests.rs");
+include!("node/precision_boundary_tests.rs");
+include!("node/magnitude_boundary_tests.rs");
+include!("node/certified_planning_tests.rs");
+include!("node/exact_sign_cache_tests.rs");
+include!("node/trig_range_proof_tests.rs");
+include!("node/asinh_range_tests.rs");
+include!("node/log_rational_range_tests.rs");
+include!("node/atan_range_tests.rs");
+include!("node/atanh_rational_range_tests.rs");
+include!("node/integral_atan_range_tests.rs");
+include!("node/acos_complement_range_tests.rs");
+include!("node/integral_atan_facts_tests.rs");
+include!("node/atan_pi_anchor_tests.rs");
+
+include!("node/ring_r18_diagnostics.rs");
