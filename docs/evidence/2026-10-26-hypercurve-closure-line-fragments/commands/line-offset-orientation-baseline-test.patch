@@ -1,0 +1,44 @@
+diff --git a/crates/hypercurve/src/segment.rs b/crates/hypercurve/src/segment.rs
+index 6059bcf6c2..faf6ad05f4 100644
+--- a/crates/hypercurve/src/segment.rs
++++ b/crates/hypercurve/src/segment.rs
+@@ -2050,6 +2050,39 @@ mod policy_cache_tests {
+         Point2::new(Real::from(x), Real::from(y))
+     }
+ 
++    #[test]
++    fn reversed_retained_line_first_offset_keeps_oriented_source() {
++        let policy = CurveContext::STRICT;
++        let half = (Real::one() / Real::from(2)).unwrap();
++        for origin in [point(0, 0), Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap())] {
++            let source = LineSeg2::try_new(origin.clone(), origin.translated(Real::from(4), Real::zero())).unwrap();
++            let fragment = source.fragment_between_after_distinct_endpoints(
++                origin.translated(Real::one(), Real::zero()),
++                origin.translated(Real::from(3), Real::zero()),
++                source.fragment_support(),
++            );
++            for reversed in [false, true] {
++                let fragment = if reversed { fragment.reversed() } else { fragment.clone() };
++                assert!(fragment.offset_provenance.is_none());
++                let sign = Real::from(if reversed { -1 } else { 1 });
++                let image = fragment.offset_left(Real::one()).unwrap();
++                // The independently known horizontal left normal has y = +/-1.
++                assert_eq!(crate::CurvePoint2::from(image.start().clone()).same_point(&fragment.start().translated(Real::zero(), sign.clone()).into(), &policy), Classification::Decided(true));
++                let expected = source.offset_left(sign.clone()).unwrap();
++                let opposite = source.offset_left(-sign.clone()).unwrap();
++                assert_eq!(image.retained_offset_relation(&expected, &policy), Some(RetainedLineRelation2::Coincident));
++                assert_eq!(image.retained_offset_relation(&opposite, &policy), Some(RetainedLineRelation2::ParallelDistinct));
++                for reverse_again in [false, true] {
++                    let image = if reverse_again { image.reversed() } else { image.clone() };
++                    let repeated = image.offset_left(half.clone()).unwrap();
++                    let total = &sign * if reverse_again { Real::one() - &half } else { Real::one() + &half };
++                    let expected = source.offset_left(total).unwrap();
++                    assert_eq!(repeated.retained_offset_relation(&expected, &policy), Some(RetainedLineRelation2::Coincident));
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn equal_line_endpoint_representations_preserve_offset_provenance() {
+         let policy = CurveContext::STRICT;

@@ -1,0 +1,85 @@
+diff --git a/crates/hypercurve/src/bezier_split.rs b/crates/hypercurve/src/bezier_split.rs
+index 110a9a8e2b..5b80eaa171 100644
+--- a/crates/hypercurve/src/bezier_split.rs
++++ b/crates/hypercurve/src/bezier_split.rs
+@@ -2632,6 +2632,80 @@ fn validate_ordered_exact_range(
+     }
+ }
+ 
++#[cfg(test)]
++mod line_split_provenance_tests {
++    use super::*;
++
++    #[test]
++    fn affine_line_splits_keep_support_offset_and_traversal() {
++        let policy = CurveContext::STRICT;
++        let half = (Real::one() / Real::from(2)).unwrap();
++        let step = (Real::one() / Real::from(8)).unwrap();
++        let root = Real::from(2).sqrt().unwrap();
++        let center = Point2::new(root.clone(), Real::from(3).sqrt().unwrap());
++        let source = crate::LineSeg2::try_new(
++            center.clone(),
++            center.translated(Real::from(5), Real::from(-3)),
++        )
++        .unwrap();
++        let offset = source.offset_left(half.clone()).unwrap();
++        let other = source.offset_left(-half.clone()).unwrap();
++        let curve = QuadraticBezier2::from_line_segment(offset.clone());
++        for t in [
++            Real::zero(),
++            Real::one(),
++            (Real::one() / Real::from(3).sqrt().unwrap()).unwrap(),
++            -root.clone(),
++            root,
++        ] {
++            let (left, right) = curve.split_at_exact(t.clone());
++            let cut = offset.point_at(t.clone());
++            for (part, scale, start, end) in [
++                (left, t.clone(), offset.start().clone(), cut.clone()),
++                (right, Real::one() - &t, cut, offset.end().clone()),
++            ] {
++                assert_eq!(
++                    CurvePoint2::from(part.start().clone()).same_point(&start.into(), &policy),
++                    Classification::Decided(true)
++                );
++                assert_eq!(
++                    CurvePoint2::from(part.end().clone()).same_point(&end.into(), &policy),
++                    Classification::Decided(true)
++                );
++                if scale == Real::zero() {
++                    assert!(part.retained_exact_line_image().is_none());
++                    continue;
++                }
++                let image = part
++                    .retained_exact_line_image()
++                    .expect("a noncollapsed line image");
++                assert!(image.shares_support_line(&offset));
++                assert_eq!(
++                    image.retained_offset_relation(&other, &policy),
++                    Some(crate::segment::RetainedLineRelation2::ParallelDistinct)
++                );
++                let sign = crate::classify::real_sign(&scale, &policy).unwrap();
++                let (dx, dy) = image.directed_support_delta();
++                assert_eq!(
++                    crate::classify::real_sign(&(Real::from(5) * dx - Real::from(3) * dy), &policy),
++                    Some(sign)
++                );
++                let repeated = image.offset_left(step.clone()).unwrap();
++                let expected_distance = if sign == hyperreal::RealSign::Positive {
++                    &half + &step
++                } else {
++                    &half - &step
++                };
++                let expected = source.offset_left(expected_distance).unwrap();
++                assert_eq!(
++                    repeated.retained_offset_relation(&expected, &policy),
++                    Some(crate::segment::RetainedLineRelation2::Coincident)
++                );
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod finite_conic_split_regression {
+     use super::*;

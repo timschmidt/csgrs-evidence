@@ -1,0 +1,223 @@
+diff --git a/crates/hypercurve/src/bezier_region/tests.rs b/crates/hypercurve/src/bezier_region/tests.rs
+index 4d3e59f006..84010e0b6d 100644
+--- a/crates/hypercurve/src/bezier_region/tests.rs
++++ b/crates/hypercurve/src/bezier_region/tests.rs
+@@ -16,6 +16,45 @@ fn q(numerator: i32, denominator: i32) -> Real {
+     (Real::from(numerator) / Real::from(denominator)).unwrap()
+ }
+ 
++#[test]
++fn shared_line_vertices_keep_support_offset_and_traversal() {
++    let policy = CurveContext::STRICT;
++    let root = Real::from(3).sqrt().unwrap();
++    let center = Point2::new(Real::from(2).sqrt().unwrap(), root.clone());
++    let source = LineSeg2::try_new(center.clone(), center.translated(Real::from(5), Real::from(-3))).unwrap();
++    let offset = source.offset_left(q(1, 2)).unwrap();
++    let other = source.offset_left(q(-1, 2)).unwrap();
++    for reversed in [false, true] {
++        let line = if reversed { offset.reversed() } else { offset.clone() };
++        let endpoint = Point2::new((line.start().x() + &root) - &root, line.start().y().clone());
++        assert_ne!(&endpoint, line.start());
++        assert_eq!(crate::CurvePoint2::from(endpoint.clone()).same_point(&line.start().clone().into(), &policy), Classification::Decided(true));
++        let corner = center.translated(Real::from(6), Real::from(2));
++        let fragment = |line| BezierSplitFragment2::Materialized {
++            start: Real::zero().into(),
++            end: Real::one().into(),
++            curve: BezierSubcurve2::Quadratic(QuadraticBezier2::from_line_segment(line)),
++        };
++        let mut fragments = [
++            fragment(LineSeg2::try_new(corner.clone(), endpoint.clone()).unwrap()),
++            fragment(line),
++            fragment(LineSeg2::try_new(if reversed { offset.start().clone() } else { offset.end().clone() }, corner).unwrap()),
++        ];
++        share_line_image_vertices(&mut fragments, &policy);
++        let BezierSplitFragment2::Materialized { curve: BezierSubcurve2::Quadratic(curve), .. } = &fragments[1] else {
++            panic!("a native affine line");
++        };
++        let image = curve.retained_exact_line_image().unwrap();
++        assert_eq!(image.start(), &endpoint);
++        assert_eq!(curve.control(), &QuadraticBezier2::from_line_segment(if reversed { offset.reversed() } else { offset.clone() }).control().clone());
++        assert!(image.shares_support_line(&offset));
++        assert_eq!(image.retained_offset_relation(&other, &policy), Some(crate::segment::RetainedLineRelation2::ParallelDistinct));
++        let repeated = image.offset_left(q(1, 8)).unwrap();
++        let expected = source.offset_left(if reversed { q(3, 8) } else { q(5, 8) }).unwrap();
++        assert_eq!(repeated.retained_offset_relation(&expected, &policy), Some(crate::segment::RetainedLineRelation2::Coincident));
++    }
++}
++
+ #[test]
+ fn concentric_circle_contacts_keep_directions_without_false_incidence() {
+     use crate::rational_bezier::{
+@@ -15763,3 +15802,76 @@ fn ordered_tangent_families_preserve_opposition_frontier() {
+         }
+     }
+ }
++
++#[test]
++fn offset_band_endpoints_share_only_certified_smooth_circle_contacts() {
++    for opposite in [false, true] {
++        for distance in [q(1, 4), q(1, 1_000_000_000)] {
++            let line_start = if opposite { p(1, 0) } else { p(-1, 0) };
++            let line = crate::LineSeg2::try_new(line_start.clone(), p(0, 0)).unwrap();
++            let linear = QuadraticBezier2::from_line_segment(line);
++            let circle = CircularArc2::try_from_center(p(0, 0), p(1, 1), p(0, 1), false).unwrap();
++            let mut fragments = vec![materialized_offset_fragment(BezierSubcurve2::Quadratic(
++                linear.clone(),
++            ))];
++            fragments.extend(
++                circle
++                    .rational_bezier_decomposition()
++                    .unwrap()
++                    .spans()
++                    .iter()
++                    .map(|span| {
++                        materialized_offset_fragment(BezierSubcurve2::RationalQuadratic(
++                            span.curve().clone(),
++                        ))
++                    }),
++            );
++            fragments.push(materialized_offset_fragment(BezierSubcurve2::Quadratic(
++                QuadraticBezier2::from_line_segment(
++                    crate::LineSeg2::try_new(p(1, 1), line_start).unwrap(),
++                ),
++            )));
++            let policy = CurveContext::STRICT;
++            let boundary = CurveRegionBoundaryLoop2::new(fragments, &policy).unwrap();
++            let Classification::Decided(runs) =
++                exact_offset_span_runs_from_boundary_loop(&boundary, &distance, &policy).unwrap()
++            else {
++                panic!("the line/circle source has exact offset spans");
++            };
++            let mut spans = runs.into_iter().map(|(span, _)| span).collect::<Vec<_>>();
++            let parallel = linear.parallel_left(distance.clone()).unwrap();
++            let retained = CurvePoint2::from(crate::BezierAnalyticParallelPoint2::new(
++                parallel,
++                BezierParameter2::Exact(Real::one()),
++                &policy,
++            ));
++            // This is the same generated line endpoint with a retained normal
++            // definition instead of independent represented coordinates.
++            assert_eq!(
++                retained.same_point(&spans[0].offset_end, &policy),
++                Classification::Decided(true)
++            );
++            spans[0].offset_end = retained.clone();
++            let circle_start = spans[1].offset_start.clone();
++            assert_ne!(retained, circle_start);
++            share_exact_offset_band_endpoints(&mut spans, &distance, &policy);
++            if opposite {
++                // The common source point has opposite tangents. The offsets
++                // stay 2d apart even for a very small positive distance.
++                assert_eq!(spans[0].offset_end, retained);
++                assert_eq!(spans[1].offset_start, circle_start);
++                assert_eq!(
++                    spans[0].offset_end.same_point(&circle_start, &policy),
++                    Classification::Decided(false)
++                );
++            } else {
++                assert_eq!(spans[0].offset_end, circle_start);
++                assert_eq!(spans[1].offset_start, circle_start);
++                assert_eq!(
++                    circle_start.coordinates(),
++                    Some(&Point2::new(Real::zero(), distance))
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index e2f17670c9..8e541d4d0c 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -5401,6 +5401,44 @@ enum FilletLinearSource2<'a> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn native_line_subcurves_keep_support_offset_and_traversal() {
++        let policy = CurveContext::STRICT;
++        let center = Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap());
++        let source = LineSeg2::try_new(
++            center.clone(),
++            center.translated(Real::from(5), Real::from(-3)),
++        )
++        .unwrap();
++        let half = (Real::one() / Real::from(2)).unwrap();
++        let step = (Real::one() / Real::from(8)).unwrap();
++        let offset = source.offset_left(half.clone()).unwrap();
++        let other = source.offset_left(-half.clone()).unwrap();
++        let start = (Real::one() / Real::from(3).sqrt().unwrap()).unwrap();
++        let end = (Real::from(3) / Real::from(4)).unwrap();
++        for reversed in [false, true] {
++            let line = if reversed { offset.reversed() } else { offset.clone() };
++            let curve = Curve2::from(line.clone());
++            let result = curve.subcurve(start.clone().into(), end.clone().into()).unwrap();
++            let Some(CurveGeometry2::Line(image)) = result.geometry() else {
++                panic!("a native line subcurve");
++            };
++            assert_eq!(image.start(), &line.point_at(start.clone()));
++            assert_eq!(image.end(), &line.point_at(end.clone()));
++            assert!(image.shares_support_line(&offset));
++            assert_eq!(
++                image.retained_offset_relation(&other, &policy),
++                Some(crate::segment::RetainedLineRelation2::ParallelDistinct)
++            );
++            let repeated = image.offset_left(step.clone()).unwrap();
++            let expected = source.offset_left(if reversed { &half - &step } else { &half + &step }).unwrap();
++            assert_eq!(
++                repeated.retained_offset_relation(&expected, &policy),
++                Some(crate::segment::RetainedLineRelation2::Coincident)
++            );
++        }
++    }
++
+     #[test]
+     fn distinct_parallel_sources_keep_a_shared_fillet_center_family() {
+         let q = |n: i64, d: i64| (Real::from(n) / Real::from(d)).unwrap();
+diff --git a/crates/hypercurve/src/curve_string.rs b/crates/hypercurve/src/curve_string.rs
+index 0c859cb082..08d8a8e59b 100644
+--- a/crates/hypercurve/src/curve_string.rs
++++ b/crates/hypercurve/src/curve_string.rs
+@@ -1890,3 +1890,42 @@ fn sampled_exact_rational_x_overlap_is_dense(first: &[&Aabb2], second: &[&Aabb2]
+     // cannot reject a geometric candidate or change topology.
+     overlap_count * 2 > sampled_pair_count
+ }
++
++#[cfg(test)]
++mod line_trim_provenance_tests {
++    use super::*;
++
++    #[test]
++    fn native_line_trims_keep_support_offset_and_traversal() {
++        let policy = CurveContext::STRICT;
++        let center = Point2::new(Real::from(2).sqrt().unwrap(), Real::from(3).sqrt().unwrap());
++        let source = LineSeg2::try_new(center.clone(), center.translated(Real::from(5), Real::from(-3))).unwrap();
++        let half = (Real::one() / Real::from(2)).unwrap();
++        let step = (Real::one() / Real::from(8)).unwrap();
++        let offset = source.offset_left(half.clone()).unwrap();
++        let other = source.offset_left(-half.clone()).unwrap();
++        let range = ParamRange::new((Real::one() / Real::from(3).sqrt().unwrap()).unwrap(), (Real::from(3) / Real::from(4)).unwrap());
++        for reversed in [false, true] {
++            let line = if reversed { offset.reversed() } else { offset.clone() };
++            let segment = Segment2::Line(line.clone());
++            let start = line.point_at(range.start().clone());
++            let end = line.point_at(range.end().clone());
++            let results = [
++                trim_segment_by_range(&segment, &range, &policy).unwrap(),
++                trim_segment_by_point_range(&segment, &range, &start, &end, &policy).unwrap(),
++            ];
++            for result in results {
++                let SegmentTrimMaterialization::Materialized(Segment2::Line(image)) = result else {
++                    panic!("a native line trim");
++                };
++                assert_eq!(image.start(), &start);
++                assert_eq!(image.end(), &end);
++                assert!(image.shares_support_line(&offset));
++                assert_eq!(image.retained_offset_relation(&other, &policy), Some(crate::segment::RetainedLineRelation2::ParallelDistinct));
++                let repeated = image.offset_left(step.clone()).unwrap();
++                let expected = source.offset_left(if reversed { &half - &step } else { &half + &step }).unwrap();
++                assert_eq!(repeated.retained_offset_relation(&expected, &policy), Some(crate::segment::RetainedLineRelation2::Coincident));
++            }
++        }
++    }
++}
