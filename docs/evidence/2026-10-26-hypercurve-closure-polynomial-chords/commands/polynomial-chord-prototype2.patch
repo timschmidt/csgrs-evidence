@@ -1,0 +1,197 @@
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+index e730ff518c..a859c9d79c 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+@@ -1923,6 +1923,20 @@ impl BezierAlgebraicChord2 {
+         {
+             return Ok(Classification::Decided(crate::classify::LineSide::On));
+         }
++        if let Some(direction) = self.certified_axis_direction()
++            && let Some(side) = self.axis_oriented_side(point, direction, policy)
++        {
++            // A construction-certified cardinal support needs one exact
++            // coordinate comparison. Independent coordinate boxes cannot
++            // recover equality of a selected constant ordinate.
++            match side {
++                decided @ Classification::Decided(_) => return Ok(decided),
++                exhausted @ Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                    return Ok(exhausted);
++                }
++                Classification::Uncertain(_) => {}
++            }
++        }
+         let procedural_point = matches!(
+             point,
+             CurvePoint2(CurvePointData2::AlgebraicChordParallel(_))
+diff --git a/crates/hypercurve/src/bezier_offset/fiber_sign.rs b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+index 7090ea7640..56bd5aecec 100644
+--- a/crates/hypercurve/src/bezier_offset/fiber_sign.rs
++++ b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+@@ -1809,6 +1809,45 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+     if predicate == incidence || divide_bivariate_polynomial_exact(predicate, incidence).is_some() {
+         return Ok(Classification::Decided(RealSign::Zero));
+     }
++    let independent_of_base = |polynomial: &BivariatePolynomial| {
++        polynomial
++            .coefficients
++            .iter()
++            .skip(1)
++            .flatten()
++            .all(Real::definitely_zero)
++    };
++    if independent_of_base(incidence) && independent_of_base(predicate) {
++        // The selected base is still owned by the fiber, but neither this
++        // root relation nor this query depends on its value. Reuse the exact
++        // univariate authority with the same selector instead of refining an
++        // irrelevant base or constructing a degree-multiplied norm.
++        let native = (|| {
++            let parameter =
++                match selected_fiber_parameter_at_exact_retained(incidence, &Real::zero(), root)? {
++                    Classification::Decided(parameter) => parameter,
++                    Classification::Uncertain(reason) => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                };
++            signed_coefficients_at_parameter(
++                predicate.coefficients.first().map_or(&[], Vec::as_slice),
++                &parameter,
++                policy,
++            )
++        })()?;
++        match native {
++            Classification::Decided(sign) => return Ok(Classification::Decided(sign)),
++            Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                return Ok(Classification::Uncertain(
++                    UncertaintyReason::BudgetExhausted,
++                ));
++            }
++            // Native conversion is optional; an unresolved coefficient must
++            // not remove the original selected-field decision route.
++            Classification::Uncertain(_) => {}
++        }
++    }
+     let retained_parameter = authority.retained_parameter_refined(64);
+     if predicate.coefficients.iter().all(|row| row.len() <= 1) {
+         return signed_coefficients_at_parameter(
+diff --git a/crates/hypercurve/src/bezier_offset/selected_fiber.rs b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+index 1b58b80638..1c667be6ad 100644
+--- a/crates/hypercurve/src/bezier_offset/selected_fiber.rs
++++ b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+@@ -1371,6 +1371,33 @@ impl BezierAlgebraicSelectedFiberParameter2 {
+             {
+                 return Ok(Classification::Decided(std::cmp::Ordering::Greater));
+             }
++            if refinement_steps == 0 {
++                // An isolator can converge to an exact singleton without
++                // ever fitting inside it. Consume an already certified
++                // native scalar before further refinement. Keep the existing
++                // interval proofs first, and retain the fiber fallback when
++                // this optional comparison cannot decide.
++                for (known, selected, reverse) in [(self, other, true), (other, self, false)] {
++                    let Some(parameter) = known.retained_bezier_parameter() else {
++                        continue;
++                    };
++                    match selected.cmp_bezier_parameter(&parameter, policy)? {
++                        Classification::Decided(order) => {
++                            return Ok(Classification::Decided(if reverse {
++                                order.reverse()
++                            } else {
++                                order
++                            }));
++                        }
++                        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                            return Ok(Classification::Uncertain(
++                                UncertaintyReason::BudgetExhausted,
++                            ));
++                        }
++                        Classification::Uncertain(_) => {}
++                    }
++                }
++            }
+             if !shares_retained_parameter && refinement_steps >= 512 {
+                 break;
+             }
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index f9a1999a05..eb712b420f 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -321,6 +321,7 @@ pub(crate) enum CurveOverlapCorrespondence2 {
+         source: Arc<crate::bezier_offset::BezierAlgebraicChordRationalOverlap2>,
+         chord_first: bool,
+     },
++    PolynomialChord(Arc<polynomial_curve_section::PolynomialChordCorrespondence2>),
+     Chords {
+         first: crate::BezierAlgebraicChord2,
+         second: crate::BezierAlgebraicChord2,
+@@ -398,6 +399,7 @@ impl CurveOverlapCorrespondence2 {
+                         )))
+                     })
+             }
++            Self::PolynomialChord(source) => source.map_parameter(parameter, forward, policy),
+         }
+     }
+ 
+@@ -529,6 +531,9 @@ impl CurveOverlapCorrespondence2 {
+                     |p| map(p, first),
+                 )
+             }
++            Self::PolynomialChord(source) => {
++                source.clipped_ranges(first_range, second_range, policy)
++            }
+         }?;
+         Ok(ranges.map(|ranges| {
+             ranges.map(|(first, second)| {
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 9228d40ff5..f10f836064 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -644,6 +644,20 @@ impl PolynomialCurveBranch2 {
+         )? == Ordering::Equal)
+     }
+ 
++    /// A selected graph of an equation independent of x has constant y on
++    /// its checked connected slab. This is a support proof, not an endpoint fit.
++    pub(crate) fn has_constant_source_ordinate(
++        &self,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<bool> {
++        for row in self.topology().equation().coefficients.iter().skip(1) {
++            if !polynomial_is_zero(row, policy)? {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
+     /// The distinct real roots of `F(x, slope*x + offset)` in the source
+     /// rectangle's first interval, in increasing order.
+     fn line_abscissas(&self, substituted: Vec<Real>) -> ExactCurveResult<Vec<CurveParameter2>> {
+diff --git a/crates/hypercurve/src/polynomial_curve_section.rs b/crates/hypercurve/src/polynomial_curve_section.rs
+index 4544ca2b0f..234ca76806 100644
+--- a/crates/hypercurve/src/polynomial_curve_section.rs
++++ b/crates/hypercurve/src/polynomial_curve_section.rs
+@@ -14,6 +14,10 @@ use super::*;
+ use crate::CurveFamily2;
+ use crate::curve::PolynomialLineSections2;
+ 
++#[path = "polynomial_curve_chord.rs"]
++mod polynomial_curve_chord;
++pub(super) use polynomial_curve_chord::PolynomialChordCorrespondence2;
++
+ /// An authored native line, or a retained restriction of one, in the source
+ /// chart shared by its public parameter.
+ ///
+@@ -283,7 +287,12 @@ pub(super) fn polynomial_line_section(
+             _ => return Ok(None),
+         };
+     let Some(line) = native_line(line_curve) else {
+-        return Ok(None);
++        return polynomial_curve_chord::intersect(
++            if branch_first { first } else { second },
++            line_curve,
++            branch_first,
++            policy,
++        );
+     };
+     let spans = line_curve.source_spans(policy, CurveOperation2::Intersection)?;
+     let [span] = &spans[..] else {

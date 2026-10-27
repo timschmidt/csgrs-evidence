@@ -1,0 +1,90 @@
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index f9a1999a05..eb712b420f 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -321,6 +321,7 @@ pub(crate) enum CurveOverlapCorrespondence2 {
+         source: Arc<crate::bezier_offset::BezierAlgebraicChordRationalOverlap2>,
+         chord_first: bool,
+     },
++    PolynomialChord(Arc<polynomial_curve_section::PolynomialChordCorrespondence2>),
+     Chords {
+         first: crate::BezierAlgebraicChord2,
+         second: crate::BezierAlgebraicChord2,
+@@ -398,6 +399,7 @@ impl CurveOverlapCorrespondence2 {
+                         )))
+                     })
+             }
++            Self::PolynomialChord(source) => source.map_parameter(parameter, forward, policy),
+         }
+     }
+ 
+@@ -529,6 +531,9 @@ impl CurveOverlapCorrespondence2 {
+                     |p| map(p, first),
+                 )
+             }
++            Self::PolynomialChord(source) => {
++                source.clipped_ranges(first_range, second_range, policy)
++            }
+         }?;
+         Ok(ranges.map(|ranges| {
+             ranges.map(|(first, second)| {
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 9228d40ff5..5bed5f8029 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -644,6 +644,26 @@ impl PolynomialCurveBranch2 {
+         )? == Ordering::Equal)
+     }
+ 
++    /// A selected graph of an equation independent of x has constant y on
++    /// its checked connected slab. This is a support proof, not an endpoint fit.
++    pub(crate) fn has_constant_source_ordinate(
++        &self,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<bool> {
++        polynomial_is_zero(
++            &self
++                .topology()
++                .equation()
++                .coefficients
++                .iter()
++                .skip(1)
++                .flatten()
++                .cloned()
++                .collect::<Vec<_>>(),
++            policy,
++        )
++    }
++
+     /// The distinct real roots of `F(x, slope*x + offset)` in the source
+     /// rectangle's first interval, in increasing order.
+     fn line_abscissas(&self, substituted: Vec<Real>) -> ExactCurveResult<Vec<CurveParameter2>> {
+diff --git a/crates/hypercurve/src/polynomial_curve_section.rs b/crates/hypercurve/src/polynomial_curve_section.rs
+index 4544ca2b0f..234ca76806 100644
+--- a/crates/hypercurve/src/polynomial_curve_section.rs
++++ b/crates/hypercurve/src/polynomial_curve_section.rs
+@@ -14,6 +14,10 @@ use super::*;
+ use crate::CurveFamily2;
+ use crate::curve::PolynomialLineSections2;
+ 
++#[path = "polynomial_curve_chord.rs"]
++mod polynomial_curve_chord;
++pub(super) use polynomial_curve_chord::PolynomialChordCorrespondence2;
++
+ /// An authored native line, or a retained restriction of one, in the source
+ /// chart shared by its public parameter.
+ ///
+@@ -283,7 +287,12 @@ pub(super) fn polynomial_line_section(
+             _ => return Ok(None),
+         };
+     let Some(line) = native_line(line_curve) else {
+-        return Ok(None);
++        return polynomial_curve_chord::intersect(
++            if branch_first { first } else { second },
++            line_curve,
++            branch_first,
++            policy,
++        );
+     };
+     let spans = line_curve.source_spans(policy, CurveOperation2::Intersection)?;
+     let [span] = &spans[..] else {
