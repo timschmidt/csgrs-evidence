@@ -1,0 +1,184 @@
+diff --git a/crates/hypercurve/src/polynomial_curve_chord.rs b/crates/hypercurve/src/polynomial_curve_chord.rs
+index 2893dfc5de..a5e885260d 100644
+--- a/crates/hypercurve/src/polynomial_curve_chord.rs
++++ b/crates/hypercurve/src/polynomial_curve_chord.rs
+@@ -104,12 +104,6 @@ fn source_forms(
+     };
+     let inverse = image.inverse().map_err(invalid)?;
+     let (a, b, d, e, x, y) = inverse.affine_components();
+-    if [a, b, d, e, x, y]
+-        .iter()
+-        .any(|v| v.exact_rational_ref().is_none())
+-    {
+-        return Ok(None);
+-    }
+     Ok(Some([
+         [a.clone(), b.clone(), x.clone()],
+         [d.clone(), e.clone(), y.clone()],
+diff --git a/crates/hypercurve/src/polynomial_curve_pair.rs b/crates/hypercurve/src/polynomial_curve_pair.rs
+index fe7842c656..278147faf5 100644
+--- a/crates/hypercurve/src/polynomial_curve_pair.rs
++++ b/crates/hypercurve/src/polynomial_curve_pair.rs
+@@ -183,15 +183,16 @@ fn negate(sign: RealSign) -> RealSign {
+ }
+ 
+ /// A common invertible image preserves source incidence and parameter order.
+-/// Compare rational affine coefficients by value, including an explicit
++/// Compare affine coefficients by certified value, including an explicit
+ /// identity versus an unmapped source. This is a sufficient chart certificate;
+ /// other images retain their existing dispatch and capability blockers.
+-fn shared_rational_similarity(
++fn shared_similarity(
+     first: &PolynomialCurveBranch2,
+     second: &PolynomialCurveBranch2,
+-) -> Option<Option<Similarity2>> {
++    policy: &CurveContext,
++) -> ExactCurveResult<Option<Option<Similarity2>>> {
+     if !first.rational_maps().is_empty() || !second.rational_maps().is_empty() {
+-        return None;
++        return Ok(None);
+     }
+     let coefficients = |branch: &PolynomialCurveBranch2| {
+         branch.image_transform().map_or_else(
+@@ -220,23 +221,23 @@ fn shared_rational_similarity(
+     };
+     let a = coefficients(first);
+     let b = coefficients(second);
+-    if !a
+-        .iter()
+-        .chain(&b)
+-        .all(|value| value.exact_rational_ref().is_some())
+-        || !a
+-            .iter()
+-            .zip(&b)
+-            .all(|(a, b)| a.exact_rational_ref() == b.exact_rational_ref())
+-    {
+-        return None;
++    let same = policy.strict_predicate_pass(|| -> ExactCurveResult<bool> {
++        for (a, b) in a.into_iter().zip(b) {
++            if order(&a.into(), &b.into(), policy)? != Ordering::Equal {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    })?;
++    if !same {
++        return Ok(None);
+     }
+-    Some(
++    Ok(Some(
+         first
+             .image_transform()
+             .or_else(|| second.image_transform())
+             .cloned(),
+-    )
++    ))
+ }
+ 
+ pub(super) fn intersect(
+@@ -247,7 +248,7 @@ pub(super) fn intersect(
+     let (Some(a), Some(b)) = (first.polynomial_branch(), second.polynomial_branch()) else {
+         return Ok(None);
+     };
+-    let Some(image) = shared_rational_similarity(a, b) else {
++    let Some(image) = shared_similarity(a, b, policy)? else {
+         return Ok(None);
+     };
+     let inverse = image
+diff --git a/crates/hypersolve/src/algebraic_fiber.rs b/crates/hypersolve/src/algebraic_fiber.rs
+index 03f42ff75c..5c49852733 100644
+--- a/crates/hypersolve/src/algebraic_fiber.rs
++++ b/crates/hypersolve/src/algebraic_fiber.rs
+@@ -3673,6 +3673,28 @@ fn count_fiber_roots(
+     count_local_polynomial_roots(first, fiber_lower, fiber_upper, endpoints, field)
+ }
+ 
++/// Keep a nonzero scalar equation factor out of a selected-field GCD when
++/// the original arithmetic did not decide. Every coefficient ratio must have
++/// an exact rational proof; a declined projection leaves the original outcome.
++fn rational_projective_fiber_equation(
++    polynomial: &BivariatePolynomial,
++) -> Option<Cow<'_, BivariatePolynomial>> {
++    if polynomial
++        .coefficients
++        .iter()
++        .flatten()
++        .all(|coefficient| coefficient.exact_rational_ref().is_some())
++    {
++        return Some(Cow::Borrowed(polynomial));
++    }
++    let (mut normalized, _) =
++        crate::curve_resultant::normalize_bivariate_projective_scale(polynomial)?;
++    for coefficient in normalized.coefficients.iter_mut().flatten() {
++        *coefficient = coefficient.exact_rational_normal_form()?.into();
++    }
++    Some(Cow::Owned(normalized))
++}
++
+ fn count_common_fiber_roots(
+     first: &BivariatePolynomial,
+     second: &BivariatePolynomial,
+@@ -3681,6 +3703,50 @@ fn count_common_fiber_roots(
+     fiber_upper: &Real,
+     endpoints: FiberIntervalEndpoints,
+     field: &mut LocalAlgebraicField,
++) -> Result<LocalRootCountOutcome, LocalFieldError> {
++    let outcome = count_common_fiber_roots_once(
++        first,
++        second,
++        retained_parameter,
++        fiber_lower,
++        fiber_upper,
++        endpoints,
++        field,
++    );
++    if !matches!(outcome, Err(LocalFieldError::Undecided)) {
++        return outcome;
++    }
++    let (Some(first), Some(second)) = (
++        rational_projective_fiber_equation(first),
++        rational_projective_fiber_equation(second),
++    ) else {
++        return outcome;
++    };
++    if matches!(&first, Cow::Borrowed(_)) && matches!(&second, Cow::Borrowed(_)) {
++        return outcome;
++    }
++    // Projective normalization proves its scalar divisor nonzero under STRICT.
++    // It is independent of both parameters, so it preserves common roots and
++    // multiplicities on this same selected sheet, including degree drops.
++    count_common_fiber_roots_once(
++        &first,
++        &second,
++        retained_parameter,
++        fiber_lower,
++        fiber_upper,
++        endpoints,
++        field,
++    )
++}
++
++fn count_common_fiber_roots_once(
++    first: &BivariatePolynomial,
++    second: &BivariatePolynomial,
++    retained_parameter: CurveResultantParameter,
++    fiber_lower: &Real,
++    fiber_upper: &Real,
++    endpoints: FiberIntervalEndpoints,
++    field: &mut LocalAlgebraicField,
+ ) -> Result<LocalRootCountOutcome, LocalFieldError> {
+     let first = local_fiber_polynomial(first, retained_parameter, field)?;
+     let second = local_fiber_polynomial(second, retained_parameter, field)?;
+diff --git a/crates/hypersolve/src/curve_resultant.rs b/crates/hypersolve/src/curve_resultant.rs
+index 3c684ed491..a959c9d1cf 100644
+--- a/crates/hypersolve/src/curve_resultant.rs
++++ b/crates/hypersolve/src/curve_resultant.rs
+@@ -649,7 +649,7 @@ fn extract_bivariate_polynomial_system_axis_factors_once(
+     }
+ }
+ 
+-fn normalize_bivariate_projective_scale(
++pub(crate) fn normalize_bivariate_projective_scale(
+     polynomial: &BivariatePolynomial,
+ ) -> Option<(BivariatePolynomial, Real)> {
+     let (_, _, scale) = leading_bivariate_term(&polynomial.coefficients)?;

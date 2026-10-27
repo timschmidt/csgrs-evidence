@@ -1,0 +1,78 @@
+from pathlib import Path
+import importlib.util
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+root = Path(__file__).resolve().parent
+checkout = Path('/tmp/hypercurve-closure-chord-replay')
+prefix = 'chord-replay-prototype5'
+assert not (root / (prefix + '-results.json')).exists()
+spec = importlib.util.spec_from_file_location('evidence', checkout / 'scripts/successive-operations.py')
+evidence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence)
+source, files, patch = evidence.source_snapshot()
+evidence.save_json(root / (prefix + '-source-before.json'), source)
+evidence.save_json(root / (prefix + '-files-before.json'), files)
+(root / (prefix + '.patch')).write_bytes(patch)
+for name in source['untracked_inputs']:
+    destination = root / (prefix + '-inputs') / name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes((checkout / name).read_bytes())
+env = {**os.environ, 'RUSTUP_TOOLCHAIN': '1.98.1', 'CARGO_TARGET_DIR': '/home/tim/Documents/GitHub/workspace/csgrs/target/hypercurve-chord-replay-admission', 'CARGO_BUILD_JOBS': '2', 'RUST_TEST_THREADS': '1', 'CCACHE_DIR': '/home/tim/Documents/GitHub/workspace/csgrs/target/hypercurve-admission-ccache', 'CCACHE_TEMPDIR': '/home/tim/Documents/GitHub/workspace/csgrs/target/hypercurve-admission-ccache/tmp'}
+records = []
+
+def execute(name, command, timeout, json_output=False):
+    assert evidence.source_snapshot()[0] == source
+    started = time.time()
+    with (root / (prefix + '-' + name + ('.jsonl' if json_output else '.log'))).open('w') as out, (root / (prefix + '-' + name + '-stderr.log')).open('w') as err:
+        proc = subprocess.Popen(command, cwd=checkout, env=env, stdout=out, stderr=err, start_new_session=True)
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            code = 'external_timeout'
+            for stem in ['hypercurve-selected-svg-', 'hypercurve-parallel-svg-', 'hypercurve-chord-svg-']:
+                temporary = Path(env.get('TMPDIR', '/tmp')) / (stem + str(proc.pid) + '.svg')
+                if temporary.is_file():
+                    payload = temporary.read_bytes()
+                    captured = root / (prefix + '-timeout-' + temporary.name)
+                    captured.write_bytes(payload)
+                    assert hashlib.sha256(captured.read_bytes()).digest() == hashlib.sha256(payload).digest()
+                    temporary.unlink()
+    after, after_files, _ = evidence.source_snapshot()
+    row = {'name': name, 'command': command, 'exit_code': code, 'elapsed_seconds': time.time() - started, 'external_timeout_seconds': timeout, 'source_stable': source == after}
+    records.append(row)
+    evidence.save_json(root / (prefix + '-results.json'), records)
+    evidence.save_json(root / (prefix + '-source-after.json'), after)
+    evidence.save_json(root / (prefix + '-files-after.json'), after_files)
+    print(row, flush=True)
+    assert row['source_stable']
+    return code
+
+command = ['cargo', 'test', '--locked', '--release', '--all-features', '-p', 'hypercurve', '--lib', '--test', 'svg_chord_replay', '--test', 'selected_point_definitions', '--test', 'native_curve_images', '--test', 'svg_parallel_replay', '--test', 'svg_selected_replay', '--test', 'hypercurve_svg', '--test', 'svg_scalar_failures', '--no-run', '--message-format=json']
+if execute('build', command, 1800, True) != 0:
+    raise SystemExit(1)
+artifacts = [json.loads(line) for line in (root / (prefix + '-build.jsonl')).read_text().splitlines()]
+binaries = {item['target']['name']: item['executable'] for item in artifacts if item.get('executable')}
+execute('projection-cache', [binaries['hypercurve'], '--exact', 'finite_projection::tests::selected_parallel_chord_projection_is_stable_after_exact_queries', '--nocapture'], 300)
+for test in ['selected_chord_split_replays_in_a_fresh_process_before_further_incidence', 'algebraic_coordinate_chords_replay_before_region_boolean_and_offset', 'replay_retains_a_valid_alternative_chart_and_exterior_support_range', 'invalid_chord_definitions_are_checked_before_an_empty_final_path', 'correlated_rational_expression_endpoints_replay_their_shared_selected_root', 'a_parallel_endpoint_and_its_incident_chord_replay_one_source_and_selector', 'shared_chord_dependencies_stay_compact_and_byte_exhaustion_recovers', 'selected_point_records_reject_wrong_references_and_original_denominator_poles', 'mixed_replay_preserves_a_hole_and_disconnected_material_through_operations']:
+    if execute(test, [binaries['svg_chord_replay'], '--exact', test, '--nocapture'], 300) == 0:
+        assert 'test result: ok. 1 passed; 0 failed; 0 ignored;' in (root / (prefix + '-' + test + '.log')).read_text()
+for name in ['svg_parallel_replay', 'svg_selected_replay', 'hypercurve_svg', 'svg_scalar_failures', 'selected_point_definitions', 'native_curve_images']:
+    execute(name, [binaries[name]], 600)
+root_command = ['cargo', 'test', '--locked', '--release', '--all-features', '-p', 'csgrs', '--test', 'svg_chord_replay', '--no-run', '--message-format=json']
+if execute('root-build', root_command, 1800, True) == 0:
+    artifacts = [json.loads(line) for line in (root / (prefix + '-root-build.jsonl')).read_text().splitlines()]
+    root_binary = next(item['executable'] for item in artifacts if item.get('executable') and item['target']['name'] == 'svg_chord_replay')
+    execute('root-svg-chord', [root_binary], 300)
+execute('matrix-guards', ['python3', 'crates/hypercurve/scripts/test_capability_matrix.py'], 120)
+execute('typos', ['typos'], 120)
+assert all(row['exit_code'] == 0 for row in records)
+print('CHORD REPLAY PROTOTYPE PASSED', flush=True)

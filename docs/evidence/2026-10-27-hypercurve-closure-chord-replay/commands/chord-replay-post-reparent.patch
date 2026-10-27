@@ -1,0 +1,421 @@
+diff --git a/crates/hypercurve/src/bezier_algebraic_image.rs b/crates/hypercurve/src/bezier_algebraic_image.rs
+index 0d5d50dcf0..b74542b83c 100644
+--- a/crates/hypercurve/src/bezier_algebraic_image.rs
++++ b/crates/hypercurve/src/bezier_algebraic_image.rs
+@@ -665,6 +665,11 @@ impl RationalBezierAlgebraicPointImage2 {
+         Arc::ptr_eq(&self.data, &other.data)
+     }
+ 
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> *const () {
++        Arc::as_ptr(&self.data).cast()
++    }
++
+     fn from_coordinates(
+         parameter: AlgebraicRootRepresentation,
+         x: BezierAlgebraicRationalCoordinateImage,
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
+index fa87ba3528..012109f791 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
+@@ -6,6 +6,8 @@ mod chord_kernel;
+ mod parallel_kernel;
+ mod points;
+ mod rational_kernel;
++#[cfg(feature = "svg")]
++mod replay;
+ mod tangent;
+ 
+ impl BezierAlgebraicChord2 {
+diff --git a/crates/hypercurve/src/bezier_offset/parallel/point.rs b/crates/hypercurve/src/bezier_offset/parallel/point.rs
+index c18f52fb23..6d461f2c8b 100644
+--- a/crates/hypercurve/src/bezier_offset/parallel/point.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel/point.rs
+@@ -2182,6 +2182,11 @@ impl BezierAnalyticParallelPoint2 {
+         Arc::ptr_eq(&self.data, &other.data)
+     }
+ 
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> *const () {
++        Arc::as_ptr(&self.data).cast()
++    }
++
+     /// Compares coordinates of two points on one zero-distance source while
+     /// preserving the selected fiber that relates their parameters.
+     ///
+@@ -2851,7 +2856,32 @@ impl BezierAnalyticParallelPoint2 {
+         {
+             return Classification::Decided(bounds.clone());
+         }
+-        let result = match &self.data.parameter {
++        let result = self.conservative_bounds_at_refinement(refinement_steps, policy);
++        if let Classification::Decided(bounds) = &result
++            && let Ok(mut cache) = self.data.bounds_cache.lock()
++            && cache
++                .as_ref()
++                .is_none_or(|(cached_policy, cached_steps, _)| {
++                    cached_policy != policy || *cached_steps <= refinement_steps
++                })
++        {
++            *cache = Some((*policy, refinement_steps, bounds.clone()));
++        }
++        result
++    }
++
++    /// Recomputes the requested enclosure from the retained definition.
++    /// Display projection needs this reproducible refinement sequence: a
++    /// stronger cached predicate bound must not change its chosen midpoint.
++    pub(crate) fn conservative_bounds_at_refinement(
++        &self,
++        refinement_steps: usize,
++        policy: &CurveContext,
++    ) -> Classification<Aabb2> {
++        if !policy.accepts_retained_policy(self.data.policy) {
++            return Classification::Uncertain(UncertaintyReason::Unsupported);
++        }
++        match &self.data.parameter {
+             BezierAnalyticParallelPointParameter2::Bezier(parameter) => {
+                 let parameter = parameter
+                     .clone()
+@@ -2909,18 +2939,7 @@ impl BezierAnalyticParallelPoint2 {
+                     &self.data.translation_y,
+                 )
+             }
+-        };
+-        if let Classification::Decided(bounds) = &result
+-            && let Ok(mut cache) = self.data.bounds_cache.lock()
+-            && cache
+-                .as_ref()
+-                .is_none_or(|(cached_policy, cached_steps, _)| {
+-                    cached_policy != policy || *cached_steps <= refinement_steps
+-                })
+-        {
+-            *cache = Some((*policy, refinement_steps, bounds.clone()));
+         }
+-        result
+     }
+ 
+     pub(in crate::bezier_offset) fn axis_coordinate_order_to_real(
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index 3c5192feed..07dcb52e9f 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -920,10 +920,16 @@ impl Curve2 {
+             }
+             return Self::from(curve);
+         }
++        Self::from_shared_retained_fragment(Arc::new(fragment))
++    }
++
++    pub(crate) fn from_shared_retained_fragment(
++        fragment: Arc<crate::BezierSplitFragment2>,
++    ) -> Self {
+         Self {
+             data: Arc::new(CurveData2 {
+                 carrier: CurveCarrier2::Restricted(Box::new(CurveRestrictedCarrier2 {
+-                    fragment: Arc::new(fragment),
++                    fragment,
+                     endpoints: [OnceLock::new(), OnceLock::new()],
+                 })),
+                 lineage: None,
+diff --git a/crates/hypercurve/src/curve_point/definition.rs b/crates/hypercurve/src/curve_point/definition.rs
+index 656f9a1a33..6bc070c84a 100644
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -62,6 +62,32 @@ pub enum CurvePointDefinition2 {
+ }
+ 
+ impl CurvePoint2 {
++    /// Retains the endpoint's existing carrier, including its selected domain
++    /// and traversal. Native interchange can record this incidence directly.
++    #[cfg(feature = "svg")]
++    pub(crate) fn endpoint_source(&self) -> Option<(crate::Curve2, bool)> {
++        let CurvePointData2::Endpoint(endpoint) = &self.0 else {
++            return None;
++        };
++        Some((
++            crate::Curve2::from_shared_retained_fragment(std::sync::Arc::clone(&endpoint.fragment)),
++            endpoint.start,
++        ))
++    }
++
++    /// Encoder-local memoization of owned immutable definitions. The encoder
++    /// must retain a clone for every key; this is not mathematical equality.
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> Option<(u8, *const ())> {
++        match &self.0 {
++            CurvePointData2::Exact(point) => Some((0, std::ptr::from_ref(point.x()).cast())),
++            CurvePointData2::Algebraic(point) => Some((1, point.replay_storage_key())),
++            CurvePointData2::AnalyticParallel(point) => Some((2, point.replay_storage_key())),
++            CurvePointData2::Endpoint(point) => Some((3, std::sync::Arc::as_ptr(point).cast())),
++            _ => None,
++        }
++    }
++
+     /// Returns a checked source definition, without eliminating selected roots.
+     /// Construction policies incompatible with strict replay remain blocked.
+     pub fn definition(&self) -> ExactCurveResult<CurvePointDefinition2> {
+diff --git a/crates/hypercurve/src/finite_projection.rs b/crates/hypercurve/src/finite_projection.rs
+index 25ab6b7934..20fa2d4ecc 100644
+--- a/crates/hypercurve/src/finite_projection.rs
++++ b/crates/hypercurve/src/finite_projection.rs
+@@ -1172,10 +1172,19 @@ fn finite_retained_point(
+     if let Some(point) = point.coordinates() {
+         return finite_point(point);
+     }
++    if let crate::CurvePointData2::Endpoint(endpoint) = &point.0
++        && let Ok(Classification::Decided(Some(resolved))) = endpoint.resolve(policy)
++    {
++        return finite_retained_point(&resolved, chord_error, policy);
++    }
+     for refinement_steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+-        let Classification::Decided(bounds) =
+-            algebraic_chord_endpoint_bounds_refined(point, refinement_steps, policy)
+-        else {
++        let bounds = match &point.0 {
++            crate::CurvePointData2::AnalyticParallel(point) => {
++                point.conservative_bounds_at_refinement(refinement_steps, policy)
++            }
++            _ => algebraic_chord_endpoint_bounds_refined(point, refinement_steps, policy),
++        };
++        let Classification::Decided(bounds) = bounds else {
+             continue;
+         };
+         let minimum = finite_point(bounds.min())?;
+@@ -1949,6 +1958,75 @@ mod tests {
+         Point2::new(Real::from(x), Real::from(y))
+     }
+ 
++    #[test]
++    fn selected_parallel_chord_projection_is_stable_after_exact_queries() {
++        use crate::{
++            BezierAlgebraicParameter2, BezierParameterInterval, BezierParameterPolynomial,
++            BezierParameterRange2, CurvePointLocations2,
++        };
++        let q = |n: i32, d: i32| (Real::from(n) / Real::from(d)).unwrap();
++        for direct_point in [false, true] {
++            let beta = BezierParameter2::Algebraic(
++                BezierAlgebraicParameter2::try_isolate(
++                    BezierParameterPolynomial::try_new_power_basis(vec![
++                        (-1).into(),
++                        0.into(),
++                        2.into(),
++                    ])
++                    .unwrap(),
++                    BezierParameterInterval::try_new(q(1, 2), q(3, 4)).unwrap(),
++                )
++                .unwrap(),
++            );
++            let source =
++                QuadraticBezier2::new(point(0, 0), Point2::new(q(1, 2), 0.into()), point(1, 1));
++            let curve = Curve2::try_analytic_parallel(
++                source.parallel_left(q(-1, 4)).unwrap(),
++                BezierParameterRange2::try_new(BezierParameter2::Exact(Real::zero()), beta)
++                    .unwrap(),
++            )
++            .unwrap();
++            let endpoint = curve.end();
++            let definition = endpoint.definition().unwrap();
++            let endpoint = if direct_point {
++                definition.into_point().unwrap()
++            } else {
++                endpoint
++            };
++            let chord = Curve2::try_line(endpoint, point(2, 0).into()).unwrap();
++            let path = CurvePath2::try_new(vec![curve, chord]).unwrap();
++            let options = FiniteProjectionOptions::try_new(0.01).unwrap();
++            let before = path.project_to_finite_polyline(&options).unwrap();
++
++            // C(t)=(t,t²), d=-1/4 and t²=1/2 give this independent
++            // endpoint. Querying its incidence warms retained point bounds.
++            let t = q(1, 2).sqrt().unwrap();
++            let speed = Real::from(3).sqrt().unwrap();
++            let expected = Point2::new(
++                &t + (&t / (Real::from(2) * &speed)).unwrap(),
++                q(1, 2) - (q(1, 4) / speed).unwrap(),
++            )
++            .into();
++            assert!(path.curves()[1].start().coincides_with(&expected).unwrap());
++            let CurvePointLocations2::Locations(locations) =
++                path.curves()[1].point_locations(&expected).unwrap()
++            else {
++                panic!("one shared endpoint");
++            };
++            assert_eq!(locations.len(), 1);
++            let after = path.project_to_finite_polyline(&options).unwrap();
++            assert_eq!(before.points(), after.points());
++
++            let fine = path
++                .project_to_finite_polyline(&FiniteProjectionOptions::try_new(0.001).unwrap())
++                .unwrap();
++            assert!(fine.points().len() >= before.points().len());
++            let coarse_again = path.project_to_finite_polyline(&options).unwrap();
++            assert_eq!(before.points(), coarse_again.points());
++            assert!(path.curves()[0].end().coincides_with(&expected).unwrap());
++        }
++    }
++
+     fn terminally_equal_x_pair() -> (Real, Real) {
+         let start = Real::e().sin();
+         let sine = Real::e().sin();
+diff --git a/crates/hypercurve/src/svg/exact.rs b/crates/hypercurve/src/svg/exact.rs
+index 8c43bae0b6..7bcb2368fe 100644
+--- a/crates/hypercurve/src/svg/exact.rs
++++ b/crates/hypercurve/src/svg/exact.rs
+@@ -12,11 +12,14 @@ const PREFIX: &str = "3:";
+ const MAGIC: &[u8; 4] = b"HCP3";
+ 
+ pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<String> {
+-    if path
+-        .curves()
+-        .iter()
+-        .any(|curve| curve.source_restriction().is_some() || curve.analytic_parallel().is_some())
+-    {
++    if path.curves().iter().any(|curve| {
++        curve.source_restriction().is_some()
++            || curve.analytic_parallel().is_some()
++            || matches!(
++                curve.retained_fragment(),
++                Some(crate::BezierSplitFragment2::AlgebraicChord(_))
++            )
++    }) {
+         return graph::encode_path(path, max_bytes);
+     }
+     let mut writer = ExactWriter::new(max_bytes);
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index 48faae27e6..d7161afbd5 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -13,6 +13,8 @@ use crate::{
+ };
+ use std::collections::HashMap;
+ 
++mod points;
++
+ pub(super) const PREFIX: &str = "4:";
+ const MAGIC: &[u8; 4] = b"HCP4";
+ const NATIVE_CURVE: u8 = 0;
+@@ -34,6 +36,10 @@ pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<Stri
+         parameters: HashMap::new(),
+         parallel_sources: HashMap::new(),
+         parallels: HashMap::new(),
++        point_sources: HashMap::new(),
++        points: HashMap::new(),
++        chords: HashMap::new(),
++        retained_curves: HashMap::new(),
+     };
+     graph.writer.bytes.extend_from_slice(MAGIC);
+     graph.writer.write_len(0)?;
+@@ -56,9 +62,13 @@ struct GraphWriter {
+     // These pointers memoize live immutable storage, never leave the encoder,
+     // and do not merge independently authored definitions by geometric fit.
+     sources: HashMap<*const CurveGeometry2, u32>,
+-    parameters: HashMap<*const BezierParameterPolynomial, u32>,
+-    parallel_sources: HashMap<*const BezierParallelSource2, u32>,
+-    parallels: HashMap<*const Real, u32>,
++    parameters: HashMap<*const BezierParameterPolynomial, (BezierAlgebraicParameter2, u32)>,
++    parallel_sources: HashMap<*const BezierParallelSource2, (BezierParallel2, u32)>,
++    parallels: HashMap<*const Real, (BezierParallel2, u32)>,
++    point_sources: HashMap<*const crate::HomogeneousControl2, (crate::RationalBezier2, u32)>,
++    points: HashMap<(u8, *const ()), (crate::CurvePoint2, u32)>,
++    chords: HashMap<*const crate::CurvePoint2, (crate::BezierAlgebraicChord2, u32)>,
++    retained_curves: HashMap<*const crate::BezierSplitFragment2, (Curve2, u32)>,
+ }
+ 
+ impl GraphWriter {
+@@ -70,6 +80,22 @@ impl GraphWriter {
+     }
+ 
+     fn curve(&mut self, curve: &Curve2) -> SvgResult<u32> {
++        let key = curve.retained_fragment().map(std::ptr::from_ref);
++        if let Some((_, index)) = key.and_then(|key| self.retained_curves.get(&key)) {
++            return Ok(*index);
++        }
++        let index = self.curve_definition(curve)?;
++        if let Some(key) = key {
++            self.retained_curves.insert(key, (curve.clone(), index));
++        }
++        Ok(index)
++    }
++
++    fn curve_definition(&mut self, curve: &Curve2) -> SvgResult<u32> {
++        if let Some(crate::BezierSplitFragment2::AlgebraicChord(chord)) = curve.retained_fragment()
++        {
++            return self.chord(chord);
++        }
+         if let Some(view) = curve.analytic_parallel() {
+             let Some((start, end)) = view.range().as_bezier_parameters() else {
+                 return Err(SvgError::Unsupported(
+@@ -122,12 +148,12 @@ impl GraphWriter {
+         // Distance belongs to the immutable parallel allocation and identifies
+         // that complete support, including its source. Its address stays local.
+         let key = std::ptr::from_ref(parallel.distance());
+-        if let Some(index) = self.parallels.get(&key) {
++        if let Some((_, index)) = self.parallels.get(&key) {
+             return Ok(*index);
+         }
+         let source = parallel.source();
+         let source_key = std::ptr::from_ref(source);
+-        let source_index = if let Some(index) = self.parallel_sources.get(&source_key) {
++        let source_index = if let Some((_, index)) = self.parallel_sources.get(&source_key) {
+             *index
+         } else {
+             let native = match source {
+@@ -138,13 +164,14 @@ impl GraphWriter {
+             let index = self.begin(NATIVE_CURVE)?;
+             // Never memoize the temporary native wrapper's address.
+             self.writer.write_curve(&native)?;
+-            self.parallel_sources.insert(source_key, index);
++            self.parallel_sources
++                .insert(source_key, (parallel.clone(), index));
+             index
+         };
+         let index = self.begin(PARALLEL_SUPPORT)?;
+         self.writer.write_u32(source_index)?;
+         self.writer.write_real(parallel.distance())?;
+-        self.parallels.insert(key, index);
++        self.parallels.insert(key, (parallel.clone(), index));
+         Ok(index)
+     }
+ 
+@@ -158,7 +185,7 @@ impl GraphWriter {
+             return Ok(index);
+         };
+         let key = std::ptr::from_ref(root.polynomial());
+-        if let Some(index) = self.parameters.get(&key) {
++        if let Some((_, index)) = self.parameters.get(&key) {
+             return Ok(*index);
+         }
+         let index = if let Some((source, numerator, denominator)) = root.source_chart() {
+@@ -176,7 +203,7 @@ impl GraphWriter {
+             self.writer.write_real(root.interval().end())?;
+             index
+         };
+-        self.parameters.insert(key, index);
++        self.parameters.insert(key, (root.clone(), index));
+         Ok(index)
+     }
+ }
+@@ -185,6 +212,8 @@ enum Definition {
+     Curve(Curve2),
+     Parameter(BezierParameter2),
+     Parallel(BezierParallel2),
++    Point(crate::CurvePoint2),
++    Chord(crate::BezierAlgebraicChord2),
+ }
+ 
+ fn curve_reference(definitions: &[Definition], index: usize) -> SvgResult<&Curve2> {
+@@ -342,6 +371,13 @@ pub(super) fn decode_path(bytes: &[u8], max_bytes: usize) -> SvgResult<CurvePath
+                     curve
+                 })
+             }
++            tag @ (points::COORDINATES
++            | points::RATIONAL_POINT
++            | points::RATIONAL_EXPRESSION
++            | points::PARALLEL_POINT
++            | points::CURVE_ENDPOINT
++            | points::CHORD_SUPPORT
++            | points::CHORD_RANGE) => points::read_definition(tag, &mut reader, &definitions)?,
+             tag => {
+                 return Err(SvgError::Unsupported(format!(
+                     "unknown exact Hypercurve definition tag {tag}"

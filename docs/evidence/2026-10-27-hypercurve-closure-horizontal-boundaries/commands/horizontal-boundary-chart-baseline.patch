@@ -1,0 +1,158 @@
+diff --git a/crates/hyperbrep/src/geometry/selected_pcurves.rs b/crates/hyperbrep/src/geometry/selected_pcurves.rs
+index 9e67edbf6c..c0557a4412 100644
+--- a/crates/hyperbrep/src/geometry/selected_pcurves.rs
++++ b/crates/hyperbrep/src/geometry/selected_pcurves.rs
+@@ -43,6 +43,25 @@ fn selected_retained_pcurve_materializes() {
+     assert!(retained().materialize().is_ok());
+ }
+ 
++#[test]
++fn represented_retained_pcurves_keep_directed_parameter_correspondence() {
++    let curve = Curve2::from(QuadraticBezier2::new(
++        CurvePoint2::from_values(0, 0),
++        CurvePoint2::new(q(1, 2), 0.into()),
++        CurvePoint2::from_values(1, 1),
++    ))
++    .restrict_source(CurveParameterRange2::try_new(q(1, 4).into(), q(3, 4).into()).unwrap())
++    .unwrap();
++    let original = SurfaceIntersectionPcurve::retained_curve(curve).unwrap();
++    for mapping in [
++        original.clone(),
++        original.reversed().unwrap(),
++        original.subcurve(&q(3, 8).into(), &q(5, 8).into()).unwrap().reversed().unwrap(),
++    ] {
++        verify_selected_mapping(&mapping);
++    }
++}
++
+ #[test]
+ fn selected_iso_pcurve_materializes() {
+     let domain = retained().domain;
+diff --git a/crates/hyperbrep/tests/support/plane_tensor_sections.rs b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+index 1d3e4f49e6..2e0dbc5ba5 100644
+--- a/crates/hyperbrep/tests/support/plane_tensor_sections.rs
++++ b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+@@ -740,12 +740,35 @@ pub fn empty_contained_boundary_and_solver_frontier() {
+         panic!("boundary tangency is an isolated point");
+     };
+     assert!(point.coincides_with(&Point3::origin().into()).unwrap());
++    // Preserve the original z=v boundary-section fixture as exact success,
++    // together with its upper-boundary counterpart z=v-1.
++    for (equation, ordinate, tag) in [
++        (y(), Real::zero(), "lower-boundary-section"),
++        (polynomial(vec![vec![(-1).into(), 1.into()]]), Real::one(), "upper-boundary-section"),
++    ] {
++        let surface = tensor([x(), y(), equation], one());
++        let sections = branches(plane().intersect_surface(&surface).unwrap());
++        assert_eq!(sections.len(), 1);
++        let section = &sections[0];
++        check_correspondence(section, &plane(), &surface);
++        let restricted = section.subcurve(&q(1, 4), &q(3, 4)).unwrap().reversed().unwrap();
++        check_correspondence(&restricted, &plane(), &surface);
++        let restored = model_and_replay(&[restricted], &surface, tag);
++        let cutting = Surface::plane(Point3::new(q(1, 2), 0.into(), 0.into()), Vector3::y(), Vector3::z()).unwrap();
++        for curve in restored.curves() {
++            let CurveSurfaceIntersection::Points(contacts) = cutting.intersect_curve(curve.geometry()).unwrap() else {
++                panic!("the replayed boundary section has one transverse contact");
++            };
++            assert_eq!(contacts.len(), 1);
++            assert!(contacts[0].point.coincides_with(&Point3::new(q(1, 2), ordinate.clone(), 0.into()).into()).unwrap());
++            assert!(contacts[0].point.coincides_with(&curve.geometry().point_at(&contacts[0].parameter).unwrap()).unwrap());
++        }
++    }
+     for (equation, expected) in [
+         (
+             polynomial(vec![vec![q(-1, 2)], vec![1.into()]]),
+             BivariateTopologyError::VerticalComponent,
+         ),
+-        (y(), BivariateTopologyError::BoundaryComponent),
+         (
+             polynomial(vec![vec![q(1, 4), (-1).into(), 1.into()]]),
+             BivariateTopologyError::RepeatedComponent,
+diff --git a/crates/hypersolve/src/bivariate_topology.rs b/crates/hypersolve/src/bivariate_topology.rs
+index 85179806e2..1b00f0e0d5 100644
+--- a/crates/hypersolve/src/bivariate_topology.rs
++++ b/crates/hypersolve/src/bivariate_topology.rs
+@@ -10,8 +10,9 @@
+ //!
+ //! This is a set-topology package, not a planar geometry carrier or an
+ //! intersection multiplicity classifier. The exact defining polynomial is
+-//! retained for those consumers. Vertical components, identically zero
+-//! boundary polynomials and repeated generic fibers have explicit blockers.
++//! retained for those consumers. Horizontal boundary components remain in
++//! the closed fibers; vertical components and repeated generic fibers have
++//! explicit blockers.
+ //! Degree and refinement controls, and the shared work budget, do not bound
+ //! every scalar operation, coefficient bit size, allocation or elapsed time.
+ 
+@@ -93,7 +94,8 @@ pub enum BivariateTopologyError {
+     VerticalComponent,
+     /// The generic fiber and its derivative share a component.
+     RepeatedComponent,
+-    /// An entire horizontal domain boundary belongs to the curve.
++    /// Legacy blocker for an entire horizontal boundary belonging to the curve.
++    /// The checked decomposition now retains these finite-fiber components.
+     BoundaryComponent,
+     /// Source or projection dimensions exceed the declared limit.
+     DegreeLimit,
+@@ -417,7 +419,11 @@ fn decompose(
+     for boundary in &domain.second {
+         let polynomial = bivariate_specialize_second(&equation, boundary);
+         if is_zero(&polynomial) {
+-            return Err(BivariateTopologyError::BoundaryComponent);
++            // A horizontal component persists in every closed fiber. It has
++            // no discrete boundary-entry events; contacts with other branches
++            // are already zeros of resultant(F, F_y). Keep F unchanged, and
++            // let the closed root counts and separator proofs retain the arc.
++            continue;
+         }
+         add_projection(&mut projection, &polynomial, config)?;
+     }
+diff --git a/crates/hypersolve/tests/support/bivariate_topology.rs b/crates/hypersolve/tests/support/bivariate_topology.rs
+index 08ca3dd59f..3a257d896a 100644
+--- a/crates/hypersolve/tests/support/bivariate_topology.rs
++++ b/crates/hypersolve/tests/support/bivariate_topology.rs
+@@ -119,10 +119,16 @@ fn audit_and_materialize(topology: &BivariateCurveTopology) {
+                 } else {
+                     &pair[1]
+                 };
+-                assert!(!Real::eval_poly(&row, lower).definitely_zero());
+-                assert!(!Real::eval_poly(&row, upper).definitely_zero());
++                let lower_is_root = Real::eval_poly(&row, lower).definitely_zero();
++                let upper_is_root = Real::eval_poly(&row, upper).definitely_zero();
++                // Separators remain root-free. Clipping to a closed domain
++                // boundary can include a root, including an entire component.
++                assert!(!lower_is_root || lower == &domain.second[0]);
++                assert!(!upper_is_root || upper == &domain.second[1]);
+                 assert_eq!(
+-                    sequence.count_distinct_roots(lower, upper, STRICT),
++                    sequence
++                        .count_distinct_roots(lower, upper, STRICT)
++                        .map(|count| count + usize::from(lower_is_root)),
+                     Some(expected)
+                 );
+             }
+@@ -436,16 +442,19 @@ pub fn explicit_dimension_degeneracy_budget_and_recovery() {
+             polynomial(&[&[0, 0, 1]]),
+             BivariateTopologyError::RepeatedComponent,
+         ),
+-        (
+-            polynomial(&[&[2, 1]]),
+-            BivariateTopologyError::BoundaryComponent,
+-        ),
+     ] {
+         assert_eq!(
+             decompose_bivariate_curve(&source, &rectangle, config),
+             Err(expected)
+         );
+     }
++    // The original boundary-component fixture now retains the complete
++    // horizontal graph, with the same equation and closed rectangle.
++    let boundary = polynomial(&[&[2, 1]]);
++    let topology = build(&boundary, &rectangle);
++    assert_eq!(topology.equation(), &boundary);
++    assert_eq!(topology.events().len(), 2);
++    assert_eq!(incidence(&topology), vec![vec![(0, 1)], vec![(1, 0)]]);
+     let nonrational = BivariatePolynomial::new(vec![vec![Real::pi(), 1.into()]]);
+     assert_eq!(
+         decompose_bivariate_curve(&nonrational, &rectangle, config),

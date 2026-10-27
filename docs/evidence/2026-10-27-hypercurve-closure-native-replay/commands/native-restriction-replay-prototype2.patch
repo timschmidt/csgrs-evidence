@@ -1,0 +1,148 @@
+diff --git a/crates/hypercurve/src/svg.rs b/crates/hypercurve/src/svg.rs
+index 9264a8e8fd..31ed36b952 100644
+--- a/crates/hypercurve/src/svg.rs
++++ b/crates/hypercurve/src/svg.rs
+@@ -12,7 +12,10 @@
+ //! path also carries a bounded, versioned `data-hypercurve-path` extension so
+ //! rational quadratics, arbitrary rational Beziers, polynomial B-splines,
+ //! NURBS, periodicity, and non-decimal [`Real`] values round-trip exactly
+-//! through Hypercurve. Other SVG consumers ignore this `data-*` attribute and
++//! through Hypercurve. Retained authored-source restrictions also preserve
++//! selected algebraic parameters, their source charts, and traversal. These
++//! guarantees concern stroke paths; filled-region export still uses its finite
++//! projection. Other SVG consumers ignore this `data-*` attribute and
+ //! render the finite standard-SVG projection in `d`.
+ 
+ mod exact;
+@@ -41,6 +44,8 @@ pub enum SvgError {
+     Unsupported(String),
+     /// Exact geometry construction, transformation, or Boolean failure.
+     Geometry(String),
++    /// Exact native-definition replay failed, retaining its typed context and cause.
++    Exact(ExactCurveError),
+     /// An exact coordinate has an undecided certificate or exhausted its budget.
+     Scalar(hyperreal::Problem),
+     /// A configured finite projection or sampling bound was exceeded.
+@@ -56,6 +61,7 @@ impl fmt::Display for SvgError {
+             Self::MalformedInput(detail) => write!(formatter, "malformed SVG input: {detail}"),
+             Self::Unsupported(detail) => write!(formatter, "unsupported SVG input: {detail}"),
+             Self::Geometry(detail) => write!(formatter, "SVG geometry conversion failed: {detail}"),
++            Self::Exact(error) => write!(formatter, "SVG exact replay failed: {error}"),
+             Self::Scalar(error) => write!(formatter, "SVG exact coordinate failed: {error}"),
+             Self::SizeOverflow { limit } => {
+                 write!(
+@@ -71,6 +77,7 @@ impl std::error::Error for SvgError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+         match self {
+             Self::Scalar(error) => Some(error),
++            Self::Exact(error) => Some(error),
+             _ => None,
+         }
+     }
+diff --git a/crates/hypercurve/src/svg/exact.rs b/crates/hypercurve/src/svg/exact.rs
+index eebc243cee..44c724541f 100644
+--- a/crates/hypercurve/src/svg/exact.rs
++++ b/crates/hypercurve/src/svg/exact.rs
+@@ -6,10 +6,19 @@ use crate::{
+ };
+ use std::fmt::Write;
+ 
++mod graph;
++
+ const PREFIX: &str = "3:";
+ const MAGIC: &[u8; 4] = b"HCP3";
+ 
+ pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<String> {
++    if path
++        .curves()
++        .iter()
++        .any(|curve| curve.source_restriction().is_some())
++    {
++        return graph::encode_path(path, max_bytes);
++    }
+     let mut writer = ExactWriter::new(max_bytes);
+     writer.bytes.extend_from_slice(MAGIC);
+     writer.write_len(path.curves().len())?;
+@@ -18,18 +27,42 @@ pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<Stri
+     }
+     writer.check_size()?;
+ 
+-    let mut encoded = String::with_capacity(PREFIX.len() + writer.bytes.len() * 2);
+-    encoded.push_str(PREFIX);
+-    for byte in writer.bytes {
++    Ok(encode_bytes(PREFIX, &writer.bytes))
++}
++
++fn encode_bytes(prefix: &str, bytes: &[u8]) -> String {
++    let mut encoded = String::with_capacity(prefix.len() + bytes.len() * 2);
++    encoded.push_str(prefix);
++    for byte in bytes {
+         write!(&mut encoded, "{byte:02x}").expect("writing exact SVG metadata cannot fail");
+     }
+-    Ok(encoded)
++    encoded
+ }
+ 
+ pub(super) fn decode_path(encoded: &str, max_bytes: usize) -> SvgResult<CurvePath2> {
++    if let Some(hex) = encoded.strip_prefix(graph::PREFIX) {
++        return graph::decode_path(&decode_bytes(hex, max_bytes)?, max_bytes);
++    }
+     let hex = encoded.strip_prefix(PREFIX).ok_or_else(|| {
+         SvgError::Unsupported("unknown Hypercurve SVG path extension version".into())
+     })?;
++    let bytes = decode_bytes(hex, max_bytes)?;
++    let mut reader = ExactReader::new(&bytes, max_bytes);
++    if reader.take(MAGIC.len())? != MAGIC {
++        return Err(malformed("exact path extension has an invalid header"));
++    }
++    let count = reader.read_len()?;
++    reader.check_collection_len(count, 1)?;
++    let curves = (0..count)
++        .map(|_| reader.read_curve())
++        .collect::<SvgResult<Vec<_>>>()?;
++    if !reader.is_empty() {
++        return Err(malformed("exact path extension has trailing bytes"));
++    }
++    CurvePath2::try_new(curves).map_err(|error| SvgError::Geometry(error.to_string()))
++}
++
++fn decode_bytes(hex: &str, max_bytes: usize) -> SvgResult<Vec<u8>> {
+     if hex.len() % 2 != 0 {
+         return Err(malformed("exact path extension has odd hexadecimal length"));
+     }
+@@ -44,19 +77,7 @@ pub(super) fn decode_path(encoded: &str, max_bytes: usize) -> SvgResult<CurvePat
+         bytes.push((high << 4) | low);
+     }
+ 
+-    let mut reader = ExactReader::new(&bytes, max_bytes);
+-    if reader.take(MAGIC.len())? != MAGIC {
+-        return Err(malformed("exact path extension has an invalid header"));
+-    }
+-    let count = reader.read_len()?;
+-    reader.check_collection_len(count, 1)?;
+-    let curves = (0..count)
+-        .map(|_| reader.read_curve())
+-        .collect::<SvgResult<Vec<_>>>()?;
+-    if !reader.is_empty() {
+-        return Err(malformed("exact path extension has trailing bytes"));
+-    }
+-    CurvePath2::try_new(curves).map_err(|error| SvgError::Geometry(error.to_string()))
++    Ok(bytes)
+ }
+ 
+ fn hex_digit(byte: u8) -> SvgResult<u8> {
+diff --git a/src/io/svg.rs b/src/io/svg.rs
+index 306e4106b9..c99a4419ba 100644
+--- a/src/io/svg.rs
++++ b/src/io/svg.rs
+@@ -27,6 +27,10 @@ fn map_svg_error(error: SvgError) -> IoError {
+             format: "SVG",
+             source: source.into(),
+         },
++        SvgError::Exact(source) => IoError::Construction {
++            format: "SVG",
++            source: source.into(),
++        },
+         SvgError::SizeOverflow { limit } => IoError::SizeOverflow {
+             format: "SVG",
+             limit,
