@@ -1,0 +1,172 @@
+diff --git a/crates/hypercurve/src/bezier_offset/selected_fiber.rs b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+index 1b58b80638..1c667be6ad 100644
+--- a/crates/hypercurve/src/bezier_offset/selected_fiber.rs
++++ b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+@@ -1371,6 +1371,33 @@ impl BezierAlgebraicSelectedFiberParameter2 {
+             {
+                 return Ok(Classification::Decided(std::cmp::Ordering::Greater));
+             }
++            if refinement_steps == 0 {
++                // An isolator can converge to an exact singleton without
++                // ever fitting inside it. Consume an already certified
++                // native scalar before further refinement. Keep the existing
++                // interval proofs first, and retain the fiber fallback when
++                // this optional comparison cannot decide.
++                for (known, selected, reverse) in [(self, other, true), (other, self, false)] {
++                    let Some(parameter) = known.retained_bezier_parameter() else {
++                        continue;
++                    };
++                    match selected.cmp_bezier_parameter(&parameter, policy)? {
++                        Classification::Decided(order) => {
++                            return Ok(Classification::Decided(if reverse {
++                                order.reverse()
++                            } else {
++                                order
++                            }));
++                        }
++                        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                            return Ok(Classification::Uncertain(
++                                UncertaintyReason::BudgetExhausted,
++                            ));
++                        }
++                        Classification::Uncertain(_) => {}
++                    }
++                }
++            }
+             if !shares_retained_parameter && refinement_steps >= 512 {
+                 break;
+             }
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index 9b0bed30cc..efd22d3ea5 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -2,8 +2,8 @@
+ 
+ #[path = "polynomial_curve.rs"]
+ mod polynomial_curve;
+-pub(crate) use polynomial_curve::PolynomialLineSections2;
+ pub use polynomial_curve::{PolynomialCurveBranch2, PolynomialCurveSet2};
++pub(crate) use polynomial_curve::{PolynomialLineSections2, polynomial_is_zero};
+ 
+ #[path = "curve_evaluation.rs"]
+ pub(crate) mod curve_evaluation;
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index f9a1999a05..c5816ec1a8 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -2,6 +2,8 @@
+ 
+ #[path = "curve_support_intersection.rs"]
+ mod curve_support_intersection;
++#[path = "polynomial_curve_pair.rs"]
++mod polynomial_curve_pair;
+ #[path = "polynomial_curve_section.rs"]
+ mod polynomial_curve_section;
+ 
+@@ -2348,7 +2350,10 @@ impl CurveIntersectionContext {
+             let result =
+                 match polynomial_curve_section::polynomial_line_section(first, second, policy)? {
+                     Some(result) => result,
+-                    None => curve_support_intersection::intersect(first, second, policy, None)?,
++                    None => match polynomial_curve_pair::intersect(first, second, policy)? {
++                        Some(result) => result,
++                        None => curve_support_intersection::intersect(first, second, policy, None)?,
++                    },
+                 };
+             return Ok(Self {
+                 data: CurveIntersectionContextData {
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 9228d40ff5..0487ba5224 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -127,7 +127,10 @@ fn decided<T>(value: Classification<T>) -> ExactCurveResult<T> {
+ /// A substituted constant can vanish through an algebraic relation that is
+ /// not a structural zero. Certify a nonzero coefficient or every zero before
+ /// distinguishing a finite section from a common supporting component.
+-fn polynomial_is_zero(coefficients: &[Real], policy: &CurveContext) -> ExactCurveResult<bool> {
++pub(crate) fn polynomial_is_zero(
++    coefficients: &[Real],
++    policy: &CurveContext,
++) -> ExactCurveResult<bool> {
+     let zero = CurveParameter2::from(Real::zero());
+     for coefficient in coefficients.iter().rev() {
+         let order = decided(
+@@ -482,7 +485,7 @@ impl PolynomialCurveBranch2 {
+                     bivariate_substitute_second_equal_affine_first(&residual, &slope, &offset);
+                 residual_equation = Some(residual);
+             }
+-            self.line_abscissas(substituted)?
++            self.section_abscissas(substituted)?
+         };
+         let dy_sign = || {
+             compare_zero(&dy).map(|order| match order {
+@@ -623,15 +626,7 @@ impl PolynomialCurveBranch2 {
+         offset: &Real,
+         policy: &CurveContext,
+     ) -> ExactCurveResult<bool> {
+-        let slab = &self.topology().slabs()[self.slab];
+-        let root = &slab.roots()[self.root];
+-        let point = PolynomialPoint2::from_fiber(
+-            self.topology().equation().clone(),
+-            BezierParameter2::Exact(slab.sample().clone()),
+-            std::slice::from_ref(root),
+-        )?
+-        .pop()
+-        .expect("one checked root supplies one selected point");
++        let point = self.checked_slab_sample()?;
+         Ok(decided(
+             crate::bezier_offset::point_affine_form_order_to_real(
+                 &point,
+@@ -644,13 +639,48 @@ impl PolynomialCurveBranch2 {
+         )? == Ordering::Equal)
+     }
+ 
+-    /// The distinct real roots of `F(x, slope*x + offset)` in the source
+-    /// rectangle's first interval, in increasing order.
+-    fn line_abscissas(&self, substituted: Vec<Real>) -> ExactCurveResult<Vec<CurveParameter2>> {
++    /// Selects a caller-certified global factor on this original graph arc.
++    /// Its simple open-fiber root cannot change factor inside the source slab.
++    pub(crate) fn selects_component(
++        &self,
++        component: &hypersolve::BivariatePolynomial,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<bool> {
++        let point = self.checked_slab_sample()?;
++        Ok(decided(
++            crate::bezier_offset::point_rational_form_sign(
++                &point,
++                component,
++                &hypersolve::BivariatePolynomial::new(vec![vec![Real::one()]]),
++                policy,
++            )
++            .map_err(invalid)?,
++        )? == RealSign::Zero)
++    }
++
++    fn checked_slab_sample(&self) -> ExactCurveResult<CurvePoint2> {
++        let slab = &self.topology().slabs()[self.slab];
++        let root = &slab.roots()[self.root];
++        Ok(PolynomialPoint2::from_fiber(
++            self.topology().equation().clone(),
++            BezierParameter2::Exact(slab.sample().clone()),
++            std::slice::from_ref(root),
++        )?
++        .pop()
++        .expect("one checked root supplies one selected point"))
++    }
++
++    /// The distinct real roots of a section's candidate polynomial in the
++    /// source rectangle's first interval, in increasing order. Every root
++    /// still needs replay on the original selected branch and active domain.
++    pub(crate) fn section_abscissas(
++        &self,
++        substituted: Vec<Real>,
++    ) -> ExactCurveResult<Vec<CurveParameter2>> {
+         use hypersolve::bivariate_arithmetic::polynomial_trim_structural_zeros;
+         let substituted = polynomial_trim_structural_zeros(substituted);
+         if polynomial_is_zero(&substituted, &CurveContext::STRICT)? {
+-            // The line is a component of the zero set.
++            // A continuous section needs its own component correspondence.
+             return Err(blocked(UncertaintyReason::Unsupported));
+         }
+         if substituted.len() <= 1 {
