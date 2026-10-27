@@ -1,0 +1,230 @@
+diff --git a/crates/hypercurve/qualification/README.md b/crates/hypercurve/qualification/README.md
+index 8f2cdd46fb..a265e42fe8 100644
+--- a/crates/hypercurve/qualification/README.md
++++ b/crates/hypercurve/qualification/README.md
+@@ -165,6 +165,15 @@ identity, overlap continuation and Certified policy receipts are asserted within
+ the named cases. General algebraic closure, native archive replay and total
+ resource bounds remain unqualified.
+ 
++The selected-polynomial policy witnesses retain the same point or transformed
++branch produced with a Certified receipt under `APPROXIMATE_512`, then consume
++it under `STRICT`. Exact coordinate relations, checked point definitions and
++further chord/line incidence remain available. A separate unit witness keeps an
++observed approximate dependency qualified through a later locally Certified
++similarity; the original explicit similarity-policy barrier regression is
++unchanged. This qualifies the named polynomial construction paths, not a new
++native archive format or every point-family policy transition.
++
+ The driver obtains executables from Cargo's artifact messages, checks exact
+ registration and ignored status, and requires one successful test summary.
+ Missing tests, ignored tests, zero-test passes, failing builds or tests, changed
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index a47a1a3c8f..3ac0a325ce 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -5476,6 +5476,102 @@
+       ],
+       "oracle": "Positive original guard 3+x on [-2,2], exact original map equality, explicit algebraic contact coordinates, determinant/traversal/exchange signs, source parameter zero and a three-piece continuation census.",
+       "timeout_seconds": 300
++    },
++    {
++      "id": "selected_point_policy_replay",
++      "target": "similarity_policy_closure",
++      "test": "certified_selected_point_created_under_approximate_policy_replays_under_strict",
++      "owner": "Hypercurve polynomial point and branch similarity construction",
++      "properties": [
++        "P4",
++        "P8",
++        "P9",
++        "P15",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "A selected point at source x=0 on y^5+5y+5=0, mapped by T(x,y)=(3-y,4+x), produced under APPROXIMATE_512 with a Certified receipt and reused under STRICT.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "An operation stores its consumed construction policy, while existing nested source-policy barriers remain intact. These cases qualify exact selected polynomial output across policy scopes, not all point-family policy transport or a native archive format.",
++      "claims": [
++        {
++          "stage": "evaluation",
++          "outcome": "exact_success",
++          "assertion": "The same returned point admits its exact world ordinate, strict abscissa bounds and equality to an independently constructed STRICT reference."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Its checked in-memory point definition replays under STRICT and agrees with the same exact selected point."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "A subsequently constructed generated chord intersects the original transformed branch in exactly that endpoint."
++        }
++      ],
++      "oracle": "The quintic derivative is positive and p(-1)=-1,p(0)=5, selecting a unique alpha in (-1,0). The explicit image is (3-alpha,4). A STRICT reference passes before construction under APPROXIMATE_512; the exact same Certified output is then queried, replayed and consumed outside that policy scope.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "selected_similarity_policy_replay",
++      "target": "similarity_policy_closure",
++      "test": "certified_selected_similarity_created_under_approximate_policy_keeps_strict_endpoints",
++      "owner": "Hypercurve polynomial point and branch similarity construction",
++      "properties": [
++        "P4",
++        "P8",
++        "P9",
++        "P15",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "The selected quintic graph on [-1,1]x[-2,2], transformed by the rational quarter turn T(x,y)=(3-y,4+x) under APPROXIMATE_512 without terminal consumption, then reused under STRICT.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "An operation stores its consumed construction policy, while existing nested source-policy barriers remain intact. These cases qualify exact selected polynomial output across policy scopes, not all point-family policy transport or a native archive format.",
++      "claims": [
++        {
++          "stage": "transforms",
++          "outcome": "exact_success",
++          "assertion": "The resulting branch reports Certified construction and preserves exact selected endpoints at world ordinates 3 and 5."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Both retained endpoints provide checked in-memory source definitions under STRICT, preserving the selected quintic geometry."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "A later horizontal line at world y=4 has one contact at source x=0 and splits the retained branch into two pieces."
++        }
++      ],
++      "oracle": "The original equation selects alpha uniquely; endpoints are (3-alpha,3) and (3-alpha,5), and the horizontal cut meets the branch once at (3-alpha,4). The same transformed output, rather than a reconstruction under a new policy, supplies the later queries and split.",
++      "timeout_seconds": 300
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 14210e6e72..c53f528c09 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -947,7 +947,7 @@ impl PolynomialCurveBranch2 {
+             Some(transform) => CurvePoint2::from(BezierSimilarityPoint2::new(
+                 point,
+                 transform.clone(),
+-                policy,
++                &policy.retained_object_policy(),
+             )),
+             None => point,
+         })
+@@ -970,7 +970,7 @@ impl PolynomialCurveBranch2 {
+             CurvePoint2::from(BezierSimilarityPoint2::new(
+                 point,
+                 transform.clone(),
+-                policy,
++                &policy.retained_object_policy(),
+             ))
+         });
+         result
+@@ -1076,3 +1076,80 @@ impl Curve2 {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod policy_tests {
++    use super::*;
++    use hypersolve::bivariate_topology::{BivariateCurveDomain, decompose_bivariate_curve};
++
++    #[test]
++    fn selected_similarity_keeps_approximate_endpoint_dependencies() {
++        let topology = decompose_bivariate_curve(
++            &hypersolve::BivariatePolynomial::new(vec![vec![
++                5.into(),
++                5.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                1.into(),
++            ]]),
++            &BivariateCurveDomain {
++                first: [(-1).into(), 1.into()],
++                second: [(-2).into(), 2.into()],
++            },
++            Default::default(),
++        )
++        .unwrap();
++        let source = PolynomialCurveSet2::from_topology(topology, Default::default()).unwrap();
++        let branch = source.curves()[0].polynomial_branch().unwrap();
++        let translation = Similarity2::try_from_real_affine(
++            1.into(),
++            0.into(),
++            0.into(),
++            1.into(),
++            1.into(),
++            0.into(),
++        )
++        .unwrap();
++        let aggregate = crate::evaluate_under(hyperlimit::PredicatePolicy::APPROXIMATE_512, || {
++            let parent = crate::policy::resolve_certified_operation(
++                &CurveContext::APPROXIMATE_512,
++                |policy| {
++                    // Seed an actual consumed-policy receipt, independently
++                    // of the following locally exact image construction.
++                    policy.observe_approximate_512();
++                    Ok::<_, CurveError>(branch.transformed(&translation, policy))
++                },
++            )
++            .unwrap();
++            assert_eq!(
++                parent.certainty,
++                crate::CurveCertainty::Approximate512Consumed
++            );
++            let child = crate::policy::resolve_certified_operation(
++                &CurveContext::APPROXIMATE_512,
++                |policy| Ok::<_, CurveError>(parent.value.transformed(&translation, policy)),
++            )
++            .unwrap();
++            assert_eq!(child.certainty, crate::CurveCertainty::Certified);
++            crate::evaluate_under(hyperlimit::PredicatePolicy::STRICT, || {
++                for endpoint in &child.value.endpoints {
++                    let query = endpoint
++                        .affine_form(0.into(), 1.into(), 0.into())
++                        .compare_to_real(&Real::zero());
++                    assert!(matches!(query, Err(ExactCurveError::Blocked(blocker))
++                        if blocker.reason() == UncertaintyReason::Unsupported));
++                    let replay = endpoint
++                        .definition()
++                        .and_then(crate::CurvePointDefinition2::into_point);
++                    assert!(matches!(replay, Err(ExactCurveError::Blocked(blocker))
++                        if blocker.reason() == UncertaintyReason::Unsupported));
++                }
++            });
++        });
++        assert_eq!(
++            aggregate.certainty(),
++            crate::CurveCertainty::Approximate512Consumed
++        );
++    }
++}
