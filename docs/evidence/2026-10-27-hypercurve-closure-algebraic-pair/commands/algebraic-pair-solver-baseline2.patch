@@ -1,0 +1,184 @@
+diff --git a/crates/hypercurve/src/bezier_offset/fiber_sign.rs b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+index 56bd5aecec..c687f9d9e3 100644
+--- a/crates/hypercurve/src/bezier_offset/fiber_sign.rs
++++ b/crates/hypercurve/src/bezier_offset/fiber_sign.rs
+@@ -1802,13 +1802,22 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+     root: &IsolatedRootInterval,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
++    let tracing = std::env::var_os("HYPERCURVE_TRACE_SHARED_IMAGE").is_some();
++    let trace = |stage: &str| {
++        if tracing {
++            eprintln!("fiber sign: {stage}");
++        }
++    };
++    trace("enter");
+     if matches!(bivariate_exact_nonzero_metadata(predicate), Some(None)) {
+         return Ok(Classification::Decided(RealSign::Zero));
+     }
+     let incidence = &authority.data.incidence;
++    trace("before exact division");
+     if predicate == incidence || divide_bivariate_polynomial_exact(predicate, incidence).is_some() {
+         return Ok(Classification::Decided(RealSign::Zero));
+     }
++    trace("after exact division");
+     let independent_of_base = |polynomial: &BivariatePolynomial| {
+         polynomial
+             .coefficients
+@@ -1848,7 +1857,9 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+             Classification::Uncertain(_) => {}
+         }
+     }
++    trace("before retained refinement");
+     let retained_parameter = authority.retained_parameter_refined(64);
++    trace("after retained refinement");
+     if predicate.coefficients.iter().all(|row| row.len() <= 1) {
+         return signed_coefficients_at_parameter(
+             &predicate
+@@ -1947,6 +1958,7 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+         );
+     }
+     let retained_root = parameter_representation(refined_retained, policy);
++    trace("selected base prepared");
+     let mut latest = root.clone();
+     let mut refinement_steps = 0_usize;
+     let mut exact_nonzero = false;
+@@ -1985,17 +1997,20 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+             BezierParameter2::Algebraic(parameter) => parameter,
+             BezierParameter2::Exact(value) => return sign_at_exact_retained(&value, &latest),
+         };
++        trace("before box substitution");
+         let restricted = predicate.substitute_affine(
+             &(retained_refined.interval().end() - retained_refined.interval().start()),
+             retained_refined.interval().start(),
+             &(&latest.upper - &latest.lower),
+             &latest.lower,
+         );
++        trace("before Bernstein signs");
+         if let Some(sign) =
+             bivariate_unit_square_strict_bernstein_sign(&restricted, &CurveContext::STRICT)?
+         {
+             return Ok(Classification::Decided(sign));
+         }
++        trace("after Bernstein signs");
+ 
+         // A speculative geometric pass may use the retained singleton box,
+         // but must yield before constructing or traversing a fiber Sturm
+@@ -2018,6 +2033,7 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+         {
+             return Ok(Classification::Decided(enclosure));
+         }
++        trace("after interval signs");
+         // A zero predicate cannot acquire a strict interval sign. Replay its
+         // common-root certificate before spending more on interval refinement;
+         // once nonzero is proved, retain that fact while refining its sign.
+@@ -2027,6 +2043,7 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+             } else {
+                 hypersolve::PredicatePolicy::STRICT
+             };
++            trace("before common count");
+             let zero_report = count_bivariate_common_fiber_roots_at_algebraic_parameter(
+                 incidence,
+                 predicate,
+@@ -2036,6 +2053,14 @@ pub(super) fn algebraic_selected_fiber_root_predicate_sign(
+                 &latest.upper,
+                 predicate_policy,
+             );
++            trace("after common count");
++            if tracing {
++                eprintln!("fiber sign: step={refinement_steps} report={zero_report:?}");
++                if refinement_steps == 0 {
++                    eprintln!("fiber sign: incidence={incidence:?} predicate={predicate:?}");
++                    eprintln!("fiber sign: root={retained_root:?} bounds={latest:?}");
++                }
++            }
+             exact_nonzero = zero_report.certainty == PredicateCertainty::Exact
+                 && zero_report.status == AlgebraicFiberRootCountStatus::Counted
+                 && zero_report.distinct_root_count == Some(0);
+diff --git a/crates/hypercurve/src/polynomial_curve_chord.rs b/crates/hypercurve/src/polynomial_curve_chord.rs
+index 2893dfc5de..a5e885260d 100644
+--- a/crates/hypercurve/src/polynomial_curve_chord.rs
++++ b/crates/hypercurve/src/polynomial_curve_chord.rs
+@@ -104,12 +104,6 @@ fn source_forms(
+     };
+     let inverse = image.inverse().map_err(invalid)?;
+     let (a, b, d, e, x, y) = inverse.affine_components();
+-    if [a, b, d, e, x, y]
+-        .iter()
+-        .any(|v| v.exact_rational_ref().is_none())
+-    {
+-        return Ok(None);
+-    }
+     Ok(Some([
+         [a.clone(), b.clone(), x.clone()],
+         [d.clone(), e.clone(), y.clone()],
+diff --git a/crates/hypercurve/src/polynomial_curve_pair.rs b/crates/hypercurve/src/polynomial_curve_pair.rs
+index fe7842c656..278147faf5 100644
+--- a/crates/hypercurve/src/polynomial_curve_pair.rs
++++ b/crates/hypercurve/src/polynomial_curve_pair.rs
+@@ -183,15 +183,16 @@ fn negate(sign: RealSign) -> RealSign {
+ }
+ 
+ /// A common invertible image preserves source incidence and parameter order.
+-/// Compare rational affine coefficients by value, including an explicit
++/// Compare affine coefficients by certified value, including an explicit
+ /// identity versus an unmapped source. This is a sufficient chart certificate;
+ /// other images retain their existing dispatch and capability blockers.
+-fn shared_rational_similarity(
++fn shared_similarity(
+     first: &PolynomialCurveBranch2,
+     second: &PolynomialCurveBranch2,
+-) -> Option<Option<Similarity2>> {
++    policy: &CurveContext,
++) -> ExactCurveResult<Option<Option<Similarity2>>> {
+     if !first.rational_maps().is_empty() || !second.rational_maps().is_empty() {
+-        return None;
++        return Ok(None);
+     }
+     let coefficients = |branch: &PolynomialCurveBranch2| {
+         branch.image_transform().map_or_else(
+@@ -220,23 +221,23 @@ fn shared_rational_similarity(
+     };
+     let a = coefficients(first);
+     let b = coefficients(second);
+-    if !a
+-        .iter()
+-        .chain(&b)
+-        .all(|value| value.exact_rational_ref().is_some())
+-        || !a
+-            .iter()
+-            .zip(&b)
+-            .all(|(a, b)| a.exact_rational_ref() == b.exact_rational_ref())
+-    {
+-        return None;
++    let same = policy.strict_predicate_pass(|| -> ExactCurveResult<bool> {
++        for (a, b) in a.into_iter().zip(b) {
++            if order(&a.into(), &b.into(), policy)? != Ordering::Equal {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    })?;
++    if !same {
++        return Ok(None);
+     }
+-    Some(
++    Ok(Some(
+         first
+             .image_transform()
+             .or_else(|| second.image_transform())
+             .cloned(),
+-    )
++    ))
+ }
+ 
+ pub(super) fn intersect(
+@@ -247,7 +248,7 @@ pub(super) fn intersect(
+     let (Some(a), Some(b)) = (first.polynomial_branch(), second.polynomial_branch()) else {
+         return Ok(None);
+     };
+-    let Some(image) = shared_rational_similarity(a, b) else {
++    let Some(image) = shared_similarity(a, b, policy)? else {
+         return Ok(None);
+     };
+     let inverse = image
