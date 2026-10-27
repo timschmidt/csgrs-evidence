@@ -1,0 +1,23 @@
+diff --git a/crates/hypercurve/src/bezier_offset/selected_fiber.rs b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+index 1b58b80638..5d4297ce2f 100644
+--- a/crates/hypercurve/src/bezier_offset/selected_fiber.rs
++++ b/crates/hypercurve/src/bezier_offset/selected_fiber.rs
+@@ -1301,6 +1301,18 @@ impl BezierAlgebraicSelectedFiberParameter2 {
+         if self == other {
+             return Ok(Classification::Decided(std::cmp::Ordering::Equal));
+         }
++        // A certified singleton value or retained native representation is
++        // already equality evidence. A nondegenerate isolator can converge
++        // to that value without ever fitting inside its singleton interval.
++        // Consume the existing scalar proof before attempting containment.
++        if let Some(parameter) = self.retained_bezier_parameter() {
++            return other
++                .cmp_bezier_parameter(&parameter, policy)
++                .map(|order| order.map(std::cmp::Ordering::reverse));
++        }
++        if let Some(parameter) = other.retained_bezier_parameter() {
++            return self.cmp_bezier_parameter(&parameter, policy);
++        }
+         let shares_retained_parameter = self.data.authority.data.retained_parameter
+             == other.data.authority.data.retained_parameter;
+         let is_other_root = if !shares_retained_parameter {
