@@ -1,0 +1,2214 @@
+diff --git a/crates/hyperbrep/src/persistence/admission/shapes.rs b/crates/hyperbrep/src/persistence/admission/shapes.rs
+index b462330a34..0d75065797 100644
+--- a/crates/hyperbrep/src/persistence/admission/shapes.rs
++++ b/crates/hyperbrep/src/persistence/admission/shapes.rs
+@@ -492,6 +492,10 @@ pub(super) enum PlanarPoint {
+         first: Box<[PlanarPoint; 2]>,
+         second: Box<[PlanarPoint; 2]>,
+     },
++    ChordDisplacement {
++        source: Box<Pcurve>,
++        origin: Option<Box<PlanarPoint>>,
++    },
+ }
+ impl Record for PlanarPoint {
+     fn admit<E: Error>(self, budget: &mut Budget<'_>) -> Result<(), E> {
+@@ -539,6 +543,15 @@ impl Record for PlanarPoint {
+                 }
+                 Ok(())
+             }
++            Self::ChordDisplacement { source, origin } => {
++                budget.record()?;
++                source.admit(budget)?;
++                if let Some(origin) = origin {
++                    budget.record()?;
++                    origin.admit(budget)?;
++                }
++                Ok(())
++            }
+         }
+     }
+ }
+diff --git a/crates/hyperbrep/src/persistence/planar_points.rs b/crates/hyperbrep/src/persistence/planar_points.rs
+index b898dee3cb..44e211bda9 100644
+--- a/crates/hyperbrep/src/persistence/planar_points.rs
++++ b/crates/hyperbrep/src/persistence/planar_points.rs
+@@ -62,6 +62,14 @@ pub(super) enum RawPlanarPoint {
+         first: Box<[RawPlanarPoint; 2]>,
+         second: Box<[RawPlanarPoint; 2]>,
+     },
++    ChordDisplacement {
++        source: Box<RawPcurve>,
++        origin: Option<Box<RawPlanarPoint>>,
++        at_end: bool,
++        distance: Real,
++        translation: [Real; 2],
++        left_normal: bool,
++    },
+ }
+ 
+ impl GraphEncoder {
+@@ -134,6 +142,24 @@ impl GraphEncoder {
+                     ]),
+                 }
+             }
++            CurvePointDefinition2::ChordDisplacement {
++                source,
++                origin,
++                at_end,
++                distance,
++                translation,
++                left_normal,
++            } => RawPlanarPoint::ChordDisplacement {
++                source: Box::new(self.pcurve(&source)?),
++                origin: origin
++                    .as_ref()
++                    .map(|point| self.planar_point(point).map(Box::new))
++                    .transpose()?,
++                at_end,
++                distance,
++                translation,
++                left_normal,
++            },
+         })
+     }
+ }
+@@ -219,6 +245,21 @@ impl SelectionGraph {
+                     second: [self.planar_point(c)?, self.planar_point(d)?],
+                 }
+             }
++            RawPlanarPoint::ChordDisplacement {
++                source,
++                origin,
++                at_end,
++                distance,
++                translation,
++                left_normal,
++            } => CurvePointDefinition2::ChordDisplacement {
++                source: pcurve(*source, self)?,
++                origin: origin.map(|point| self.planar_point(*point)).transpose()?,
++                at_end,
++                distance,
++                translation,
++                left_normal,
++            },
+         };
+         Ok(definition.into_point().map_err(GeometryError::from)?)
+     }
+diff --git a/crates/hypercurve/README.md b/crates/hypercurve/README.md
+index 87281e5468..a3086d5d91 100644
+--- a/crates/hypercurve/README.md
++++ b/crates/hypercurve/README.md
+@@ -501,12 +501,25 @@ exact signatures.
+   exact coordinates, rational source images, rational expressions and native
+   parallel points at retained Bezier parameters. Shared curve-endpoint records
+   preserve their incidence relation. Import proves point definitions, support
+-  incidence and chart order, including for unused records. Recursive point
+-  definitions, selected joint fibers and auxiliary chord contacts remain open.
++  incidence and chart order, including for unused records. Auxiliary chord
++  contacts and general joint-parameter charts remain open.
+   Parallel endpoint projection uses the requested refinement independently of
+   stronger cached predicate bounds, keeping repeated display output stable after
+   exact incidence queries.
+   The standard SVG `d` attribute is only a finite display projection.
++  Point dependencies also retain polynomial fibers, rational maps, exact
++  similarities and unique supporting-line intersections. Replay validates fiber
++  selectors and optional exact-root witnesses, original denominator guards and
++  line uniqueness. These points need no independently materialized scalar
++  coordinates. Chord displacements retain the actual selected source, normal or
++  tangent direction, signed distance, optional origin and exact translation;
++  paired endpoints share one replayed recipe.
++  `SvgOptions::max_point_definition_depth` defaults to 256 and
++  counts nested map, similarity, displacement and supporting-line point definitions; leaves
++  have depth zero. Endpoint and chord references carry their dependency depth.
++  Reached depth limits return `SvgError::SizeOverflow` before publishing a path;
++  callers may retry with a larger limit. This limit and extension bytes do not
++  bound total arithmetic, coefficient growth, retained memory or cancellation.
+   Filled-region native replay, other generated supports and sharing across
+   separate paths remain open. Byte and segment limits do not bound all scalar
+   decoding, arithmetic, expression growth, memory or cancellation.
+diff --git a/crates/hypercurve/fuzz/fuzz_targets/bezier_region.rs b/crates/hypercurve/fuzz/fuzz_targets/bezier_region.rs
+index 1a11b59cbd..f4b2febd14 100644
+--- a/crates/hypercurve/fuzz/fuzz_targets/bezier_region.rs
++++ b/crates/hypercurve/fuzz/fuzz_targets/bezier_region.rs
+@@ -4,8 +4,8 @@ mod support;
+ 
+ use hypercurve::{
+     BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
+-    BezierParameterPolynomial, Classification, Curve2, PredicatePolicy, CurvePath2, CurvePoint2,
+-    CurveRegion2, LineSeg2, Point2, QuadraticBezier2, RationalQuadraticBezier2, Real,
++    BezierParameterPolynomial, Classification, Curve2, CurvePath2, CurvePoint2, CurveRegion2,
++    LineSeg2, Point2, PredicatePolicy, QuadraticBezier2, RationalQuadraticBezier2, Real,
+ };
+ use libfuzzer_sys::fuzz_target;
+ 
+@@ -183,15 +183,13 @@ fuzz_target!(|data: &[u8]| {
+         .into_iter()
+         .filter_map(|(start, end)| algebraic_chord(start, end, &policy))
+         .collect::<Vec<_>>();
+-    if outer.len() == 4 && inner.len() == 4 {
+-        if let (Ok(outer), Ok(inner)) = (CurvePath2::try_new(outer), CurvePath2::try_new(inner)) {
+-            if let Ok(region) = CurveRegion2::try_from_boundary_paths(
+-                &[outer, inner],
+-                hypercurve::FillRule::EvenOdd,
+-            ) {
+-                let _ = region.loop_roles();
+-            }
+-        }
++    if outer.len() == 4
++        && inner.len() == 4
++        && let (Ok(outer), Ok(inner)) = (CurvePath2::try_new(outer), CurvePath2::try_new(inner))
++        && let Ok(region) =
++            CurveRegion2::try_from_boundary_paths(&[outer, inner], hypercurve::FillRule::EvenOdd)
++    {
++        let _ = region.loop_roles();
+     }
+ 
+     for chunk in data.chunks(9).take(4) {
+diff --git a/crates/hypercurve/fuzz/fuzz_targets/curve_string_editing.rs b/crates/hypercurve/fuzz/fuzz_targets/curve_string_editing.rs
+index 1d922f1211..bfb868981d 100644
+--- a/crates/hypercurve/fuzz/fuzz_targets/curve_string_editing.rs
++++ b/crates/hypercurve/fuzz/fuzz_targets/curve_string_editing.rs
+@@ -3,8 +3,8 @@
+ mod support;
+ 
+ use hypercurve::{
+-    BulgeVertex2, Classification, Curve2, PredicatePolicy, CurveCornerMode2, CurvePath2, CurveRegion2,
+-    CurveString2, CurveStringEndpoint2, CurveStringTrimPoint2, FillRule, Point2, Real, Segment2,
++    BulgeVertex2, Classification, Curve2, CurveCornerMode2, CurvePath2, CurveRegion2, CurveString2,
++    CurveStringEndpoint2, CurveStringTrimPoint2, FillRule, Point2, PredicatePolicy, Real, Segment2,
+ };
+ use libfuzzer_sys::fuzz_target;
+ 
+@@ -52,11 +52,7 @@ fn rectangle_region(origin: Point2, width: u8, height: u8) -> Option<CurveRegion
+         FillRule::NonZero,
+     )
+     .ok()
+-    .and_then(|contour| {
+-        CurveRegion2::try_from_native_material_contours(vec![contour])
+-            .ok()
+-            .map(|outcome| outcome)
+-    })
++    .and_then(|contour| CurveRegion2::try_from_native_material_contours(vec![contour]).ok())
+ }
+ 
+ fn touch_curve(curve: &CurveString2, policy: &PredicatePolicy, data: &[u8]) {
+@@ -86,7 +82,8 @@ fuzz_target!(|data: &[u8]| {
+     let points = data
+         .chunks(2)
+         .take(6)
+-        .filter_map(|chunk| (chunk.len() == 2).then(|| point(chunk[0], chunk[1])))
++        .filter(|chunk| chunk.len() == 2)
++        .map(|chunk| point(chunk[0], chunk[1]))
+         .collect::<Vec<_>>();
+     let Some(curve) = curve_from_points(&points[0..4]) else {
+         return;
+diff --git a/crates/hypercurve/fuzz/fuzz_targets/svg.rs b/crates/hypercurve/fuzz/fuzz_targets/svg.rs
+index aa44360809..9fa5eef494 100644
+--- a/crates/hypercurve/fuzz/fuzz_targets/svg.rs
++++ b/crates/hypercurve/fuzz/fuzz_targets/svg.rs
+@@ -17,6 +17,7 @@ fuzz_target!(|bytes: &[u8]| {
+             curve_tolerance: 0.1,
+             max_curve_segments: 4096,
+             max_extension_bytes: 64 * 1024,
++            ..SvgOptions::default()
+         });
+     }
+ 
+@@ -24,8 +25,10 @@ fuzz_target!(|bytes: &[u8]| {
+     for byte in bytes {
+         write!(&mut extension, "{byte:02x}").unwrap();
+     }
+-    let document = format!(
+-        r#"<svg xmlns="http://www.w3.org/2000/svg"><path fill="none" stroke="black" data-hypercurve-path="3:{extension}" d="M0 0 L1 1"/></svg>"#
+-    );
+-    let _ = import_svg_document(&document);
++    for version in [3, 4] {
++        let document = format!(
++            r#"<svg xmlns="http://www.w3.org/2000/svg"><path fill="none" stroke="black" data-hypercurve-path="{version}:{extension}" d="M0 0 L1 1"/></svg>"#
++        );
++        let _ = import_svg_document(&document);
++    }
+ });
+diff --git a/crates/hypercurve/qualification/README.md b/crates/hypercurve/qualification/README.md
+index 0987022ec6..f3a5cf203a 100644
+--- a/crates/hypercurve/qualification/README.md
++++ b/crates/hypercurve/qualification/README.md
+@@ -112,8 +112,43 @@ boundaries with a circular hole and disconnected material, then checks loop
+ roles, hole ownership, boundary reconstruction, empty-set Boolean continuation
+ and a round offset's specified exact hole boundary. Point-location assertions
+ are finite expectations, not a standalone proof of the entire offset set.
+-Recursive point definitions, joint fibers, auxiliary contact records, generated
+-circles, filled-region archives and total resource bounds remain unqualified.
++The additional point-graph witnesses below extend that initial point vocabulary.
++Auxiliary contact records, generated circles, filled-region archives and total
++resource bounds remain unqualified.
++
++The point-graph SVG witnesses encode polynomial fibers, rational images,
++similarities and supporting-line intersections as prior validated dependencies.
++The original degree-seven fillet yields a trimmed line whose selected contact
++replays in another process before a further exact split and another archive.
++This is a line-piece witness: replay of the complete generated fillet circle
++remains open, with the original full failure retained in the evidence record.
++Other witnesses retain a correlated cubic fiber over a quadratic base, an
++original rational denominator, an algebraic reflection and independently
++selected degree-seven/degree-five line supports with exterior intersections.
++Defining relations and exact point queries are checked separately from complete
++SVG determinism. Invalid references, multiple or missing fiber roots, false
++exact-root witnesses, nonsimilar matrices, degenerate or parallel line pairs
++and original poles are rejected even for an empty final path.
++
++The point-definition depth limit is separate from extension bytes. A raw graph
++with 300 nested similarities checks the default limit and a larger retry; an
++endpoint/chord indirection cannot reset depth. Rational-map chains exercise
++export limits and recovery. The 4/8/16-span prefix fixture checks linear native
++record growth and byte exhaustion/retry. These checks do not bound solver work,
++existing native prefix-vector allocations, scalar expression trees or total
++memory. Chord-displacement witnesses additionally check signed tangent and normal
++distances, arbitrary origins, exact translations, reversed sources, paired
++endpoint sharing and malformed recipe references. Joint point definitions are
++distinct from general joint parameter
++charts, whose interchange is still unsupported.
++
++The displacement definition also passes through Hyperbrep's native planar-point
++archive. Public model tests retain the original selected fillet cut before
++another split and archive, and check a native-coordinate source with and without
++an explicit origin. The source and origin consume archive record budgets before
++scalar decoding; exhausted attempts allow a larger retry. Degenerate or nonlinear
++source substitutions remain invalid. These tests do not turn Hyperbrep's nested
++point format into a shared dependency graph or qualify generated circle replay.
+ 
+ The rational-similarity section witnesses retain the original translated
+ quintic case as a positive fixture. They also check transformed selected-line
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index 922a3d64f5..1a967cb7a8 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -4,7 +4,7 @@
+   "target_domain": "The AGENTS.md algebraic closure contract and M0-M6/A1-A4 remain the target. Native and generated instances are identified independently. This catalog is an initial subset, not an exhaustive family or degeneracy inventory.",
+   "unqualified_targets": [
+     "General algebraic coefficients and arbitrary-degree implicit region admission and operations.",
+-    "Native save/reload of generated supports and filled regions beyond the authored-source restriction, procedural-parallel and named selected-chord witnesses.",
++    "Native save/reload of generated supports and filled regions beyond authored-source restrictions, procedural parallels, selected chords and the named point-definition witnesses.",
+     "Complete nonrational ellipse, parabola and PH offset chains, singular events and overlap correspondences.",
+     "Invalid operands paired with canonical empty, full disappearance chains and all hole/disconnected configurations.",
+     "Total arithmetic, coefficient/system growth, retained-memory limits and cooperative cancellation.",
+@@ -1404,7 +1404,7 @@
+           "assertion": "The unchanged two-branch parabola and vertical-line path has counterclockwise orientation and one three-piece filled boundary."
+         }
+       ],
+-      "oracle": "The selected quintic has negative y while the positive parabola has nonnegative y; the original region represents 0<=x<=1/4 and y²<=x, with its two ordered roots and closing line.",
++      "oracle": "The selected quintic has negative y while the positive parabola has nonnegative y; the original region represents 0<=x<=1/4 and y\u00b2<=x, with its two ordered roots and closing line.",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4120,7 +4120,7 @@
+           "assertion": "Both fill rules publish one boundary with two selected polynomial branches and one line."
+         }
+       ],
+-      "oracle": "The exact region is 0<=x<=1/4 and y²<=x; all original pieces remain.",
++      "oracle": "The exact region is 0<=x<=1/4 and y\u00b2<=x; all original pieces remain.",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4158,7 +4158,7 @@
+           "assertion": "Inside, outside and boundary locations remain exact, including selected branch points."
+         }
+       ],
+-      "oracle": "Independent inequalities 0<=x<=1/4 and y²<=x; exact cap and cusp-axis boundary points.",
++      "oracle": "Independent inequalities 0<=x<=1/4 and y\u00b2<=x; exact cap and cusp-axis boundary points.",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4272,7 +4272,7 @@
+           "assertion": "Subtraction/Xor creates a hole with opposite orientation; reversal and reconstruction preserve it; union restores the cap."
+         }
+       ],
+-      "oracle": "The entire hole obeys y²<=1/64<1/16<=x; two loop orientations, independent point roles and set identities.",
++      "oracle": "The entire hole obeys y\u00b2<=1/64<1/16<=x; two loop orientations, independent point roles and set identities.",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4365,7 +4365,7 @@
+         "P19",
+         "P20"
+       ],
+-      "domain": "The strictly increasing graph y=x^5+x²+5x-5 capped at y=3, clipped by y>=0 and then x>=3/4 and x>=7/8.",
++      "domain": "The strictly increasing graph y=x^5+x\u00b2+5x-5 capped at y=3, clipped by y>=0 and then x>=3/4 and x>=7/8.",
+       "origins": [
+         "authored",
+         "selected_implicit",
+@@ -4424,7 +4424,7 @@
+           "assertion": "The retained segment has exact endpoints (0,0) and (1/4,0)."
+         }
+       ],
+-      "oracle": "The intersection of y=0 with 0<=x<=1/4 and y²<=x is independently the closed interval [0,1/4].",
++      "oracle": "The intersection of y=0 with 0<=x<=1/4 and y\u00b2<=x is independently the closed interval [0,1/4].",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4501,7 +4501,7 @@
+           "assertion": "Two selected polynomial pieces, two circular pieces and one line remain consumable exact boundaries."
+         }
+       ],
+-      "oracle": "Polynomial/circle contacts satisfy x²+x=1/4 with alpha=(sqrt(2)-1)/2; source domains, circle equations, cap x-coordinate and independent filled-set points.",
++      "oracle": "Polynomial/circle contacts satisfy x\u00b2+x=1/4 with alpha=(sqrt(2)-1)/2; source domains, circle equations, cap x-coordinate and independent filled-set points.",
+       "timeout_seconds": 300
+     },
+     {
+@@ -4615,7 +4615,7 @@
+         "P19",
+         "P20"
+       ],
+-      "domain": "The cusp cap 0<=x<=1,y²<=x³, clipped and reconstructed.",
++      "domain": "The cusp cap 0<=x<=1,y\u00b2<=x\u00b3, clipped and reconstructed.",
+       "origins": [
+         "authored",
+         "selected_implicit",
+@@ -4653,7 +4653,7 @@
+         "P19",
+         "P20"
+       ],
+-      "domain": "Both material lobes of y²<=x², -1<=x<=1, meeting only at the origin, under both fill rules.",
++      "domain": "Both material lobes of y\u00b2<=x\u00b2, -1<=x<=1, meeting only at the origin, under both fill rules.",
+       "origins": [
+         "authored",
+         "selected_implicit",
+@@ -7168,6 +7168,457 @@
+       ],
+       "oracle": "Independently authored rectangle and circle coordinates, exact endpoints, winding/ownership invariants, regularized set identities and the specified offset radius. Finite point tests do not alone prove the entire offset set.",
+       "timeout_seconds": 300
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_fillet_contact",
++      "test": "a_fillet_trimmed_line_replays_in_a_fresh_process_before_further_split",
++      "domain": "The first line retained by the unique trim-only radius1/4 fillet of a right-angle path translated by the degree-seven root of 2t^7-1.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "A child process replays the line with its selected supporting-line intersection endpoint, then reproduces complete SVG bytes."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Locate the exact midpoint, split, replay again and retain the independently derived cut at beta+3/4."
++        }
++      ],
++      "oracle": "The degree-seven defining root, exact rational chord setback and independently formed midpoint; the complete generated circle remains outside this witness."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT",
++        "APPROXIMATE_512"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_fiber_map_similarity",
++      "test": "polynomial_fibers_maps_and_algebraic_similarities_keep_their_defining_relations",
++      "domain": "Selected alpha^2=2, beta^3=alpha with positive isolators; map (alpha,beta)/(1+beta), followed by an algebraic reflection and translation.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Retain both defining relations, the original rational map and similarity under strict/approximate/strict caller transitions; full SVG bytes agree."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "The inverse rational map returns the original correlated point, the similarity retains the mapped source, and reversal retains endpoints."
++        }
++      ],
++      "oracle": "Polynomial residuals are exactly zero and the inverse rational map recovers the original selected fiber, independently of finite projection."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_independent_intersection",
++      "test": "intersections_keep_independent_selected_supports_and_exterior_parameters",
++      "domain": "A vertical line at a degree-seven selected root and horizontal line at an independent degree-five selected root; their crossing lies outside both finite witnesses.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Retain both finite support witnesses and exact selected coordinates, and reproduce complete SVG bytes."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "Both coordinate forms equal their independent selected roots without requiring Real coordinates."
++        }
++      ],
++      "oracle": "Independent degree-seven and degree-five root definitions and exact retained support endpoint comparisons."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_invalid_nodes",
++      "test": "new_point_records_reject_wrong_typed_forward_and_self_references",
++      "domain": "Handwritten unused point definitions with wrong, self or forward references; nonsimilar/singular matrices; degenerate, coincident and parallel line pairs.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "invalid",
++          "assertion": "Reject malformed references and invalid constructions before accepting an empty final path."
++        }
++      ],
++      "oracle": "Typed MalformedInput versus Exact Invalid assertions for known bad references and algebraically invalid matrices/line pairs."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_fiber_selectors",
++      "test": "polynomial_fiber_replay_proves_the_selector_and_exact_root_witness",
++      "domain": "y^2-2 at x=0 with singleton, multiple, empty, reversed and false-exact selectors; a linear fiber with an exact point interval.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "The valid selector gives (0,sqrt(2)); a valid exact point-interval witness is admitted."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "invalid",
++          "assertion": "Multiple or absent roots, reversed bounds and a forged exact root cannot become empty success."
++        }
++      ],
++      "oracle": "Independent positive sqrt(2) coordinates and known root counts/equation residuals; no serialized trusted count."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_original_poles",
++      "test": "original_rational_map_poles_are_checked_on_the_selected_fiber",
++      "domain": "A selected sqrt(2) fiber mapped through denominators y^2-2 or zero, including removable 0/0, followed by a valid translation.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "invalid",
++          "assertion": "Original poles retain ZeroRationalPointDenominator even when numerator factors could cancel."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "The non-pole translation replays to (1,sqrt(2))."
++        }
++      ],
++      "oracle": "The original defining polynomial vanishes at the selector; valid output has independently expressed exact coordinates."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_depth_retry",
++      "test": "point_depth_limits_cover_endpoint_indirection_and_retry_without_cached_failure",
++      "domain": "An endpoint/chord dependency bridge, 300 raw nested similarity definitions and eight/nine rational map prefixes.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exhausted",
++          "assertion": "Configured point-depth limits reject import and export before path publication, including endpoint indirection."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Larger retries succeed, mapped paths reproduce full SVG bytes and depth zero admits a leaf."
++        }
++      ],
++      "oracle": "Derived graph depth, distinct SizeOverflow label and exact larger-retry/determinism assertions; canonicalized similarities do not reset raw input depth."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_prefix_sharing",
++      "test": "shared_rational_map_prefixes_stay_linear_and_byte_exhaustion_recovers",
++      "domain": "4/8/16 consecutive line spans between shared rational-map prefixes of one correlated polynomial point.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Record counts obey the published linear ceiling; import/re-export preserves full bytes."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exhausted",
++          "assertion": "64-byte budgets reject import/export, then larger retries reproduce the original document."
++        }
++      ],
++      "oracle": "Count native definition records independently of draw commands; require <=4n+8 records and consecutive doubling bound. This is a serialization-growth assertion, not a timing or total-memory claim."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_chord_displacement",
++      "test": "chord_displacements_preserve_direction_origin_translation_and_source",
++      "domain": "A degree-seven selected 3-4-5 direction with both normal/tangent conventions, positive/negative distances, reversed traversal, optional arbitrary origins and rational translations.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Replay every named displacement and retain source, origin, distance, translation and direction; complete SVG bytes agree."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "Each endpoint equals the independently derived signed unit-direction formula in its original selected parameter."
++        }
++      ],
++      "oracle": "The exact 3-4-5 unit tangent and left normal, explicitly adjusted for source reversal and origin selection; no coordinate fitting."
++    },
++    {
++      "target": "svg_point_replay",
++      "owner": "Hypercurve selected point owners and native SVG dependency graph",
++      "properties": [
++        "P15",
++        "P18",
++        "P19",
++        "P20",
++        "P27",
++        "P28",
++        "P29",
++        "P30"
++      ],
++      "origins": [
++        "authored",
++        "generated",
++        "selected_implicit"
++      ],
++      "families": [
++        "Line",
++        "RationalBezier",
++        "ImplicitPolynomial"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Version4 stroke metadata replays prior validated point dependencies through existing strict constructors. Polynomial fibers retain their base and singleton selector; rational maps retain original poles; similarities and line intersections re-establish their construction. Depth and byte limits are separate. No claim of generated-circle, general joint-parameter or filled-region replay, complete algebraic closure, total work or heap bounds; timeout is external containment.",
++      "timeout_seconds": 300,
++      "id": "point_replay_displacement_sharing",
++      "test": "displacement_recipes_validate_references_and_share_endpoint_selections",
++      "domain": "One displacement recipe over a retained 3-4-5 chord, its two endpoint selections, malformed source/origin/recipe references and a depth-zero budget.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Two displaced endpoints share one recipe; nine native records replay to independently expressed rational endpoints with full SVG determinism."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "invalid",
++          "assertion": "Wrong/self/forward source, origin and recipe references are rejected even with no final path."
++        },
++        {
++          "stage": "exact_replay",
++          "outcome": "exhausted",
++          "assertion": "A depth-zero budget rejects the displacement; default settings replay it successfully."
++        }
++      ],
++      "oracle": "Exact rational endpoint coordinates, the explicit nine-record shared graph and distinct malformed versus depth-limit errors."
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/src/bezier_offset.rs b/crates/hypercurve/src/bezier_offset.rs
+index 44087ee057..8cd99a30d7 100644
+--- a/crates/hypercurve/src/bezier_offset.rs
++++ b/crates/hypercurve/src/bezier_offset.rs
+@@ -46,6 +46,8 @@ pub use approximation::*;
+ pub(crate) use bivariate_replay::*;
+ pub(crate) use cusp_overlap::overlap_parameter_is_in_range;
+ use cusp_overlap::*;
++#[cfg(feature = "svg")]
++pub(crate) use cusp_semicircle::{CircleChordNormalDefinition2, CircleParameterDefinition2};
+ pub(crate) use fiber_sign::*;
+ use multivariate_sign::*;
+ pub(crate) use parallel_components::*;
+@@ -13452,6 +13454,12 @@ impl BezierSimilarityPoint2 {
+             .accepts_retained_policy(self.data.policy)
+             .then_some((&self.data.source, &self.data.transform))
+     }
++
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> *const () {
++        Arc::as_ptr(&self.data).cast()
++    }
++
+     pub(crate) fn new(
+         mut source: CurvePoint2,
+         mut transform: Similarity2,
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs
+index d4bca8a38d..fbd21b0b6c 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs
+@@ -14,6 +14,11 @@ impl BezierAlgebraicChordPairPoint2 {
+         })
+     }
+ 
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> *const () {
++        Arc::as_ptr(&self.data).cast()
++    }
++
+     pub(in crate::bezier_offset) fn accepts_policy(&self, policy: &CurveContext) -> bool {
+         policy.accepts_retained_policy(self.data.policy)
+     }
+@@ -2569,6 +2574,82 @@ impl BezierAlgebraicChordPairPoint2 {
+ }
+ 
+ impl BezierAlgebraicChordParallelPoint2 {
++    pub(crate) fn strict_definition(&self) -> Option<crate::CurvePointDefinition2> {
++        self.accepts_policy(&CurveContext::STRICT).then(|| {
++            crate::CurvePointDefinition2::ChordDisplacement {
++                source: self.data.source.clone().into(),
++                origin: self.data.source_point.as_deref().cloned(),
++                at_end: self.at_end,
++                distance: self.data.distance.clone(),
++                translation: [
++                    self.data.translation_x.clone(),
++                    self.data.translation_y.clone(),
++                ],
++                left_normal: self.data.direction
++                    == BezierAlgebraicChordUnitDisplacement2::LeftNormal,
++            }
++        })
++    }
++
++    pub(crate) fn from_replay_definition(
++        source: crate::Curve2,
++        origin: Option<CurvePoint2>,
++        at_end: bool,
++        distance: Real,
++        translation: [Real; 2],
++        left_normal: bool,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Self>> {
++        let source = if let Some(crate::BezierSplitFragment2::AlgebraicChord(source)) =
++            source.retained_fragment()
++        {
++            source.clone()
++        } else if let Some(crate::CurveGeometry2::Line(line)) = source.geometry() {
++            match BezierAlgebraicChord2::try_new(
++                line.start().clone().into(),
++                line.end().clone().into(),
++                policy,
++            )? {
++                Classification::Decided(source) => source,
++                Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++            }
++        } else {
++            return Err(CurveError::InvalidCurveParameter);
++        };
++        source.validate_policy(policy)?;
++        let [translation_x, translation_y] = translation;
++        Ok(Classification::Decided(Self {
++            data: Arc::new(BezierAlgebraicChordParallelData2 {
++                source,
++                source_point: origin.map(Arc::new),
++                distance,
++                translation_x,
++                translation_y,
++                direction: if left_normal {
++                    BezierAlgebraicChordUnitDisplacement2::LeftNormal
++                } else {
++                    BezierAlgebraicChordUnitDisplacement2::Tangent
++                },
++                policy: policy.retained_object_policy(),
++                recursive_points: OnceLock::new(),
++            }),
++            at_end,
++        }))
++    }
++
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> (bool, *const ()) {
++        (self.at_end, Arc::as_ptr(&self.data).cast())
++    }
++
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_endpoint(&self, at_end: bool) -> Self {
++        Self {
++            data: Arc::clone(&self.data),
++            at_end,
++        }
++    }
++
+     pub(in crate::bezier_offset) fn accepts_policy(&self, policy: &CurveContext) -> bool {
+         policy.accepts_retained_policy(self.data.policy)
+     }
+@@ -7233,3 +7314,78 @@ impl BezierAlgebraicCuspChordDerivedPoint2 {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod replay_tests {
++    use super::*;
++
++    #[test]
++    fn chord_displacement_replay_preserves_policy_barriers() {
++        let build = |policy: &CurveContext| {
++            let Classification::Decided(chord) = BezierAlgebraicChord2::try_new(
++                Point2::from_values(0, 0).into(),
++                Point2::from_values(3, 4).into(),
++                policy,
++            )
++            .unwrap() else {
++                panic!("the exact nonzero chord must construct")
++            };
++            chord
++        };
++        let strict = build(&CurveContext::STRICT);
++        let outcome =
++            crate::policy::resolve_certified_operation(&CurveContext::APPROXIMATE_512, |policy| {
++                policy.observe_approximate_512();
++                let chord = build(policy);
++                let point = BezierAlgebraicChordParallelPoint2::new_pair(
++                    strict.clone(),
++                    1.into(),
++                    0.into(),
++                    0.into(),
++                    policy,
++                )
++                .0;
++                Ok::<_, CurveError>((chord, point))
++            })
++            .unwrap();
++        assert_eq!(
++            outcome.certainty,
++            crate::CurveCertainty::Approximate512Consumed
++        );
++        let (qualified_source, qualified_point) = outcome.into_value();
++        assert!(qualified_point.strict_definition().is_none());
++        let replay = |source| {
++            crate::CurvePointDefinition2::ChordDisplacement {
++                source,
++                origin: None,
++                at_end: false,
++                distance: 1.into(),
++                translation: [0.into(), 0.into()],
++                left_normal: true,
++            }
++            .into_point()
++        };
++        assert!(replay(qualified_source.into()).is_err());
++        let point = replay(strict.into()).unwrap();
++        assert!(
++            point
++                .coincides_with(
++                    &Point2::new(
++                        (Real::from(-4) / Real::from(5)).unwrap(),
++                        (Real::from(3) / Real::from(5)).unwrap(),
++                    )
++                    .into()
++                )
++                .unwrap()
++        );
++        assert!(
++            point
++                .definition()
++                .unwrap()
++                .into_point()
++                .unwrap()
++                .coincides_with(&point)
++                .unwrap()
++        );
++    }
++}
+diff --git a/crates/hypercurve/src/bezier_offset/cusp_semicircle.rs b/crates/hypercurve/src/bezier_offset/cusp_semicircle.rs
+index adc8661513..da87e5aefd 100644
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle.rs
+@@ -10,6 +10,11 @@ mod parallel_kernel;
+ mod parameters;
+ mod points;
+ mod rational_kernel;
++#[cfg(feature = "svg")]
++mod replay;
++
++#[cfg(feature = "svg")]
++pub(crate) use replay::{CircleChordNormalDefinition2, CircleParameterDefinition2};
+ 
+ impl BezierAlgebraicCuspSemicircle2 {
+     #[inline]
+diff --git a/crates/hypercurve/src/bezier_offset/cusp_semicircle/fragment.rs b/crates/hypercurve/src/bezier_offset/cusp_semicircle/fragment.rs
+index d0f0ff2001..65be80d063 100644
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/fragment.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/fragment.rs
+@@ -3,6 +3,48 @@
+ use super::*;
+ 
+ impl BezierAlgebraicCuspSemicircleFragment2 {
++    /// Locates a represented or retained point using this circle's incidence,
++    /// angular inversion and finite-range authorities without materializing
++    /// independent scalar coordinates.
++    pub(crate) fn point_parameter(
++        &self,
++        point: &CurvePoint2,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Option<CurveParameter2>>> {
++        self.validate_policy(policy)?;
++        match self
++            .semicircle()
++            .retained_point_incidence_sign(point, policy)?
++        {
++            Classification::Decided(RealSign::Zero) => {}
++            Classification::Decided(_) => return Ok(Classification::Decided(None)),
++            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++        }
++        let parameter = match self
++            .semicircle()
++            .parameter_at_certified_incident_point(point, policy)?
++        {
++            Classification::Decided(parameter) => parameter,
++            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++        };
++        let Some(cusp) = parameter
++            .as_algebraic_cusp()
++            .filter(|_| !parameter.is_algebraic_cusp_complement())
++        else {
++            return Ok(Classification::Decided(None));
++        };
++        self.certified_incident_point_evidence_location(cusp, point, policy)
++            .map(|location| {
++                location.map(|location| {
++                    (!matches!(
++                        location,
++                        BezierAlgebraicCuspSemicircleIncidentLocation2::Exterior
++                    ))
++                    .then_some(parameter)
++                })
++            })
++    }
++
+     pub(crate) fn validate_policy(&self, policy: &CurveContext) -> CurveResult<()> {
+         policy.validate_retained_policy(self.data.policy)
+     }
+diff --git a/crates/hypercurve/src/curve_intersection.rs b/crates/hypercurve/src/curve_intersection.rs
+index c6f9326293..71ef1b1bd9 100644
+--- a/crates/hypercurve/src/curve_intersection.rs
++++ b/crates/hypercurve/src/curve_intersection.rs
+@@ -2761,14 +2761,23 @@ impl Curve2 {
+             let spans = self.source_spans(policy, CurveOperation2::Intersection)?;
+             let mut locations = Vec::new();
+             for (span_index, span) in spans.iter().enumerate() {
+-                let crate::curve_support::CurveSupport2::Line(chord) =
+-                    crate::curve_support::CurveSupport2::from_fragment(&span.fragment)
+-                else {
+-                    return Err(blocked(UncertaintyReason::Unsupported));
+-                };
++                let parameter =
++                    match crate::curve_support::CurveSupport2::from_fragment(&span.fragment) {
++                        crate::curve_support::CurveSupport2::Line(chord) => {
++                            chord.point_parameter(point, policy).map(|parameter| {
++                                parameter.map(|parameter| {
++                                    parameter.map(CurveParameter2::from_algebraic_chord)
++                                })
++                            })
++                        }
++                        crate::curve_support::CurveSupport2::Circle(circle) => {
++                            circle.point_parameter(point, policy)
++                        }
++                        _ => return Err(blocked(UncertaintyReason::Unsupported)),
++                    };
+                 let parameter = ExactCurveError::decided(
+                     CurveOperation2::Intersection,
+-                    chord.point_parameter(point, policy).map_err(|cause| {
++                    parameter.map_err(|cause| {
+                         ExactCurveError::invalid(
+                             CurveOperation2::Intersection,
+                             self.family(),
+@@ -2777,11 +2786,7 @@ impl Curve2 {
+                     })?,
+                 )?;
+                 if let Some(parameter) = parameter {
+-                    locations.push(CurveLocation2::new(
+-                        span_index,
+-                        span.chart(),
+-                        CurveParameter2::from_algebraic_chord(parameter),
+-                    ));
++                    locations.push(CurveLocation2::new(span_index, span.chart(), parameter));
+                 }
+             }
+             return Ok(CurvePointLocations2::Locations(locations));
+@@ -2970,48 +2975,13 @@ impl Curve2 {
+                             }
+                         }
+                         crate::curve_support::CurveSupport2::Circle(circle) => {
+-                            let incidence = circle
+-                                .semicircle()
+-                                .retained_point_incidence_sign(&query, policy)
+-                                .map_err(invalid)?;
+-                            if let Classification::Uncertain(reason) = incidence {
+-                                return Ok(Classification::Uncertain(reason));
+-                            }
+-                            if incidence != Classification::Decided(crate::RealSign::Zero) {
+-                                Vec::new()
+-                            } else {
+-                                let parameter = match circle
+-                                    .semicircle()
+-                                    .parameter_at_certified_incident_point(&query, policy)
+-                                    .map_err(invalid)?
+-                                {
+-                                    Classification::Decided(parameter) => parameter,
+-                                    Classification::Uncertain(reason) => {
+-                                        return Ok(Classification::Uncertain(reason));
+-                                    }
+-                                };
+-                                // A point on the complementary half lies off
+-                                // this fragment's angular range.
+-                                let inside = match parameter.as_algebraic_cusp() {
+-                                    Some(cusp) if !parameter.is_algebraic_cusp_complement() => {
+-                                        match circle
+-                                            .certified_incident_point_evidence_location(
+-                                                cusp, &query, policy,
+-                                            )
+-                                            .map_err(invalid)?
+-                                        {
+-                                            Classification::Decided(location) => !matches!(
+-                                                location,
+-                                                crate::bezier_offset::BezierAlgebraicCuspSemicircleIncidentLocation2::Exterior
+-                                            ),
+-                                            Classification::Uncertain(reason) => {
+-                                                return Ok(Classification::Uncertain(reason));
+-                                            }
+-                                        }
+-                                    }
+-                                    _ => false,
+-                                };
+-                                if inside { vec![parameter] } else { Vec::new() }
++                            match circle.point_parameter(&query, policy).map_err(invalid)? {
++                                Classification::Decided(parameter) => {
++                                    parameter.into_iter().collect()
++                                }
++                                Classification::Uncertain(reason) => {
++                                    return Ok(Classification::Uncertain(reason));
++                                }
+                             }
+                         }
+                     }
+diff --git a/crates/hypercurve/src/curve_point/definition.rs b/crates/hypercurve/src/curve_point/definition.rs
+index 6bc070c84a..4c78a01abb 100644
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -59,6 +59,20 @@ pub enum CurvePointDefinition2 {
+         first: [CurvePoint2; 2],
+         second: [CurvePoint2; 2],
+     },
++    /// A signed unit-direction displacement, retaining its selected straight
++    /// source. `source` must be a native line or retained chord. With `origin: None`,
++    /// `at_end` selects that chord's start or end; an explicit origin may be
++    /// anywhere. `left_normal` selects the source's left normal when true and
++    /// its forward unit tangent otherwise. Exact translation is applied after
++    /// the displacement. No independent normalized scalar fields are required.
++    ChordDisplacement {
++        source: crate::Curve2,
++        origin: Option<CurvePoint2>,
++        at_end: bool,
++        distance: crate::Real,
++        translation: [crate::Real; 2],
++        left_normal: bool,
++    },
+ }
+ 
+ impl CurvePoint2 {
+@@ -84,6 +98,13 @@ impl CurvePoint2 {
+             CurvePointData2::Algebraic(point) => Some((1, point.replay_storage_key())),
+             CurvePointData2::AnalyticParallel(point) => Some((2, point.replay_storage_key())),
+             CurvePointData2::Endpoint(point) => Some((3, std::sync::Arc::as_ptr(point).cast())),
++            CurvePointData2::Polynomial(point) => Some(point.replay_storage_key()),
++            CurvePointData2::Similarity(point) => Some((5, point.replay_storage_key())),
++            CurvePointData2::AlgebraicChordPair(point) => Some((6, point.replay_storage_key())),
++            CurvePointData2::AlgebraicChordParallel(point) => {
++                let (at_end, key) = point.replay_storage_key();
++                Some((8 + u8::from(at_end), key))
++            }
+             _ => None,
+         }
+     }
+@@ -155,6 +176,9 @@ impl CurvePoint2 {
+                 let [first, second] = point.strict_support_endpoints().ok_or_else(blocked)?;
+                 Ok(CurvePointDefinition2::SupportingLineIntersection { first, second })
+             }
++            CurvePointData2::AlgebraicChordParallel(point) => {
++                point.strict_definition().ok_or_else(blocked)
++            }
+             CurvePointData2::Endpoint(endpoint) => {
+                 let point = ExactCurveError::decided(
+                     CurveOperation2::Evaluation,
+@@ -174,6 +198,22 @@ impl CurvePointDefinition2 {
+     /// Replays the source with pole, regular-normal and line-uniqueness checks under strict
+     /// predicates. The input definition carries no trusted validation flags.
+     pub fn into_point(self) -> ExactCurveResult<CurvePoint2> {
++        self.replay(false)
++    }
++
++    /// Replays one graph node whose source point records have already passed
++    /// strict replay. The native decoder owns those immutable checked records;
++    /// no serialized certainty flag may satisfy this precondition.
++    ///
++    /// Reusing their validation prevents a shared dependency graph from being
++    /// recursively rebuilt as a tree. The current construction's denominator,
++    /// selector, similarity and unique-incidence checks still run normally.
++    #[cfg(feature = "svg")]
++    pub(crate) fn into_point_with_checked_sources(self) -> ExactCurveResult<CurvePoint2> {
++        self.replay(true)
++    }
++
++    fn replay(self, sources_checked: bool) -> ExactCurveResult<CurvePoint2> {
+         crate::policy::resolve_certified_operation(&CurveContext::STRICT, |policy| match self {
+             Self::Coordinates(point) => Ok(point.into()),
+             Self::RationalImage { source, map } => source.rational_image(&map),
+@@ -259,11 +299,49 @@ impl CurvePointDefinition2 {
+                 }
+             }
+             Self::Parallel { source, parameter } => source.checked_native_point(&parameter, policy),
++            Self::ChordDisplacement {
++                source,
++                origin,
++                at_end,
++                distance,
++                translation,
++                left_normal,
++            } => {
++                if !sources_checked {
++                    source.start().definition()?.into_point()?;
++                    source.end().definition()?.into_point()?;
++                    if let Some(origin) = &origin {
++                        origin.definition()?.into_point()?;
++                    }
++                }
++                let point = crate::BezierAlgebraicChordParallelPoint2::from_replay_definition(
++                    source,
++                    origin,
++                    at_end,
++                    distance,
++                    translation,
++                    left_normal,
++                    policy,
++                )
++                .map_err(|cause| {
++                    ExactCurveError::invalid(
++                        CurveOperation2::Construction,
++                        CurveFamily2::Line,
++                        cause,
++                    )
++                })?;
++                ExactCurveError::decided(
++                    CurveOperation2::Construction,
++                    point.map(CurvePoint2::from),
++                )
++            }
+             Self::Similarity { source, transform } => {
+                 // Replaying the definition establishes its source under the
+                 // same strict policy; an arbitrary incompatible source cannot
+                 // acquire a stronger claim merely by being wrapped.
+-                source.definition()?.into_point()?;
++                if !sources_checked {
++                    source.definition()?.into_point()?;
++                }
+                 Ok(crate::BezierSimilarityPoint2::new(source, transform, policy).into())
+             }
+             Self::SupportingLineIntersection { first, second } => {
+@@ -273,8 +351,10 @@ impl CurvePointDefinition2 {
+                 let line = |[start, end]: [CurvePoint2; 2]| {
+                     // Retain source identity after proving every recursive
+                     // definition admissible under the strict replay policy.
+-                    start.definition()?.into_point()?;
+-                    end.definition()?.into_point()?;
++                    if !sources_checked {
++                        start.definition()?.into_point()?;
++                        end.definition()?.into_point()?;
++                    }
+                     ExactCurveError::decided(
+                         CurveOperation2::Evaluation,
+                         crate::BezierAlgebraicChord2::try_new(start, end, policy)
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index 7b55d215e4..2dbe7ff703 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -21,6 +21,18 @@ pub(crate) struct PolynomialPoint2 {
+ }
+ 
+ impl PolynomialPoint2 {
++    /// Prefix views may have different wrapper allocations while retaining the
++    /// same immutable map application or selected fiber. An owning point clone
++    /// keeps either key alive for the duration of one native export.
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> (u8, *const ()) {
++        if let Some(map) = self.maps.last() {
++            (4, std::sync::Arc::as_ptr(map).cast())
++        } else {
++            (7, std::ptr::from_ref(self.fiber.root()).cast())
++        }
++    }
++
+     pub(crate) fn polynomial_sign(
+         &self,
+         polynomial: &BivariatePolynomial,
+diff --git a/crates/hypercurve/src/svg.rs b/crates/hypercurve/src/svg.rs
+index 728ad186c0..51fbcca310 100644
+--- a/crates/hypercurve/src/svg.rs
++++ b/crates/hypercurve/src/svg.rs
+@@ -20,8 +20,15 @@
+ //! and directed endpoints. Those endpoints may be exact coordinates, rational
+ //! source images, rational expressions or native parallel evaluations at retained
+ //! Bezier parameters; shared curve-endpoint references preserve incidence.
++//! Polynomial fibers retain the base parameter, equation and singleton selector.
++//! Rational images retain original denominator guards; similarities and unique
++//! supporting-line intersections retain their checked point dependencies.
+ //! Replay rechecks point definitions, support incidence and strict chart order.
+-//! Other selected point definitions and auxiliary chord contacts remain unsupported.
++//! Auxiliary chord contacts and other generated curve carriers remain unsupported.
++//! Chord displacements retain their selected source, origin, signed normal or
++//! tangent displacement and translation, sharing one recipe for paired endpoints.
++//! Point-definition nesting and extension bytes have separate configurable limits;
++//! neither is a total arithmetic-work, memory or cancellation bound.
+ //! These guarantees concern stroke paths; filled-region export still
+ //! uses its finite projection. Other SVG consumers ignore this `data-*` attribute and
+ //! render the finite standard-SVG projection in `d`.
+@@ -56,7 +63,7 @@ pub enum SvgError {
+     Exact(ExactCurveError),
+     /// An exact coordinate has an undecided certificate or exhausted its budget.
+     Scalar(hyperreal::Problem),
+-    /// A configured finite projection or sampling bound was exceeded.
++    /// A configured projection, extension-byte or point-definition-depth bound was exceeded.
+     SizeOverflow {
+         /// Name of the exceeded bound.
+         limit: &'static str,
+@@ -121,6 +128,10 @@ pub struct SvgOptions {
+     pub max_curve_segments: usize,
+     /// Maximum decoded byte length of one exact Hypercurve path extension.
+     pub max_extension_bytes: usize,
++    /// Maximum nested rational-image, similarity, chord-displacement or supporting-line point
++    /// constructions in one exact path graph. Leaf point definitions have
++    /// depth zero. This is distinct from arithmetic work and memory limits.
++    pub max_point_definition_depth: usize,
+ }
+ 
+ impl Default for SvgOptions {
+@@ -129,6 +140,7 @@ impl Default for SvgOptions {
+             curve_tolerance: 0.1,
+             max_curve_segments: 4096,
+             max_extension_bytes: 16 * 1024 * 1024,
++            max_point_definition_depth: 256,
+         }
+     }
+ }
+@@ -1269,7 +1281,11 @@ fn path_geometry(
+     options: SvgOptions,
+ ) -> SvgResult<SvgGeometry2> {
+     if let Some(encoded) = exact_path {
+-        let path = exact::decode_path(encoded, options.max_extension_bytes)?;
++        let path = exact::decode_path(
++            encoded,
++            options.max_extension_bytes,
++            options.max_point_definition_depth,
++        )?;
+         if context.fills() && path.start() != path.end() {
+             return Err(SvgError::Geometry(
+                 "filled exact path contains an explicitly open subpath".into(),
+@@ -1515,7 +1531,11 @@ pub fn export_svg_document_with_options(
+ 
+     for wire in &geometry.wires {
+         let path = curve_path_from_wire(wire)?;
+-        let exact = exact::encode_path(&path, options.max_extension_bytes)?;
++        let exact = exact::encode_path(
++            &path,
++            options.max_extension_bytes,
++            options.max_point_definition_depth,
++        )?;
+         write!(
+             &mut body,
+             "<path fill=\"none\" stroke=\"black\" {EXACT_PATH_ATTRIBUTE}=\"{exact}\" d=\""
+@@ -1525,7 +1545,11 @@ pub fn export_svg_document_with_options(
+         body.push_str("\"/>\n");
+     }
+     for path in &geometry.paths {
+-        let exact = exact::encode_path(path, options.max_extension_bytes)?;
++        let exact = exact::encode_path(
++            path,
++            options.max_extension_bytes,
++            options.max_point_definition_depth,
++        )?;
+         write!(
+             &mut body,
+             "<path fill=\"none\" stroke=\"black\" {EXACT_PATH_ATTRIBUTE}=\"{exact}\" d=\""
+diff --git a/crates/hypercurve/src/svg/exact.rs b/crates/hypercurve/src/svg/exact.rs
+index 7bcb2368fe..79053fae5a 100644
+--- a/crates/hypercurve/src/svg/exact.rs
++++ b/crates/hypercurve/src/svg/exact.rs
+@@ -11,16 +11,23 @@ mod graph;
+ const PREFIX: &str = "3:";
+ const MAGIC: &[u8; 4] = b"HCP3";
+ 
+-pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<String> {
++pub(super) fn encode_path(
++    path: &CurvePath2,
++    max_bytes: usize,
++    max_point_depth: usize,
++) -> SvgResult<String> {
+     if path.curves().iter().any(|curve| {
+         curve.source_restriction().is_some()
+             || curve.analytic_parallel().is_some()
+             || matches!(
+                 curve.retained_fragment(),
+-                Some(crate::BezierSplitFragment2::AlgebraicChord(_))
++                Some(
++                    crate::BezierSplitFragment2::AlgebraicChord(_)
++                        | crate::BezierSplitFragment2::AlgebraicCuspSemicircle(_)
++                )
+             )
+     }) {
+-        return graph::encode_path(path, max_bytes);
++        return graph::encode_path(path, max_bytes, max_point_depth);
+     }
+     let mut writer = ExactWriter::new(max_bytes);
+     writer.bytes.extend_from_slice(MAGIC);
+@@ -42,9 +49,13 @@ fn encode_bytes(prefix: &str, bytes: &[u8]) -> String {
+     encoded
+ }
+ 
+-pub(super) fn decode_path(encoded: &str, max_bytes: usize) -> SvgResult<CurvePath2> {
++pub(super) fn decode_path(
++    encoded: &str,
++    max_bytes: usize,
++    max_point_depth: usize,
++) -> SvgResult<CurvePath2> {
+     if let Some(hex) = encoded.strip_prefix(graph::PREFIX) {
+-        return graph::decode_path(&decode_bytes(hex, max_bytes)?, max_bytes);
++        return graph::decode_path(&decode_bytes(hex, max_bytes)?, max_bytes, max_point_depth);
+     }
+     let hex = encoded.strip_prefix(PREFIX).ok_or_else(|| {
+         SvgError::Unsupported("unknown Hypercurve SVG path extension version".into())
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index d7161afbd5..8969b6a5b5 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -13,6 +13,7 @@ use crate::{
+ };
+ use std::collections::HashMap;
+ 
++mod circles;
+ mod points;
+ 
+ pub(super) const PREFIX: &str = "4:";
+@@ -25,7 +26,11 @@ const SOURCE_RESTRICTION: u8 = 4;
+ const PARALLEL_SUPPORT: u8 = 5;
+ const PARALLEL_RANGE: u8 = 6;
+ 
+-pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<String> {
++pub(super) fn encode_path(
++    path: &CurvePath2,
++    max_bytes: usize,
++    max_point_depth: usize,
++) -> SvgResult<String> {
+     if path.curves().len() > max_bytes / 4 {
+         return Err(extension_overflow());
+     }
+@@ -40,6 +45,11 @@ pub(super) fn encode_path(path: &CurvePath2, max_bytes: usize) -> SvgResult<Stri
+         points: HashMap::new(),
+         chords: HashMap::new(),
+         retained_curves: HashMap::new(),
++        displacements: HashMap::new(),
++        point_depths: Vec::new(),
++        max_point_depth,
++        circles: HashMap::new(),
++        circle_parameters: HashMap::new(),
+     };
+     graph.writer.bytes.extend_from_slice(MAGIC);
+     graph.writer.write_len(0)?;
+@@ -69,6 +79,17 @@ struct GraphWriter {
+     points: HashMap<(u8, *const ()), (crate::CurvePoint2, u32)>,
+     chords: HashMap<*const crate::CurvePoint2, (crate::BezierAlgebraicChord2, u32)>,
+     retained_curves: HashMap<*const crate::BezierSplitFragment2, (Curve2, u32)>,
++    displacements: HashMap<*const (), (crate::CurvePoint2, u32)>,
++    point_depths: Vec<usize>,
++    max_point_depth: usize,
++    circles: HashMap<*const (), (crate::bezier_offset::BezierAlgebraicCuspSemicircle2, u32)>,
++    circle_parameters: HashMap<
++        (u32, *const ()),
++        (
++            crate::bezier_offset::BezierAlgebraicCuspSemicircleParameter2,
++            u32,
++        ),
++    >,
+ }
+ 
+ impl GraphWriter {
+@@ -76,6 +97,7 @@ impl GraphWriter {
+         let index = self.count;
+         self.count = self.count.checked_add(1).ok_or_else(extension_overflow)?;
+         self.writer.write_u8(tag)?;
++        self.point_depths.push(0);
+         Ok(index)
+     }
+ 
+@@ -92,6 +114,11 @@ impl GraphWriter {
+     }
+ 
+     fn curve_definition(&mut self, curve: &Curve2) -> SvgResult<u32> {
++        if let Some(crate::BezierSplitFragment2::AlgebraicCuspSemicircle(fragment)) =
++            curve.retained_fragment()
++        {
++            return self.circle_fragment(fragment);
++        }
+         if let Some(crate::BezierSplitFragment2::AlgebraicChord(chord)) = curve.retained_fragment()
+         {
+             return self.chord(chord);
+@@ -214,6 +241,12 @@ enum Definition {
+     Parallel(BezierParallel2),
+     Point(crate::CurvePoint2),
+     Chord(crate::BezierAlgebraicChord2),
++    Displacement(crate::BezierAlgebraicChordParallelPoint2),
++    Circle(crate::bezier_offset::BezierAlgebraicCuspSemicircle2),
++    CircleParameter {
++        circle: u32,
++        parameter: crate::bezier_offset::BezierAlgebraicCuspSemicircleParameter2,
++    },
+ }
+ 
+ fn curve_reference(definitions: &[Definition], index: usize) -> SvgResult<&Curve2> {
+@@ -244,7 +277,11 @@ fn certified<T>(value: CurveResult<Classification<T>>) -> SvgResult<T> {
+     ExactCurveError::decided(CurveOperation2::Construction, value).map_err(SvgError::Exact)
+ }
+ 
+-pub(super) fn decode_path(bytes: &[u8], max_bytes: usize) -> SvgResult<CurvePath2> {
++pub(super) fn decode_path(
++    bytes: &[u8],
++    max_bytes: usize,
++    max_point_depth: usize,
++) -> SvgResult<CurvePath2> {
+     let mut reader = ExactReader::new(bytes, max_bytes);
+     if reader.take(MAGIC.len())? != MAGIC {
+         return Err(malformed(
+@@ -254,10 +291,12 @@ pub(super) fn decode_path(bytes: &[u8], max_bytes: usize) -> SvgResult<CurvePath
+     let count = reader.read_len()?;
+     reader.check_collection_len(count, 1)?;
+     let mut definitions = Vec::new();
++    let mut point_depths = Vec::new();
+     // Different distances on one serialized source retain one source owner.
+     // Regularity belongs to each finite range, not to this unbounded recipe.
+     let mut parallel_sources: HashMap<usize, BezierParallel2> = HashMap::new();
+     for _ in 0..count {
++        let mut point_depth = 0;
+         let definition = match reader.read_u8()? {
+             NATIVE_CURVE => Definition::Curve(reader.read_curve()?),
+             SCALAR_PARAMETER => Definition::Parameter(BezierParameter2::Exact(reader.read_real()?)),
+@@ -377,7 +416,38 @@ pub(super) fn decode_path(bytes: &[u8], max_bytes: usize) -> SvgResult<CurvePath
+             | points::PARALLEL_POINT
+             | points::CURVE_ENDPOINT
+             | points::CHORD_SUPPORT
+-            | points::CHORD_RANGE) => points::read_definition(tag, &mut reader, &definitions)?,
++            | points::CHORD_RANGE
++            | points::POLYNOMIAL_FIBER
++            | points::RATIONAL_IMAGE
++            | points::SIMILARITY_POINT
++            | points::SUPPORTING_LINE_POINT
++            | points::CHORD_DISPLACEMENT
++            | points::DISPLACEMENT_POINT) => {
++                let (definition, depth) = points::read_definition(
++                    tag,
++                    &mut reader,
++                    &definitions,
++                    &point_depths,
++                    max_point_depth,
++                )?;
++                point_depth = depth;
++                definition
++            }
++            tag @ (circles::CHORD_NORMAL_CIRCLE
++            | circles::SCALAR_CIRCLE_PARAMETER
++            | circles::CHORD_NORMAL_CONTACT
++            | circles::CIRCLE_RANGE
++            | circles::INCIDENT_CIRCLE_POINT) => {
++                let (definition, depth) = circles::read_definition(
++                    tag,
++                    &mut reader,
++                    &definitions,
++                    &point_depths,
++                    max_point_depth,
++                )?;
++                point_depth = depth;
++                definition
++            }
+             tag => {
+                 return Err(SvgError::Unsupported(format!(
+                     "unknown exact Hypercurve definition tag {tag}"
+@@ -385,6 +455,7 @@ pub(super) fn decode_path(bytes: &[u8], max_bytes: usize) -> SvgResult<CurvePath
+             }
+         };
+         definitions.push(definition);
++        point_depths.push(point_depth);
+     }
+     let count = reader.read_len()?;
+     reader.check_collection_len(count, 4)?;
+diff --git a/crates/hypercurve/src/svg/exact/graph/points.rs b/crates/hypercurve/src/svg/exact/graph/points.rs
+index fc494cc8cf..6c629cc24a 100644
+--- a/crates/hypercurve/src/svg/exact/graph/points.rs
++++ b/crates/hypercurve/src/svg/exact/graph/points.rs
+@@ -10,6 +10,35 @@ pub(super) const PARALLEL_POINT: u8 = 10;
+ pub(super) const CHORD_SUPPORT: u8 = 11;
+ pub(super) const CHORD_RANGE: u8 = 12;
+ pub(super) const CURVE_ENDPOINT: u8 = 13;
++pub(super) const POLYNOMIAL_FIBER: u8 = 14;
++pub(super) const RATIONAL_IMAGE: u8 = 15;
++pub(super) const SIMILARITY_POINT: u8 = 16;
++pub(super) const SUPPORTING_LINE_POINT: u8 = 17;
++pub(super) const CHORD_DISPLACEMENT: u8 = 18;
++pub(super) const DISPLACEMENT_POINT: u8 = 19;
++
++fn depth_overflow() -> SvgError {
++    SvgError::SizeOverflow {
++        limit: "configured exact point-definition depth",
++    }
++}
++
++pub(super) fn check_depth(depth: usize, limit: usize) -> SvgResult<usize> {
++    if depth > limit {
++        Err(depth_overflow())
++    } else {
++        Ok(depth)
++    }
++}
++
++pub(super) fn next_depth(depth: usize, limit: usize) -> SvgResult<usize> {
++    check_depth(depth.checked_add(1).ok_or_else(depth_overflow)?, limit)
++}
++
++enum PointTask {
++    Visit(CurvePoint2, usize),
++    Emit(CurvePoint2, CurvePointDefinition2, Option<(Curve2, bool)>),
++}
+ 
+ impl GraphWriter {
+     fn point_source(&mut self, source: &RationalBezier2) -> SvgResult<u32> {
+@@ -30,16 +59,109 @@ impl GraphWriter {
+         self.parameter(parameter)
+     }
+ 
+-    fn point(&mut self, point: &CurvePoint2) -> SvgResult<u32> {
++    pub(super) fn point(&mut self, point: &CurvePoint2) -> SvgResult<u32> {
++        // Postorder traversal keeps the native dependency DAG shared without
++        // consuming the Rust call stack for every nested point construction.
++        let mut tasks = vec![PointTask::Visit(point.clone(), 0)];
++        let mut active = std::collections::HashSet::new();
++        while let Some(task) = tasks.pop() {
++            match task {
++                PointTask::Visit(point, ancestors) => {
++                    let key = point.replay_storage_key();
++                    if let Some((_, index)) = key.and_then(|key| self.points.get(&key)) {
++                        check_depth(
++                            ancestors
++                                .checked_add(self.point_depths[*index as usize])
++                                .ok_or_else(depth_overflow)?,
++                            self.max_point_depth,
++                        )?;
++                        continue;
++                    }
++                    let definition = point.definition().map_err(SvgError::Exact)?;
++                    let key = key.ok_or_else(|| {
++                        SvgError::Unsupported(
++                            "exact point replay requires an owned definition identity".into(),
++                        )
++                    })?;
++                    if !active.insert(key) {
++                        return Err(malformed("exact point definitions contain a cycle"));
++                    }
++                    let endpoint = point.endpoint_source();
++                    let dependencies = if endpoint.is_some() {
++                        Vec::new()
++                    } else {
++                        match &definition {
++                            CurvePointDefinition2::RationalImage { source, .. }
++                            | CurvePointDefinition2::Similarity { source, .. } => {
++                                vec![source.clone()]
++                            }
++                            CurvePointDefinition2::SupportingLineIntersection { first, second } => {
++                                first.iter().chain(second).cloned().collect()
++                            }
++                            CurvePointDefinition2::ChordDisplacement { source, origin, .. } => {
++                                [source.start(), source.end()]
++                                    .into_iter()
++                                    .chain(origin.iter().cloned())
++                                    .collect()
++                            }
++                            _ => Vec::new(),
++                        }
++                    };
++                    let next = if dependencies.is_empty() {
++                        check_depth(ancestors, self.max_point_depth)?
++                    } else {
++                        next_depth(ancestors, self.max_point_depth)?
++                    };
++                    tasks.push(PointTask::Emit(point, definition, endpoint));
++                    tasks.extend(
++                        dependencies
++                            .into_iter()
++                            .rev()
++                            .map(|point| PointTask::Visit(point, next)),
++                    );
++                }
++                PointTask::Emit(point, definition, endpoint) => {
++                    self.write_point_definition(&point, definition, endpoint)?;
++                    active.remove(&point.replay_storage_key().expect("checked point identity"));
++                }
++            }
++        }
++        self.point_index(point)
++    }
++
++    fn point_index(&self, point: &CurvePoint2) -> SvgResult<u32> {
++        point
++            .replay_storage_key()
++            .and_then(|key| self.points.get(&key))
++            .map(|(_, index)| *index)
++            .ok_or_else(|| malformed("exact point dependency was not emitted"))
++    }
++
++    fn polynomial(&mut self, polynomial: &hypersolve::BivariatePolynomial) -> SvgResult<()> {
++        self.writer.write_len(polynomial.coefficients.len())?;
++        for row in &polynomial.coefficients {
++            self.writer.write_reals(row)?;
++        }
++        Ok(())
++    }
++
++    fn write_point_definition(
++        &mut self,
++        point: &CurvePoint2,
++        definition: CurvePointDefinition2,
++        endpoint: Option<(Curve2, bool)>,
++    ) -> SvgResult<u32> {
+         let key = point.replay_storage_key();
+         if let Some((_, index)) = key.and_then(|key| self.points.get(&key)) {
+             return Ok(*index);
+         }
+-        // Keeping an endpoint reference must not bypass strict point-policy
+-        // validation or turn inherited qualification into an exact claim.
+-        let definition = point.definition().map_err(SvgError::Exact)?;
+-        let index = if let Some((source, start)) = point.endpoint_source() {
++        // The traversal already checked the strict point definition before
++        // retaining any endpoint reference.
++        let mut depth = 0;
++        let index = if let Some((source, start)) = endpoint {
+             let source = self.curve(&source)?;
++            depth = self.point_depths[source as usize];
++            check_depth(depth, self.max_point_depth)?;
+             let index = self.begin(CURVE_ENDPOINT)?;
+             self.writer.write_u32(source)?;
+             self.writer.write_bool(start)?;
+@@ -81,13 +203,109 @@ impl GraphWriter {
+                     self.writer.write_u32(parameter)?;
+                     index
+                 }
+-                _ => {
+-                    return Err(SvgError::Unsupported(
+-                        "exact SVG metadata does not encode this selected point definition".into(),
+-                    ));
++                CurvePointDefinition2::PolynomialFiber {
++                    equation,
++                    parameter,
++                    root,
++                } => {
++                    let parameter = self.parameter(&parameter)?;
++                    let index = self.begin(POLYNOMIAL_FIBER)?;
++                    self.writer.write_u32(parameter)?;
++                    self.polynomial(&equation)?;
++                    self.writer.write_real(&root.lower)?;
++                    self.writer.write_real(&root.upper)?;
++                    self.writer.write_bool(root.exact_root.is_some())?;
++                    if let Some(exact) = root.exact_root {
++                        self.writer.write_real(&exact)?;
++                    }
++                    index
++                }
++                CurvePointDefinition2::RationalImage { source, map } => {
++                    let source = self.point_index(&source)?;
++                    depth = next_depth(self.point_depths[source as usize], self.max_point_depth)?;
++                    let index = self.begin(RATIONAL_IMAGE)?;
++                    self.writer.write_u32(source)?;
++                    for polynomial in map.numerators().iter().chain([map.denominator()]) {
++                        self.polynomial(polynomial)?;
++                    }
++                    index
++                }
++                CurvePointDefinition2::Similarity { source, transform } => {
++                    let source = self.point_index(&source)?;
++                    depth = next_depth(self.point_depths[source as usize], self.max_point_depth)?;
++                    let index = self.begin(SIMILARITY_POINT)?;
++                    self.writer.write_u32(source)?;
++                    let (a, b, d, e, x, y) = transform.affine_components();
++                    for value in [a, b, d, e, x, y] {
++                        self.writer.write_real(value)?;
++                    }
++                    index
++                }
++                CurvePointDefinition2::SupportingLineIntersection { first, second } => {
++                    let references = first
++                        .iter()
++                        .chain(&second)
++                        .map(|point| self.point_index(point))
++                        .collect::<SvgResult<Vec<_>>>()?;
++                    let source_depth = references
++                        .iter()
++                        .map(|index| self.point_depths[*index as usize])
++                        .max()
++                        .unwrap_or(0);
++                    depth = next_depth(source_depth, self.max_point_depth)?;
++                    let index = self.begin(SUPPORTING_LINE_POINT)?;
++                    for reference in references {
++                        self.writer.write_u32(reference)?;
++                    }
++                    index
++                }
++                CurvePointDefinition2::ChordDisplacement {
++                    source,
++                    origin,
++                    at_end,
++                    distance,
++                    translation,
++                    left_normal,
++                } => {
++                    let (_, key) = key.expect("checked displacement identity");
++                    let support = if let Some((_, index)) = self.displacements.get(&key) {
++                        *index
++                    } else {
++                        let source = self.curve(&source)?;
++                        let origin = origin
++                            .as_ref()
++                            .map(|point| self.point_index(point))
++                            .transpose()?;
++                        let source_depth =
++                            origin.map_or(self.point_depths[source as usize], |origin| {
++                                self.point_depths[source as usize]
++                                    .max(self.point_depths[origin as usize])
++                            });
++                        let depth = next_depth(source_depth, self.max_point_depth)?;
++                        let index = self.begin(CHORD_DISPLACEMENT)?;
++                        self.writer.write_u32(source)?;
++                        self.writer.write_bool(origin.is_some())?;
++                        if let Some(origin) = origin {
++                            self.writer.write_u32(origin)?;
++                        }
++                        self.writer.write_real(&distance)?;
++                        for value in translation {
++                            self.writer.write_real(&value)?;
++                        }
++                        self.writer.write_bool(left_normal)?;
++                        self.point_depths[index as usize] = depth;
++                        self.displacements.insert(key, (point.clone(), index));
++                        index
++                    };
++                    depth = self.point_depths[support as usize];
++                    let index = self.begin(DISPLACEMENT_POINT)?;
++                    self.writer.write_u32(support)?;
++                    self.writer.write_bool(at_end)?;
++                    index
+                 }
+             }
+         };
++        self.point_depths[index as usize] = depth;
+         if let Some(key) = key {
+             self.points.insert(key, (point.clone(), index));
+         }
+@@ -118,6 +336,8 @@ impl GraphWriter {
+             Axis2::Y => 1,
+         })?;
+         self.writer.write_bool(increases)?;
++        self.point_depths[index as usize] =
++            self.point_depths[start as usize].max(self.point_depths[end as usize]);
+         self.chords.insert(key, (chord.clone(), index));
+         Ok(index)
+     }
+@@ -143,11 +363,16 @@ impl GraphWriter {
+             Axis2::Y => 1,
+         })?;
+         self.writer.write_bool(increases)?;
++        self.point_depths[index as usize] = [support, start, end]
++            .into_iter()
++            .map(|index| self.point_depths[index as usize])
++            .max()
++            .unwrap_or(0);
+         Ok(index)
+     }
+ }
+ 
+-fn point_reference(definitions: &[Definition], index: usize) -> SvgResult<&CurvePoint2> {
++pub(super) fn point_reference(definitions: &[Definition], index: usize) -> SvgResult<&CurvePoint2> {
+     match definitions.get(index) {
+         Some(Definition::Point(point)) => Ok(point),
+         _ => Err(malformed("exact path has an invalid point reference")),
+@@ -162,20 +387,33 @@ fn read_axis(reader: &mut ExactReader<'_>) -> SvgResult<Axis2> {
+     }
+ }
+ 
++fn read_polynomial(reader: &mut ExactReader<'_>) -> SvgResult<hypersolve::BivariatePolynomial> {
++    let count = reader.read_len()?;
++    reader.check_collection_len(count, 4)?;
++    let coefficients = (0..count)
++        .map(|_| reader.read_reals())
++        .collect::<SvgResult<Vec<_>>>()?;
++    Ok(hypersolve::BivariatePolynomial::new(coefficients))
++}
++
+ pub(super) fn read_definition(
+     tag: u8,
+     reader: &mut ExactReader<'_>,
+     definitions: &[Definition],
+-) -> SvgResult<Definition> {
++    point_depths: &[usize],
++    max_point_depth: usize,
++) -> SvgResult<(Definition, usize)> {
++    let mut depth = 0;
+     let point = match tag {
+         CURVE_ENDPOINT => {
+-            let source = curve_reference(definitions, reader.read_len()?)?;
++            let index = reader.read_len()?;
++            let source = curve_reference(definitions, index)?;
++            depth = check_depth(point_depths[index], max_point_depth)?;
+             let start = reader.read_bool()?;
+-            return Ok(Definition::Point(if start {
+-                source.start()
+-            } else {
+-                source.end()
+-            }));
++            return Ok((
++                Definition::Point(if start { source.start() } else { source.end() }),
++                depth,
++            ));
+         }
+         COORDINATES => CurvePointDefinition2::Coordinates(reader.read_point()?),
+         RATIONAL_POINT => {
+@@ -209,9 +447,121 @@ pub(super) fn read_definition(
+                     .into(),
+             }
+         }
++        POLYNOMIAL_FIBER => {
++            let parameter = parameter_reference(definitions, reader.read_len()?)?.clone();
++            let equation = read_polynomial(reader)?;
++            let lower = reader.read_real()?;
++            let upper = reader.read_real()?;
++            let exact_root = if reader.read_bool()? {
++                Some(reader.read_real()?)
++            } else {
++                None
++            };
++            CurvePointDefinition2::PolynomialFiber {
++                equation,
++                parameter,
++                root: hypersolve::IsolatedRootInterval {
++                    lower,
++                    upper,
++                    exact_root,
++                    // This requests a singleton. The point owner proves it;
++                    // the archive cannot supply a trusted root-count flag.
++                    distinct_root_count: 1,
++                },
++            }
++        }
++        RATIONAL_IMAGE => {
++            let index = reader.read_len()?;
++            let source = point_reference(definitions, index)?.clone();
++            depth = next_depth(point_depths[index], max_point_depth)?;
++            CurvePointDefinition2::RationalImage {
++                source,
++                map: crate::RationalMap2::new(
++                    [read_polynomial(reader)?, read_polynomial(reader)?],
++                    read_polynomial(reader)?,
++                ),
++            }
++        }
++        SIMILARITY_POINT => {
++            let index = reader.read_len()?;
++            let source = point_reference(definitions, index)?.clone();
++            depth = next_depth(point_depths[index], max_point_depth)?;
++            let transform = certified(
++                crate::Similarity2::try_from_real_affine(
++                    reader.read_real()?,
++                    reader.read_real()?,
++                    reader.read_real()?,
++                    reader.read_real()?,
++                    reader.read_real()?,
++                    reader.read_real()?,
++                )
++                .map(Classification::Decided),
++            )?;
++            CurvePointDefinition2::Similarity { source, transform }
++        }
++        SUPPORTING_LINE_POINT => {
++            let mut endpoint = || -> SvgResult<CurvePoint2> {
++                let index = reader.read_len()?;
++                let point = point_reference(definitions, index)?.clone();
++                depth = depth.max(point_depths[index]);
++                Ok(point)
++            };
++            let first = [endpoint()?, endpoint()?];
++            let second = [endpoint()?, endpoint()?];
++            depth = next_depth(depth, max_point_depth)?;
++            CurvePointDefinition2::SupportingLineIntersection { first, second }
++        }
++        CHORD_DISPLACEMENT => {
++            let source_index = reader.read_len()?;
++            let source = curve_reference(definitions, source_index)?.clone();
++            depth = point_depths[source_index];
++            let origin = if reader.read_bool()? {
++                let index = reader.read_len()?;
++                let point = point_reference(definitions, index)?.clone();
++                depth = depth.max(point_depths[index]);
++                Some(point)
++            } else {
++                None
++            };
++            depth = next_depth(depth, max_point_depth)?;
++            let distance = reader.read_real()?;
++            let translation = [reader.read_real()?, reader.read_real()?];
++            let left_normal = reader.read_bool()?;
++            let point = certified(
++                crate::BezierAlgebraicChordParallelPoint2::from_replay_definition(
++                    source,
++                    origin,
++                    false,
++                    distance,
++                    translation,
++                    left_normal,
++                    &CurveContext::STRICT,
++                ),
++            )?;
++            return Ok((Definition::Displacement(point), depth));
++        }
++        DISPLACEMENT_POINT => {
++            let index = reader.read_len()?;
++            let Some(Definition::Displacement(point)) = definitions.get(index) else {
++                return Err(malformed(
++                    "exact point has an invalid displacement reference",
++                ));
++            };
++            let at_end = reader.read_bool()?;
++            return Ok((
++                Definition::Point(point.replay_endpoint(at_end).into()),
++                check_depth(point_depths[index], max_point_depth)?,
++            ));
++        }
+         CHORD_SUPPORT => {
+-            let start = point_reference(definitions, reader.read_len()?)?.clone();
+-            let end = point_reference(definitions, reader.read_len()?)?.clone();
++            let start_index = reader.read_len()?;
++            let start = point_reference(definitions, start_index)?.clone();
++            let end_index = reader.read_len()?;
++            let end = point_reference(definitions, end_index)?.clone();
++            depth = check_depth(
++                point_depths[start_index].max(point_depths[end_index]),
++                max_point_depth,
++            )?;
+             let axis = read_axis(reader)?;
+             let increases = reader.read_bool()?;
+             return certified(BezierAlgebraicChord2::try_from_replay_definition(
+@@ -221,14 +571,23 @@ pub(super) fn read_definition(
+                 increases,
+                 &CurveContext::STRICT,
+             ))
+-            .map(Definition::Chord);
++            .map(|chord| (Definition::Chord(chord), depth));
+         }
+         CHORD_RANGE => {
+-            let Some(Definition::Chord(chord)) = definitions.get(reader.read_len()?) else {
++            let support = reader.read_len()?;
++            let Some(Definition::Chord(chord)) = definitions.get(support) else {
+                 return Err(malformed("exact range has an invalid chord reference"));
+             };
+-            let start = point_reference(definitions, reader.read_len()?)?.clone();
+-            let end = point_reference(definitions, reader.read_len()?)?.clone();
++            let start_index = reader.read_len()?;
++            let start = point_reference(definitions, start_index)?.clone();
++            let end_index = reader.read_len()?;
++            let end = point_reference(definitions, end_index)?.clone();
++            depth = check_depth(
++                point_depths[support]
++                    .max(point_depths[start_index])
++                    .max(point_depths[end_index]),
++                max_point_depth,
++            )?;
+             let axis = read_axis(reader)?;
+             let increases = reader.read_bool()?;
+             return certified(chord.replay_selected_range(
+@@ -238,12 +597,12 @@ pub(super) fn read_definition(
+                 increases,
+                 &CurveContext::STRICT,
+             ))
+-            .map(|chord| Definition::Curve(chord.into()));
++            .map(|chord| (Definition::Curve(chord.into()), depth));
+         }
+         _ => unreachable!("caller selected a point or chord definition tag"),
+     };
+     point
+-        .into_point()
+-        .map(Definition::Point)
++        .into_point_with_checked_sources()
++        .map(|point| (Definition::Point(point), depth))
+         .map_err(SvgError::Exact)
+ }
+diff --git a/crates/hypercurve/tests/hypercurve_svg.rs b/crates/hypercurve/tests/hypercurve_svg.rs
+index 0af31ff746..2a26fa2a95 100644
+--- a/crates/hypercurve/tests/hypercurve_svg.rs
++++ b/crates/hypercurve/tests/hypercurve_svg.rs
+@@ -581,6 +581,7 @@ fn options_bound_import_sampling_and_export_projection() {
+         curve_tolerance: 0.000_001,
+         max_curve_segments: 8,
+         max_extension_bytes: 4096,
++        ..SvgOptions::default()
+     };
+     assert!(matches!(
+         import_svg_document_with_options(
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 920cb5d6b4..6717cfea81 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -92,6 +92,26 @@ remain an open migration target.
+ 
+ These changes alter represented sets, coordinates, file lengths or checksums.
+ 
++- **Selected-point graph replay (2026-10-27).** Version 4 metadata adds
++  polynomial-fiber, rational-image, similarity, supporting-line-intersection
++  and shared chord-displacement point records (tags 14–19). Existing version 3
++  and version 4 records remain
++  readable; older readers reject the new tags. Authored version 3 encoding is
++  unchanged. Shared rational-map prefixes are encoded once per path. Check
++  geometric equality separately when updating deterministic output expectations.
++  `SvgOptions` adds `max_point_definition_depth` with default 256; complete Rust
++  struct literals must set it or use `..SvgOptions::default()`. The new
++  `CurvePointDefinition2::ChordDisplacement` variant requires exhaustive enum
++  matches to add an arm. Zero allows leaf
++  point definitions. The limit counts map, similarity, displacement and
++  intersection nesting
++  in the input graph, including dependencies reached through curve endpoints,
++  even when a constructor can simplify the resulting point. It does not bound
++  total arithmetic work, coefficient growth, heap use or cancellation.
++  Hyperbrep native planar-point archives also add `ChordDisplacement`, replaying
++  it through Hypercurve after counting its source and optional origin records.
++  Older readers reject this new variant; existing archive variants keep their
++  format. Hyperbrep retains its existing nested point syntax and archive budgets.
+ - **Selected-chord SVG replay (2026-10-27).** Version 4 native path metadata
+   gains point, supporting-chord, selected-range and curve-endpoint records
+   (tags 7–13). Repeated retained curves may share one definition, changing
