@@ -1,0 +1,292 @@
+diff --git a/crates/hypersolve/src/recursive_quadratic_field.rs b/crates/hypersolve/src/recursive_quadratic_field.rs
+index 03afb03bd6..f88dd3013a 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field.rs
+@@ -20,7 +20,9 @@ use crate::tensor_support::*;
+ use crate::*;
+ 
+ mod polynomial;
+-pub use polynomial::evaluate_bivariate_homogeneous_polynomial;
++pub use polynomial::{
++    compose_bivariate_homogeneous_polynomial, evaluate_bivariate_homogeneous_polynomial,
++};
+ 
+ /// One exact coefficient field retained by recursively composed line/circle
+ /// contacts.  The base is the existing dense selected-root/two-speed-radical
+diff --git a/crates/hypersolve/src/recursive_quadratic_field/polynomial.rs b/crates/hypersolve/src/recursive_quadratic_field/polynomial.rs
+index 0cd6fd31a5..61b9025c22 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field/polynomial.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field/polynomial.rs
+@@ -44,3 +44,74 @@ pub fn evaluate_bivariate_homogeneous_polynomial(
+     }
+     Some(result)
+ }
++
++/// Substitutes polynomial homogeneous coordinates into a bivariate equation.
++///
++/// The returned ascending coefficients represent
++/// `W(t)^degree * P(X(t)/W(t), Y(t)/W(t))`. Every coefficient retains the same
++/// selected field as the input coordinates; no global algebraic projection or
++/// independently selected coordinate is constructed. `degree` may exceed the
++/// active total degree of `P` when several equations need a common degree.
++///
++/// All three coordinate polynomials must be nonempty and use one field.
++/// `None` reports incompatible fields, insufficient degree, or unavailable
++/// checked arithmetic/storage. This is polynomial construction only: it does
++/// not prove `W` nonzero, cancel homogeneous factors, extend a source domain,
++/// or select a real branch of the equation. Those guards remain with callers.
++pub fn compose_bivariate_homogeneous_polynomial(
++    polynomial: &BivariatePolynomial,
++    x: &[RecursiveQuadraticValue],
++    y: &[RecursiveQuadraticValue],
++    w: &[RecursiveQuadraticValue],
++    degree: usize,
++) -> Option<Vec<RecursiveQuadraticValue>> {
++    let count = degree.checked_add(1)?;
++    let field = w.first()?.field();
++    if x.is_empty()
++        || y.is_empty()
++        || x.iter()
++            .chain(y)
++            .chain(w)
++            .any(|value| !field.same_field(&value.field()))
++    {
++        return None;
++    }
++    for (i, row) in polynomial.coefficients.iter().enumerate() {
++        for (j, coefficient) in row.iter().enumerate() {
++            if !coefficient.definitely_zero() && i.checked_add(j)? > degree {
++                return None;
++            }
++        }
++    }
++    let powers = |coordinate: &[RecursiveQuadraticValue]| {
++        let mut powers = Vec::new();
++        powers.try_reserve_exact(count).ok()?;
++        powers.push(vec![field.constant(Real::one())?]);
++        for i in 0..degree {
++            powers.push(recursive_quadratic_polynomial_multiply(
++                &powers[i], coordinate,
++            )?);
++        }
++        Some(powers)
++    };
++    let xs = powers(x)?;
++    let ys = powers(y)?;
++    let ws = powers(w)?;
++    let mut result = vec![field.constant(Real::zero())?];
++    for (i, row) in polynomial.coefficients.iter().enumerate() {
++        for (j, coefficient) in row.iter().enumerate() {
++            if coefficient.definitely_zero() {
++                continue;
++            }
++            let k = degree.checked_sub(i.checked_add(j)?)?;
++            let product = recursive_quadratic_polynomial_multiply(xs.get(i)?, ys.get(j)?)?;
++            let product = recursive_quadratic_polynomial_multiply(&product, &ws[k])?;
++            let term = product
++                .iter()
++                .map(|value| value.scale(coefficient))
++                .collect::<Option<Vec<_>>>()?;
++            result = recursive_quadratic_polynomial_combine(&result, &term, false)?;
++        }
++    }
++    Some(result)
++}
+diff --git a/crates/hypersolve/tests/recursive_polynomial_substitution.rs b/crates/hypersolve/tests/recursive_polynomial_substitution.rs
+new file mode 100644
+index 0000000000..62446465f9
+--- /dev/null
++++ b/crates/hypersolve/tests/recursive_polynomial_substitution.rs
+@@ -0,0 +1,192 @@
++//! Polynomial equations on rational charts over retained algebraic fields.
++//! Expectations use explicit coefficients and the independent relation a^3=2.
++
++#[path = "support/recursive_quadratic.rs"]
++#[allow(dead_code)]
++mod support;
++
++use hyperreal::{Real, RealSign};
++use hypersolve::BivariatePolynomial;
++use hypersolve::classification::Classification;
++use hypersolve::recursive_quadratic_field::*;
++use support::*;
++
++fn cubic_field() -> RecursiveQuadraticField {
++    RecursiveQuadraticField::base(
++        vec![cube_root_two()],
++        constant_tensor(1, real(1)),
++        constant_tensor(1, real(1)),
++    )
++    .unwrap()
++}
++
++fn in_cubic(field: &RecursiveQuadraticField, coefficients: &[Real]) -> RecursiveQuadraticValue {
++    axis_value(field, coefficients, &[real(0)], &[real(0)], &[real(0)]).unwrap()
++}
++
++fn assert_same(actual: &RecursiveQuadraticValue, expected: &RecursiveQuadraticValue) {
++    assert!(actual.field().same_field(&expected.field()));
++    assert_eq!(
++        actual
++            .subtract(expected)
++            .unwrap()
++            .sign(&TestContext::strict())
++            .unwrap(),
++        Classification::Decided(RealSign::Zero)
++    );
++}
++
++#[test]
++fn recursive_field_circle_substitution_keeps_cubic_center_relation() {
++    let field = cubic_field();
++    let a = in_cubic(&field, &[real(0), real(1)]);
++    let r = fraction(1, 64);
++    let r2 = &r * &r;
++    let r3 = &r2 * &r;
++    // q=(a,1) lies on y^2-x^3+1=0. The rational circle chart is
++    // x=a+r(1-t^2)/(1+t^2), y=1+2rt/(1+t^2).
++    let x = vec![
++        a.add(&field.constant(r.clone()).unwrap()).unwrap(),
++        field.constant(real(0)).unwrap(),
++        a.subtract(&field.constant(r.clone()).unwrap()).unwrap(),
++    ];
++    let y = vec![
++        field.constant(real(1)).unwrap(),
++        field.constant(real(2) * &r).unwrap(),
++        field.constant(real(1)).unwrap(),
++    ];
++    let w = vec![
++        field.constant(real(1)).unwrap(),
++        field.constant(real(0)).unwrap(),
++        field.constant(real(1)).unwrap(),
++    ];
++    let equation = BivariatePolynomial::new(vec![
++        vec![real(1), real(0), real(1)],
++        vec![],
++        vec![],
++        vec![real(-1)],
++    ]);
++    let actual = compose_bivariate_homogeneous_polynomial(&equation, &x, &y, &w, 3).unwrap();
++    // Expansion of Y^2 W - X^3 + W^3, reduced only by a^3=2.
++    let expected = [
++        vec![-r3.clone(), -real(3) * &r2, -real(3) * &r],
++        vec![real(4) * &r],
++        vec![real(4) * &r2 + real(3) * &r3, real(3) * &r2, -real(3) * &r],
++        vec![real(8) * &r],
++        vec![real(4) * &r2 - real(3) * &r3, real(3) * &r2, real(3) * &r],
++        vec![real(4) * &r],
++        vec![r3, -real(3) * r2, real(3) * r],
++    ];
++    assert_eq!(actual.len(), expected.len());
++    for (actual, expected) in actual.iter().zip(&expected) {
++        assert_same(actual, &in_cubic(&field, expected));
++    }
++    // The new polynomial is itself consumed by exact retained-field algebra.
++    // Reversing the circle chart t -> -t changes precisely the odd terms.
++    let reversed_y = vec![y[0].clone(), y[1].scale(&real(-1)).unwrap(), y[2].clone()];
++    let reversed =
++        compose_bivariate_homogeneous_polynomial(&equation, &x, &reversed_y, &w, 3).unwrap();
++    for (index, (forward, backward)) in actual.iter().zip(&reversed).enumerate() {
++        assert_same(
++            backward,
++            &forward
++                .scale(&real(if index % 2 == 0 { 1 } else { -1 }))
++                .unwrap(),
++        );
++    }
++}
++
++#[test]
++fn recursive_field_substitution_has_no_fixed_polynomial_degree_limit() {
++    let field = cubic_field();
++    let one = field.constant(real(1)).unwrap();
++    let x = vec![in_cubic(&field, &[real(0), real(1)]), one.clone()];
++    let y = vec![one.clone(), field.constant(real(-1)).unwrap()];
++    let mut rows = vec![vec![real(-3), real(0), real(1)]];
++    rows.resize(38, Vec::new());
++    rows[37] = vec![real(1)];
++    let equation = BivariatePolynomial::new(rows);
++    let actual =
++        compose_bivariate_homogeneous_polynomial(&equation, &x, &y, std::slice::from_ref(&one), 37)
++            .unwrap();
++    assert_eq!(actual.len(), 38);
++    let mut binomial = 1_i64;
++    for (k, coefficient) in actual.iter().enumerate() {
++        let exponent = 37 - k;
++        let mut expected = vec![real(0); 3];
++        expected[exponent % 3] = Real::from(binomial * (1_i64 << (exponent / 3)));
++        // (1-t)^2-3 contributes -2-2t+t^2 independently.
++        expected[0] += Real::from(match k {
++            0 | 1 => -2,
++            2 => 1,
++            _ => 0,
++        });
++        assert_same(coefficient, &in_cubic(&field, &expected));
++        if k < 37 {
++            binomial = binomial * (37 - k as i64) / (k as i64 + 1);
++        }
++    }
++}
++
++#[test]
++fn recursive_field_substitution_preserves_homogeneous_factors_and_refuses_invalid_inputs() {
++    let field = cubic_field();
++    let one = field.constant(real(1)).unwrap();
++    let zero = field.constant(real(0)).unwrap();
++    let equation = BivariatePolynomial::new(vec![vec![real(0), real(1)], vec![real(1)]]);
++    // At degree two, P=x+y becomes XW+YW. With X=Y=1,W=t
++    // the factor t must remain; composition does not extend a rational chart
++    // to the excluded denominator zero or cancel its authored guard.
++    let output = compose_bivariate_homogeneous_polynomial(
++        &equation,
++        std::slice::from_ref(&one),
++        std::slice::from_ref(&one),
++        &[zero.clone(), one.clone()],
++        2,
++    )
++    .unwrap();
++    assert_eq!(output.len(), 2);
++    assert_same(&output[0], &zero);
++    assert_same(&output[1], &field.constant(real(2)).unwrap());
++    for empty_axis in 0..3 {
++        let mut inputs = [vec![one.clone()], vec![one.clone()], vec![one.clone()]];
++        inputs[empty_axis].clear();
++        assert!(
++            compose_bivariate_homogeneous_polynomial(
++                &equation, &inputs[0], &inputs[1], &inputs[2], 2
++            )
++            .is_none()
++        );
++    }
++    assert!(
++        compose_bivariate_homogeneous_polynomial(
++            &equation,
++            std::slice::from_ref(&one),
++            std::slice::from_ref(&one),
++            std::slice::from_ref(&one),
++            0
++        )
++        .is_none()
++    );
++    assert!(
++        compose_bivariate_homogeneous_polynomial(
++            &equation,
++            std::slice::from_ref(&one),
++            std::slice::from_ref(&one),
++            std::slice::from_ref(&one),
++            usize::MAX
++        )
++        .is_none()
++    );
++    let foreign = cubic_field().constant(real(1)).unwrap();
++    assert!(
++        compose_bivariate_homogeneous_polynomial(
++            &equation,
++            std::slice::from_ref(&one),
++            std::slice::from_ref(&foreign),
++            std::slice::from_ref(&one),
++            2
++        )
++        .is_none()
++    );
++}
