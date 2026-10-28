@@ -1,0 +1,832 @@
+//! Rational queries dispatch through the original joint point authority.
+
+use super::*;
+use hypersolve::bivariate_arithmetic::{
+    bivariate_add, bivariate_compose, bivariate_multiply, bivariate_scale, bivariate_subtract,
+};
+
+#[derive(Clone, Debug)]
+pub(crate) struct PointFormSource2 {
+    pub(crate) source: CurvePoint2,
+    pub(crate) numerator: BivariatePolynomial,
+    pub(crate) denominator: BivariatePolynomial,
+}
+
+impl PointFormSource2 {
+    pub(crate) fn new(
+        source: CurvePoint2,
+        numerator: BivariatePolynomial,
+        denominator: BivariatePolynomial,
+    ) -> Self {
+        Self {
+            source,
+            numerator,
+            denominator,
+        }
+    }
+}
+
+/// A similarity transports a joint point field without separating its
+/// coordinates. This is only a dispatch hint; the queried determinant still
+/// validates the retained maps, guards and policy in that field.
+pub(crate) fn point_retains_joint_field(point: &CurvePoint2) -> bool {
+    match &point.0 {
+        CurvePointData2::Polynomial(_) | CurvePointData2::RationalImage(_) => true,
+        CurvePointData2::Similarity(image) => point_retains_joint_field(&image.data.source),
+        _ => false,
+    }
+}
+
+/// Aligns source-bound queries using their retained coordinate maps. The
+/// caller keeps the original immutable inputs and denominator guards; these
+/// pulled-back forms are temporary predicate views, not replacement points.
+pub(crate) fn common_point_form_sources(
+    mut first: PointFormSource2,
+    mut second: PointFormSource2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<[PointFormSource2; 2]>> {
+    if first.source.shares_storage(&second.source) || first.source == second.source {
+        return Ok(Classification::Decided([first, second]));
+    }
+    for form in [&mut first, &mut second] {
+        *form = match point_form_source(&form.source, &form.numerator, &form.denominator, policy)? {
+            Classification::Decided(form) => form,
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        };
+        if let Some(point) = form.source.coordinates() {
+            form.numerator = BivariatePolynomial::new(vec![vec![bivariate_evaluate_exact(
+                &form.numerator,
+                point.x(),
+                point.y(),
+            )]]);
+            form.denominator = BivariatePolynomial::new(vec![vec![bivariate_evaluate_exact(
+                &form.denominator,
+                point.x(),
+                point.y(),
+            )]]);
+        }
+    }
+    let constant = |polynomial: &BivariatePolynomial| {
+        polynomial.coefficients.iter().enumerate().all(|(i, row)| {
+            row.iter()
+                .enumerate()
+                .all(|(j, coefficient)| (i == 0 && j == 0) || coefficient.definitely_zero())
+        })
+    };
+    if constant(&first.numerator) && constant(&first.denominator) {
+        first.source = second.source.clone();
+    } else if constant(&second.numerator) && constant(&second.denominator) {
+        second.source = first.source.clone();
+    }
+    Ok(match first.source.same_point(&second.source, policy) {
+        Classification::Decided(true) => Classification::Decided([first, second]),
+        Classification::Decided(false) => Classification::Uncertain(UncertaintyReason::Unsupported),
+        Classification::Uncertain(reason) => Classification::Uncertain(reason),
+    })
+}
+
+fn point_form_difference(
+    first: PointFormSource2,
+    second: PointFormSource2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<PointFormSource2>> {
+    Ok(
+        common_point_form_sources(first, second, policy)?.map(|[first, second]| {
+            let (numerator, denominator) = if first.denominator == second.denominator {
+                (
+                    bivariate_subtract(&first.numerator, &second.numerator),
+                    first.denominator,
+                )
+            } else {
+                (
+                    bivariate_subtract(
+                        &bivariate_multiply(&first.numerator, &second.denominator),
+                        &bivariate_multiply(&second.numerator, &first.denominator),
+                    ),
+                    bivariate_multiply(&first.denominator, &second.denominator),
+                )
+            };
+            PointFormSource2::new(first.source, numerator, denominator)
+        }),
+    )
+}
+
+/// Recovers a represented displacement when common-field cancellation makes
+/// both differences constant. This never materializes the original coordinates
+/// or substitutes an enclosure for a nonconstant selected value.
+pub(super) fn common_point_constant_displacement(
+    first: &CurvePoint2,
+    second: &CurvePoint2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<Option<(Real, Real)>>> {
+    let mut values = [Real::zero(), Real::zero()];
+    for (value, numerator) in values.iter_mut().zip([
+        BivariatePolynomial::new(vec![vec![Real::zero()], vec![Real::one()]]),
+        BivariatePolynomial::new(vec![vec![Real::zero(), Real::one()]]),
+    ]) {
+        let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+        let difference = match point_form_difference(
+            PointFormSource2::new(first.clone(), numerator.clone(), one.clone()),
+            PointFormSource2::new(second.clone(), numerator, one),
+            policy,
+        )? {
+            Classification::Decided(form) => form,
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        };
+        let constant = |polynomial: &BivariatePolynomial| {
+            polynomial
+                .coefficients
+                .iter()
+                .enumerate()
+                .all(|(i, row)| {
+                    row.iter()
+                        .enumerate()
+                        .all(|(j, coefficient)| (i == 0 && j == 0) || coefficient.definitely_zero())
+                })
+                .then(|| {
+                    polynomial
+                        .coefficients
+                        .first()
+                        .and_then(|row| row.first())
+                        .cloned()
+                        .unwrap_or_else(Real::zero)
+                })
+        };
+        let (Some(numerator), Some(denominator)) = (
+            constant(&difference.numerator),
+            constant(&difference.denominator),
+        ) else {
+            return Ok(Classification::Decided(None));
+        };
+        if let Classification::Uncertain(reason) =
+            point_rational_denominator_sign(&difference.source, &difference.denominator, policy)?
+        {
+            return Ok(Classification::Uncertain(reason));
+        }
+        *value = (numerator / denominator)?;
+    }
+    let [x, y] = values;
+    Ok(Classification::Decided(Some((x, y))))
+}
+
+/// Compares a linear projection before separating correlated point coordinates.
+pub(super) fn common_point_linear_order(
+    first: &CurvePoint2,
+    second: &CurvePoint2,
+    a: &Real,
+    b: &Real,
+    policy: &CurveContext,
+) -> CurveResult<Classification<std::cmp::Ordering>> {
+    let numerator = BivariatePolynomial::new(vec![vec![Real::zero(), b.clone()], vec![a.clone()]]);
+    let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+    let form = match point_form_difference(
+        PointFormSource2::new(first.clone(), numerator.clone(), one.clone()),
+        PointFormSource2::new(second.clone(), numerator, one),
+        policy,
+    )? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    Ok(
+        point_rational_form_sign(&form.source, &form.numerator, &form.denominator, policy)?.map(
+            |sign| match sign {
+                RealSign::Negative => std::cmp::Ordering::Less,
+                RealSign::Zero => std::cmp::Ordering::Equal,
+                RealSign::Positive => std::cmp::Ordering::Greater,
+            },
+        ),
+    )
+}
+
+/// Retains both coordinates of P-C in one shared query field. The caller
+/// keeps the original point and center, including their denominator guards.
+pub(super) fn common_point_displacement(
+    point: &CurvePoint2,
+    center: &CurvePoint2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<[PointFormSource2; 2]>> {
+    let coordinate_difference = |numerator: BivariatePolynomial| {
+        let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+        point_form_difference(
+            PointFormSource2::new(point.clone(), numerator.clone(), one.clone()),
+            PointFormSource2::new(center.clone(), numerator, one),
+            policy,
+        )
+    };
+    let dx = match coordinate_difference(BivariatePolynomial::new(vec![
+        vec![Real::zero()],
+        vec![Real::one()],
+    ]))? {
+        Classification::Decided(value) => value,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let dy = match coordinate_difference(BivariatePolynomial::new(vec![vec![
+        Real::zero(),
+        Real::one(),
+    ]]))? {
+        Classification::Decided(value) => value,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    common_point_form_sources(dx, dy, policy)
+}
+
+/// Intersects a line with a fixed coordinate in the endpoints' shared field.
+/// The caller owns the finite placement on the line's injective axis. Original
+/// coordinate denominators remain guards even when division moves a factor
+/// into a numerator.
+pub(super) fn common_point_line_at_coordinate(
+    start: &CurvePoint2,
+    end: &CurvePoint2,
+    axis: Axis2,
+    coordinate: &Real,
+    policy: &CurveContext,
+) -> CurveResult<Classification<CurvePoint2>> {
+    let [dx, dy] = match common_point_displacement(end, start, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let (direction, other_direction, axis_polynomial, other_polynomial) = match axis {
+        Axis2::X => (
+            dx,
+            dy,
+            BivariatePolynomial::new(vec![vec![-coordinate], vec![Real::one()]]),
+            BivariatePolynomial::new(vec![vec![Real::zero(), Real::one()]]),
+        ),
+        Axis2::Y => (
+            dy,
+            dx,
+            BivariatePolynomial::new(vec![vec![-coordinate, Real::one()]]),
+            BivariatePolynomial::new(vec![vec![Real::zero()], vec![Real::one()]]),
+        ),
+    };
+    match point_rational_form_sign(
+        &direction.source,
+        &direction.numerator,
+        &direction.denominator,
+        policy,
+    )? {
+        Classification::Decided(RealSign::Positive | RealSign::Negative) => {}
+        Classification::Decided(RealSign::Zero) => {
+            return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+        }
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    }
+    let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+    let axis_difference = match point_form_source(start, &axis_polynomial, &one, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let [axis_difference, other_direction] =
+        match common_point_form_sources(axis_difference, other_direction, policy)? {
+            Classification::Decided(forms) => forms,
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        };
+    let product = PointFormSource2::new(
+        axis_difference.source,
+        bivariate_multiply(&axis_difference.numerator, &other_direction.numerator),
+        bivariate_multiply(&axis_difference.denominator, &other_direction.denominator),
+    );
+    let [product, direction] = match common_point_form_sources(product, direction, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let quotient = PointFormSource2::new(
+        product.source,
+        bivariate_multiply(
+            &bivariate_multiply(&product.numerator, &direction.denominator),
+            &direction.denominator,
+        ),
+        bivariate_multiply(
+            &bivariate_multiply(&product.denominator, &direction.numerator),
+            &direction.denominator,
+        ),
+    );
+    let other = match point_form_difference(
+        PointFormSource2::new(start.clone(), other_polynomial, one),
+        quotient,
+        policy,
+    )? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let fixed = bivariate_scale(other.denominator.clone(), coordinate);
+    let numerators = match axis {
+        Axis2::X => [fixed, other.numerator],
+        Axis2::Y => [other.numerator, fixed],
+    };
+    crate::ExactCurveError::classify_result(other.source.rational_image_with_policy(
+        &crate::RationalMap2::new(numerators, other.denominator),
+        policy,
+    ))
+}
+
+/// A linear query of two already aligned field coordinates. Keep a shared
+/// denominator instead of multiplying it into itself on every angular query.
+pub(super) fn point_form_linear_combination(
+    [x, y]: &[PointFormSource2; 2],
+    a: &Real,
+    b: &Real,
+) -> PointFormSource2 {
+    let (numerator, denominator) = if x.denominator == y.denominator {
+        (
+            bivariate_add(
+                &bivariate_scale(x.numerator.clone(), a),
+                &bivariate_scale(y.numerator.clone(), b),
+            ),
+            x.denominator.clone(),
+        )
+    } else {
+        (
+            bivariate_add(
+                &bivariate_scale(bivariate_multiply(&x.numerator, &y.denominator), a),
+                &bivariate_scale(bivariate_multiply(&y.numerator, &x.denominator), b),
+            ),
+            bivariate_multiply(&x.denominator, &y.denominator),
+        )
+    };
+    PointFormSource2::new(x.source.clone(), numerator, denominator)
+}
+
+fn point_form_product(
+    first: PointFormSource2,
+    second: PointFormSource2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<PointFormSource2>> {
+    Ok(
+        common_point_form_sources(first, second, policy)?.map(|[first, second]| {
+            PointFormSource2::new(
+                first.source,
+                bivariate_multiply(&first.numerator, &second.numerator),
+                bivariate_multiply(&first.denominator, &second.denominator),
+            )
+        }),
+    )
+}
+
+fn point_form_dot(
+    first: &[PointFormSource2; 2],
+    second: &[PointFormSource2; 2],
+    policy: &CurveContext,
+) -> CurveResult<Classification<PointFormSource2>> {
+    let mut products = Vec::with_capacity(2);
+    for (first, second) in first.iter().zip(second) {
+        match point_form_product(first.clone(), second.clone(), policy)? {
+            Classification::Decided(product) => products.push(product),
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        }
+    }
+    let [x, y] = products.try_into().expect("two vector components");
+    Ok(common_point_form_sources(x, y, policy)?
+        .map(|forms| point_form_linear_combination(&forms, &Real::one(), &Real::one())))
+}
+
+/// Given an incident point A, the second contact on direction D is
+/// A - 2 ((A-C).D) D / (D.D). No new root or coordinate projection is needed.
+/// The dot sign also gives tangency and the two opposite transverse signs.
+pub(super) fn common_point_circle_second_line_contact(
+    incident: &CurvePoint2,
+    center: &CurvePoint2,
+    start: &CurvePoint2,
+    end: &CurvePoint2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<(CurvePoint2, RealSign)>> {
+    let radial = match common_point_displacement(incident, center, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let direction = match common_point_displacement(end, start, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let norm = match point_form_dot(&direction, &direction, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    match point_rational_form_sign(&norm.source, &norm.numerator, &norm.denominator, policy)? {
+        Classification::Decided(RealSign::Positive) => {}
+        Classification::Decided(_) => {
+            return Err(CurveError::Topology(
+                "a circle contact line must have positive squared direction".into(),
+            ));
+        }
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    }
+    let dot = match point_form_dot(&radial, &direction, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let sign =
+        match point_rational_form_sign(&dot.source, &dot.numerator, &dot.denominator, policy)? {
+            Classification::Decided(RealSign::Zero) => {
+                return Ok(Classification::Decided((incident.clone(), RealSign::Zero)));
+            }
+            Classification::Decided(sign) => sign,
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        };
+    let [dot, norm] = match common_point_form_sources(dot, norm, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    // Division moves the norm denominator upstairs. Keep it as an original
+    // nonzero guard as well, including after native replay of the final map.
+    let scale = PointFormSource2::new(
+        dot.source,
+        bivariate_scale(
+            bivariate_multiply(
+                &bivariate_multiply(&dot.numerator, &norm.denominator),
+                &norm.denominator,
+            ),
+            &Real::from(2),
+        ),
+        bivariate_multiply(
+            &bivariate_multiply(&dot.denominator, &norm.numerator),
+            &norm.denominator,
+        ),
+    );
+    let coordinates = [
+        BivariatePolynomial::new(vec![vec![Real::zero()], vec![Real::one()]]),
+        BivariatePolynomial::new(vec![vec![Real::zero(), Real::one()]]),
+    ];
+    let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+    let mut result = Vec::with_capacity(2);
+    for (direction, coordinate) in direction.into_iter().zip(coordinates) {
+        let delta = match point_form_product(scale.clone(), direction, policy)? {
+            Classification::Decided(form) => form,
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        };
+        match point_form_difference(
+            PointFormSource2::new(incident.clone(), coordinate, one.clone()),
+            delta,
+            policy,
+        )? {
+            Classification::Decided(form) => result.push(form),
+            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+        }
+    }
+    let [x, y] = result.try_into().expect("two contact coordinates");
+    let [x, y] = match common_point_form_sources(x, y, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let (numerators, denominator) = if x.denominator == y.denominator {
+        ([x.numerator, y.numerator], x.denominator)
+    } else {
+        (
+            [
+                bivariate_multiply(&x.numerator, &y.denominator),
+                bivariate_multiply(&y.numerator, &x.denominator),
+            ],
+            bivariate_multiply(&x.denominator, &y.denominator),
+        )
+    };
+    Ok(crate::ExactCurveError::classify_result(
+        x.source
+            .rational_image_with_policy(&crate::RationalMap2::new(numerators, denominator), policy),
+    )?
+    .map(|point| (point, sign)))
+}
+
+/// Signs |P-C|^2-r^2 in one certified common coordinate field. The squared
+/// denominator is positive only after both original difference denominators
+/// have been proved nonzero under the consuming policy.
+pub(super) fn common_point_circle_residual_sign(
+    point: &CurvePoint2,
+    center: &CurvePoint2,
+    radius_squared: &Real,
+    policy: &CurveContext,
+) -> CurveResult<Classification<RealSign>> {
+    let [dx, dy] = match common_point_displacement(point, center, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    for form in [&dx, &dy] {
+        if let Classification::Uncertain(reason) =
+            point_rational_denominator_sign(&form.source, &form.denominator, policy)?
+        {
+            return Ok(Classification::Uncertain(reason));
+        }
+    }
+    let (x, y, denominator) = if dx.denominator == dy.denominator {
+        (dx.numerator, dy.numerator, dx.denominator)
+    } else {
+        (
+            bivariate_multiply(&dx.numerator, &dy.denominator),
+            bivariate_multiply(&dy.numerator, &dx.denominator),
+            bivariate_multiply(&dx.denominator, &dy.denominator),
+        )
+    };
+    let residual = bivariate_subtract(
+        &bivariate_add(&bivariate_multiply(&x, &x), &bivariate_multiply(&y, &y)),
+        &bivariate_scale(
+            bivariate_multiply(&denominator, &denominator),
+            radius_squared,
+        ),
+    );
+    point_polynomial_sign(&dx.source, &residual, policy)
+}
+
+/// Signs the oriented area of three points in their retained common field.
+/// Each original coordinate denominator remains a guard of the determinant.
+pub(super) fn common_point_oriented_side(
+    start: &CurvePoint2,
+    end: &CurvePoint2,
+    point: &CurvePoint2,
+    policy: &CurveContext,
+) -> CurveResult<Classification<crate::classify::LineSide>> {
+    let [ux, uy] = match common_point_displacement(end, start, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let [vx, vy] = match common_point_displacement(point, start, policy)? {
+        Classification::Decided(forms) => forms,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let first = match point_form_product(ux, vy, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let second = match point_form_product(uy, vx, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let determinant = match point_form_difference(first, second, policy)? {
+        Classification::Decided(form) => form,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    Ok(point_rational_form_sign(
+        &determinant.source,
+        &determinant.numerator,
+        &determinant.denominator,
+        policy,
+    )?
+    .map(|sign| match sign {
+        RealSign::Negative => crate::classify::LineSide::Right,
+        RealSign::Zero => crate::classify::LineSide::On,
+        RealSign::Positive => crate::classify::LineSide::Left,
+    }))
+}
+
+/// Pulls a query into its original coordinate field. The public form retains
+/// its original operands/guards; this is not a replacement point definition.
+pub(crate) fn point_form_source(
+    source: &CurvePoint2,
+    numerator: &BivariatePolynomial,
+    denominator: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<PointFormSource2>> {
+    match &source.0 {
+        CurvePointData2::RationalImage(image) => {
+            match image.pullback(numerator, denominator, policy)? {
+                Classification::Decided((numerator, denominator)) => {
+                    point_form_source(&image.source, &numerator, &denominator, policy)
+                }
+                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+            }
+        }
+        CurvePointData2::Polynomial(point) => {
+            Ok(match point.source_query(numerator, denominator) {
+                Some(query) => Classification::Decided(query),
+                None => Classification::Uncertain(UncertaintyReason::Unsupported),
+            })
+        }
+        CurvePointData2::Algebraic(image) => {
+            image.rational_query_source(numerator, denominator, policy)
+        }
+        CurvePointData2::Similarity(image) => {
+            if !policy.accepts_retained_policy(image.data.policy) {
+                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+            }
+            point_form_source(
+                &image.data.source,
+                &pullback(numerator, &image.data.transform),
+                &pullback(denominator, &image.data.transform),
+                policy,
+            )
+        }
+        CurvePointData2::Endpoint(endpoint) => match endpoint.resolve(policy)? {
+            Classification::Decided(Some(point)) => {
+                point_form_source(&point, numerator, denominator, policy)
+            }
+            Classification::Decided(None) => {
+                Ok(Classification::Uncertain(UncertaintyReason::Unsupported))
+            }
+            Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+        },
+        _ => Ok(Classification::Decided(PointFormSource2::new(
+            source.clone(),
+            numerator.clone(),
+            denominator.clone(),
+        ))),
+    }
+}
+
+pub(crate) fn point_rational_denominator_sign(
+    source: &CurvePoint2,
+    denominator: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<RealSign>> {
+    match point_polynomial_sign(source, denominator, policy)? {
+        Classification::Decided(RealSign::Zero) => Err(CurveError::ZeroRationalPointDenominator),
+        sign => Ok(sign),
+    }
+}
+
+pub(crate) fn point_rational_form_sign(
+    source: &CurvePoint2,
+    numerator: &BivariatePolynomial,
+    denominator: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<RealSign>> {
+    let denominator = match point_rational_denominator_sign(source, denominator, policy)? {
+        Classification::Decided(sign) => sign,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    Ok(point_polynomial_sign(source, numerator, policy)?
+        .map(|sign| product_sign(sign, denominator)))
+}
+
+fn point_polynomial_sign(
+    source: &CurvePoint2,
+    polynomial: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<RealSign>> {
+    match &source.0 {
+        CurvePointData2::RationalImage(image) => {
+            let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+            match image.pullback(polynomial, &one, policy)? {
+                Classification::Decided((numerator, denominator)) => {
+                    point_rational_form_sign(&image.source, &numerator, &denominator, policy)
+                }
+                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+            }
+        }
+        CurvePointData2::Exact(point) => Ok(real_sign(
+            &bivariate_evaluate_exact(polynomial, point.x(), point.y()),
+            policy,
+        )
+        .map_or(
+            Classification::Uncertain(UncertaintyReason::Predicate),
+            Classification::Decided,
+        )),
+        CurvePointData2::Polynomial(point) => point.polynomial_sign(polynomial, policy),
+        CurvePointData2::Endpoint(endpoint) => match endpoint.resolve(policy)? {
+            Classification::Decided(Some(point)) => {
+                point_polynomial_sign(&point, polynomial, policy)
+            }
+            Classification::Decided(None) => {
+                Ok(Classification::Uncertain(UncertaintyReason::Unsupported))
+            }
+            Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+        },
+        CurvePointData2::Similarity(image) => {
+            if !policy.accepts_retained_policy(image.data.policy) {
+                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+            }
+            point_polynomial_sign(
+                &image.data.source,
+                &pullback(polynomial, &image.data.transform),
+                policy,
+            )
+        }
+        _ => {
+            let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+            match recursive_rational_value(source, polynomial, &one, policy)? {
+                Classification::Decided(Some(value)) => value.numerator.sign(policy),
+                Classification::Decided(None) => {
+                    Ok(Classification::Uncertain(UncertaintyReason::Unsupported))
+                }
+                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+            }
+        }
+    }
+}
+
+fn pullback(polynomial: &BivariatePolynomial, transform: &Similarity2) -> BivariatePolynomial {
+    let (a, b, c, d, x, y) = transform.affine_components();
+    bivariate_compose(
+        polynomial,
+        &BivariatePolynomial::new(vec![vec![x.clone(), b.clone()], vec![a.clone()]]),
+        &BivariatePolynomial::new(vec![vec![y.clone(), d.clone()], vec![c.clone()]]),
+    )
+}
+
+pub(crate) fn point_rational_form_parameter(
+    source: &CurvePoint2,
+    numerator: &BivariatePolynomial,
+    denominator: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<CurveParameter2>> {
+    let sign = match point_rational_denominator_sign(source, denominator, policy)? {
+        Classification::Decided(sign) => sign,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    match &source.0 {
+        CurvePointData2::RationalImage(image) => {
+            match image.pullback(numerator, denominator, policy)? {
+                Classification::Decided((numerator, denominator)) => {
+                    point_rational_form_parameter(&image.source, &numerator, &denominator, policy)
+                }
+                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+            }
+        }
+        CurvePointData2::Exact(point) => Ok(Classification::Decided(
+            (bivariate_evaluate_exact(numerator, point.x(), point.y())
+                / bivariate_evaluate_exact(denominator, point.x(), point.y()))?
+            .into(),
+        )),
+        CurvePointData2::Polynomial(point) => {
+            point.rational_parameter(numerator, denominator, policy)
+        }
+        CurvePointData2::Endpoint(endpoint) => match endpoint.resolve(policy)? {
+            Classification::Decided(Some(point)) => {
+                point_rational_form_parameter(&point, numerator, denominator, policy)
+            }
+            Classification::Decided(None) => {
+                Ok(Classification::Uncertain(UncertaintyReason::Unsupported))
+            }
+            Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
+        },
+        CurvePointData2::Similarity(image) => {
+            if !policy.accepts_retained_policy(image.data.policy) {
+                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+            }
+            point_rational_form_parameter(
+                &image.data.source,
+                &pullback(numerator, &image.data.transform),
+                &pullback(denominator, &image.data.transform),
+                policy,
+            )
+        }
+        _ => {
+            let mut value = match recursive_rational_value(source, numerator, denominator, policy)?
+            {
+                Classification::Decided(Some(value)) => value,
+                Classification::Decided(None) => {
+                    return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+                }
+                Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+            };
+            if sign == RealSign::Negative {
+                let Some(numerator) = value.numerator.scale(&Real::from(-1)) else {
+                    return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+                };
+                let Some(denominator) = value.denominator.scale(&Real::from(-1)) else {
+                    return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+                };
+                value = RecursiveQuadraticProjectiveScalar {
+                    numerator,
+                    denominator,
+                };
+            }
+            Ok(BezierRecursiveProjectiveParameter2::new(value, policy)?
+                .map(CurveParameter2::from_recursive_projective))
+        }
+    }
+}
+
+fn recursive_rational_value(
+    source: &CurvePoint2,
+    numerator: &BivariatePolynomial,
+    denominator: &BivariatePolynomial,
+    policy: &CurveContext,
+) -> CurveResult<Classification<Option<RecursiveQuadraticProjectiveScalar>>> {
+    let points = match recursive_projective_evidence_points(&[source], policy)? {
+        Classification::Decided(Some(points)) => points,
+        Classification::Decided(None) => return Ok(Classification::Decided(None)),
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let point = match positive_recursive_projective_point(
+        points.into_iter().next().expect("one source point"),
+    )? {
+        Classification::Decided(point) => point,
+        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+    };
+    let degree = [numerator, denominator]
+        .into_iter()
+        .flat_map(|p| {
+            p.coefficients.iter().enumerate().flat_map(|(i, row)| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.definitely_zero())
+                    .map(move |(j, _)| i.checked_add(j))
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|degrees| degrees.into_iter().max().or(Some(0)));
+    let Some(degree) = degree else {
+        return Ok(Classification::Decided(None));
+    };
+    let evaluate = |p| {
+        evaluate_bivariate_homogeneous_polynomial(p, &point.x, &point.y, &point.denominator, degree)
+    };
+    Ok(Classification::Decided(
+        evaluate(numerator)
+            .zip(evaluate(denominator))
+            .map(
+                |(numerator, denominator)| RecursiveQuadraticProjectiveScalar {
+                    numerator,
+                    denominator,
+                },
+            ),
+    ))
+}
