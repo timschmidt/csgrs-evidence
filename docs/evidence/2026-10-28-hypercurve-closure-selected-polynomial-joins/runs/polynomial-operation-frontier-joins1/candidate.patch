@@ -1,0 +1,2055 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 1f15f353cb..88159bb981 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -60,6 +60,14 @@
+ 
+ ### Added
+ 
++- Exact joins of independently selected polynomial fields retain native and
++  polynomial generator embeddings, original singleton selectors, and finite
++  denominator proofs for further arithmetic and selected constructions.
++
++- Retain arbitrary finite-degree polynomial extensions and dependent rational
++  values over selected coefficient fields. Exact root counting validates open
++  singleton selectors, including repeated roots; denominator guards are checked
++  at the selected root. Native quadratic fields remain shared dependencies.
+ - Compose bivariate equations with polynomial homogeneous coordinates in one
+   retained recursive coefficient field. The result preserves selected algebraic
+   dependencies and denominator factors for subsequent exact root isolation;
+diff --git a/crates/hypersolve/src/lib.rs b/crates/hypersolve/src/lib.rs
+index ca7dc02217..60c1c55c67 100644
+--- a/crates/hypersolve/src/lib.rs
++++ b/crates/hypersolve/src/lib.rs
+@@ -53,6 +53,7 @@ pub mod residual_replay;
+ pub mod resultant;
+ pub mod root_isolation;
+ mod root_sign;
++pub mod selected_polynomial_field;
+ pub mod simplex_projection;
+ pub mod sketch;
+ mod sketch_arc_incidence;
+@@ -340,8 +341,8 @@ pub use root_isolation::{
+     subdivide_bernstein_univariate_polynomial_interval_roots,
+ };
+ pub use root_sign::{
+-    ordered_field_sign_at_selected_root, ordered_field_vanishes_at_selected_root,
+-    sign_at_selected_root, sign_at_selected_tuple,
++    ordered_field_count_roots, ordered_field_sign_at_selected_root,
++    ordered_field_vanishes_at_selected_root, sign_at_selected_root, sign_at_selected_tuple,
+ };
+ pub use simplex_projection::{
+     SimplexProjectionConfig, SimplexProjectionError, SimplexProjectionReport,
+diff --git a/crates/hypersolve/src/root_sign.rs b/crates/hypersolve/src/root_sign.rs
+index 660978fcb8..dace634367 100644
+--- a/crates/hypersolve/src/root_sign.rs
++++ b/crates/hypersolve/src/root_sign.rs
+@@ -111,7 +111,7 @@ pub fn ordered_field_sign_at_selected_root<C: Clone, F: OrderedFieldPolynomialCo
+     };
+     // The chain's first division, `defining' * predicate mod defining`, has
+     // a known elimination count; decline before forming its product.
+-    let mut budget = RemainderBudget::new(field.remainder_elimination_budget());
++    let budget = RemainderBudget::new(field.remainder_elimination_budget());
+     if !budget.covers(product_len.saturating_sub(first.len() - 1)) {
+         return Ok(None);
+     }
+@@ -124,16 +124,81 @@ pub fn ordered_field_sign_at_selected_root<C: Clone, F: OrderedFieldPolynomialCo
+             *entry = field.add(entry, &term)?;
+         }
+     }
+-    // The first polynomial's endpoint signs were already certified above.
+-    let mut previous = [lower_sign, upper_sign];
++    Ok(field_remainder_variations(
++        first,
++        second,
++        [&interval.lower, &interval.upper],
++        [lower_sign, upper_sign],
++        budget,
++        field,
++    )?
++    .and_then(|v| query_sign_from_variations(v[0], v[1])))
++}
++
++/// Counts distinct real roots in an open interval over an exact ordered field.
++///
++/// The original equation may be reducible, nonmonic or repeated. Both
++/// endpoints must be off its zero set. The zero equation, an invalid interval,
++/// an endpoint root, or an unavailable bounded remainder chain returns `None`;
++/// a nonzero constant or a rootless interval returns `Some(0)`. Coefficient
++/// decisions propagate through the caller's field context. This is a selection
++/// proof, not an isolator metadata check and not a total resource bound.
++pub fn ordered_field_count_roots<C: Clone, F: OrderedFieldPolynomialContext<C>>(
++    defining: &[C],
++    lower: &Real,
++    upper: &Real,
++    field: &mut F,
++) -> Result<Option<usize>, F::Error> {
++    if sign(&(upper - lower)) != Some(Ordering::Greater) {
++        return Ok(None);
++    }
++    let mut first = defining.to_vec();
++    field.normalize_positive_scale(&mut first);
++    trim_polynomial(&mut first, field)?;
++    let Some(leading) = first.last() else {
++        return Ok(None);
++    };
++    if first.len() == 1 {
++        return Ok((field.sign(leading)? != Ordering::Equal).then_some(0));
++    }
++    let previous = [
++        field_polynomial_sign(&first, lower, field)?,
++        field_polynomial_sign(&first, upper, field)?,
++    ];
++    if previous.contains(&Ordering::Equal) {
++        return Ok(None);
++    }
++    let second = first
++        .iter()
++        .enumerate()
++        .skip(1)
++        .map(|(power, coefficient)| field.scale(coefficient, &Real::from(power as u128)))
++        .collect::<Result<Vec<_>, _>>()?;
++    let budget = RemainderBudget::new(field.remainder_elimination_budget());
++    Ok(
++        field_remainder_variations(first, second, [lower, upper], previous, budget, field)?
++            .and_then(|v| v[0].checked_sub(v[1])),
++    )
++}
++
++// Shared signed remainder chain for root counting and selected-root signs.
++// Strictly positive pseudo-remainder scales preserve both Sturm variations.
++fn field_remainder_variations<C: Clone, F: OrderedFieldPolynomialContext<C>>(
++    mut first: Vec<C>,
++    mut second: Vec<C>,
++    bounds: [&Real; 2],
++    mut previous: [Ordering; 2],
++    mut budget: RemainderBudget,
++    field: &mut F,
++) -> Result<Option<[usize; 2]>, F::Error> {
+     let mut variations = [0_usize; 2];
+     loop {
+         field.normalize_positive_scale(&mut second);
+         trim_polynomial(&mut second, field)?;
+         if second.is_empty() {
+-            return Ok(query_sign_from_variations(variations[0], variations[1]));
++            return Ok(Some(variations));
+         }
+-        for (endpoint, point) in [&interval.lower, &interval.upper].into_iter().enumerate() {
++        for (endpoint, point) in bounds.into_iter().enumerate() {
+             let current = field_polynomial_sign(&second, point, field)?;
+             if current != Ordering::Equal {
+                 variations[endpoint] += usize::from(previous[endpoint] != current);
+@@ -142,7 +207,7 @@ pub fn ordered_field_sign_at_selected_root<C: Clone, F: OrderedFieldPolynomialCo
+         }
+         // A constant, including the retained zero coefficient, ends the chain.
+         if second.len() == 1 {
+-            return Ok(query_sign_from_variations(variations[0], variations[1]));
++            return Ok(Some(variations));
+         }
+         if !budget.spend(&first, &second) {
+             return Ok(None);
+diff --git a/crates/hypersolve/src/selected_polynomial_field.rs b/crates/hypersolve/src/selected_polynomial_field.rs
+new file mode 100644
+index 0000000000..1a33dce494
+--- /dev/null
++++ b/crates/hypersolve/src/selected_polynomial_field.rs
+@@ -0,0 +1,768 @@
++//! Finite polynomial extensions with retained real-root selections.
++//!
++//! A value is a rational function in one selected generator over its parent
++//! field. Parent fields are shared, so dependent roots retain a construction
++//! graph rather than becoming independently projected coordinates. Recursive
++//! quadratic fields remain the native base specialization. Local monic
++//! reduction preserves values on the original relation, including when that
++//! relation is reducible or repeated; denominators need only be nonzero at
++//! the selected root. No irreducibility or global inverse is assumed.
++//!
++//! One shared promotion unit admits each new extension's selection proof.
++//! Arithmetic and remainder work inside that proof are not a total work,
++//! coefficient-size, memory or cancellation bound. Common fields retain exact
++//! embeddings of independent selections; construction-identity checks alone
++//! do not decide equality of arbitrary algebraic values.
++
++mod join;
++pub use join::SelectedPolynomialJoin;
++
++use std::{cmp::Ordering, sync::Arc};
++
++use hyperreal::{Real, RealSign};
++
++use crate::classification::{Classification, UncertaintyReason};
++use crate::ordered_field_roots::OrderedFieldPolynomialContext;
++use crate::recursive_quadratic_field::{
++    RecursiveQuadraticField, RecursiveQuadraticProjectiveScalar, RecursiveQuadraticValue,
++};
++use crate::{
++    IsolatedRootInterval, SelectedAlgebraContext, ordered_field_count_roots,
++    ordered_field_sign_at_selected_root,
++};
++
++/// Arithmetic that could not retain the requested field value.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum SelectedPolynomialArithmeticError {
++    /// The operands need an embedding not supplied by their ancestor chain.
++    IncompatibleField,
++    /// Checked size or underlying field construction was unavailable.
++    /// This does not assert that a declared resource budget was exhausted.
++    ConstructionUnavailable,
++    /// A native base has no adjoined polynomial generator.
++    NoPolynomialGenerator,
++}
++
++/// A failed selection or exact field operation.
++#[derive(Debug)]
++pub enum SelectedPolynomialError<E> {
++    /// Failure from the caller's selected-algebra authority.
++    Context(E),
++    /// A field or storage construction could not be completed.
++    Arithmetic(SelectedPolynomialArithmeticError),
++    /// The open selector is reversed, empty, or has a defining root at an endpoint.
++    InvalidSelector,
++    /// The defining equation vanishes identically in the parent field.
++    ZeroPolynomial,
++    /// The selector contains no real root of the defining equation.
++    NoRoot,
++    /// The selector contains this many distinct roots and selects none uniquely.
++    MultipleRoots(usize),
++    /// A rational value's denominator vanishes at the selected root.
++    ZeroDenominator,
++    /// Internal ordered-field contexts propagate an undecided predicate.
++    /// Public selection and value predicates return this as `Classification`.
++    Uncertain(UncertaintyReason),
++}
++
++impl<E> From<SelectedPolynomialArithmeticError> for SelectedPolynomialError<E> {
++    fn from(error: SelectedPolynomialArithmeticError) -> Self {
++        Self::Arithmetic(error)
++    }
++}
++
++type ArithmeticResult<T> = Result<T, SelectedPolynomialArithmeticError>;
++type ExactResult<T, E> = Result<Classification<T>, SelectedPolynomialError<E>>;
++
++/// An admitted coefficient field or one selected polynomial extension.
++#[derive(Clone, Debug)]
++pub struct SelectedPolynomialField(Arc<FieldData>);
++
++#[derive(Debug)]
++enum FieldData {
++    Recursive(RecursiveQuadraticField),
++    Extension {
++        parent: SelectedPolynomialField,
++        defining: Vec<SelectedPolynomialValue>,
++        monic: Vec<SelectedPolynomialValue>,
++        interval: IsolatedRootInterval,
++    },
++}
++
++/// A finite rational value retaining its selected field and denominator proof.
++#[derive(Clone, Debug)]
++pub struct SelectedPolynomialValue(Arc<ValueData>);
++
++#[derive(Debug)]
++struct ValueData {
++    field: SelectedPolynomialField,
++    coordinates: Coordinates,
++}
++
++#[derive(Debug)]
++enum Coordinates {
++    Recursive(RecursiveQuadraticProjectiveScalar),
++    Extension {
++        numerator: Vec<SelectedPolynomialValue>,
++        // Strictly positive at this selected generator, by construction.
++        denominator: Vec<SelectedPolynomialValue>,
++    },
++}
++
++fn finish<T, E>(result: Result<T, SelectedPolynomialError<E>>) -> ExactResult<T, E> {
++    if crate::work_budget::exhaustion().is_some() {
++        return Ok(Classification::Uncertain(
++            UncertaintyReason::BudgetExhausted,
++        ));
++    }
++    match result {
++        Ok(value) => Ok(Classification::Decided(value)),
++        Err(SelectedPolynomialError::Uncertain(reason)) => Ok(Classification::Uncertain(reason)),
++        Err(error) => Err(error),
++    }
++}
++
++fn unavailable<T>(value: Option<T>) -> ArithmeticResult<T> {
++    value.ok_or(SelectedPolynomialArithmeticError::ConstructionUnavailable)
++}
++
++fn recursive_ancestor(field: &RecursiveQuadraticField, ancestor: &RecursiveQuadraticField) -> bool {
++    if field.same_field(ancestor) {
++        return true;
++    }
++    match field {
++        RecursiveQuadraticField::Base(_) => false,
++        RecursiveQuadraticField::Extension(extension) => {
++            recursive_ancestor(&extension.parent, ancestor)
++        }
++    }
++}
++
++impl SelectedPolynomialField {
++    /// Retains an existing admitted native coefficient field without projection.
++    /// Its existing selected-root and positive-radical preconditions still apply.
++    pub fn from_recursive(field: RecursiveQuadraticField) -> Self {
++        Self(Arc::new(FieldData::Recursive(field)))
++    }
++
++    /// Tests shared construction authority, not equality of algebraic fields.
++    pub fn shares_authority(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
++            || match (self.0.as_ref(), other.0.as_ref()) {
++                (FieldData::Recursive(a), FieldData::Recursive(b)) => a.same_field(b),
++                _ => false,
++            }
++    }
++
++    /// The retained coefficient field of a polynomial extension.
++    pub fn parent(&self) -> Option<&Self> {
++        match self.0.as_ref() {
++            FieldData::Extension { parent, .. } => Some(parent),
++            _ => None,
++        }
++    }
++
++    /// Original ascending coefficients, including repeated factors.
++    pub fn defining_polynomial(&self) -> Option<&[SelectedPolynomialValue]> {
++        match self.0.as_ref() {
++            FieldData::Extension { defining, .. } => Some(defining),
++            _ => None,
++        }
++    }
++
++    /// Certified open singleton bounds; the defining equation is nonzero at both.
++    pub fn isolating_bounds(&self) -> Option<[&Real; 2]> {
++        match self.0.as_ref() {
++            FieldData::Extension { interval, .. } => Some([&interval.lower, &interval.upper]),
++            _ => None,
++        }
++    }
++
++    /// Embeds one exact represented scalar.
++    pub fn constant(&self, value: Real) -> ArithmeticResult<SelectedPolynomialValue> {
++        match self.0.as_ref() {
++            FieldData::Recursive(field) => self.recursive_value(
++                unavailable(field.constant(value))?,
++                unavailable(field.constant(Real::one()))?,
++            ),
++            FieldData::Extension { parent, .. } => self.extension_value(
++                vec![parent.constant(value)?],
++                vec![parent.constant(Real::one())?],
++            ),
++        }
++    }
++
++    /// Imports a native value through the same native field or its descendants.
++    pub fn import_recursive(
++        &self,
++        value: &RecursiveQuadraticValue,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        match self.0.as_ref() {
++            FieldData::Recursive(field) => {
++                if !recursive_ancestor(field, &value.field()) {
++                    return Err(SelectedPolynomialArithmeticError::IncompatibleField);
++                }
++                self.recursive_value(
++                    unavailable(field.lift(value))?,
++                    unavailable(field.constant(Real::one()))?,
++                )
++            }
++            FieldData::Extension { parent, .. } => self.lift(&parent.import_recursive(value)?),
++        }
++    }
++
++    /// Lifts a value through certified ancestor inclusions, retaining selections.
++    pub fn lift(
++        &self,
++        value: &SelectedPolynomialValue,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        if self.shares_authority(value.field()) {
++            return Ok(value.clone());
++        }
++        match (self.0.as_ref(), &value.0.coordinates) {
++            (FieldData::Recursive(field), Coordinates::Recursive(scalar)) => {
++                if !recursive_ancestor(field, &scalar.numerator.field()) {
++                    return Err(SelectedPolynomialArithmeticError::IncompatibleField);
++                }
++                self.recursive_value(
++                    unavailable(field.lift(&scalar.numerator))?,
++                    unavailable(field.lift(&scalar.denominator))?,
++                )
++            }
++            (FieldData::Extension { parent, .. }, _) => self.extension_value(
++                vec![parent.lift(value)?],
++                vec![parent.constant(Real::one())?],
++            ),
++            _ => Err(SelectedPolynomialArithmeticError::IncompatibleField),
++        }
++    }
++
++    /// Returns the selected root, retaining its full original relation.
++    pub fn generator(&self) -> ArithmeticResult<SelectedPolynomialValue> {
++        let Some(parent) = self.parent() else {
++            return Err(SelectedPolynomialArithmeticError::NoPolynomialGenerator);
++        };
++        self.extension_value(
++            vec![
++                parent.constant(Real::zero())?,
++                parent.constant(Real::one())?,
++            ],
++            vec![parent.constant(Real::one())?],
++        )
++    }
++
++    /// Adjoins the unique distinct root in the supplied open interval.
++    ///
++    /// Strict Sturm root counting replays the selector; repeated and reducible
++    /// relations remain valid. No caller-supplied root count is trusted. Zero
++    /// equations, no root, multiple roots and invalid selectors are distinct
++    /// errors. Unavailable decisions and reached work limits remain uncertain.
++    pub fn select<C: SelectedAlgebraContext>(
++        &self,
++        coefficients: Vec<SelectedPolynomialValue>,
++        lower: Real,
++        upper: Real,
++        policy: &C,
++    ) -> ExactResult<Self, C::Error> {
++        finish(
++            policy.strict_predicate_pass(|| self.select_strict(coefficients, lower, upper, policy)),
++        )
++    }
++
++    fn select_strict<C: SelectedAlgebraContext>(
++        &self,
++        coefficients: Vec<SelectedPolynomialValue>,
++        lower: Real,
++        upper: Real,
++        policy: &C,
++    ) -> Result<Self, SelectedPolynomialError<C::Error>> {
++        match policy.real_sign(&(&upper - &lower)) {
++            Some(RealSign::Positive) => {}
++            Some(_) => return Err(SelectedPolynomialError::InvalidSelector),
++            None => {
++                return Err(SelectedPolynomialError::Uncertain(
++                    UncertaintyReason::RealSign,
++                ));
++            }
++        }
++        let defining = coefficients
++            .iter()
++            .map(|value| self.lift(value))
++            .collect::<ArithmeticResult<Vec<_>>>()?;
++        crate::work_budget::consume(crate::work_budget::WorkKind::AlgebraicPromotion, 1)
++            .map_err(|_| SelectedPolynomialError::Uncertain(UncertaintyReason::BudgetExhausted))?;
++        let mut reduced = defining.clone();
++        while let Some(value) = reduced.last() {
++            if value.sign_strict(policy)? != RealSign::Zero {
++                break;
++            }
++            reduced.pop();
++        }
++        if reduced.is_empty() {
++            return Err(SelectedPolynomialError::ZeroPolynomial);
++        }
++        if reduced.len() == 1 {
++            return Err(SelectedPolynomialError::NoRoot);
++        }
++        for endpoint in [&lower, &upper] {
++            if evaluate(&reduced, endpoint, self)?.sign_strict(policy)? == RealSign::Zero {
++                return Err(SelectedPolynomialError::InvalidSelector);
++            }
++        }
++        let mut context = SelectedPolynomialContext {
++            field: self.clone(),
++            policy,
++        };
++        match ordered_field_count_roots(&reduced, &lower, &upper, &mut context)? {
++            Some(0) => return Err(SelectedPolynomialError::NoRoot),
++            Some(1) => {}
++            Some(count) => return Err(SelectedPolynomialError::MultipleRoots(count)),
++            None => {
++                return Err(SelectedPolynomialError::Uncertain(
++                    UncertaintyReason::Predicate,
++                ));
++            }
++        }
++        let leading = reduced
++            .last()
++            .expect("a nonconstant relation has a leading term");
++        let inverse = leading.reciprocal_strict(policy)?;
++        let monic = reduced
++            .iter()
++            .map(|value| value.multiply(&inverse))
++            .collect::<ArithmeticResult<Vec<_>>>()?;
++        Ok(Self(Arc::new(FieldData::Extension {
++            parent: self.clone(),
++            defining,
++            monic,
++            interval: IsolatedRootInterval {
++                lower,
++                upper,
++                exact_root: None,
++                distinct_root_count: 1,
++            },
++        })))
++    }
++
++    // Both constructors below are private. Positivity follows from constants,
++    // multiplication, ancestor lifting, or a strict reciprocal sign proof.
++    fn recursive_value(
++        &self,
++        numerator: RecursiveQuadraticValue,
++        denominator: RecursiveQuadraticValue,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        let mut pair = [numerator, denominator];
++        RecursiveQuadraticValue::normalize_positive_scale(&mut pair);
++        let [numerator, denominator] = pair;
++        Ok(SelectedPolynomialValue(Arc::new(ValueData {
++            field: self.clone(),
++            coordinates: Coordinates::Recursive(RecursiveQuadraticProjectiveScalar {
++                numerator,
++                denominator,
++            }),
++        })))
++    }
++
++    fn extension_value(
++        &self,
++        numerator: Vec<SelectedPolynomialValue>,
++        denominator: Vec<SelectedPolynomialValue>,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        Ok(SelectedPolynomialValue(Arc::new(ValueData {
++            field: self.clone(),
++            coordinates: Coordinates::Extension {
++                numerator: self.reduce(numerator)?,
++                denominator: self.reduce(denominator)?,
++            },
++        })))
++    }
++
++    fn reduce(
++        &self,
++        mut polynomial: Vec<SelectedPolynomialValue>,
++    ) -> ArithmeticResult<Vec<SelectedPolynomialValue>> {
++        let FieldData::Extension { parent, monic, .. } = self.0.as_ref() else {
++            return Err(SelectedPolynomialArithmeticError::NoPolynomialGenerator);
++        };
++        let degree = monic.len() - 1;
++        while polynomial.len() > degree {
++            let leading = polynomial.pop().expect("one coefficient is eliminated");
++            let shift = polynomial.len() - degree;
++            if leading.stored_zero() {
++                continue;
++            }
++            for (index, coefficient) in monic[..degree].iter().enumerate() {
++                polynomial[shift + index] =
++                    polynomial[shift + index].subtract(&leading.multiply(coefficient)?)?;
++            }
++        }
++        while polynomial.len() > 1
++            && polynomial
++                .last()
++                .is_some_and(SelectedPolynomialValue::stored_zero)
++        {
++            polynomial.pop();
++        }
++        if polynomial.is_empty() {
++            polynomial.push(parent.constant(Real::zero())?);
++        }
++        Ok(polynomial)
++    }
++}
++
++impl SelectedPolynomialValue {
++    /// Field retaining this value's selected dependencies.
++    pub fn field(&self) -> &SelectedPolynomialField {
++        &self.0.field
++    }
++
++    fn stored_zero(&self) -> bool {
++        match &self.0.coordinates {
++            Coordinates::Recursive(scalar) => scalar.numerator.is_structurally_zero(),
++            Coordinates::Extension { numerator, .. } => numerator.iter().all(Self::stored_zero),
++        }
++    }
++
++    fn align(&self, other: &Self) -> ArithmeticResult<(SelectedPolynomialField, Self, Self)> {
++        match self.field().lift(other) {
++            Ok(other) => Ok((self.field().clone(), self.clone(), other)),
++            Err(SelectedPolynomialArithmeticError::IncompatibleField) => Ok((
++                other.field().clone(),
++                other.field().lift(self)?,
++                other.clone(),
++            )),
++            Err(error) => Err(error),
++        }
++    }
++
++    /// Exact addition through the common ancestor chain.
++    pub fn add(&self, other: &Self) -> ArithmeticResult<Self> {
++        let (field, left, right) = self.align(other)?;
++        match (&left.0.coordinates, &right.0.coordinates) {
++            (Coordinates::Recursive(a), Coordinates::Recursive(b)) => field.recursive_value(
++                unavailable(
++                    unavailable(a.numerator.multiply(&b.denominator))?
++                        .add(&unavailable(b.numerator.multiply(&a.denominator))?),
++                )?,
++                unavailable(a.denominator.multiply(&b.denominator))?,
++            ),
++            (
++                Coordinates::Extension {
++                    numerator: a,
++                    denominator: b,
++                },
++                Coordinates::Extension {
++                    numerator: c,
++                    denominator: d,
++                },
++            ) => {
++                let parent = field.parent().expect("extension coordinates have a parent");
++                field.extension_value(
++                    add(&multiply(a, d, parent)?, &multiply(c, b, parent)?, parent)?,
++                    multiply(b, d, parent)?,
++                )
++            }
++            _ => Err(SelectedPolynomialArithmeticError::IncompatibleField),
++        }
++    }
++
++    /// Exact subtraction without changing either operand's selection.
++    pub fn subtract(&self, other: &Self) -> ArithmeticResult<Self> {
++        self.add(&other.scale(&Real::from(-1))?)
++    }
++
++    /// Exact multiplication with local defining-relation reduction.
++    pub fn multiply(&self, other: &Self) -> ArithmeticResult<Self> {
++        let (field, left, right) = self.align(other)?;
++        match (&left.0.coordinates, &right.0.coordinates) {
++            (Coordinates::Recursive(a), Coordinates::Recursive(b)) => field.recursive_value(
++                unavailable(a.numerator.multiply(&b.numerator))?,
++                unavailable(a.denominator.multiply(&b.denominator))?,
++            ),
++            (
++                Coordinates::Extension {
++                    numerator: a,
++                    denominator: b,
++                },
++                Coordinates::Extension {
++                    numerator: c,
++                    denominator: d,
++                },
++            ) => {
++                let parent = field.parent().expect("extension coordinates have a parent");
++                field.extension_value(multiply(a, c, parent)?, multiply(b, d, parent)?)
++            }
++            _ => Err(SelectedPolynomialArithmeticError::IncompatibleField),
++        }
++    }
++
++    /// Exact scalar multiplication; retained denominator guards remain valid.
++    pub fn scale(&self, scale: &Real) -> ArithmeticResult<Self> {
++        match &self.0.coordinates {
++            Coordinates::Recursive(scalar) => self.field().recursive_value(
++                unavailable(scalar.numerator.scale(scale))?,
++                scalar.denominator.clone(),
++            ),
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => self.field().extension_value(
++                numerator
++                    .iter()
++                    .map(|value| value.scale(scale))
++                    .collect::<ArithmeticResult<Vec<_>>>()?,
++                denominator.clone(),
++            ),
++        }
++    }
++
++    /// Divides only after proving the denominator nonzero at its selected root.
++    pub fn divide<C: SelectedAlgebraContext>(
++        &self,
++        other: &Self,
++        policy: &C,
++    ) -> ExactResult<Self, C::Error> {
++        finish(policy.strict_predicate_pass(|| {
++            let (_, left, right) = self.align(other)?;
++            Ok(left.multiply(&right.reciprocal_strict(policy)?)?)
++        }))
++    }
++
++    fn reciprocal_strict<C: SelectedAlgebraContext>(
++        &self,
++        policy: &C,
++    ) -> Result<Self, SelectedPolynomialError<C::Error>> {
++        let scale = match self.sign_strict(policy)? {
++            RealSign::Zero => return Err(SelectedPolynomialError::ZeroDenominator),
++            RealSign::Positive => Real::one(),
++            RealSign::Negative => Real::from(-1),
++        };
++        Ok(match &self.0.coordinates {
++            Coordinates::Recursive(scalar) => self.field().recursive_value(
++                unavailable(scalar.denominator.scale(&scale))?,
++                unavailable(scalar.numerator.scale(&scale))?,
++            )?,
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => self.field().extension_value(
++                denominator
++                    .iter()
++                    .map(|value| value.scale(&scale))
++                    .collect::<ArithmeticResult<Vec<_>>>()?,
++                numerator
++                    .iter()
++                    .map(|value| value.scale(&scale))
++                    .collect::<ArithmeticResult<Vec<_>>>()?,
++            )?,
++        })
++    }
++
++    /// Exact sign on the retained selection, with no approximate terminal.
++    pub fn sign<C: SelectedAlgebraContext>(&self, policy: &C) -> ExactResult<RealSign, C::Error> {
++        finish(policy.strict_predicate_pass(|| self.sign_strict(policy)))
++    }
++
++    fn sign_strict<C: SelectedAlgebraContext>(
++        &self,
++        policy: &C,
++    ) -> Result<RealSign, SelectedPolynomialError<C::Error>> {
++        if crate::work_budget::exhaustion().is_some() {
++            return Err(SelectedPolynomialError::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        if self.stored_zero() {
++            return Ok(RealSign::Zero);
++        }
++        match (&self.field().0.as_ref(), &self.0.coordinates) {
++            (_, Coordinates::Recursive(scalar)) => match scalar
++                .numerator
++                .sign(policy)
++                .map_err(SelectedPolynomialError::Context)?
++            {
++                Classification::Decided(sign) => Ok(sign),
++                Classification::Uncertain(reason) => {
++                    Err(SelectedPolynomialError::Uncertain(reason))
++                }
++            },
++            (
++                FieldData::Extension {
++                    parent,
++                    defining,
++                    interval,
++                    ..
++                },
++                Coordinates::Extension { numerator, .. },
++            ) => {
++                if let [constant] = numerator.as_slice() {
++                    return constant.sign_strict(policy);
++                }
++                let mut context = SelectedPolynomialContext {
++                    field: parent.clone(),
++                    policy,
++                };
++                match ordered_field_sign_at_selected_root(
++                    defining,
++                    numerator,
++                    interval,
++                    &mut context,
++                )? {
++                    Some(Ordering::Less) => Ok(RealSign::Negative),
++                    Some(Ordering::Equal) => Ok(RealSign::Zero),
++                    Some(Ordering::Greater) => Ok(RealSign::Positive),
++                    None => Err(SelectedPolynomialError::Uncertain(
++                        UncertaintyReason::Predicate,
++                    )),
++                }
++            }
++            _ => Err(SelectedPolynomialArithmeticError::IncompatibleField.into()),
++        }
++    }
++}
++
++/// Adapter to the shared ordered-field isolator and remainder/sign machinery.
++/// All coefficient signs run inside a strict pass, even with an approximate policy.
++pub struct SelectedPolynomialContext<'a, C> {
++    /// Shared selected coefficient field.
++    pub field: SelectedPolynomialField,
++    /// Caller-owned decision and resource context.
++    pub policy: &'a C,
++}
++
++impl<C: SelectedAlgebraContext> OrderedFieldPolynomialContext<SelectedPolynomialValue>
++    for SelectedPolynomialContext<'_, C>
++{
++    type Error = SelectedPolynomialError<C::Error>;
++    fn constant(&mut self, value: &Real) -> Result<SelectedPolynomialValue, Self::Error> {
++        Ok(self.field.constant(value.clone())?)
++    }
++    fn add(
++        &mut self,
++        a: &SelectedPolynomialValue,
++        b: &SelectedPolynomialValue,
++    ) -> Result<SelectedPolynomialValue, Self::Error> {
++        Ok(self.field.lift(a)?.add(&self.field.lift(b)?)?)
++    }
++    fn multiply(
++        &mut self,
++        a: &SelectedPolynomialValue,
++        b: &SelectedPolynomialValue,
++    ) -> Result<SelectedPolynomialValue, Self::Error> {
++        Ok(self.field.lift(a)?.multiply(&self.field.lift(b)?)?)
++    }
++    fn scale(
++        &mut self,
++        value: &SelectedPolynomialValue,
++        scale: &Real,
++    ) -> Result<SelectedPolynomialValue, Self::Error> {
++        Ok(self.field.lift(value)?.scale(scale)?)
++    }
++    fn normalize_positive_scale(&mut self, values: &mut [SelectedPolynomialValue]) {
++        let mut numerators = Vec::with_capacity(values.len());
++        for value in values.iter() {
++            let Coordinates::Recursive(scalar) = &value.0.coordinates else {
++                return;
++            };
++            if !scalar.denominator.is_coefficientwise_stored_one() {
++                return;
++            }
++            numerators.push(scalar.numerator.clone());
++        }
++        RecursiveQuadraticValue::normalize_positive_scale(&mut numerators);
++        for (value, numerator) in values.iter_mut().zip(numerators) {
++            let Coordinates::Recursive(scalar) = &value.0.coordinates else {
++                unreachable!()
++            };
++            *value = SelectedPolynomialValue(Arc::new(ValueData {
++                field: value.field().clone(),
++                coordinates: Coordinates::Recursive(RecursiveQuadraticProjectiveScalar {
++                    numerator,
++                    denominator: scalar.denominator.clone(),
++                }),
++            }));
++        }
++    }
++    fn sign(&mut self, value: &SelectedPolynomialValue) -> Result<Ordering, Self::Error> {
++        self.policy
++            .strict_predicate_pass(|| self.field.lift(value)?.sign_strict(self.policy))
++            .map(sign_order)
++    }
++    fn sign_if_separated(
++        &mut self,
++        value: &SelectedPolynomialValue,
++    ) -> Result<Option<Ordering>, Self::Error> {
++        let value = self.field.lift(value)?;
++        if value.stored_zero() {
++            return Ok(Some(Ordering::Equal));
++        }
++        Ok(match &value.0.coordinates {
++            Coordinates::Recursive(scalar) => scalar
++                .numerator
++                .bounded_or_exact_real_witness_sign()
++                .map(sign_order),
++            Coordinates::Extension { .. } => None,
++        })
++    }
++    fn remainder_elimination_budget(&self) -> Option<usize> {
++        // A speculative bounded pass declines after ten leading eliminations;
++        // an unbounded strict pass retains the complete finite remainder chain.
++        self.policy
++            .has_bounded_exact_predicate_budget()
++            .then_some(10)
++    }
++}
++
++fn sign_order(sign: RealSign) -> Ordering {
++    match sign {
++        RealSign::Negative => Ordering::Less,
++        RealSign::Zero => Ordering::Equal,
++        RealSign::Positive => Ordering::Greater,
++    }
++}
++
++fn evaluate(
++    polynomial: &[SelectedPolynomialValue],
++    point: &Real,
++    field: &SelectedPolynomialField,
++) -> ArithmeticResult<SelectedPolynomialValue> {
++    let mut result = field.constant(Real::zero())?;
++    for coefficient in polynomial.iter().rev() {
++        result = result.scale(point)?.add(coefficient)?;
++    }
++    Ok(result)
++}
++
++fn add(
++    a: &[SelectedPolynomialValue],
++    b: &[SelectedPolynomialValue],
++    field: &SelectedPolynomialField,
++) -> ArithmeticResult<Vec<SelectedPolynomialValue>> {
++    let zero = field.constant(Real::zero())?;
++    (0..a.len().max(b.len()))
++        .map(|i| a.get(i).unwrap_or(&zero).add(b.get(i).unwrap_or(&zero)))
++        .collect()
++}
++
++fn multiply(
++    a: &[SelectedPolynomialValue],
++    b: &[SelectedPolynomialValue],
++    field: &SelectedPolynomialField,
++) -> ArithmeticResult<Vec<SelectedPolynomialValue>> {
++    let count = a
++        .len()
++        .checked_add(b.len())
++        .and_then(|n| n.checked_sub(1))
++        .ok_or(SelectedPolynomialArithmeticError::ConstructionUnavailable)?;
++    let mut result = Vec::new();
++    result
++        .try_reserve_exact(count)
++        .map_err(|_| SelectedPolynomialArithmeticError::ConstructionUnavailable)?;
++    result.resize(count, field.constant(Real::zero())?);
++    for (i, left) in a.iter().enumerate() {
++        for (j, right) in b.iter().enumerate() {
++            result[i + j] = result[i + j].add(&left.multiply(right)?)?;
++        }
++    }
++    Ok(result)
++}
+diff --git a/crates/hypersolve/src/selected_polynomial_field/join.rs b/crates/hypersolve/src/selected_polynomial_field/join.rs
+new file mode 100644
+index 0000000000..afe4237fe0
+--- /dev/null
++++ b/crates/hypersolve/src/selected_polynomial_field/join.rs
+@@ -0,0 +1,371 @@
++//! Exact common fields and retained generator correspondences.
++
++use std::collections::HashMap;
++
++use super::*;
++use crate::recursive_quadratic_field::{
++    RecursiveQuadraticBaseField, RecursiveQuadraticExtensionEmbedding,
++    RecursiveQuadraticForeignBaseEmbedding, recursive_embed_foreign_field,
++    recursive_quadratic_source_union, recursive_rebase_field_preserving_base,
++    recursive_rebase_value_preserving_base,
++};
++use crate::tensor_support::{dense_reduce_selected_tuple_relations, dense_tensor_embed_axes};
++
++/// A common selected field and validated embeddings of its operand fields.
++///
++/// Original generator relations are replayed over embedded parent values in
++/// their original singleton selectors. A correspondence therefore denotes the
++/// same selected real value, including for reducible or repeated equations.
++/// Ancestor fields retain their authority. Divergent polynomial generators
++/// are appended without projection; algebraically equal selections need not
++/// have the same allocation or polynomial presentation.
++pub struct SelectedPolynomialJoin {
++    field: SelectedPolynomialField,
++    native: Vec<NativeEmbedding>,
++    generators: Vec<GeneratorEmbedding>,
++}
++
++impl std::fmt::Debug for SelectedPolynomialJoin {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SelectedPolynomialJoin")
++            .field("field", &self.field)
++            .field("native_embeddings", &self.native.len())
++            .field("generator_embeddings", &self.generators.len())
++            .finish()
++    }
++}
++
++struct GeneratorEmbedding {
++    source: SelectedPolynomialField,
++    image: SelectedPolynomialValue,
++}
++
++struct NativeEmbedding {
++    source: RecursiveQuadraticField,
++    target: RecursiveQuadraticField,
++    map: NativeMap,
++}
++
++enum NativeMap {
++    Extensions(Vec<RecursiveQuadraticExtensionEmbedding>),
++    Rebased {
++        source: Arc<RecursiveQuadraticBaseField>,
++        target: Arc<RecursiveQuadraticBaseField>,
++        axes: Vec<usize>,
++        extensions: Vec<RecursiveQuadraticExtensionEmbedding>,
++    },
++    Foreign(RecursiveQuadraticForeignBaseEmbedding),
++}
++
++impl NativeEmbedding {
++    fn value(&self, value: &RecursiveQuadraticValue) -> Option<RecursiveQuadraticValue> {
++        if !recursive_ancestor(&self.source, &value.field()) {
++            return None;
++        }
++        match &self.map {
++            NativeMap::Extensions(extensions) => self.target.embed_value(value, extensions),
++            NativeMap::Rebased {
++                source,
++                target,
++                axes,
++                extensions,
++            } => self.target.lift(&recursive_rebase_value_preserving_base(
++                value, source, target, axes, extensions,
++            )?),
++            NativeMap::Foreign(embedding) => embedding.value(value, &self.target),
++        }
++    }
++}
++
++impl SelectedPolynomialField {
++    /// Constructs a common selected field with exact embeddings of both inputs.
++    ///
++    /// Native recursive fields use their existing source-union and embedding
++    /// authority. Every new polynomial generator replays its original equation
++    /// and selector after transporting its coefficients. This consumes the
++    /// same shared promotion unit as `select`; no total work or memory bound
++    /// follows from that counter. An unavailable proof cannot publish a join.
++    pub fn joined_with<C: SelectedAlgebraContext>(
++        &self,
++        other: &Self,
++        policy: &C,
++    ) -> ExactResult<SelectedPolynomialJoin, C::Error> {
++        finish(policy.strict_predicate_pass(|| {
++            if self.contains_field(other) {
++                return Ok(SelectedPolynomialJoin::retained(self.clone()));
++            }
++            if other.contains_field(self) {
++                return Ok(SelectedPolynomialJoin::retained(other.clone()));
++            }
++            let (first_native, first_path) = self.native_and_path();
++            let (second_native, second_path) = other.native_and_path();
++            let (native, maps) = join_native(first_native, second_native, policy)?;
++            let field = if native.same_field(first_native) {
++                self.clone()
++            } else {
++                Self::from_recursive(native)
++            };
++            let mut joined = SelectedPolynomialJoin {
++                field,
++                native: maps,
++                generators: Vec::new(),
++            };
++            for source in first_path.into_iter().chain(second_path) {
++                joined.append(source, policy)?;
++            }
++            Ok(joined)
++        }))
++    }
++
++    fn contains_field(&self, source: &Self) -> bool {
++        if self.shares_authority(source) {
++            return true;
++        }
++        match (self.0.as_ref(), source.0.as_ref()) {
++            (FieldData::Recursive(target), FieldData::Recursive(source)) => {
++                recursive_ancestor(target, source)
++            }
++            (FieldData::Extension { parent, .. }, _) => parent.contains_field(source),
++            _ => false,
++        }
++    }
++
++    fn native_and_path(&self) -> (&RecursiveQuadraticField, Vec<Self>) {
++        let mut current = self;
++        let mut path = Vec::new();
++        loop {
++            match current.0.as_ref() {
++                FieldData::Recursive(native) => {
++                    path.reverse();
++                    return (native, path);
++                }
++                FieldData::Extension { parent, .. } => {
++                    path.push(current.clone());
++                    current = parent;
++                }
++            }
++        }
++    }
++}
++
++impl SelectedPolynomialJoin {
++    fn retained(field: SelectedPolynomialField) -> Self {
++        Self {
++            field,
++            native: Vec::new(),
++            generators: Vec::new(),
++        }
++    }
++
++    /// The common field, usable as the parent of a further selected extension.
++    pub fn field(&self) -> &SelectedPolynomialField {
++        &self.field
++    }
++
++    /// Transports a value from either input or an ancestor through the retained
++    /// generator correspondences. Original finite-denominator proofs are
++    /// preserved by these exact real-field embeddings; they are not inferred
++    /// from approximate coordinates or a new independent selection.
++    ///
++    /// A call-local memo retains shared input values during traversal. It has
++    /// no cross-call or policy lifetime, and stores no failed decisions.
++    pub fn embed(
++        &self,
++        value: &SelectedPolynomialValue,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        self.embed_inner(value, &mut HashMap::new())
++    }
++
++    fn embed_inner(
++        &self,
++        value: &SelectedPolynomialValue,
++        memo: &mut HashMap<usize, SelectedPolynomialValue>,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        match self.field.lift(value) {
++            Ok(value) => return Ok(value),
++            Err(SelectedPolynomialArithmeticError::IncompatibleField) => {}
++            Err(error) => return Err(error),
++        }
++        // The immutable source graph remains owned throughout this call, so
++        // pointer keys cannot outlive their nodes or be recycled during traversal.
++        let key = Arc::as_ptr(&value.0) as usize;
++        if let Some(mapped) = memo.get(&key) {
++            return Ok(mapped.clone());
++        }
++        let mapped = match &value.0.coordinates {
++            Coordinates::Recursive(scalar) => {
++                let embedding = self
++                    .native
++                    .iter()
++                    .find(|map| recursive_ancestor(&map.source, &scalar.numerator.field()))
++                    .ok_or(SelectedPolynomialArithmeticError::IncompatibleField)?;
++                let numerator = self
++                    .field
++                    .import_recursive(&unavailable(embedding.value(&scalar.numerator))?)?;
++                let denominator = self
++                    .field
++                    .import_recursive(&unavailable(embedding.value(&scalar.denominator))?)?;
++                numerator.multiply(&denominator.positive_reciprocal()?)?
++            }
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => {
++                let generator = self
++                    .generators
++                    .iter()
++                    .find(|map| map.source.shares_authority(value.field()))
++                    .ok_or(SelectedPolynomialArithmeticError::IncompatibleField)?;
++                let generator = self.field.lift(&generator.image)?;
++                let numerator = self.evaluate_embedded(numerator, &generator, memo)?;
++                let denominator = self.evaluate_embedded(denominator, &generator, memo)?;
++                numerator.multiply(&denominator.positive_reciprocal()?)?
++            }
++        };
++        memo.insert(key, mapped.clone());
++        Ok(mapped)
++    }
++
++    fn evaluate_embedded(
++        &self,
++        coefficients: &[SelectedPolynomialValue],
++        generator: &SelectedPolynomialValue,
++        memo: &mut HashMap<usize, SelectedPolynomialValue>,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        let mut result = self.field.constant(Real::zero())?;
++        for coefficient in coefficients.iter().rev() {
++            result = result
++                .multiply(generator)?
++                .add(&self.embed_inner(coefficient, memo)?)?;
++        }
++        Ok(result)
++    }
++
++    fn append<C: SelectedAlgebraContext>(
++        &mut self,
++        source: SelectedPolynomialField,
++        policy: &C,
++    ) -> Result<(), SelectedPolynomialError<C::Error>> {
++        if self.field.contains_field(&source)
++            || self
++                .generators
++                .iter()
++                .any(|map| map.source.shares_authority(&source))
++        {
++            return Ok(());
++        }
++        let FieldData::Extension {
++            defining, interval, ..
++        } = source.0.as_ref()
++        else {
++            return Err(SelectedPolynomialArithmeticError::NoPolynomialGenerator.into());
++        };
++        let mut memo = HashMap::new();
++        let coefficients = defining
++            .iter()
++            .map(|coefficient| self.embed_inner(coefficient, &mut memo))
++            .collect::<ArithmeticResult<Vec<_>>>()?;
++        let field = self.field.select_strict(
++            coefficients,
++            interval.lower.clone(),
++            interval.upper.clone(),
++            policy,
++        )?;
++        self.generators.push(GeneratorEmbedding {
++            source,
++            image: field.generator()?,
++        });
++        self.field = field;
++        Ok(())
++    }
++}
++
++impl SelectedPolynomialValue {
++    // Only called after exact embedding has transported an existing strict
++    // positivity proof. The public reciprocal path still performs its sign test.
++    fn positive_reciprocal(&self) -> ArithmeticResult<Self> {
++        match &self.0.coordinates {
++            Coordinates::Recursive(scalar) => self
++                .field()
++                .recursive_value(scalar.denominator.clone(), scalar.numerator.clone()),
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => self
++                .field()
++                .extension_value(denominator.clone(), numerator.clone()),
++        }
++    }
++}
++
++fn require_native<T, E>(value: Classification<Option<T>>) -> Result<T, SelectedPolynomialError<E>> {
++    match value {
++        Classification::Decided(value) => Ok(unavailable(value)?),
++        Classification::Uncertain(reason) => Err(SelectedPolynomialError::Uncertain(reason)),
++    }
++}
++
++fn join_native<C: SelectedAlgebraContext>(
++    first: &RecursiveQuadraticField,
++    second: &RecursiveQuadraticField,
++    policy: &C,
++) -> Result<(RecursiveQuadraticField, Vec<NativeEmbedding>), SelectedPolynomialError<C::Error>> {
++    let (first_base, _) = first.base_and_extension_path();
++    let (second_base, _) = second.base_and_extension_path();
++    if Arc::ptr_eq(&first_base, &second_base) {
++        let (joined, extensions) = require_native(
++            first
++                .joined_with(second, policy)
++                .map_err(SelectedPolynomialError::Context)?,
++        )?;
++        let map = NativeEmbedding {
++            source: second.clone(),
++            target: joined.clone(),
++            map: NativeMap::Extensions(extensions),
++        };
++        return Ok((joined, vec![map]));
++    }
++    let (sources, first_axes, second_axes) =
++        recursive_quadratic_source_union(&first_base.sources, &second_base.sources);
++    let embed_speed = |polynomial| {
++        dense_tensor_embed_axes(polynomial, sources.len(), &first_axes)
++            .and_then(|polynomial| dense_reduce_selected_tuple_relations(polynomial, &sources))
++    };
++    let first_speed = unavailable(embed_speed(&first_base.first_speed_squared))?;
++    let second_speed = unavailable(embed_speed(&first_base.second_speed_squared))?;
++    let base = unavailable(RecursiveQuadraticField::base(
++        sources,
++        first_speed,
++        second_speed,
++    ))?;
++    let RecursiveQuadraticField::Base(target_base) = &base else {
++        unreachable!()
++    };
++    let (rebased, source_base, extensions) = unavailable(recursive_rebase_field_preserving_base(
++        first,
++        target_base.clone(),
++        &first_axes,
++    ))?;
++    let (joined, foreign) = require_native(
++        recursive_embed_foreign_field(second, target_base.clone(), second_axes, rebased, policy)
++            .map_err(SelectedPolynomialError::Context)?,
++    )?;
++    let maps = vec![
++        NativeEmbedding {
++            source: first.clone(),
++            target: joined.clone(),
++            map: NativeMap::Rebased {
++                source: source_base,
++                target: target_base.clone(),
++                axes: first_axes,
++                extensions,
++            },
++        },
++        NativeEmbedding {
++            source: second.clone(),
++            target: joined.clone(),
++            map: NativeMap::Foreign(foreign),
++        },
++    ];
++    Ok((joined, maps))
++}
+diff --git a/crates/hypersolve/src/work_budget.rs b/crates/hypersolve/src/work_budget.rs
+index 10d4014f20..5628ef81f2 100644
+--- a/crates/hypersolve/src/work_budget.rs
++++ b/crates/hypersolve/src/work_budget.rs
+@@ -22,7 +22,8 @@
+ //! promotion units. Selected-fiber polynomial-image norms, bivariate quotient
+ //! norms, tagged tensor-fiber projections, bivariate system resultants,
+ //! constrained tensor-axis resultants, fixed-rank three/four-variable norms,
+-//! their subresultants, bivariate cofactor parameter lifts, common-component
++//! their subresultants, selected polynomial-field extension validation,
++//! bivariate cofactor parameter lifts, common-component
+ //! discovery, and axis-factor extraction also participate.
+ //! Bivariate finite-fiber topology charges its construction entry, its existing
+ //! projection/fiber operations, and connection-strip or outer-separator
+@@ -34,6 +35,11 @@
+ //! comprehensively instrumented. Those paths need additional work
+ //! before any whole-operation completion or time bound can be claimed.
+ //!
++//! A new selected polynomial extension charges one promotion unit before its
++//! singleton root count and local monic normalization. Reusing an admitted
++//! field or performing its arithmetic charges no extension unit. The count
++//! and arithmetic are not bounded by this entry counter.
++//!
+ //! One promotion unit admits one instrumented projection entry, regardless of
+ //! its degree or number of eliminated axes; root subdivisions performed inside
+ //! it consume separate refinement units. Nested projection entries share the
+diff --git a/crates/hypersolve/tests/selected_polynomial_fields.rs b/crates/hypersolve/tests/selected_polynomial_fields.rs
+new file mode 100644
+index 0000000000..90b1de3027
+--- /dev/null
++++ b/crates/hypersolve/tests/selected_polynomial_fields.rs
+@@ -0,0 +1,410 @@
++//! Dependent algebraic roots must keep their defining field relations.
++
++#[path = "support/recursive_quadratic.rs"]
++#[allow(dead_code)]
++mod support;
++
++use hyperreal::{Real, RealSign};
++use hypersolve::classification::Classification;
++use hypersolve::recursive_quadratic_field::{
++    RecursiveQuadraticField, RecursiveQuadraticOrderedFieldContext,
++};
++use hypersolve::selected_polynomial_field::{
++    SelectedPolynomialError, SelectedPolynomialField, SelectedPolynomialValue,
++};
++use hypersolve::work_budget::{WorkBudget, WorkKind, with_budget};
++use support::*;
++
++fn base() -> SelectedPolynomialField {
++    SelectedPolynomialField::from_recursive(
++        RecursiveQuadraticField::base(
++            Vec::new(),
++            constant_tensor(0, real(1)),
++            constant_tensor(0, real(1)),
++        )
++        .unwrap(),
++    )
++}
++
++fn decided<T: std::fmt::Debug>(value: Classification<T>) -> T {
++    match value {
++        Classification::Decided(value) => value,
++        other => panic!("expected exact completion, got {other:?}"),
++    }
++}
++
++fn coefficients(field: &SelectedPolynomialField, values: &[i32]) -> Vec<SelectedPolynomialValue> {
++    values
++        .iter()
++        .map(|v| field.constant(Real::from(*v)).unwrap())
++        .collect()
++}
++
++fn select(
++    field: &SelectedPolynomialField,
++    values: Vec<SelectedPolynomialValue>,
++    lo: i32,
++    hi: i32,
++) -> SelectedPolynomialField {
++    decided(
++        field
++            .select(
++                values,
++                Real::from(lo),
++                Real::from(hi),
++                &TestContext::strict(),
++            )
++            .unwrap(),
++    )
++}
++
++fn power(value: &SelectedPolynomialValue, mut exponent: usize) -> SelectedPolynomialValue {
++    let mut result = value.field().constant(real(1)).unwrap();
++    let mut factor = value.clone();
++    while exponent != 0 {
++        if exponent % 2 == 1 {
++            result = result.multiply(&factor).unwrap();
++        }
++        exponent /= 2;
++        if exponent != 0 {
++            factor = factor.multiply(&factor).unwrap();
++        }
++    }
++    result
++}
++
++fn is_zero(value: &SelectedPolynomialValue) {
++    assert_eq!(
++        value.sign(&TestContext::strict()).unwrap(),
++        Classification::Decided(RealSign::Zero)
++    );
++}
++
++#[test]
++fn dependent_nonradical_generators_preserve_joint_relations() {
++    let q = base();
++    let a_field = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let a = a_field.generator().unwrap();
++    let b_field = select(
++        &a_field,
++        vec![
++            a.scale(&real(-1)).unwrap(),
++            a_field.constant(real(0)).unwrap(),
++            a_field.constant(real(0)).unwrap(),
++            a_field.constant(real(1)).unwrap(),
++        ],
++        1,
++        2,
++    );
++    let b = b_field.generator().unwrap();
++    let mut c_equation = coefficients(&b_field, &[0, 0, 0, 0, 0, 1]);
++    c_equation[0] = b.scale(&real(-1)).unwrap();
++    let c_field = select(&b_field, c_equation, 1, 2);
++    let c = c_field.generator().unwrap();
++    assert!(c_field.parent().unwrap().shares_authority(&b_field));
++    assert!(b_field.parent().unwrap().shares_authority(&a_field));
++    is_zero(
++        &power(&a, 3)
++            .subtract(&a_field.constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    is_zero(&power(&b, 3).subtract(&b_field.lift(&a).unwrap()).unwrap());
++    is_zero(&power(&c, 5).subtract(&c_field.lift(&b).unwrap()).unwrap());
++    // Independent elimination of the three original defining relations.
++    is_zero(
++        &power(&c, 45)
++            .subtract(&c_field.constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    assert_eq!(
++        c.subtract(&c_field.constant(real(1)).unwrap())
++            .unwrap()
++            .sign(&TestContext::strict())
++            .unwrap(),
++        Classification::Decided(RealSign::Positive)
++    );
++    // A quotient produced in the deepest field remains an ordinary operand.
++    let denominator = c.add(&c_field.lift(&a).unwrap()).unwrap();
++    let image = decided(c.divide(&denominator, &TestContext::strict()).unwrap());
++    is_zero(&image.multiply(&denominator).unwrap().subtract(&c).unwrap());
++}
++
++#[test]
++fn repeated_nonmonic_relation_selects_one_distinct_root() {
++    let q = base();
++    // -3(t^3-2)^2 has one distinct root in (1,2), of multiplicity two.
++    let selected = select(&q, coefficients(&q, &[-12, 0, 0, 12, 0, 0, -3]), 1, 2);
++    let a = selected.generator().unwrap();
++    is_zero(
++        &power(&a, 3)
++            .subtract(&selected.constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    assert_eq!(selected.defining_polynomial().unwrap().len(), 7);
++    let [lower, upper] = selected.isolating_bounds().unwrap();
++    assert_eq!(lower, &real(1));
++    assert_eq!(upper, &real(2));
++    // Re-selection replays the original relation and interval, including its
++    // multiplicity; no serialized singleton flag is an input to this API.
++    let replay = select(&q, selected.defining_polynomial().unwrap().to_vec(), 1, 2);
++    let r = replay.generator().unwrap();
++    is_zero(
++        &power(&r, 3)
++            .subtract(&replay.constant(real(2)).unwrap())
++            .unwrap(),
++    );
++}
++
++#[test]
++fn local_denominator_guards_do_not_require_global_invertibility() {
++    let q = base();
++    // (t^2-2)(t-3), selecting sqrt(2). t-3 vanishes on another component.
++    let selected = select(&q, coefficients(&q, &[6, -2, -3, 1]), 1, 2);
++    let a = selected.generator().unwrap();
++    let denominator = a.subtract(&selected.constant(real(3)).unwrap()).unwrap();
++    let numerator = a.add(&selected.constant(real(1)).unwrap()).unwrap();
++    let quotient = decided(
++        numerator
++            .divide(&denominator, &TestContext::strict())
++            .unwrap(),
++    );
++    is_zero(
++        &quotient
++            .multiply(&denominator)
++            .unwrap()
++            .subtract(&numerator)
++            .unwrap(),
++    );
++    assert_eq!(
++        quotient.sign(&TestContext::strict()).unwrap(),
++        Classification::Decided(RealSign::Negative)
++    );
++    let zero = power(&a, 2)
++        .subtract(&selected.constant(real(2)).unwrap())
++        .unwrap();
++    assert!(matches!(
++        numerator.divide(&zero, &TestContext::strict()),
++        Err(SelectedPolynomialError::ZeroDenominator)
++    ));
++}
++
++#[test]
++fn selectors_distinguish_no_root_ambiguity_and_invalid_evidence() {
++    let q = base();
++    let policy = TestContext::strict();
++    let run = |p: &[i32], lo: i32, hi: i32| {
++        q.select(coefficients(&q, p), Real::from(lo), Real::from(hi), &policy)
++    };
++    assert!(matches!(
++        run(&[1, 0, 1], -1, 1),
++        Err(SelectedPolynomialError::NoRoot)
++    ));
++    assert!(matches!(
++        run(&[-2, 0, 1], -2, 2),
++        Err(SelectedPolynomialError::MultipleRoots(2))
++    ));
++    assert!(matches!(
++        run(&[0], -1, 1),
++        Err(SelectedPolynomialError::ZeroPolynomial)
++    ));
++    assert!(matches!(
++        run(&[-2, 0, 1], 2, 1),
++        Err(SelectedPolynomialError::InvalidSelector)
++    ));
++    assert!(matches!(
++        run(&[0, 1], 0, 1),
++        Err(SelectedPolynomialError::InvalidSelector)
++    ));
++}
++
++#[test]
++fn selection_budget_refusal_does_not_poison_retry_or_permit_approximation() {
++    let q = base();
++    let policy = TestContext::approximate();
++    let run = || q.select(coefficients(&q, &[-2, 0, 0, 1]), real(1), real(2), &policy);
++    let refused = with_budget(WorkBudget::ZERO, run);
++    assert_eq!(
++        refused.result.unwrap_err().kind,
++        WorkKind::AlgebraicPromotion
++    );
++    assert_eq!(refused.usage.promotions, 0);
++    let retried = with_budget(
++        WorkBudget {
++            refinements: 1000,
++            promotions: 10,
++        },
++        run,
++    );
++    let field = decided(retried.result.unwrap().unwrap());
++    assert_eq!(retried.usage.promotions, 1);
++    is_zero(
++        &power(&field.generator().unwrap(), 3)
++            .subtract(&field.constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    assert_eq!(policy.approximations(), 0);
++}
++
++#[test]
++fn exact_root_count_preserves_repeated_and_negative_factors() {
++    let field = RecursiveQuadraticField::base(
++        Vec::new(),
++        constant_tensor(0, real(1)),
++        constant_tensor(0, real(1)),
++    )
++    .unwrap();
++    let mut context = RecursiveQuadraticOrderedFieldContext {
++        field: field.clone(),
++        policy: TestContext::strict(),
++    };
++    let mut count = |p: &[i32], lo: i32, hi: i32| {
++        let p = p
++            .iter()
++            .map(|v| field.constant(Real::from(*v)).unwrap())
++            .collect::<Vec<_>>();
++        hypersolve::ordered_field_count_roots(&p, &Real::from(lo), &Real::from(hi), &mut context)
++            .unwrap()
++    };
++    // (t^2-1)^2(t-2) = t^5-2t^4-2t^3+4t^2+t-2.
++    assert_eq!(count(&[-2, 1, 4, -2, -2, 1], -3, 3), Some(3));
++    assert_eq!(count(&[6, -3, -12, 6, 6, -3], -3, 3), Some(3));
++    assert_eq!(count(&[-2, 1, 4, -2, -2, 1], 0, 3), Some(2));
++    assert_eq!(count(&[-2, 1, 4, -2, -2, 1], 3, 4), Some(0));
++    assert_eq!(count(&[-2, 1, 4, -2, -2, 1], 1, 3), None);
++    assert_eq!(count(&[0], -1, 1), None);
++}
++
++#[test]
++fn elliptic_corner_contact_keeps_original_curve_distance_and_selected_side() {
++    use hypersolve::BivariatePolynomial;
++    use hypersolve::recursive_quadratic_field::compose_bivariate_homogeneous_polynomial;
++
++    // The Boolean-generated corner of y^2=1+x^3 clipped at y=1/2 is
++    // q=(a,1/2), where 4a^3+3=0, -1<a<0. Its coordinates are not
++    // independently materialized. This is the original radius 1/64 witness.
++    let root = selected_root(
++        vec![real(3), real(0), real(0), real(4)],
++        real(-1),
++        real(0),
++        13,
++    );
++    let native = RecursiveQuadraticField::base(
++        vec![root.clone()],
++        constant_tensor(1, real(1)),
++        constant_tensor(1, real(1)),
++    )
++    .unwrap();
++    let a = native.retained_root_value(&root).unwrap();
++    let r = fraction(1, 64);
++    let zero = native.constant(real(0)).unwrap();
++    let one = native.constant(real(1)).unwrap();
++    let radius = native.constant(r.clone()).unwrap();
++    let x = [
++        a.add(&radius).unwrap(),
++        zero.clone(),
++        a.subtract(&radius).unwrap(),
++    ];
++    let y = [
++        native.constant(fraction(1, 2)).unwrap(),
++        native.constant(real(2) * &r).unwrap(),
++        native.constant(fraction(1, 2)).unwrap(),
++    ];
++    let w = [one.clone(), zero, one];
++    let source = BivariatePolynomial::new(vec![
++        vec![real(-1), real(0), real(1)],
++        vec![],
++        vec![],
++        vec![real(-1)],
++    ]);
++    let contact = compose_bivariate_homogeneous_polynomial(&source, &x, &y, &w, 3).unwrap();
++    let parent = SelectedPolynomialField::from_recursive(native);
++    let equation = contact
++        .iter()
++        .map(|v| parent.import_recursive(v).unwrap())
++        .collect();
++    eprintln!("elliptic contact: select retained circle root");
++    let field = select(&parent, equation, -2, -1);
++    let t = field.generator().unwrap();
++    let a = field.import_recursive(&a).unwrap();
++    let one = field.constant(real(1)).unwrap();
++    let t2 = power(&t, 2);
++    let denominator = one.add(&t2).unwrap();
++    eprintln!("elliptic contact: construct correlated coordinates");
++    let dx = decided(
++        one.subtract(&t2)
++            .unwrap()
++            .scale(&r)
++            .unwrap()
++            .divide(&denominator, &TestContext::strict())
++            .unwrap(),
++    );
++    let dy = decided(
++        t.scale(&(real(2) * &r))
++            .unwrap()
++            .divide(&denominator, &TestContext::strict())
++            .unwrap(),
++    );
++    let x = a.add(&dx).unwrap();
++    let y = field.constant(fraction(1, 2)).unwrap().add(&dy).unwrap();
++    assert!(x.field().shares_authority(y.field()));
++    eprintln!("elliptic contact: replay original source and distance");
++    is_zero(
++        &power(&y, 2)
++            .subtract(&power(&x, 3))
++            .unwrap()
++            .subtract(&one)
++            .unwrap(),
++    );
++    is_zero(
++        &power(&dx, 2)
++            .add(&power(&dy, 2))
++            .unwrap()
++            .subtract(&field.constant(&r * &r).unwrap())
++            .unwrap(),
++    );
++    // The cut remains on the original upper branch between x=-1 and x=a;
++    // the right/up circle contact would violate the authored trim.
++    for value in [dx, dy] {
++        assert_sign(value.sign(&TestContext::strict()), RealSign::Negative);
++    }
++    assert_sign(
++        x.add(&one).unwrap().sign(&TestContext::strict()),
++        RealSign::Positive,
++    );
++    assert_sign(y.sign(&TestContext::strict()), RealSign::Positive);
++}
++
++#[test]
++fn nearby_exact_selectors_remain_distinct() {
++    let q = base();
++    let small = fraction(1, 1_u64 << 40);
++    let small = &small * &small;
++    let small = &small * &small;
++    let quarter = (&small / real(4)).unwrap();
++    let first = real(1);
++    let second = &first + &small;
++    // (t-1)(t-1-e), e=2^-160. Both selectors are exact and disjoint.
++    let polynomial = vec![
++        q.constant(second.clone()).unwrap(),
++        q.constant(-(&first + &second)).unwrap(),
++        q.constant(real(1)).unwrap(),
++    ];
++    for center in [first, second] {
++        let field = decided(
++            q.select(
++                polynomial.clone(),
++                &center - &quarter,
++                &center + &quarter,
++                &TestContext::strict(),
++            )
++            .unwrap(),
++        );
++        is_zero(
++            &field
++                .generator()
++                .unwrap()
++                .subtract(&field.constant(center).unwrap())
++                .unwrap(),
++        );
++    }
++}
+diff --git a/crates/hypersolve/tests/selected_polynomial_joins.rs b/crates/hypersolve/tests/selected_polynomial_joins.rs
+new file mode 100644
+index 0000000000..90216cd323
+--- /dev/null
++++ b/crates/hypersolve/tests/selected_polynomial_joins.rs
+@@ -0,0 +1,306 @@
++//! A common field preserves each source selection and its dependent values.
++#[path = "support/recursive_quadratic.rs"]
++#[allow(dead_code)]
++mod support;
++
++use hyperreal::{Real, RealSign};
++use hypersolve::classification::{Classification, UncertaintyReason};
++use hypersolve::recursive_quadratic_field::RecursiveQuadraticField;
++use hypersolve::selected_polynomial_field::{SelectedPolynomialField, SelectedPolynomialValue};
++use hypersolve::work_budget::{WorkBudget, WorkKind, with_budget};
++use support::*;
++
++fn decided<T: std::fmt::Debug>(value: Classification<T>) -> T {
++    match value {
++        Classification::Decided(value) => value,
++        other => panic!("expected exact completion, got {other:?}"),
++    }
++}
++fn base() -> SelectedPolynomialField {
++    SelectedPolynomialField::from_recursive(
++        RecursiveQuadraticField::base(
++            Vec::new(),
++            constant_tensor(0, real(1)),
++            constant_tensor(0, real(1)),
++        )
++        .unwrap(),
++    )
++}
++fn coefficients(field: &SelectedPolynomialField, values: &[i32]) -> Vec<SelectedPolynomialValue> {
++    values
++        .iter()
++        .map(|v| field.constant(Real::from(*v)).unwrap())
++        .collect()
++}
++fn select(
++    field: &SelectedPolynomialField,
++    values: Vec<SelectedPolynomialValue>,
++    lo: i32,
++    hi: i32,
++) -> SelectedPolynomialField {
++    decided(
++        field
++            .select(
++                values,
++                Real::from(lo),
++                Real::from(hi),
++                &TestContext::strict(),
++            )
++            .unwrap(),
++    )
++}
++fn root(
++    parent: &SelectedPolynomialField,
++    radicand: &SelectedPolynomialValue,
++    degree: usize,
++) -> SelectedPolynomialField {
++    let mut p = vec![parent.constant(real(0)).unwrap(); degree + 1];
++    p[0] = radicand.scale(&real(-1)).unwrap();
++    p[degree] = parent.constant(real(1)).unwrap();
++    select(parent, p, 1, 2)
++}
++fn power(value: &SelectedPolynomialValue, exponent: usize) -> SelectedPolynomialValue {
++    (0..exponent).fold(value.field().constant(real(1)).unwrap(), |result, _| {
++        result.multiply(value).unwrap()
++    })
++}
++fn is_zero(value: &SelectedPolynomialValue) {
++    assert_eq!(
++        value.sign(&TestContext::strict()).unwrap(),
++        Classification::Decided(RealSign::Zero)
++    );
++}
++
++#[test]
++fn divergent_generators_embed_quotients_and_feed_a_further_selection() {
++    let q = base();
++    let a_field = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let a = a_field.generator().unwrap();
++    let b_field = root(&a_field, &a, 3);
++    let c_field = root(&a_field, &a, 5);
++    let b = b_field.generator().unwrap();
++    let c = c_field.generator().unwrap();
++    let c_quotient = decided(
++        c.divide(&c.add(&a).unwrap(), &TestContext::strict())
++            .unwrap(),
++    );
++    let join = decided(
++        b_field
++            .joined_with(&c_field, &TestContext::strict())
++            .unwrap(),
++    );
++    let x = join.embed(&b).unwrap();
++    let y = join.embed(&c).unwrap();
++    let a = join.embed(&a).unwrap();
++    is_zero(&power(&x, 3).subtract(&a).unwrap());
++    is_zero(&power(&y, 5).subtract(&a).unwrap());
++    is_zero(
++        &power(&x, 9)
++            .subtract(&join.field().constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    is_zero(
++        &join
++            .embed(&c_quotient)
++            .unwrap()
++            .multiply(&y.add(&a).unwrap())
++            .unwrap()
++            .subtract(&y)
++            .unwrap(),
++    );
++    assert_eq!(
++        x.subtract(&y)
++            .unwrap()
++            .sign(&TestContext::strict())
++            .unwrap(),
++        Classification::Decided(RealSign::Positive)
++    );
++    // The joined values remain ordinary coefficients of another exact construction.
++    let sum = x.add(&y).unwrap();
++    let next = root(join.field(), &sum, 2);
++    is_zero(
++        &power(&next.generator().unwrap(), 2)
++            .subtract(&next.lift(&sum).unwrap())
++            .unwrap(),
++    );
++    assert!(join.field().parent().unwrap().shares_authority(&b_field));
++}
++
++#[test]
++fn independently_selected_equal_values_and_opposite_roots_are_distinguished() {
++    let q = base();
++    let first = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let second = select(&q, coefficients(&q, &[-12, 0, 0, 12, 0, 0, -3]), 1, 2);
++    assert!(!first.shares_authority(&second));
++    let join = decided(first.joined_with(&second, &TestContext::strict()).unwrap());
++    is_zero(
++        &join
++            .embed(&first.generator().unwrap())
++            .unwrap()
++            .subtract(&join.embed(&second.generator().unwrap()).unwrap())
++            .unwrap(),
++    );
++    let positive = select(&q, coefficients(&q, &[-2, 0, 1]), 1, 2);
++    let negative = select(&q, coefficients(&q, &[-2, 0, 1]), -2, -1);
++    let join = decided(
++        positive
++            .joined_with(&negative, &TestContext::strict())
++            .unwrap(),
++    );
++    let p = join.embed(&positive.generator().unwrap()).unwrap();
++    let n = join.embed(&negative.generator().unwrap()).unwrap();
++    is_zero(&p.add(&n).unwrap());
++    assert_eq!(
++        p.subtract(&n)
++            .unwrap()
++            .sign(&TestContext::strict())
++            .unwrap(),
++        Classification::Decided(RealSign::Positive)
++    );
++}
++
++#[test]
++fn foreign_native_roots_and_radicals_keep_their_relations() {
++    let first_native = RecursiveQuadraticField::base(
++        vec![cube_root_two()],
++        constant_tensor(1, real(1)),
++        constant_tensor(1, real(1)),
++    )
++    .unwrap();
++    let a_native = first_native.retained_root_value(&cube_root_two()).unwrap();
++    let first = SelectedPolynomialField::from_recursive(first_native);
++    let a = first.import_recursive(&a_native).unwrap();
++    let b = root(&first, &a, 3);
++
++    let second_base = RecursiveQuadraticField::base(
++        vec![sqrt_two_root()],
++        constant_tensor(1, real(2)),
++        constant_tensor(1, real(3)),
++    )
++    .unwrap();
++    let s_native = second_base.retained_root_value(&sqrt_two_root()).unwrap();
++    let radicand = s_native
++        .add(&second_base.constant(real(1)).unwrap())
++        .unwrap();
++    let second_native = second_base.extension(radicand.clone()).unwrap();
++    let r_native = second_native
++        .retained_positive_square_root(&radicand)
++        .unwrap();
++    let second = SelectedPolynomialField::from_recursive(second_native);
++    let r = second.import_recursive(&r_native).unwrap();
++    let s = second.import_recursive(&s_native).unwrap();
++    let c = root(&second, &r, 3);
++    let join = decided(b.joined_with(&c, &TestContext::strict()).unwrap());
++    let x = join.embed(&b.generator().unwrap()).unwrap();
++    let y = join.embed(&c.generator().unwrap()).unwrap();
++    let mapped_s = join.embed(&s).unwrap();
++    let mapped_r = join.embed(&r).unwrap();
++    is_zero(
++        &power(&x, 9)
++            .subtract(&join.field().constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    is_zero(&power(&y, 3).subtract(&mapped_r).unwrap());
++    is_zero(
++        &power(&mapped_r, 2)
++            .subtract(&mapped_s)
++            .unwrap()
++            .subtract(&join.field().constant(real(1)).unwrap())
++            .unwrap(),
++    );
++    is_zero(
++        &power(&mapped_s, 2)
++            .subtract(&join.field().constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    let quotient = decided(x.divide(&y, &TestContext::strict()).unwrap());
++    is_zero(&quotient.multiply(&y).unwrap().subtract(&x).unwrap());
++}
++
++#[test]
++fn joining_preserves_nearby_distinct_selected_roots() {
++    let q = base();
++    let epsilon = power(&q.constant(fraction(1, 1_u64 << 40)).unwrap(), 4);
++    let one = q.constant(real(1)).unwrap();
++    let next = one.add(&epsilon).unwrap();
++    let equation = vec![
++        next.clone(),
++        one.add(&next).unwrap().scale(&real(-1)).unwrap(),
++        one,
++    ];
++    let delta = (fraction(1, 1_u64 << 40) * fraction(1, 1_u64 << 40))
++        * (fraction(1, 1_u64 << 40) * fraction(1, 1_u64 << 40));
++    let half = &delta * fraction(1, 2);
++    let first = decided(
++        q.select(
++            equation.clone(),
++            real(1) - &half,
++            real(1) + &half,
++            &TestContext::strict(),
++        )
++        .unwrap(),
++    );
++    let second = decided(
++        q.select(
++            equation,
++            real(1) + &half,
++            real(1) + &delta + &half,
++            &TestContext::strict(),
++        )
++        .unwrap(),
++    );
++    let join = decided(first.joined_with(&second, &TestContext::strict()).unwrap());
++    let distance = join
++        .embed(&second.generator().unwrap())
++        .unwrap()
++        .subtract(&join.embed(&first.generator().unwrap()).unwrap())
++        .unwrap();
++    is_zero(&distance.subtract(&join.embed(&epsilon).unwrap()).unwrap());
++    assert_eq!(
++        distance.sign(&TestContext::strict()).unwrap(),
++        Classification::Decided(RealSign::Positive)
++    );
++}
++
++#[test]
++fn join_budget_refusal_retries_and_ancestor_join_reuses_authority() {
++    let q = base();
++    let first = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let second = select(&q, coefficients(&q, &[-3, 0, 0, 1]), 1, 2);
++    let policy = TestContext::approximate();
++    let refused = with_budget(WorkBudget::ZERO, || {
++        let outcome = first.joined_with(&second, &policy).unwrap();
++        assert!(matches!(
++            outcome,
++            Classification::Uncertain(UncertaintyReason::BudgetExhausted)
++        ));
++        outcome
++    });
++    assert_eq!(refused.usage.promotions, 0);
++    assert_eq!(
++        refused.result.unwrap_err().kind,
++        WorkKind::AlgebraicPromotion
++    );
++    let retried = with_budget(
++        WorkBudget {
++            refinements: 1000,
++            promotions: 10,
++        },
++        || first.joined_with(&second, &policy).unwrap(),
++    );
++    let join = decided(retried.result.unwrap());
++    assert_eq!(retried.usage.promotions, 1);
++    is_zero(
++        &power(&join.embed(&second.generator().unwrap()).unwrap(), 3)
++            .subtract(&join.field().constant(real(3)).unwrap())
++            .unwrap(),
++    );
++    let reused = with_budget(WorkBudget::ZERO, || first.joined_with(&q, &policy).unwrap());
++    assert!(
++        decided(reused.result.unwrap())
++            .field()
++            .shares_authority(&first)
++    );
++    assert_eq!(reused.usage.promotions, 0);
++    assert_eq!(policy.approximations(), 0);
++}
