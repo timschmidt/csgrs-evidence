@@ -1,0 +1,1533 @@
+--- a/crates/hypercurve/src/bezier_algebraic_image.rs
++++ b/crates/hypercurve/src/bezier_algebraic_image.rs
+@@ -1344,31 +1344,14 @@
+         &'a self,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<RationalBezierAlgebraicPointPredicate2<'a>>> {
+-        let Some(image) = self.resolved(policy) else {
+-            return Err(CurveError::Topology(
+-                "algebraic point image did not retain a replayable source".into(),
+-            ));
++        // The authored rational chart already supplies both coordinates in
++        // one selected field. Predicates do not require independently isolated
++        // coordinate images; materialization remains an optional consumer.
++        let image = self;
++        let Some((x_numerator, y_numerator, denominator)) = image.retained_coordinate_polynomials()
++        else {
++            return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+         };
+-        let (x_numerator, y_numerator, denominator) =
+-            if let Some(expression) = image.retained_expression() {
+-                (
+-                    expression.x_numerator.as_slice(),
+-                    expression.y_numerator.as_slice(),
+-                    expression.denominator.as_slice(),
+-                )
+-            } else {
+-                let (Some(x), Some(y)) = (image.x(), image.y()) else {
+-                    return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+-                };
+-                if x.denominator_coefficients() != y.denominator_coefficients() {
+-                    return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+-                }
+-                (
+-                    x.numerator_coefficients(),
+-                    y.numerator_coefficients(),
+-                    x.denominator_coefficients(),
+-                )
+-            };
+         let parameter = match image.source_parameter(policy)? {
+             Classification::Decided(parameter) => parameter,
+             Classification::Uncertain(reason) => {
+--- a/crates/hypercurve/src/bezier_arrangement.rs
++++ b/crates/hypercurve/src/bezier_arrangement.rs
+@@ -758,7 +758,8 @@
+                 | crate::CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => None,
+             };
+             let mut data = retained_topology_endpoint_data(arrangement_fragment);
+--- a/crates/hypercurve/src/bezier_offset.rs
++++ b/crates/hypercurve/src/bezier_offset.rs
+@@ -5225,7 +5225,8 @@
+         | CurvePoint2(
+             CurvePointData2::Similarity(_)
+             | CurvePointData2::Endpoint(_)
+-            | CurvePointData2::Polynomial(_),
++            | CurvePointData2::Polynomial(_)
++            | CurvePointData2::RationalImage(_),
+         ) => None,
+     };
+     let constant_axis = match parameter_axis.axis {
+@@ -8902,6 +8903,11 @@
+     axis: Axis2,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<std::cmp::Ordering>> {
++    for point in [first, second] {
++        if let Classification::Uncertain(reason) = point.validate_rational_image(policy)? {
++            return Ok(Classification::Uncertain(reason));
++        }
++    }
+     if first.shares_storage(second) {
+         return Ok(Classification::Decided(std::cmp::Ordering::Equal));
+     }
+@@ -8910,6 +8916,7 @@
+         // already own both selected scalar coordinates; do not recursively
+         // ask for common-source alignment again at that base case.
+         CurvePointData2::Polynomial(point) => point.has_rational_maps(),
++        CurvePointData2::RationalImage(_) => true,
+         CurvePointData2::Similarity(image) => {
+             matches!(image.data.source.0, CurvePointData2::Polynomial(_))
+         }
+@@ -9429,7 +9436,8 @@
+             CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ),
+             _,
+         )
+@@ -9438,7 +9446,8 @@
+             CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ),
+         ) => Ok(algebraic_chord_point_coordinate_order_fallback(
+             first, second, axis, policy,
+@@ -9672,7 +9681,8 @@
+         | CurvePoint2(
+             CurvePointData2::Similarity(_)
+             | CurvePointData2::Endpoint(_)
+-            | CurvePointData2::Polynomial(_),
++            | CurvePointData2::Polynomial(_)
++            | CurvePointData2::RationalImage(_),
+         ) => {
+             return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+         }
+@@ -9744,7 +9754,8 @@
+         | CurvePoint2(
+             CurvePointData2::Similarity(_)
+             | CurvePointData2::Endpoint(_)
+-            | CurvePointData2::Polynomial(_),
++            | CurvePointData2::Polynomial(_)
++            | CurvePointData2::RationalImage(_),
+         ) => None,
+     }
+ }
+@@ -9963,6 +9974,7 @@
+     #[cfg(feature = "dispatch-trace")]
+     let evidence_kind = |point: &CurvePoint2| match point {
+         CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++        CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+         CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+         CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+         CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+@@ -11265,6 +11277,9 @@
+     local_only: bool,
+ ) -> Classification<Aabb2> {
+     let composite = match endpoint {
++        CurvePoint2(CurvePointData2::RationalImage(point)) => {
++            Some(point.bounds(refinement_steps, policy))
++        }
+         CurvePoint2(CurvePointData2::Polynomial(point)) => {
+             Some(point.bounds(refinement_steps, policy))
+         }
+@@ -11490,6 +11505,14 @@
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
+     match point {
++        CurvePoint2(CurvePointData2::RationalImage(_)) => {
++            return common_point_circle_residual_sign(
++                point,
++                &center.clone().into(),
++                radius_squared,
++                policy,
++            );
++        }
+         CurvePoint2(CurvePointData2::Polynomial(point)) => {
+             return point.circle_residual_sign(center, radius_squared, policy);
+         }
+@@ -12904,7 +12927,8 @@
+         | CurvePoint2(
+             CurvePointData2::Similarity(_)
+             | CurvePointData2::Endpoint(_)
+-            | CurvePointData2::Polynomial(_),
++            | CurvePointData2::Polynomial(_)
++            | CurvePointData2::RationalImage(_),
+         ) => {
+             unreachable!("correlated chord endpoints return before algebraic image normalization")
+         }
+@@ -13264,7 +13288,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         let retained_side_was_uncertain = if let Some(side) = retained_side {
+@@ -13329,7 +13354,8 @@
+                 CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => {
+                     return chord.oriented_side_by_refinement(point, policy);
+                 }
+@@ -13374,7 +13400,8 @@
+                     | CurvePoint2(
+                         CurvePointData2::Similarity(_)
+                         | CurvePointData2::Endpoint(_)
+-                        | CurvePointData2::Polynomial(_),
++                        | CurvePointData2::Polynomial(_)
++                        | CurvePointData2::RationalImage(_),
+                     ) => {
+                         unreachable!("correlated chord points return before image normalization")
+                     }
+@@ -13619,7 +13646,7 @@
+             ));
+         }
+         let source = match &self.data.source {
+-            CurvePoint2(CurvePointData2::Polynomial(_)) => {
++            CurvePoint2(CurvePointData2::Polynomial(_) | CurvePointData2::RationalImage(_)) => {
+                 return Ok(Classification::Decided(None));
+             }
+             CurvePoint2(CurvePointData2::Endpoint(endpoint)) => match endpoint.resolve(policy)? {
+--- a/crates/hypercurve/src/bezier_offset/affine_form.rs
++++ b/crates/hypercurve/src/bezier_offset/affine_form.rs
+@@ -95,6 +95,9 @@
+     coefficients: &[Real; 3],
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<CurveParameter2>> {
++    if let Classification::Uncertain(reason) = source.validate_rational_image(policy)? {
++        return Ok(Classification::Uncertain(reason));
++    }
+     let [a, b, c] = coefficients;
+     if a.zero_status() == ZeroKnowledge::Zero && b.zero_status() == ZeroKnowledge::Zero {
+         return Ok(Classification::Decided(c.clone().into()));
+@@ -127,6 +130,14 @@
+         ))
+     };
+     match &source.0 {
++        CurvePointData2::RationalImage(_) => {
++            return point_rational_form_parameter(
++                source,
++                &BivariatePolynomial::new(vec![vec![c.clone(), b.clone()], vec![a.clone()]]),
++                &BivariatePolynomial::new(vec![vec![Real::one()]]),
++                policy,
++            );
++        }
+         CurvePointData2::Polynomial(point) => {
+             return Ok(point
+                 .affine_parameter(&[a.clone(), b.clone(), c.clone()], policy)?
+@@ -257,6 +268,9 @@
+     value: &Real,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<std::cmp::Ordering>> {
++    if let Classification::Uncertain(reason) = point.validate_rational_image(policy)? {
++        return Ok(Classification::Uncertain(reason));
++    }
+     use std::cmp::Ordering;
+     let order = |sign| match sign {
+         RealSign::Negative => Ordering::Less,
+@@ -270,6 +284,13 @@
+         ));
+     }
+     match &point.0 {
++        CurvePointData2::RationalImage(_) => point_rational_form_sign(
++            point,
++            &BivariatePolynomial::new(vec![vec![-value.clone(), b.clone()], vec![a.clone()]]),
++            &BivariatePolynomial::new(vec![vec![Real::one()]]),
++            policy,
++        )
++        .map(|sign| sign.map(order)),
+         CurvePointData2::Polynomial(point) => point.affine_order(a, b, value, policy),
+         CurvePointData2::Exact(point) => Ok(compare_reals(
+             &Real::dot2_refs([a, b], [point.x(), point.y()]),
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
+@@ -1426,6 +1426,7 @@
+         if std::env::var_os("HYPERCURVE_DEBUG_CHORD_PAIR_SIDES").is_some() {
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+@@ -1581,7 +1582,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => None,
+             })
+         };
+@@ -2951,7 +2953,11 @@
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<CurvePoint2>> {
+         match endpoint {
+-            CurvePoint2(CurvePointData2::Endpoint(_) | CurvePointData2::Polynomial(_)) => {
++            CurvePoint2(
++                CurvePointData2::Endpoint(_)
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
++            ) => {
+                 let transform = Similarity2::try_from_real_affine(
+                     Real::one(),
+                     Real::zero(),
+@@ -3067,7 +3073,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             )) => {
+                 let complement = Real::one() - scale;
+                 let transform = Similarity2::try_from_real_affine(
+@@ -3177,7 +3184,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             )) => {
+                 let Some(similarity) = similarity else {
+                     return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+@@ -3644,7 +3652,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         if let (Some(start), Some(end)) = (exact_endpoint(self.start()), exact_endpoint(self.end()))
+@@ -4836,6 +4845,7 @@
+             "chord-normal-displacement-point-kind",
+             match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+@@ -4854,6 +4864,7 @@
+             "chord-normal-displacement-center-kind",
+             match center {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/chord_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/chord_kernel.rs
+@@ -1829,7 +1829,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         if let Some(point) = represented_point {
+@@ -2066,7 +2067,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => algebraic_chord_point_linear_order_to_exact(
+                     endpoint,
+                     line.start(),
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/parallel_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/parallel_kernel.rs
+@@ -90,6 +90,7 @@
+                                 let kind = |point: &CurvePoint2| {
+                                     match point {
+ CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                                         CurvePoint2(CurvePointData2::Exact(_)) => {
+                                             "exact"
+                                         }
+@@ -2259,6 +2260,7 @@
+             let caller = std::panic::Location::caller();
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+@@ -2696,6 +2698,7 @@
+             );
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+@@ -2788,6 +2791,7 @@
+                 let caller = std::panic::Location::caller();
+                 let kind = |point: &CurvePoint2| match point {
+                     CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                    CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                     CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                     CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                     CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/points.rs
+@@ -614,7 +614,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         Ok(Classification::Decided(coordinate))
+@@ -1820,7 +1821,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => {}
+             }
+         }
+@@ -2177,7 +2179,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         let shares_first_support = chord.shares_retained_support(&self.data.first)
+@@ -3037,6 +3040,7 @@
+                         "represented-chord-parallel-origin-kind",
+                         match self.source_endpoint() {
+                             CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                            CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                             CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                             CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                             CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+@@ -4958,7 +4962,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         Ok(Classification::Decided(
+@@ -5697,7 +5702,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ),
+             )
+             | Classification::Uncertain(_) => None,
+@@ -7291,7 +7297,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => retained_point_evidence_equality_by_refinement(
+                 &CurvePoint2::from(self.clone()),
+                 other,
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/rational_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/rational_kernel.rs
+@@ -20,6 +20,7 @@
+         if std::env::var_os("HYPERCURVE_DEBUG_RATIONAL_BLOCKER").is_some() {
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+@@ -217,6 +217,7 @@
+         #[cfg(test)]
+         let evidence_kind = |point: &CurvePoint2| match point {
+             CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++            CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+             CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+             CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+             CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+@@ -2141,6 +2142,7 @@
+         {
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+@@ -2750,6 +2752,7 @@
+         if std::env::var_os("HYPERCURVE_DEBUG_PAIR_SCALAR").is_some() {
+             let kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/chord_kernel.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/chord_kernel.rs
+@@ -1151,6 +1151,7 @@
+                     "recursive-selected-radial-frame",
+                     match _point {
+                         CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                        CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                         CurvePoint2(CurvePointData2::Exact(_)) => "exact-center",
+                         CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic-center",
+                         CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair-center",
+@@ -5017,6 +5018,7 @@
+         {
+             let point_kind = |point: &CurvePoint2| match point {
+                 CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                 CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                 CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "chord-pair",
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/parameters.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/parameters.rs
+@@ -4195,7 +4195,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ),
+             )
+             | None => None,
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/points.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/points.rs
+@@ -494,7 +494,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => retained_point_evidence_equality_by_refinement(
+                 &CurvePoint2::from(self.clone()),
+                 other,
+--- a/crates/hypercurve/src/bezier_offset/parallel.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel.rs
+@@ -1514,7 +1514,9 @@
+         };
+         let CurvePoint2(CurvePointData2::Algebraic(point)) = point else {
+             return match point {
+-                CurvePoint2(CurvePointData2::Polynomial(_)) => retained(point, visitor),
++                CurvePoint2(CurvePointData2::Polynomial(_) | CurvePointData2::RationalImage(_)) => {
++                    retained(point, visitor)
++                }
+                 CurvePoint2(CurvePointData2::Endpoint(endpoint)) => {
+                     match endpoint.resolve(policy)? {
+                         Classification::Decided(Some(point)) => self
+--- a/crates/hypercurve/src/bezier_offset/rational_form.rs
++++ b/crates/hypercurve/src/bezier_offset/rational_form.rs
+@@ -294,6 +294,14 @@
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<PointFormSource2>> {
+     match &source.0 {
++        CurvePointData2::RationalImage(image) => {
++            match image.pullback(numerator, denominator, policy)? {
++                Classification::Decided((numerator, denominator)) => {
++                    point_form_source(&image.source, &numerator, &denominator, policy)
++                }
++                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
++            }
++        }
+         CurvePointData2::Polynomial(point) => {
+             Ok(match point.source_query(numerator, denominator) {
+                 Some(query) => Classification::Decided(query),
+@@ -362,6 +370,15 @@
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
+     match &source.0 {
++        CurvePointData2::RationalImage(image) => {
++            let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
++            match image.pullback(polynomial, &one, policy)? {
++                Classification::Decided((numerator, denominator)) => {
++                    point_rational_form_sign(&image.source, &numerator, &denominator, policy)
++                }
++                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
++            }
++        }
+         CurvePointData2::Exact(point) => Ok(real_sign(
+             &bivariate_evaluate_exact(polynomial, point.x(), point.y()),
+             policy,
+@@ -423,6 +440,14 @@
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+     };
+     match &source.0 {
++        CurvePointData2::RationalImage(image) => {
++            match image.pullback(numerator, denominator, policy)? {
++                Classification::Decided((numerator, denominator)) => {
++                    point_rational_form_parameter(&image.source, &numerator, &denominator, policy)
++                }
++                Classification::Uncertain(reason) => Ok(Classification::Uncertain(reason)),
++            }
++        }
+         CurvePointData2::Exact(point) => Ok(Classification::Decided(
+             (bivariate_evaluate_exact(numerator, point.x(), point.y())
+                 / bivariate_evaluate_exact(denominator, point.x(), point.y()))?
+--- a/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs
++++ b/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs
+@@ -570,6 +570,48 @@
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<Option<BezierRecursiveProjectivePointSource2>>> {
+     let source = match point {
++        CurvePoint2(CurvePointData2::RationalImage(image)) => {
++            if let Classification::Uncertain(reason) = image.validate(policy)? {
++                return Ok(Classification::Uncertain(reason));
++            }
++            let sources = match recursive_projective_evidence_points(&[&image.source], policy)? {
++                Classification::Decided(Some(sources)) => sources,
++                Classification::Decided(None) => return Ok(Classification::Decided(None)),
++                Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++            };
++            let source = &sources[0];
++            let polynomials = [
++                &image.map.numerators()[0],
++                &image.map.numerators()[1],
++                image.map.denominator(),
++            ];
++            let Some(degree) = polynomials
++                .iter()
++                .map(|polynomial| {
++                    hypersolve::bivariate_arithmetic::bivariate_active_total_degree(polynomial)
++                })
++                .collect::<Option<Vec<_>>>()
++                .and_then(|degrees| degrees.into_iter().max())
++            else {
++                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++            };
++            let values = polynomials.map(|polynomial| {
++                evaluate_bivariate_homogeneous_polynomial(
++                    polynomial,
++                    &source.x,
++                    &source.y,
++                    &source.denominator,
++                    degree,
++                )
++            });
++            let [Some(x), Some(y), Some(denominator)] = values else {
++                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++            };
++            return Ok(positive_recursive_projective_point(
++                BezierRecursiveQuadraticProjectivePoint2 { x, y, denominator },
++            )?
++            .map(|point| Some(BezierRecursiveProjectivePointSource2::Recursive(point))));
++        }
+         CurvePoint2(CurvePointData2::Polynomial(_)) => None,
+         CurvePoint2(CurvePointData2::Endpoint(endpoint)) => {
+             return match endpoint.resolve(policy)? {
+@@ -698,6 +740,12 @@
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
+     match point {
++        CurvePoint2(CurvePointData2::RationalImage(image)) => {
++            // The homogeneous image above is normalized before publication.
++            image
++                .validate(policy)
++                .map(|valid| valid.map(|()| RealSign::Positive))
++        }
+         CurvePoint2(CurvePointData2::Polynomial(_)) => {
+             Ok(Classification::Decided(RealSign::Positive))
+         }
+@@ -1252,6 +1300,7 @@
+                 if std::env::var_os("HYPERCURVE_DEBUG_RATIONAL_BLOCKER").is_some() {
+                     let kind = match point {
+                         CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++                        CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                         CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                         CurvePoint2(CurvePointData2::Algebraic(_)) => "algebraic",
+                         CurvePoint2(CurvePointData2::AlgebraicChordPair(_)) => "pair",
+--- a/crates/hypercurve/src/bezier_region/point_location.rs
++++ b/crates/hypercurve/src/bezier_region/point_location.rs
+@@ -123,7 +123,8 @@
+         | CurvePoint2(
+             CurvePointData2::Similarity(_)
+             | CurvePointData2::Endpoint(_)
+-            | CurvePointData2::Polynomial(_),
++            | CurvePointData2::Polynomial(_)
++            | CurvePointData2::RationalImage(_),
+         ) => None,
+     };
+     match direct {
+--- a/crates/hypercurve/src/curve_corner_chain.rs
++++ b/crates/hypercurve/src/curve_corner_chain.rs
+@@ -3124,7 +3124,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         let represented_previous = exact_point(&previous_cut.point);
+--- a/crates/hypercurve/src/curve_fillet_centers.rs
++++ b/crates/hypercurve/src/curve_fillet_centers.rs
+@@ -1176,7 +1176,8 @@
+                     | CurvePoint2(
+                         CurvePointData2::Similarity(_)
+                         | CurvePointData2::Endpoint(_)
+-                        | CurvePointData2::Polynomial(_),
++                        | CurvePointData2::Polynomial(_)
++                        | CurvePointData2::RationalImage(_),
+                     ) => None,
+                 };
+                 let selected_center_parameter = anchor_parameter
+--- a/crates/hypercurve/src/curve_point.rs
++++ b/crates/hypercurve/src/curve_point.rs
+@@ -10,9 +10,11 @@
+ mod affine;
+ mod definition;
+ mod rational;
++mod rational_image;
+ pub use affine::CurvePointAffineForm2;
+ pub use definition::CurvePointDefinition2;
+ pub use rational::CurvePointRationalForm2;
++pub(crate) use rational_image::RationalPointImage2;
+ 
+ /// An exact affine point with shared scalar or selected geometric evidence.
+ ///
+@@ -209,6 +211,8 @@
+     Exact(Point2),
+     /// A correlated point selected on a rational polynomial plane curve.
+     Polynomial(std::sync::Arc<crate::polynomial_point::PolynomialPoint2>),
++    /// A shared rational map of an exact point, retaining its original poles.
++    RationalImage(std::sync::Arc<RationalPointImage2>),
+     /// The contact point is retained as exact algebraic point evidence.
+     ///
+     /// A retained rational-expression status may defer coordinate images
+@@ -262,6 +266,10 @@
+             (
+                 Self(CurvePointData2::Polynomial(first)),
+                 Self(CurvePointData2::Polynomial(second)),
++            ) => std::sync::Arc::ptr_eq(first, second),
++            (
++                Self(CurvePointData2::RationalImage(first)),
++                Self(CurvePointData2::RationalImage(second)),
+             ) => std::sync::Arc::ptr_eq(first, second),
+             (
+                 Self(CurvePointData2::AlgebraicChordPair(_)),
+@@ -348,6 +356,13 @@
+     /// endpoint fields. Any predicate that remains unproved stays explicit
+     /// under `policy`.
+     pub(crate) fn same_point(&self, other: &Self, policy: &CurveContext) -> Classification<bool> {
++        for point in [self, other] {
++            match point.validate_rational_image(policy) {
++                Ok(Classification::Decided(())) => {}
++                Ok(Classification::Uncertain(reason)) => return Classification::Uncertain(reason),
++                Err(_) => return Classification::Uncertain(UncertaintyReason::Predicate),
++            }
++        }
+         // Separate projections of one retained contact can allocate distinct
+         // point handles while sharing the same source and exact transform.
+         // Consume that positive identity before reconstructing either field.
+@@ -406,7 +421,9 @@
+         }
+         match (self, other) {
+             (Self(CurvePointData2::Polynomial(_)), _)
+-            | (_, Self(CurvePointData2::Polynomial(_))) => {
++            | (_, Self(CurvePointData2::Polynomial(_)))
++            | (Self(CurvePointData2::RationalImage(_)), _)
++            | (_, Self(CurvePointData2::RationalImage(_))) => {
+                 self.same_point_by_coordinate_evidence(other, policy)
+             }
+             (Self(CurvePointData2::Endpoint(_)), _) | (_, Self(CurvePointData2::Endpoint(_))) => {
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -99,6 +99,9 @@
+             CurvePointData2::AnalyticParallel(point) => Some((2, point.replay_storage_key())),
+             CurvePointData2::Endpoint(point) => Some((3, std::sync::Arc::as_ptr(point).cast())),
+             CurvePointData2::Polynomial(point) => Some(point.replay_storage_key()),
++            CurvePointData2::RationalImage(point) => {
++                Some((10, std::sync::Arc::as_ptr(point).cast()))
++            }
+             CurvePointData2::Similarity(point) => Some((5, point.replay_storage_key())),
+             CurvePointData2::AlgebraicChordPair(point) => Some((6, point.replay_storage_key())),
+             CurvePointData2::AlgebraicChordParallel(point) => {
+@@ -122,6 +125,18 @@
+         match &self.0 {
+             CurvePointData2::Exact(point) => Ok(CurvePointDefinition2::Coordinates(point.clone())),
+             CurvePointData2::Polynomial(point) => Ok(point.definition()),
++            CurvePointData2::RationalImage(point) => {
++                ExactCurveError::decided(
++                    CurveOperation2::Evaluation,
++                    point.validate(&CurveContext::STRICT).map_err(|cause| {
++                        ExactCurveError::invalid_unattributed(CurveOperation2::Evaluation, cause)
++                    })?,
++                )?;
++                Ok(CurvePointDefinition2::RationalImage {
++                    source: point.source.clone(),
++                    map: point.map.clone(),
++                })
++            }
+             CurvePointData2::Algebraic(point) => {
+                 if let Some((source, parameter)) = point.native_curve_evaluation() {
+                     return Ok(CurvePointDefinition2::Rational {
+@@ -216,7 +231,7 @@
+     fn replay(self, sources_checked: bool) -> ExactCurveResult<CurvePoint2> {
+         crate::policy::resolve_certified_operation(&CurveContext::STRICT, |policy| match self {
+             Self::Coordinates(point) => Ok(point.into()),
+-            Self::RationalImage { source, map } => source.rational_image(&map),
++            Self::RationalImage { source, map } => source.rational_image_with_policy(&map, policy),
+             Self::PolynomialFiber {
+                 equation,
+                 parameter,
+--- a/crates/hypercurve/src/curve_region_boolean/fragment_location.rs
++++ b/crates/hypercurve/src/curve_region_boolean/fragment_location.rs
+@@ -298,7 +298,8 @@
+                 | CurvePoint2(
+                     CurvePointData2::Similarity(_)
+                     | CurvePointData2::Endpoint(_)
+-                    | CurvePointData2::Polynomial(_),
++                    | CurvePointData2::Polynomial(_)
++                    | CurvePointData2::RationalImage(_),
+                 ) => None,
+             };
+             if let Some(classification) = direct {
+@@ -315,6 +316,9 @@
+             }
+             for refinement_steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
+                 let bounds = match endpoint {
++                    CurvePoint2(CurvePointData2::RationalImage(point)) => {
++                        point.bounds(refinement_steps, &self.data.policy)
++                    }
+                     CurvePoint2(CurvePointData2::Polynomial(point)) => {
+                         point.bounds(refinement_steps, &self.data.policy)
+                     }
+@@ -423,7 +427,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => None,
+         };
+         match direct {
+@@ -1248,7 +1253,8 @@
+             | CurvePoint2(
+                 CurvePointData2::Similarity(_)
+                 | CurvePointData2::Endpoint(_)
+-                | CurvePointData2::Polynomial(_),
++                | CurvePointData2::Polynomial(_)
++                | CurvePointData2::RationalImage(_),
+             ) => {
+                 return Ok(None);
+             }
+--- a/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs
++++ b/crates/hypercurve/src/curve_region_boolean/pair_kernels.rs
+@@ -1909,6 +1909,7 @@
+                         let debug_kind = |point: &CurvePoint2| {
+                             match point {
+ CurvePoint2(CurvePointData2::Polynomial(_)) => "polynomial",
++CurvePoint2(CurvePointData2::RationalImage(_)) => "rational-image",
+                                 CurvePoint2(CurvePointData2::Exact(_)) => "exact",
+                                 CurvePoint2(CurvePointData2::Algebraic(_)) => {
+                                     "algebraic"
+--- a/crates/hypercurve/src/rational_map.rs
++++ b/crates/hypercurve/src/rational_map.rs
+@@ -253,14 +253,32 @@
+ }
+ 
+ impl CurvePoint2 {
+-    /// Applies a rational map while preserving the joint polynomial point.
+-    /// Authored points and similarities of polynomial points are also accepted.
++    /// Applies a rational map while preserving the joint selected point.
++    /// Authored, selected rational-curve and polynomial-fiber points retain
++    /// their source authority through repeated maps and similarities.
+     /// Original poles remain invalid even if the image admits cancellation.
+     pub fn rational_image(&self, map: &RationalMap2) -> ExactCurveResult<Self> {
+-        self.rational_form(
+-            BivariatePolynomial::new(Vec::new()),
+-            map.denominator.clone(),
+-        )?;
++        self.rational_image_with_policy(map, &crate::policy::principal_context())
++    }
++
++    pub(crate) fn rational_image_with_policy(
++        &self,
++        map: &RationalMap2,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<Self> {
++        if matches!(
++            self.0,
++            CurvePointData2::Algebraic(_) | CurvePointData2::RationalImage(_)
++        ) {
++            return crate::curve_point::RationalPointImage2::construct(self, map, policy);
++        }
++        let guard = crate::policy::resolve_certified_operation(policy, |attempt| {
++            crate::curve_point::RationalPointImage2::validate_map(self, map, attempt)
++        })
++        .map_err(|cause| {
++            ExactCurveError::invalid_unattributed(CurveOperation2::Construction, cause)
++        })?;
++        ExactCurveError::decided(CurveOperation2::Construction, guard.into_value())?;
+         match &self.0 {
+             CurvePointData2::Polynomial(point) => Ok(point.mapped(map)),
+             CurvePointData2::Exact(point) => {
+@@ -291,8 +309,8 @@
+             CurvePointData2::Similarity(image) => {
+                 let (source, transform) = image.strict_definition().ok_or_else(blocked)?;
+                 source
+-                    .rational_image(&RationalMap2::from_similarity(transform))?
+-                    .rational_image(map)
++                    .rational_image_with_policy(&RationalMap2::from_similarity(transform), policy)?
++                    .rational_image_with_policy(map, policy)
+             }
+             CurvePointData2::Endpoint(endpoint) => {
+                 let source = ExactCurveError::decided(
+@@ -302,7 +320,7 @@
+                     })?,
+                 )?
+                 .ok_or_else(blocked)?;
+-                source.rational_image(map)
++                source.rational_image_with_policy(map, policy)
+             }
+             _ => Err(blocked()),
+         }
+--- /dev/null
++++ b/crates/hypercurve/src/curve_point/rational_image.rs
+@@ -0,0 +1,243 @@
++//! Shared rational point images keep construction and pole evidence together.
++
++use hypersolve::BivariatePolynomial;
++
++use crate::{
++    Aabb2, Classification, CurveContext, CurveOperation2, CurvePoint2, CurvePointData2,
++    CurveResult, ExactCurveError, ExactCurveResult, RationalMap2, UncertaintyReason,
++};
++
++#[derive(Debug, PartialEq)]
++pub(crate) struct RationalPointImage2 {
++    pub(crate) source: CurvePoint2,
++    pub(crate) map: RationalMap2,
++    policy: CurveContext,
++}
++
++impl RationalPointImage2 {
++    pub(crate) fn construct(
++        source: &CurvePoint2,
++        map: &RationalMap2,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<CurvePoint2> {
++        crate::policy::resolve_certified_operation(policy, |policy| {
++            Self::validate_map(source, map, policy).map(|sign| {
++                sign.map(|_| {
++                    CurvePoint2(CurvePointData2::RationalImage(std::sync::Arc::new(Self {
++                        source: source.clone(),
++                        map: map.clone(),
++                        policy: policy.retained_object_policy(),
++                    })))
++                })
++            })
++        })
++        .map_err(|cause| {
++            ExactCurveError::invalid_unattributed(CurveOperation2::Construction, cause)
++        })
++        .and_then(|outcome| {
++            ExactCurveError::decided(CurveOperation2::Construction, outcome.into_value())
++        })
++    }
++
++    pub(crate) fn validate_map(
++        source: &CurvePoint2,
++        map: &RationalMap2,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<()>> {
++        let sign = crate::bezier_offset::point_rational_denominator_sign(
++            source,
++            map.denominator(),
++            policy,
++        )?;
++        // The shared scope also reports exhaustion, but a constructor must
++        // not publish a point between the reached limit and that boundary.
++        Ok(if hypersolve::work_budget::exhaustion().is_some() {
++            Classification::Uncertain(UncertaintyReason::BudgetExhausted)
++        } else {
++            sign.map(|_| ())
++        })
++    }
++
++    /// Every consuming query checks the original guard before cancellation or
++    /// field reduction. A failed attempt never becomes retained evidence.
++    pub(crate) fn validate(&self, policy: &CurveContext) -> CurveResult<Classification<()>> {
++        if !policy.accepts_retained_policy(self.policy) {
++            return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++        }
++        if self.policy.selects_approximate_512() {
++            policy.observe_approximate_512();
++        }
++        Self::validate_map(&self.source, &self.map, policy)
++    }
++
++    pub(crate) fn pullback(
++        &self,
++        numerator: &BivariatePolynomial,
++        denominator: &BivariatePolynomial,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<(BivariatePolynomial, BivariatePolynomial)>> {
++        if let Classification::Uncertain(reason) = self.validate(policy)? {
++            return Ok(Classification::Uncertain(reason));
++        }
++        Ok(self.map.pullback(numerator, denominator).map_or(
++            Classification::Uncertain(UncertaintyReason::Unsupported),
++            Classification::Decided,
++        ))
++    }
++
++    pub(crate) fn bounds(&self, steps: usize, policy: &CurveContext) -> Classification<Aabb2> {
++        match self.validate(policy) {
++            Ok(Classification::Decided(())) => {}
++            Ok(Classification::Uncertain(reason)) => return Classification::Uncertain(reason),
++            Err(_) => return Classification::Uncertain(UncertaintyReason::Predicate),
++        }
++        let source = match crate::bezier_offset::algebraic_chord_endpoint_local_bounds_refined(
++            &self.source,
++            steps,
++            policy,
++        ) {
++            Classification::Decided(source) => source,
++            Classification::Uncertain(reason) => return Classification::Uncertain(reason),
++        };
++        self.map.bounds(&source).map_or(
++            Classification::Uncertain(UncertaintyReason::Predicate),
++            Classification::Decided,
++        )
++    }
++}
++
++impl CurvePoint2 {
++    /// Identity and constant queries still consume the image's admission.
++    pub(crate) fn validate_rational_image(
++        &self,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<()>> {
++        match &self.0 {
++            CurvePointData2::RationalImage(image) => image.validate(policy),
++            _ => Ok(Classification::Decided(())),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{
++        Axis2, BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
++        BezierParameterPolynomial, CurveCertainty, Real,
++    };
++    use std::cmp::Ordering;
++
++    fn source() -> CurvePoint2 {
++        let alpha = BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![
++                (-1).into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                2.into(),
++            ])
++            .unwrap(),
++            BezierParameterInterval::try_new((Real::from(3) / Real::from(4)).unwrap(), 1.into())
++                .unwrap(),
++        )
++        .unwrap();
++        crate::CurveParameter2::from(BezierParameter2::Algebraic(alpha))
++            .affine_point(1.into(), 0.into(), 0.into(), 0.into())
++            .unwrap()
++    }
++    fn identity() -> RationalMap2 {
++        RationalMap2::new(
++            [
++                BivariatePolynomial::new(vec![vec![0.into()], vec![1.into()]]),
++                BivariatePolynomial::new(vec![vec![0.into(), 1.into()]]),
++            ],
++            BivariatePolynomial::new(vec![vec![1.into()]]),
++        )
++    }
++    #[test]
++    fn rational_point_images_retain_qualification_through_identity_queries() {
++        let source = source();
++        // A synthetic already-qualified dependency exercises provenance even
++        // when the local map and consumed equality are exact identities.
++        let qualified = CurvePoint2(CurvePointData2::RationalImage(std::sync::Arc::new(
++            RationalPointImage2 {
++                source: source.clone(),
++                map: identity(),
++                policy: CurveContext::APPROXIMATE_512,
++            },
++        )));
++        assert!(qualified.definition().is_err());
++        for query in [
++            qualified
++                .coincides_with_with_policy(&qualified, &CurveContext::STRICT)
++                .map(|v| v.map(|_| ())),
++            qualified
++                .compare_coordinate_with_policy(&qualified, Axis2::X, &CurveContext::STRICT)
++                .unwrap()
++                .map(|v| v.map(|_| ())),
++        ] {
++            assert!(matches!(
++                query.into_value(),
++                Classification::Uncertain(UncertaintyReason::Unsupported)
++            ));
++        }
++        let exact = crate::provisional(|| source.rational_image(&identity()).unwrap())
++            .certified()
++            .unwrap();
++        assert!(exact.definition().is_ok());
++        let approved = qualified
++            .compare_coordinate_with_policy(&qualified, Axis2::X, &CurveContext::APPROXIMATE_512)
++            .unwrap();
++        assert_eq!(approved.value, Classification::Decided(Ordering::Equal));
++        assert_eq!(approved.certainty, CurveCertainty::Approximate512Consumed);
++        let fresh = exact
++            .compare_coordinate_with_policy(&exact, Axis2::X, &CurveContext::APPROXIMATE_512)
++            .unwrap();
++        assert_eq!(fresh.certainty, CurveCertainty::Certified);
++    }
++    #[test]
++    fn rational_point_native_replay_stays_strict_inside_provisional() {
++        let qualified = CurvePoint2(CurvePointData2::RationalImage(std::sync::Arc::new(
++            RationalPointImage2 {
++                source: source(),
++                map: identity(),
++                policy: CurveContext::APPROXIMATE_512,
++            },
++        )));
++        let replay = crate::provisional(|| {
++            crate::CurvePointDefinition2::RationalImage {
++                source: qualified,
++                map: identity(),
++            }
++            .into_point()
++        });
++        assert!(replay.as_unverified().is_err());
++    }
++    #[test]
++    fn rational_point_constant_affine_queries_keep_qualification() {
++        let qualified = CurvePoint2(CurvePointData2::RationalImage(std::sync::Arc::new(
++            RationalPointImage2 {
++                source: source(),
++                map: identity(),
++                policy: CurveContext::APPROXIMATE_512,
++            },
++        )));
++        let zero = Real::zero();
++        let order = crate::bezier_offset::point_affine_form_order_to_real(
++            &qualified,
++            &zero,
++            &zero,
++            &zero,
++            &CurveContext::STRICT,
++        )
++        .unwrap();
++        assert!(matches!(
++            order,
++            Classification::Uncertain(UncertaintyReason::Unsupported)
++        ));
++    }
++}
+--- /dev/null
++++ b/crates/hypercurve/tests/rational_point_images.rs
+@@ -0,0 +1,362 @@
++use hypercurve::*;
++use hypersolve::BivariatePolynomial;
++use std::cmp::Ordering;
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++
++fn source_and_independent_circle_point() -> (CurvePoint2, CurvePoint2) {
++    let parameter = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![
++                (-1).into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                2.into(),
++            ])
++            .unwrap(),
++            BezierParameterInterval::try_new(q(3, 4), Real::one()).unwrap(),
++        )
++        .unwrap(),
++    );
++    let parabola = Curve2::from(
++        RationalBezier2::try_new(
++            vec![
++                Point2::from_values(0, 0),
++                Point2::new(q(1, 2), 0.into()),
++                Point2::from_values(1, 1),
++            ],
++            vec![1.into(); 3],
++        )
++        .unwrap(),
++    );
++    // Independent Bernstein data for (2t/(1+t²), (1-t²)/(1+t²)).
++    let circle = Curve2::from(
++        RationalBezier2::try_new(
++            vec![
++                Point2::from_values(0, 1),
++                Point2::from_values(1, 1),
++                Point2::from_values(1, 0),
++            ],
++            vec![1.into(), 1.into(), 2.into()],
++        )
++        .unwrap(),
++    );
++    (
++        parabola.point_at(&parameter.clone().into()).unwrap(),
++        circle.point_at(&parameter.into()).unwrap(),
++    )
++}
++
++fn circle_map() -> RationalMap2 {
++    RationalMap2::new(
++        [polynomial(&[&[0], &[2]]), polynomial(&[&[1, -1]])],
++        polynomial(&[&[1, 1]]),
++    )
++}
++
++#[test]
++fn native_scalar_image_rational_query_control() {
++    let (source, expected) = source_and_independent_circle_point();
++    assert!(source.coordinates().is_none());
++    for (numerator, coordinate) in [
++        (polynomial(&[&[0], &[2]]), polynomial(&[&[0], &[1]])),
++        (polynomial(&[&[1, -1]]), polynomial(&[&[0, 1]])),
++    ] {
++        let actual = source
++            .rational_form(numerator, polynomial(&[&[1, 1]]))
++            .unwrap();
++        let independent = expected
++            .rational_form(coordinate, polynomial(&[&[1]]))
++            .unwrap();
++        assert_eq!(actual.compare(&independent).unwrap(), Ordering::Equal);
++    }
++}
++
++#[test]
++fn native_scalar_point_image_replays_and_reenters_another_rational_map() {
++    let (source, expected) = source_and_independent_circle_point();
++    let mapped = source.rational_image(&circle_map()).unwrap();
++    assert!(mapped.coincides_with(&expected).unwrap());
++    let unit = mapped
++        .rational_form(polynomial(&[&[-1, 0, 1], &[], &[1]]), polynomial(&[&[1]]))
++        .unwrap();
++    assert_eq!(
++        unit.compare_to_real(&Real::zero()).unwrap(),
++        Ordering::Equal
++    );
++    let replay = mapped.definition().unwrap().into_point().unwrap();
++    assert!(replay.coincides_with(&expected).unwrap());
++    // Recover (t,t²), using t = X/(1+Y) and preserving its original guard.
++    let inverse = RationalMap2::new(
++        [polynomial(&[&[0], &[1, 1]]), polynomial(&[&[], &[], &[1]])],
++        polynomial(&[&[1, 2, 1]]),
++    );
++    assert!(
++        replay
++            .rational_image(&inverse)
++            .unwrap()
++            .coincides_with(&source)
++            .unwrap()
++    );
++}
++
++#[test]
++fn native_scalar_point_map_rejects_the_original_pole() {
++    let (source, _) = source_and_independent_circle_point();
++    let pole = polynomial(&[&[-1], &[], &[], &[], &[], &[], &[], &[2]]);
++    let invalid = RationalMap2::new([pole.clone(), pole.clone()], pole);
++    assert!(matches!(
++        source.rational_image(&invalid),
++        Err(ExactCurveError::Invalid {
++            cause: CurveError::ZeroRationalPointDenominator,
++            ..
++        })
++    ));
++}
++
++fn shifted(point: CurvePoint2, dx: Real, dy: Real) -> CurvePoint2 {
++    CurvePointDefinition2::Similarity {
++        source: point,
++        transform: Similarity2::try_from_real_affine(
++            1.into(),
++            0.into(),
++            0.into(),
++            1.into(),
++            dx,
++            dy,
++        )
++        .unwrap(),
++    }
++    .into_point()
++    .unwrap()
++}
++
++#[test]
++fn native_scalar_point_images_preserve_negative_denominators_and_order() {
++    let (source, expected) = source_and_independent_circle_point();
++    let negative = RationalMap2::new(
++        [polynomial(&[&[0], &[-2]]), polynomial(&[&[-1, 1]])],
++        polynomial(&[&[-1, -1]]),
++    );
++    let mapped = source.rational_image(&negative).unwrap();
++    assert!(mapped.coincides_with(&expected).unwrap());
++    let near = shifted(expected.clone(), q(1, 1_000_000), 0.into());
++    assert_eq!(
++        mapped.compare_coordinate(&near, Axis2::X).unwrap(),
++        Ordering::Less
++    );
++    assert_eq!(
++        near.compare_coordinate(&mapped, Axis2::X).unwrap(),
++        Ordering::Greater
++    );
++    assert_eq!(
++        mapped.compare_coordinate(&near, Axis2::Y).unwrap(),
++        Ordering::Equal
++    );
++    assert!(!mapped.coincides_with(&near).unwrap());
++    for image in [
++        mapped.clone(),
++        shifted(mapped.clone(), 1.into(), (-1).into()),
++    ] {
++        let replay = image.definition().unwrap().into_point().unwrap();
++        assert!(image.coincides_with(&replay).unwrap());
++        let bounds = image.bounds().unwrap();
++        for axis in [Axis2::X, Axis2::Y] {
++            assert!(matches!(
++                image
++                    .compare_coordinate(&bounds.min().clone().into(), axis)
++                    .unwrap(),
++                Ordering::Equal | Ordering::Greater
++            ));
++            assert!(matches!(
++                image
++                    .compare_coordinate(&bounds.max().clone().into(), axis)
++                    .unwrap(),
++                Ordering::Equal | Ordering::Less
++            ));
++        }
++    }
++    // A downstream 0/0 must remain invalid even when numerator and denominator cancel.
++    let unit = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    let bad = CurvePointDefinition2::RationalImage {
++        source: mapped.clone(),
++        map: RationalMap2::new([unit.clone(), unit.clone()], unit),
++    };
++    assert!(matches!(
++        bad.into_point(),
++        Err(ExactCurveError::Invalid {
++            cause: CurveError::ZeroRationalPointDenominator,
++            ..
++        })
++    ));
++    assert!(mapped.coincides_with(&expected).unwrap());
++}
++
++#[test]
++#[cfg(feature = "svg")]
++fn native_scalar_point_images_replay_in_a_fresh_process_before_exact_split() {
++    const INPUT: &str = "HYPERCURVE_RATIONAL_POINT_IMAGE_REPLAY_INPUT";
++    let document = |path| {
++        export_svg_document(&SvgGeometry2::new(
++            CurveRegion2::empty(),
++            vec![],
++            vec![path],
++        ))
++        .unwrap()
++    };
++    let verify = |text: &str| {
++        let replay = import_svg_document(text).unwrap();
++        let (_, expected) = source_and_independent_circle_point();
++        let line = &replay.paths()[0].curves()[0];
++        assert!(line.start().coincides_with(&expected).unwrap());
++        assert!(
++            line.end()
++                .coincides_with(&shifted(expected.clone(), 1.into(), 0.into()))
++                .unwrap()
++        );
++        let midpoint = shifted(expected, q(1, 2), 0.into());
++        let CurvePointLocations2::Locations(locations) = line.point_locations(&midpoint).unwrap()
++        else {
++            panic!("exact midpoint location")
++        };
++        assert_eq!(locations.len(), 1);
++        let (first, second) = line.split_at(locations[0].parameter().unwrap()).unwrap();
++        assert!(first.end().coincides_with(&midpoint).unwrap());
++        assert!(second.start().coincides_with(&midpoint).unwrap());
++        let next = document(CurvePath2::try_new(vec![first, second]).unwrap());
++        assert_eq!(
++            export_svg_document(&import_svg_document(&next).unwrap()).unwrap(),
++            next
++        );
++        assert_eq!(export_svg_document(&replay).unwrap(), text);
++        // Continue with a rational map after native reconstruction.
++        let identity = RationalMap2::new(
++            [polynomial(&[&[0], &[1]]), polynomial(&[&[0, 1]])],
++            polynomial(&[&[1]]),
++        );
++        assert!(
++            line.start()
++                .rational_image(&identity)
++                .unwrap()
++                .coincides_with(&line.start())
++                .unwrap()
++        );
++    };
++    if let Some(file) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(file).unwrap());
++        return;
++    }
++    let (source, _) = source_and_independent_circle_point();
++    let mapped = source.rational_image(&circle_map()).unwrap();
++    let line = Curve2::try_line(mapped.clone(), shifted(mapped, 1.into(), 0.into())).unwrap();
++    let text = document(CurvePath2::try_new(vec![line]).unwrap());
++    verify(&text);
++    let file = std::env::temp_dir().join(format!(
++        "hypercurve-rational-point-image-{}.svg",
++        std::process::id()
++    ));
++    std::fs::write(&file, &text).unwrap();
++    let output = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "native_scalar_point_images_replay_in_a_fresh_process_before_exact_split",
++            "--nocapture",
++        ])
++        .env(INPUT, &file)
++        .output()
++        .unwrap();
++    std::fs::remove_file(file).unwrap();
++    assert!(
++        output.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++#[test]
++fn native_scalar_point_map_uses_no_independent_coordinate_promotion() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let (source, expected) = source_and_independent_circle_point();
++    let attempt = with_budget(
++        WorkBudget {
++            refinements: 4096,
++            promotions: 0,
++        },
++        || {
++            let image = source.rational_image(&circle_map())?;
++            image.coincides_with(&expected)
++        },
++    );
++    assert!(attempt.result.unwrap().unwrap());
++    assert_eq!(attempt.usage.promotions, 0);
++}
++
++#[test]
++fn native_scalar_point_image_does_not_publish_after_reached_exhaustion() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let (source, _) = source_and_independent_circle_point();
++    let attempt = with_budget(WorkBudget::ZERO, || {
++        let result = source.rational_image(&circle_map());
++        assert!(hypersolve::work_budget::exhaustion().is_some());
++        assert!(
++            matches!(result,Err(ExactCurveError::Blocked(blocker)) if blocker.reason()==UncertaintyReason::BudgetExhausted)
++        );
++    });
++    let reached = attempt.result.unwrap_err();
++    assert_eq!((reached.limit, reached.used), (0, 0));
++    assert!(reached.requested > 0);
++}
++
++#[test]
++fn native_scalar_point_images_retry_after_actual_exhaustion() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    for _ in 0..2 {
++        let (source, expected) = source_and_independent_circle_point();
++        let denied = with_budget(WorkBudget::ZERO, || source.rational_image(&circle_map()));
++        let reached = denied.result.unwrap_err();
++        assert_eq!((reached.limit, reached.used), (0, 0));
++        assert!(reached.requested > 0);
++        let retry = with_budget(
++            WorkBudget {
++                refinements: 4096,
++                promotions: 0,
++            },
++            || {
++                let image = source.rational_image(&circle_map())?;
++                image.coincides_with(&expected)
++            },
++        );
++        assert!(retry.result.unwrap().unwrap());
++        assert_eq!(retry.usage.promotions, 0);
++        for policy in [
++            PredicatePolicy::STRICT,
++            PredicatePolicy::APPROXIMATE_512,
++            PredicatePolicy::STRICT,
++        ] {
++            let request = evaluate_under(policy, || source.rational_image(&circle_map()).unwrap());
++            assert_eq!(request.certainty(), CurveCertainty::Certified);
++            assert!(
++                request
++                    .certified()
++                    .unwrap()
++                    .coincides_with(&expected)
++                    .unwrap()
++            );
++        }
++    }
++}
