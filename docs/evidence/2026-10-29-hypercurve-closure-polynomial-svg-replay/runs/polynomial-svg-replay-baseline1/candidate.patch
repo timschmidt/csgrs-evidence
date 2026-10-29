@@ -1,0 +1,148 @@
+diff --git a/crates/hypercurve/tests/polynomial_projection.rs b/crates/hypercurve/tests/polynomial_projection.rs
+new file mode 100644
+index 0000000000..d393368523
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_projection.rs
+@@ -0,0 +1,142 @@
++//! Display chords consume certified enclosures without replacing selected curves.
++
++use std::cmp::Ordering;
++
++use hypercurve::{
++    BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
++    BezierParameterPolynomial, CurveParameterRange2, CurvePath2, FiniteProjectionOptions,
++    PolynomialCurveSet2, Real, Similarity2,
++};
++use hyperlimit::{PredicatePolicy, compare_reals};
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++use hypersolve::{AlgebraicFiberRootIsolationConfig, BivariatePolynomial};
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++
++fn curves(rows: &[&[i32]], first: [i32; 2], second: [i32; 2]) -> PolynomialCurveSet2 {
++    let equation = BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    );
++    let topology = decompose_bivariate_curve(
++        &equation,
++        &BivariateCurveDomain {
++            first: first.map(Real::from),
++            second: second.map(Real::from),
++        },
++        BivariateTopologyConfig::default(),
++    )
++    .unwrap();
++    PolynomialCurveSet2::from_topology(topology, AlgebraicFiberRootIsolationConfig::default())
++        .unwrap()
++}
++
++fn leq(first: &Real, second: &Real) {
++    assert!(matches!(
++        compare_reals(first, second, PredicatePolicy::STRICT).value(),
++        Some(Ordering::Less | Ordering::Equal)
++    ));
++}
++
++#[test]
++fn polynomial_projection_preserves_the_exact_source() {
++    let source = curves(&[&[1, 2], &[], &[-2]], [-1, 1], [-1, 1]);
++    assert_eq!(source.curves().len(), 1);
++    let curve = source.curves()[0].clone();
++    let path = CurvePath2::try_new(vec![curve.clone()]).unwrap();
++    let options = FiniteProjectionOptions::try_new(0.01).unwrap();
++    let projection = path.project_to_finite_polyline(&options).unwrap();
++    assert!(!projection.is_closed());
++    assert_eq!(projection.points().first(), Some(&[-1.0, 0.5]));
++    assert_eq!(projection.points().last(), Some(&[1.0, 0.5]));
++    let error = Real::try_from(options.chord_error()).unwrap();
++    let points: Vec<_> = projection
++        .points()
++        .iter()
++        .map(|point| point.map(|coordinate| Real::try_from(coordinate).unwrap()))
++        .collect();
++    for [x, y] in &points {
++        // All expected vertices in this dyadic quadratic have an exact oracle.
++        assert_eq!(
++            compare_reals(y, &(x * x - q(1, 2)), PredicatePolicy::STRICT).value(),
++            Some(Ordering::Equal)
++        );
++    }
++    for pair in points.windows(2) {
++        let dx = &pair[1][0] - &pair[0][0];
++        assert_eq!(
++            compare_reals(&dx, &Real::zero(), PredicatePolicy::STRICT).value(),
++            Some(Ordering::Greater)
++        );
++        // y minus its exact secant is (x-a)(x-b), whose absolute maximum
++        // on [a,b] is (b-a)^2/4. This bounds the entire arc independently.
++        leq(&((&dx * &dx / Real::from(4)).unwrap()), &error);
++    }
++    assert!(
++        path.curves()[0]
++            .polynomial_branch()
++            .unwrap()
++            .shares_source(curve.polynomial_branch().unwrap())
++    );
++    let (left, right) = path.curves()[0].split_at(Real::zero().into()).unwrap();
++    assert!(left.end().coincides_with(&right.start()).unwrap());
++    assert!(left.start().coincides_with(&curve.start()).unwrap());
++    assert!(right.end().coincides_with(&curve.end()).unwrap());
++}
++
++#[test]
++fn polynomial_projection_handles_selected_trims_and_singular_endpoints() {
++    let source = curves(&[&[0, 0, 1], &[], &[], &[-1]], [0, 1], [-1, 1]);
++    assert_eq!(source.curves().len(), 2);
++    let end = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![q(-1, 2), 0.into(), 1.into()])
++                .unwrap(),
++            BezierParameterInterval::try_new(q(1, 2), 1.into()).unwrap(),
++        )
++        .unwrap(),
++    );
++    let curve = source.curves()[1]
++        .restrict_source(CurveParameterRange2::try_new(Real::zero().into(), end.into()).unwrap())
++        .unwrap();
++    let transform = Similarity2::try_from_real_affine(
++        0.into(),
++        (-2).into(),
++        2.into(),
++        0.into(),
++        1.into(),
++        3.into(),
++    )
++    .unwrap();
++    for curve in [
++        curve.clone(),
++        curve.reversed().unwrap(),
++        curve.transform_similarity(&transform).unwrap(),
++    ] {
++        let path = CurvePath2::try_new(vec![curve.clone()]).unwrap();
++        let projected = path
++            .project_to_finite_polyline(&FiniteProjectionOptions::try_new(0.02).unwrap())
++            .unwrap();
++        assert!(projected.points().len() >= 2);
++        assert!(
++            projected
++                .points()
++                .iter()
++                .flatten()
++                .all(|value| value.is_finite())
++        );
++        assert!(
++            path.curves()[0]
++                .start()
++                .coincides_with(&curve.start())
++                .unwrap()
++        );
++        assert!(path.curves()[0].end().coincides_with(&curve.end()).unwrap());
++        assert!(path.curves()[0].polynomial_branch().is_some());
++    }
++}

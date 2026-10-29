@@ -1,0 +1,992 @@
+diff --git a/crates/hypercurve/src/finite_projection.rs b/crates/hypercurve/src/finite_projection.rs
+index bf29f31535..4d4d59f00b 100644
+--- a/crates/hypercurve/src/finite_projection.rs
++++ b/crates/hypercurve/src/finite_projection.rs
+@@ -22,10 +22,15 @@ use crate::{
+ };
+ use hyperreal::{Real, RealSign};
+ 
++#[path = "finite_projection_polynomial.rs"]
++mod polynomial;
++
+ /// Options for projecting native curves to finite `f64` polylines.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+ pub struct FiniteProjectionOptions {
+     chord_error: f64,
++    polynomial_max_depth: usize,
++    polynomial_max_boxes: usize,
+ }
+ 
+ /// Finite `f64` polyline emitted from a native curve object.
+@@ -50,12 +55,27 @@ impl FiniteProjectionOptions {
+     /// Constructs projection options with a positive finite chord-error budget.
+     pub fn try_new(chord_error: f64) -> CurveResult<Self> {
+         if chord_error.is_finite() && chord_error > 0.0 {
+-            Ok(Self { chord_error })
++            Ok(Self {
++                chord_error,
++                polynomial_max_depth: 128,
++                polynomial_max_boxes: 65_536,
++            })
+         } else {
+             Err(CurveError::InvalidFiniteProjectionOptions)
+         }
+     }
+ 
++    /// Bounds polynomial graph projection by subdivision depth and total
++    /// attempted parameter boxes per path. Zero permits a denied-budget probe.
++    /// Defaults are depth 128 and 65,536 boxes. Selected-point enclosures use
++    /// at most 512 refinement steps per attempt; shared solver budgets also
++    /// apply. These limits do not bound coefficient arithmetic or heap bytes.
++    pub const fn with_polynomial_subdivision_limits(mut self, depth: usize, boxes: usize) -> Self {
++        self.polynomial_max_depth = depth;
++        self.polynomial_max_boxes = boxes;
++        self
++    }
++
+     /// Returns the maximum requested chord error.
+     pub const fn chord_error(&self) -> f64 {
+         self.chord_error
+@@ -501,8 +521,18 @@ impl CurvePath2 {
+             }
+         };
+         let mut points = Vec::with_capacity(self.curves().len() + 1);
++        let mut polynomial_boxes = 0;
+         for curve in self.curves() {
+-            if let Some(spans) = curve
++            if let Some(branch) = curve.polynomial_branch() {
++                polynomial::append(
++                    &mut points,
++                    curve,
++                    branch,
++                    options,
++                    policy,
++                    &mut polynomial_boxes,
++                )?;
++            } else if let Some(spans) = curve
+                 .restricted_source_spans(policy, crate::CurveOperation2::Evaluation)
+                 .map_err(|error| CurveError::Topology(error.to_string()))?
+             {
+diff --git a/crates/hypercurve/src/finite_projection_polynomial.rs b/crates/hypercurve/src/finite_projection_polynomial.rs
+new file mode 100644
+index 0000000000..926d83b056
+--- /dev/null
++++ b/crates/hypercurve/src/finite_projection_polynomial.rs
+@@ -0,0 +1,279 @@
++//! Polynomial display projection uses certified whole-arc boxes.
++
++use super::*;
++use crate::{Aabb2, PolynomialCurveBranch2, UncertaintyReason};
++use std::cmp::Ordering;
++
++fn uncertain(reason: UncertaintyReason) -> CurveError {
++    CurveError::UncertainFiniteCurveProjection { reason }
++}
++
++fn exact_error(error: crate::ExactCurveError) -> CurveError {
++    match error {
++        crate::ExactCurveError::Blocked(blocker) => uncertain(blocker.reason()),
++        crate::ExactCurveError::Invalid { cause, .. } => cause,
++    }
++}
++
++fn real(value: f64) -> CurveResult<Real> {
++    Real::try_from(value).map_err(|_| CurveError::NonFiniteProjectionPoint)
++}
++
++fn leq(first: &Real, second: &Real, policy: &CurveContext) -> bool {
++    matches!(
++        crate::classify::compare_reals(first, second, policy),
++        Some(Ordering::Less | Ordering::Equal)
++    )
++}
++
++fn all_corners(bounds: &Aabb2, mut predicate: impl FnMut(&Real, &Real) -> bool) -> bool {
++    for x in [bounds.min().x(), bounds.max().x()] {
++        for y in [bounds.min().y(), bounds.max().y()] {
++            if !predicate(x, y) {
++                return false;
++            }
++        }
++    }
++    true
++}
++
++fn project_point(point: &CurvePoint2, policy: &CurveContext) -> CurveResult<[f64; 2]> {
++    if let Some(point) = point.coordinates() {
++        return finite_point(point);
++    }
++    for steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
++        let bounds = match algebraic_chord_endpoint_bounds_refined(point, steps, policy) {
++            Classification::Decided(bounds) => bounds,
++            Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                return Err(uncertain(UncertaintyReason::BudgetExhausted));
++            }
++            Classification::Uncertain(_) => continue,
++        };
++        let lower = finite_point(bounds.min())?;
++        let upper = finite_point(bounds.max())?;
++        if lower == upper {
++            return Ok(lower);
++        }
++    }
++    Err(uncertain(UncertaintyReason::BudgetExhausted))
++}
++
++fn certify_endpoint(
++    point: &CurvePoint2,
++    projected: [f64; 2],
++    squared_error: &Real,
++    policy: &CurveContext,
++) -> CurveResult<()> {
++    let [px, py] = [real(projected[0])?, real(projected[1])?];
++    for steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
++        let bounds = match algebraic_chord_endpoint_bounds_refined(point, steps, policy) {
++            Classification::Decided(bounds) => bounds,
++            Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                return Err(uncertain(UncertaintyReason::BudgetExhausted));
++            }
++            Classification::Uncertain(_) => continue,
++        };
++        if all_corners(&bounds, |x, y| {
++            let dx = x - &px;
++            let dy = y - &py;
++            leq(&(&dx * &dx + &dy * &dy), squared_error, policy)
++        }) {
++            return Ok(());
++        }
++    }
++    // A finite coordinate can still be too coarsely quantized for this error.
++    // Never silently enlarge the caller's tolerance to its binary64 spacing.
++    Err(uncertain(UncertaintyReason::Predicate))
++}
++
++fn inside_capsule(
++    bounds: &Aabb2,
++    start: [f64; 2],
++    end: [f64; 2],
++    squared_error: &Real,
++    policy: &CurveContext,
++) -> CurveResult<bool> {
++    let [ax, ay] = [real(start[0])?, real(start[1])?];
++    let [bx, by] = [real(end[0])?, real(end[1])?];
++    let dx = &bx - &ax;
++    let dy = &by - &ay;
++    let length_squared = &dx * &dx + &dy * &dy;
++    // A segment's closed error capsule is convex. Containing every rectangle
++    // corner therefore contains the entire certified curve enclosure.
++    Ok(all_corners(bounds, |x, y| {
++        let vx = x - &ax;
++        let vy = y - &ay;
++        let dot = &vx * &dx + &vy * &dy;
++        if length_squared.definitely_zero() || leq(&dot, &Real::zero(), policy) {
++            return leq(&(&vx * &vx + &vy * &vy), squared_error, policy);
++        }
++        if leq(&length_squared, &dot, policy) {
++            let ex = x - &bx;
++            let ey = y - &by;
++            return leq(&(&ex * &ex + &ey * &ey), squared_error, policy);
++        }
++        // Both comparisons must be definite before choosing the strip case.
++        if crate::classify::compare_reals(&dot, &Real::zero(), policy) != Some(Ordering::Greater)
++            || crate::classify::compare_reals(&dot, &length_squared, policy) != Some(Ordering::Less)
++        {
++            return false;
++        }
++        let cross = &vx * &dy - &vy * &dx;
++        leq(
++            &(&cross * &cross),
++            &(squared_error * &length_squared),
++            policy,
++        )
++    }))
++}
++
++pub(super) fn append(
++    points: &mut Vec<[f64; 2]>,
++    curve: &Curve2,
++    branch: &PolynomialCurveBranch2,
++    options: &FiniteProjectionOptions,
++    policy: &CurveContext,
++    boxes: &mut usize,
++) -> CurveResult<()> {
++    policy.strict_predicate_pass(|| {
++        let error = real(options.chord_error)?;
++        let error_squared = &error * &error;
++        let endpoint_error_squared = (&error_squared / Real::from(16))?;
++        let start = points
++            .last()
++            .copied()
++            .map_or_else(|| project_point(&curve.start(), policy), Ok)?;
++        let end = project_point(&curve.end(), policy)?;
++        certify_endpoint(&curve.start(), start, &endpoint_error_squared, policy)?;
++        certify_endpoint(&curve.end(), end, &endpoint_error_squared, policy)?;
++        if points.is_empty() {
++            points.push(start);
++        }
++        let margin = (&error / Real::from(4))?;
++        let mut sampler = Sampler {
++            branch,
++            options,
++            policy,
++            boxes,
++            error_squared,
++            endpoint_error_squared,
++        };
++        sampler.interval(
++            points,
++            branch.parameter_range().start(),
++            branch.parameter_range().end(),
++            start,
++            end,
++            &margin,
++            0,
++        )
++    })
++}
++
++struct Sampler<'a> {
++    branch: &'a PolynomialCurveBranch2,
++    options: &'a FiniteProjectionOptions,
++    policy: &'a CurveContext,
++    boxes: &'a mut usize,
++    error_squared: Real,
++    endpoint_error_squared: Real,
++}
++
++impl Sampler<'_> {
++    #[allow(clippy::too_many_arguments)]
++    fn interval(
++        &mut self,
++        points: &mut Vec<[f64; 2]>,
++        lower_parameter: &CurveParameter2,
++        upper_parameter: &CurveParameter2,
++        start: [f64; 2],
++        end: [f64; 2],
++        margin: &Real,
++        depth: usize,
++    ) -> CurveResult<()> {
++        if *self.boxes >= self.options.polynomial_max_boxes {
++            return Err(uncertain(UncertaintyReason::BudgetExhausted));
++        }
++        *self.boxes += 1;
++        let mut separated = None;
++        for steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
++            let lower = finite_region_parameter_projection(lower_parameter, steps, self.policy)?;
++            let upper = finite_region_parameter_projection(upper_parameter, steps, self.policy)?;
++            let gap = &upper.lower - &lower.upper;
++            let uncertainty = (&lower.upper - &lower.lower) + (&upper.upper - &upper.lower);
++            // Separation alone permits midpoints to converge to a stale lower
++            // isolator instead of the selected endpoint. Bound uncertainty by
++            // the gap so each child makes progress in the actual domain.
++            if crate::classify::compare_reals(&gap, &Real::zero(), self.policy)
++                == Some(Ordering::Greater)
++                && leq(&(uncertainty * Real::from(2)), &gap, self.policy)
++            {
++                separated = Some((lower, upper));
++                break;
++            }
++        }
++        let (lower, upper) =
++            separated.ok_or_else(|| uncertain(UncertaintyReason::BudgetExhausted))?;
++        let midpoint = ((&lower.upper + &upper.lower) / Real::from(2))?;
++        let (bounds, anchor) = self
++            .branch
++            .projection_enclosure([&lower.lower, &upper.upper], &midpoint, margin, self.policy)
++            .map_err(exact_error)?;
++        if let Some(bounds) = &bounds
++            && inside_capsule(bounds, start, end, &self.error_squared, self.policy)?
++        {
++            push_if_new(points, end);
++            return Ok(());
++        }
++        if depth >= self.options.polynomial_max_depth {
++            return Err(uncertain(UncertaintyReason::BudgetExhausted));
++        }
++        let middle = project_point(&anchor, self.policy)?;
++        certify_endpoint(&anchor, middle, &self.endpoint_error_squared, self.policy)?;
++        let next_margin = if bounds.is_some() {
++            (margin / Real::from(2))?
++        } else {
++            margin.clone()
++        };
++        let parameter = midpoint.into();
++        if self.branch.is_reversed() {
++            self.interval(
++                points,
++                &parameter,
++                upper_parameter,
++                start,
++                middle,
++                &next_margin,
++                depth + 1,
++            )?;
++            self.interval(
++                points,
++                lower_parameter,
++                &parameter,
++                middle,
++                end,
++                &next_margin,
++                depth + 1,
++            )
++        } else {
++            self.interval(
++                points,
++                lower_parameter,
++                &parameter,
++                start,
++                middle,
++                &next_margin,
++                depth + 1,
++            )?;
++            self.interval(
++                points,
++                &parameter,
++                upper_parameter,
++                middle,
++                end,
++                &next_margin,
++                depth + 1,
++            )
++        }
++    }
++}
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 310b4a462e..696ea8f3a5 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -14,6 +14,9 @@ use hypersolve::{
+ };
+ use std::cmp::Ordering;
+ 
++#[path = "polynomial_curve_projection.rs"]
++mod projection;
++
+ #[path = "polynomial_curve_differential.rs"]
+ mod differential;
+ 
+@@ -1194,10 +1197,13 @@ impl PolynomialCurveBranch2 {
+     pub(super) fn bounds(&self) -> ExactCurveResult<Aabb2> {
+         // The entire certified rectangle is conservative for every restriction.
+         let domain = self.topology().domain();
+-        let mut bounds = Aabb2::new_unchecked(
++        self.image_box(Aabb2::new_unchecked(
+             Point2::new(domain.first[0].clone(), domain.second[0].clone()),
+             Point2::new(domain.first[1].clone(), domain.second[1].clone()),
+-        );
++        ))
++    }
++
++    fn image_box(&self, mut bounds: Aabb2) -> ExactCurveResult<Aabb2> {
+         for map in &self.maps {
+             bounds = map.bounds(&bounds)?;
+         }
+diff --git a/crates/hypercurve/src/polynomial_curve_projection.rs b/crates/hypercurve/src/polynomial_curve_projection.rs
+new file mode 100644
+index 0000000000..463b04c15a
+--- /dev/null
++++ b/crates/hypercurve/src/polynomial_curve_projection.rs
+@@ -0,0 +1,154 @@
++//! Enclosures of a connected selected graph, proved without display samples.
++
++use super::*;
++use hypersolve::RealInterval;
++
++fn compare(a: &Real, b: &Real, policy: &CurveContext) -> ExactCurveResult<Ordering> {
++    crate::classify::compare_reals(a, b, policy)
++        .ok_or_else(|| blocked(UncertaintyReason::Predicate))
++}
++
++impl PolynomialCurveBranch2 {
++    /// Bounds the connected source subarc inside the supplied abscissa interval.
++    /// The anchor must lie strictly inside this branch. A missing box means
++    /// subdivision is needed, not that the curve is absent or unbounded.
++    pub(crate) fn projection_enclosure(
++        &self,
++        first: [&Real; 2],
++        anchor: &Real,
++        margin: &Real,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<(Option<Aabb2>, CurvePoint2)> {
++        hypersolve::work_budget::consume(hypersolve::work_budget::WorkKind::RootRefinement, 1)
++            .map_err(|_| blocked(UncertaintyReason::BudgetExhausted))?;
++        let parameter: CurveParameter2 = anchor.clone().into();
++        if !decided(
++            parameter
++                .cmp_by_refinement(self.range.start(), policy)
++                .map_err(invalid)?,
++        )?
++        .is_gt()
++            || !decided(
++                parameter
++                    .cmp_by_refinement(self.range.end(), policy)
++                    .map_err(invalid)?,
++            )?
++            .is_lt()
++            || !compare(first[0], anchor, policy)?.is_lt()
++            || !compare(anchor, first[1], policy)?.is_lt()
++            || !compare(margin, &Real::zero(), policy)?.is_gt()
++        {
++            return Err(invalid(CurveError::InvalidCurveParameter));
++        }
++        let source_point = self.interior_point(&parameter, policy)?;
++        let image_point = self.map_point(source_point.clone(), policy)?;
++        let mut point_bounds = None;
++        for steps in [0, 2, 4, 8, 16, 32, 64, 128, 256, 512] {
++            let bounds = match crate::bezier_offset::algebraic_chord_endpoint_bounds_refined(
++                &source_point,
++                steps,
++                policy,
++            ) {
++                Classification::Decided(bounds) => bounds,
++                Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                    return Err(blocked(UncertaintyReason::BudgetExhausted));
++                }
++                Classification::Uncertain(_) => continue,
++            };
++            if !compare(&(bounds.max().y() - bounds.min().y()), margin, policy)?.is_gt() {
++                point_bounds = Some(bounds);
++                break;
++            }
++        }
++        let point = point_bounds.ok_or_else(|| blocked(UncertaintyReason::BudgetExhausted))?;
++        let domain = self.topology().domain();
++        let lower = if compare(first[0], &domain.first[0], policy)?.is_lt() {
++            domain.first[0].clone()
++        } else {
++            first[0].clone()
++        };
++        let upper = if compare(first[1], &domain.first[1], policy)?.is_gt() {
++            domain.first[1].clone()
++        } else {
++            first[1].clone()
++        };
++        let x = RealInterval { lower, upper };
++        let anchor_x = RealInterval {
++            lower: anchor.clone(),
++            upper: anchor.clone(),
++        };
++        let equation = self.topology().equation();
++        // At most twice the ordinate degree can make an edge pass through
++        // another root of the anchor fiber. The admitted finite fiber is not
++        // identically zero. Try distinct positive margins inside the requested
++        // band; no nearby roots are merged or removed.
++        let degree = equation
++            .coefficients
++            .iter()
++            .map(Vec::len)
++            .max()
++            .unwrap_or(0);
++        let choices = degree
++            .checked_mul(2)
++            .and_then(|n| n.checked_add(1))
++            .ok_or_else(|| blocked(UncertaintyReason::Unsupported))?;
++        for index in (1..=choices).rev() {
++            let width = (margin * Real::from(index as u128)
++                / Real::from(
++                    choices
++                        .checked_add(1)
++                        .ok_or_else(|| blocked(UncertaintyReason::Unsupported))?
++                        as u128,
++                ))
++            .map_err(|error| invalid(error.into()))?;
++            let mut bottom = point.min().y() - &width;
++            let mut top = point.max().y() + &width;
++            let lower_guard = compare(&bottom, &domain.second[0], policy)?.is_gt();
++            let upper_guard = compare(&top, &domain.second[1], policy)?.is_lt();
++            if !lower_guard {
++                bottom = domain.second[0].clone();
++            }
++            if !upper_guard {
++                top = domain.second[1].clone();
++            }
++            let edge_sign = |axis: &RealInterval, ordinate: &Real| {
++                RealInterval::evaluate_bivariate_power_basis(
++                    equation,
++                    axis,
++                    &RealInterval {
++                        lower: ordinate.clone(),
++                        upper: ordinate.clone(),
++                    },
++                )
++                .and_then(|value| value.strict_nonzero_sign())
++            };
++            if (lower_guard && edge_sign(&anchor_x, &bottom).is_none())
++                || (upper_guard && edge_sign(&anchor_x, &top).is_none())
++            {
++                continue;
++            }
++            if (lower_guard && edge_sign(&x, &bottom).is_none())
++                || (upper_guard && edge_sign(&x, &top).is_none())
++            {
++                return Ok((None, image_point));
++            }
++            // The selected graph is continuous and contains the anchor. It
++            // cannot leave this strip without meeting one of its horizontal
++            // edges. Domain-clamped edges use the original topology bound.
++            let bounds = Aabb2::new_unchecked(
++                Point2::new(x.lower.clone(), bottom),
++                Point2::new(x.upper.clone(), top),
++            );
++            return match self.image_box(bounds) {
++                Ok(bounds) => Ok((Some(bounds), image_point)),
++                Err(ExactCurveError::Blocked(error))
++                    if error.reason() != UncertaintyReason::BudgetExhausted =>
++                {
++                    Ok((None, image_point))
++                }
++                Err(error) => Err(error),
++            };
++        }
++        Ok((None, image_point))
++    }
++}
+diff --git a/crates/hypercurve/src/svg.rs b/crates/hypercurve/src/svg.rs
+index 676b5cd7ff..de39e9311b 100644
+--- a/crates/hypercurve/src/svg.rs
++++ b/crates/hypercurve/src/svg.rs
+@@ -69,6 +69,8 @@ pub enum SvgError {
+     Geometry(String),
+     /// Exact native-definition replay failed, retaining its typed context and cause.
+     Exact(ExactCurveError),
++    /// Polynomial topology reconstruction failed before publishing an exact path.
++    PolynomialTopology(hypersolve::bivariate_topology::BivariateTopologyError),
+     /// An exact coordinate has an undecided certificate or exhausted its budget.
+     Scalar(hyperreal::Problem),
+     /// A configured projection, extension-byte or point-definition-depth bound was exceeded.
+@@ -86,6 +88,9 @@ impl fmt::Display for SvgError {
+             Self::Geometry(detail) => write!(formatter, "SVG geometry conversion failed: {detail}"),
+             Self::Exact(error) => write!(formatter, "SVG exact replay failed: {error}"),
+             Self::Scalar(error) => write!(formatter, "SVG exact coordinate failed: {error}"),
++            Self::PolynomialTopology(error) => {
++                write!(formatter, "SVG polynomial topology failed: {error:?}")
++            }
+             Self::SizeOverflow { limit } => {
+                 write!(
+                     formatter,
+diff --git a/crates/hypercurve/src/svg/exact.rs b/crates/hypercurve/src/svg/exact.rs
+index 5d99af881e..e14db26cff 100644
+--- a/crates/hypercurve/src/svg/exact.rs
++++ b/crates/hypercurve/src/svg/exact.rs
+@@ -17,7 +17,8 @@ pub(super) fn encode_path(
+     max_point_depth: usize,
+ ) -> SvgResult<String> {
+     if path.curves().iter().any(|curve| {
+-        curve.source_restriction().is_some()
++        curve.polynomial_branch().is_some()
++            || curve.source_restriction().is_some()
+             || curve.analytic_parallel().is_some()
+             || matches!(
+                 curve.retained_fragment(),
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index f3699961ba..c99bbd1484 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -16,6 +16,7 @@ use std::collections::HashMap;
+ 
+ mod circles;
+ mod points;
++mod polynomial;
+ 
+ pub(super) const PREFIX: &str = "4:";
+ const MAGIC: &[u8; 4] = b"HCP4";
+@@ -71,6 +72,10 @@ struct GraphWriter {
+     max_point_depth: usize,
+     query_parameters:
+         HashMap<(bool, *const ()), (crate::selected_query_scalar::SelectedQueryScalar2, u32)>,
++    polynomial_sources: HashMap<
++        *const hypersolve::bivariate_topology::BivariateCurveTopology,
++        (crate::PolynomialCurveBranch2, u32),
++    >,
+     circles: HashMap<*const (), (crate::bezier_offset::BezierAlgebraicCuspSemicircle2, u32)>,
+     circle_parameters: HashMap<
+         (u32, *const ()),
+@@ -99,6 +104,7 @@ impl GraphWriter {
+             max_point_depth,
+             query_parameters: HashMap::new(),
+             circles: HashMap::new(),
++            polynomial_sources: HashMap::new(),
+             circle_parameters: HashMap::new(),
+         }
+     }
+@@ -124,6 +130,9 @@ impl GraphWriter {
+     }
+ 
+     fn curve_definition(&mut self, curve: &Curve2) -> SvgResult<u32> {
++        if let Some(branch) = curve.polynomial_branch() {
++            return self.polynomial_branch(branch);
++        }
+         if let Some(crate::BezierSplitFragment2::AlgebraicCuspSemicircle(fragment)) =
+             curve.retained_fragment()
+         {
+@@ -242,6 +251,7 @@ impl GraphWriter {
+ }
+ 
+ enum Definition {
++    PolynomialSource(crate::PolynomialCurveSet2),
+     Curve(Curve2),
+     Parameter(BezierParameter2),
+     QueryParameter(crate::CurveParameter2),
+@@ -493,6 +503,12 @@ fn read_definitions(
+                 point_depth = depth;
+                 definition
+             }
++            tag @ (polynomial::POLYNOMIAL_SOURCE | polynomial::POLYNOMIAL_BRANCH) => {
++                let (definition, depth) =
++                    polynomial::read_definition(tag, reader, &definitions, &point_depths)?;
++                point_depth = depth;
++                definition
++            }
+             tag => {
+                 return Err(SvgError::Unsupported(format!(
+                     "unknown exact Hypercurve definition tag {tag}"
+diff --git a/crates/hypercurve/src/svg/exact/graph/points.rs b/crates/hypercurve/src/svg/exact/graph/points.rs
+index fd8bbbab53..8ea79434e5 100644
+--- a/crates/hypercurve/src/svg/exact/graph/points.rs
++++ b/crates/hypercurve/src/svg/exact/graph/points.rs
+@@ -177,7 +177,10 @@ impl GraphWriter {
+             .ok_or_else(|| malformed("exact point dependency was not emitted"))
+     }
+ 
+-    fn polynomial(&mut self, polynomial: &hypersolve::BivariatePolynomial) -> SvgResult<()> {
++    pub(super) fn polynomial(
++        &mut self,
++        polynomial: &hypersolve::BivariatePolynomial,
++    ) -> SvgResult<()> {
+         self.writer.write_len(polynomial.coefficients.len())?;
+         for row in &polynomial.coefficients {
+             self.writer.write_reals(row)?;
+@@ -500,7 +503,9 @@ fn read_axis(reader: &mut ExactReader<'_>) -> SvgResult<Axis2> {
+     }
+ }
+ 
+-fn read_polynomial(reader: &mut ExactReader<'_>) -> SvgResult<hypersolve::BivariatePolynomial> {
++pub(super) fn read_polynomial(
++    reader: &mut ExactReader<'_>,
++) -> SvgResult<hypersolve::BivariatePolynomial> {
+     let count = reader.read_len()?;
+     reader.check_collection_len(count, 4)?;
+     let coefficients = (0..count)
+diff --git a/crates/hypercurve/src/svg/exact/graph/polynomial.rs b/crates/hypercurve/src/svg/exact/graph/polynomial.rs
+new file mode 100644
+index 0000000000..2d7829ca36
+--- /dev/null
++++ b/crates/hypercurve/src/svg/exact/graph/polynomial.rs
+@@ -0,0 +1,168 @@
++//! Whole polynomial branches replay through the original topology authority.
++
++use super::*;
++use crate::{PolynomialCurveBranch2, PolynomialCurveSet2, RationalMap2, Similarity2};
++use hypersolve::AlgebraicFiberRootIsolationConfig;
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++
++pub(super) const POLYNOMIAL_SOURCE: u8 = 29;
++pub(super) const POLYNOMIAL_BRANCH: u8 = 30;
++
++impl GraphWriter {
++    fn polynomial_source(&mut self, branch: &PolynomialCurveBranch2) -> SvgResult<u32> {
++        let topology = branch.topology();
++        let key = std::ptr::from_ref(topology);
++        if let Some((_, index)) = self.polynomial_sources.get(&key) {
++            return Ok(*index);
++        }
++        let index = self.begin(POLYNOMIAL_SOURCE)?;
++        self.polynomial(topology.equation())?;
++        for value in topology
++            .domain()
++            .first
++            .iter()
++            .chain(&topology.domain().second)
++        {
++            self.writer.write_real(value)?;
++        }
++        let construction = topology.config();
++        let evaluation = branch.evaluation_config();
++        for value in [
++            construction.max_axis_degree,
++            construction.max_projection_degree,
++            construction.max_refinement_rounds,
++            construction.fiber.max_subdivision_depth,
++            construction.fiber.refinement_steps,
++            evaluation.max_subdivision_depth,
++            evaluation.refinement_steps,
++        ] {
++            self.writer.write_len(value)?;
++        }
++        // Keep the immutable owner alive while its address memoizes this graph.
++        self.polynomial_sources.insert(key, (branch.clone(), index));
++        Ok(index)
++    }
++
++    pub(super) fn polynomial_branch(&mut self, branch: &PolynomialCurveBranch2) -> SvgResult<u32> {
++        let source = self.polynomial_source(branch)?;
++        let start = self.scalar_parameter(branch.parameter_range().start())?;
++        let end = self.scalar_parameter(branch.parameter_range().end())?;
++        let index = self.begin(POLYNOMIAL_BRANCH)?;
++        self.writer.write_u32(source)?;
++        self.writer.write_len(branch.slab_index())?;
++        self.writer.write_len(branch.root_index())?;
++        self.writer.write_u32(start)?;
++        self.writer.write_u32(end)?;
++        self.writer.write_bool(branch.is_reversed())?;
++        self.writer.write_len(branch.rational_maps().len())?;
++        for map in branch.rational_maps() {
++            for polynomial in map.numerators().iter().chain([map.denominator()]) {
++                self.polynomial(polynomial)?;
++            }
++        }
++        self.writer.write_bool(branch.image_transform().is_some())?;
++        if let Some(map) = branch.image_transform() {
++            let (a, b, c, d, x, y) = map.affine_components();
++            for value in [a, b, c, d, x, y] {
++                self.writer.write_real(value)?;
++            }
++        }
++        self.point_depths[index as usize] =
++            self.point_depths[start as usize].max(self.point_depths[end as usize]);
++        Ok(index)
++    }
++}
++
++fn read_source(reader: &mut ExactReader<'_>) -> SvgResult<PolynomialCurveSet2> {
++    let equation = points::read_polynomial(reader)?;
++    let domain = BivariateCurveDomain {
++        first: [reader.read_real()?, reader.read_real()?],
++        second: [reader.read_real()?, reader.read_real()?],
++    };
++    let construction = BivariateTopologyConfig {
++        max_axis_degree: reader.read_len()?,
++        max_projection_degree: reader.read_len()?,
++        max_refinement_rounds: reader.read_len()?,
++        fiber: AlgebraicFiberRootIsolationConfig {
++            max_subdivision_depth: reader.read_len()?,
++            refinement_steps: reader.read_len()?,
++        },
++    };
++    let evaluation = AlgebraicFiberRootIsolationConfig {
++        max_subdivision_depth: reader.read_len()?,
++        refinement_steps: reader.read_len()?,
++    };
++    // No serialized arc, connectivity flag or live cache counts as a proof.
++    let topology = decompose_bivariate_curve(&equation, &domain, construction)
++        .map_err(SvgError::PolynomialTopology)?;
++    PolynomialCurveSet2::from_topology(topology, evaluation).map_err(SvgError::Exact)
++}
++
++pub(super) fn read_definition(
++    tag: u8,
++    reader: &mut ExactReader<'_>,
++    definitions: &[Definition],
++    point_depths: &[usize],
++) -> SvgResult<(Definition, usize)> {
++    if tag == POLYNOMIAL_SOURCE {
++        return Ok((Definition::PolynomialSource(read_source(reader)?), 0));
++    }
++    let source = match definitions.get(reader.read_len()?) {
++        Some(Definition::PolynomialSource(source)) => source,
++        _ => {
++            return Err(malformed(
++                "exact polynomial branch has an invalid source reference",
++            ));
++        }
++    };
++    let slab = reader.read_len()?;
++    let root = reader.read_len()?;
++    let curve = source
++        .curves()
++        .iter()
++        .find(|curve| {
++            curve
++                .polynomial_branch()
++                .is_some_and(|branch| branch.slab_index() == slab && branch.root_index() == root)
++        })
++        .ok_or_else(|| malformed("exact polynomial branch has an invalid slab or root index"))?;
++    let start_index = reader.read_len()?;
++    let end_index = reader.read_len()?;
++    let start = scalar_parameter_reference(definitions, start_index)?;
++    let end = scalar_parameter_reference(definitions, end_index)?;
++    let depth = point_depths[start_index].max(point_depths[end_index]);
++    let reversed = reader.read_bool()?;
++    let mut curve = curve.subcurve(start, end).map_err(SvgError::Exact)?;
++    let count = reader.read_len()?;
++    reader.check_collection_len(count, 12)?;
++    for _ in 0..count {
++        let numerators = [
++            points::read_polynomial(reader)?,
++            points::read_polynomial(reader)?,
++        ];
++        let denominator = points::read_polynomial(reader)?;
++        curve = curve
++            .rational_image(&RationalMap2::new(numerators, denominator))
++            .map_err(SvgError::Exact)?;
++    }
++    if reader.read_bool()? {
++        let transform = Similarity2::try_from_real_affine(
++            reader.read_real()?,
++            reader.read_real()?,
++            reader.read_real()?,
++            reader.read_real()?,
++            reader.read_real()?,
++            reader.read_real()?,
++        )
++        .map_err(SvgError::Exact)?;
++        curve = curve
++            .transform_similarity(&transform)
++            .map_err(SvgError::Exact)?;
++    }
++    if reversed {
++        curve = curve.reversed().map_err(SvgError::Exact)?;
++    }
++    Ok((Definition::Curve(curve), depth))
++}
+diff --git a/crates/hypercurve/tests/polynomial_projection.rs b/crates/hypercurve/tests/polynomial_projection.rs
+new file mode 100644
+index 0000000000..d393368523
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_projection.rs
+@@ -0,0 +1,142 @@
++//! Display chords consume certified enclosures without replacing selected curves.
++
++use std::cmp::Ordering;
++
++use hypercurve::{
++    BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
++    BezierParameterPolynomial, CurveParameterRange2, CurvePath2, FiniteProjectionOptions,
++    PolynomialCurveSet2, Real, Similarity2,
++};
++use hyperlimit::{PredicatePolicy, compare_reals};
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++use hypersolve::{AlgebraicFiberRootIsolationConfig, BivariatePolynomial};
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++
++fn curves(rows: &[&[i32]], first: [i32; 2], second: [i32; 2]) -> PolynomialCurveSet2 {
++    let equation = BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    );
++    let topology = decompose_bivariate_curve(
++        &equation,
++        &BivariateCurveDomain {
++            first: first.map(Real::from),
++            second: second.map(Real::from),
++        },
++        BivariateTopologyConfig::default(),
++    )
++    .unwrap();
++    PolynomialCurveSet2::from_topology(topology, AlgebraicFiberRootIsolationConfig::default())
++        .unwrap()
++}
++
++fn leq(first: &Real, second: &Real) {
++    assert!(matches!(
++        compare_reals(first, second, PredicatePolicy::STRICT).value(),
++        Some(Ordering::Less | Ordering::Equal)
++    ));
++}
++
++#[test]
++fn polynomial_projection_preserves_the_exact_source() {
++    let source = curves(&[&[1, 2], &[], &[-2]], [-1, 1], [-1, 1]);
++    assert_eq!(source.curves().len(), 1);
++    let curve = source.curves()[0].clone();
++    let path = CurvePath2::try_new(vec![curve.clone()]).unwrap();
++    let options = FiniteProjectionOptions::try_new(0.01).unwrap();
++    let projection = path.project_to_finite_polyline(&options).unwrap();
++    assert!(!projection.is_closed());
++    assert_eq!(projection.points().first(), Some(&[-1.0, 0.5]));
++    assert_eq!(projection.points().last(), Some(&[1.0, 0.5]));
++    let error = Real::try_from(options.chord_error()).unwrap();
++    let points: Vec<_> = projection
++        .points()
++        .iter()
++        .map(|point| point.map(|coordinate| Real::try_from(coordinate).unwrap()))
++        .collect();
++    for [x, y] in &points {
++        // All expected vertices in this dyadic quadratic have an exact oracle.
++        assert_eq!(
++            compare_reals(y, &(x * x - q(1, 2)), PredicatePolicy::STRICT).value(),
++            Some(Ordering::Equal)
++        );
++    }
++    for pair in points.windows(2) {
++        let dx = &pair[1][0] - &pair[0][0];
++        assert_eq!(
++            compare_reals(&dx, &Real::zero(), PredicatePolicy::STRICT).value(),
++            Some(Ordering::Greater)
++        );
++        // y minus its exact secant is (x-a)(x-b), whose absolute maximum
++        // on [a,b] is (b-a)^2/4. This bounds the entire arc independently.
++        leq(&((&dx * &dx / Real::from(4)).unwrap()), &error);
++    }
++    assert!(
++        path.curves()[0]
++            .polynomial_branch()
++            .unwrap()
++            .shares_source(curve.polynomial_branch().unwrap())
++    );
++    let (left, right) = path.curves()[0].split_at(Real::zero().into()).unwrap();
++    assert!(left.end().coincides_with(&right.start()).unwrap());
++    assert!(left.start().coincides_with(&curve.start()).unwrap());
++    assert!(right.end().coincides_with(&curve.end()).unwrap());
++}
++
++#[test]
++fn polynomial_projection_handles_selected_trims_and_singular_endpoints() {
++    let source = curves(&[&[0, 0, 1], &[], &[], &[-1]], [0, 1], [-1, 1]);
++    assert_eq!(source.curves().len(), 2);
++    let end = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![q(-1, 2), 0.into(), 1.into()])
++                .unwrap(),
++            BezierParameterInterval::try_new(q(1, 2), 1.into()).unwrap(),
++        )
++        .unwrap(),
++    );
++    let curve = source.curves()[1]
++        .restrict_source(CurveParameterRange2::try_new(Real::zero().into(), end.into()).unwrap())
++        .unwrap();
++    let transform = Similarity2::try_from_real_affine(
++        0.into(),
++        (-2).into(),
++        2.into(),
++        0.into(),
++        1.into(),
++        3.into(),
++    )
++    .unwrap();
++    for curve in [
++        curve.clone(),
++        curve.reversed().unwrap(),
++        curve.transform_similarity(&transform).unwrap(),
++    ] {
++        let path = CurvePath2::try_new(vec![curve.clone()]).unwrap();
++        let projected = path
++            .project_to_finite_polyline(&FiniteProjectionOptions::try_new(0.02).unwrap())
++            .unwrap();
++        assert!(projected.points().len() >= 2);
++        assert!(
++            projected
++                .points()
++                .iter()
++                .flatten()
++                .all(|value| value.is_finite())
++        );
++        assert!(
++            path.curves()[0]
++                .start()
++                .coincides_with(&curve.start())
++                .unwrap()
++        );
++        assert!(path.curves()[0].end().coincides_with(&curve.end()).unwrap());
++        assert!(path.curves()[0].polynomial_branch().is_some());
++    }
++}
