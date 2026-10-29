@@ -1,0 +1,2267 @@
+diff --git a/crates/hypercurve/src/bezier_offset.rs b/crates/hypercurve/src/bezier_offset.rs
+index deb757ac53..56529c44a8 100644
+--- a/crates/hypercurve/src/bezier_offset.rs
++++ b/crates/hypercurve/src/bezier_offset.rs
+@@ -31,7 +31,9 @@ mod parallel_construction;
+ mod parallel_pair_sets;
+ #[path = "curve_parameter_component.rs"]
+ mod parameter_component;
++mod polynomial_field;
+ mod rational_form;
++pub(crate) use polynomial_field::*;
+ mod recursive_field;
+ use recursive_field::foreign_embedding_projective_point;
+ #[cfg(test)]
+diff --git a/crates/hypercurve/src/bezier_offset/polynomial_field.rs b/crates/hypercurve/src/bezier_offset/polynomial_field.rs
+new file mode 100644
+index 0000000000..cd15081c30
+--- /dev/null
++++ b/crates/hypercurve/src/bezier_offset/polynomial_field.rs
+@@ -0,0 +1,136 @@
++//! Lossless imports of admitted native authorities into selected polynomial fields.
++
++use super::*;
++use crate::selected_field::{self as field, Field, Value};
++use crate::selected_scalar::SelectedScalar2;
++
++pub(crate) fn selected_field_bezier(
++    parameter: &BezierParameter2,
++    policy: &CurveContext,
++) -> field::Result<Value> {
++    let sources = match parameter {
++        BezierParameter2::Exact(_) => Vec::new(),
++        BezierParameter2::Algebraic(root) => vec![certified_parameter_representation(root, policy)],
++    };
++    let rank = sources.len();
++    let one = field::available(DenseTensorPolynomial::try_new(
++        vec![1; rank],
++        vec![Real::one()],
++    ))?;
++    let native = field::available(RecursiveQuadraticField::base(sources, one.clone(), one))?;
++    let field = Field::from_recursive(native.clone());
++    match parameter {
++        BezierParameter2::Exact(value) => Ok(field.constant(value.clone())?),
++        BezierParameter2::Algebraic(_) => {
++            let RecursiveQuadraticField::Base(base) = native else {
++                unreachable!("native base")
++            };
++            let axis = field::available(DenseTensorPolynomial::from_axis_polynomial(
++                1,
++                0,
++                &[Real::zero(), Real::one()],
++            ))?;
++            let value = field::available(recursive_quadratic_rational_value(&base, axis))?;
++            Ok(field.import_recursive(&value)?)
++        }
++    }
++}
++
++pub(crate) fn selected_field_fiber(
++    parameter: &BezierAlgebraicSelectedFiberParameter2,
++    policy: &CurveContext,
++) -> field::Result<[Value; 2]> {
++    parameter
++        .validate_policy(policy)
++        .map_err(field::FieldError::Context)?;
++    let (equation, base) = parameter.defining_fiber();
++    let x = selected_field_bezier(&BezierParameter2::Algebraic(base.clone()), policy)?;
++    let parent = x.field();
++    let root = parameter.root();
++    if let Some(value) = &root.exact_root {
++        return Ok([x.clone(), parent.constant(value.clone())?]);
++    }
++    let degree = equation
++        .coefficients
++        .iter()
++        .map(Vec::len)
++        .max()
++        .unwrap_or(0);
++    let coefficients = (0..degree)
++        .map(|power| {
++            let coefficients = equation
++                .coefficients
++                .iter()
++                .map(|row| row.get(power).cloned().unwrap_or_else(Real::zero))
++                .collect::<Vec<_>>();
++            field::polynomial(&coefficients, &x)
++        })
++        .collect::<field::Result<Vec<_>>>()?;
++    // Non-point fiber selectors are admitted endpoint-free open intervals.
++    // Native base roots retain their own endpoint ownership in the native field.
++    let selected = field::decided(parent.select(
++        coefficients,
++        root.lower.clone(),
++        root.upper.clone(),
++        policy,
++    )?)?;
++    Ok([selected.lift(&x)?, selected.generator()?])
++}
++
++pub(crate) fn selected_field_scalar(
++    parameter: &SelectedScalar2,
++    policy: &CurveContext,
++) -> field::Result<Value> {
++    let strict = policy.strict_counterpart();
++    let policy = &strict;
++    match parameter {
++        SelectedScalar2::Bezier(value) => selected_field_bezier(value, policy),
++        SelectedScalar2::SelectedFiber(value) => {
++            Ok(selected_field_fiber(value, policy)?[1].clone())
++        }
++        SelectedScalar2::Polynomial(value) => value.value(),
++        SelectedScalar2::RecursiveProjective(value) => {
++            value
++                .validate_policy(policy)
++                .map_err(field::FieldError::Context)?;
++            if let Some(value) = value.projective_scalar() {
++                let field = Field::from_recursive(value.numerator.field());
++                let numerator = field.import_recursive(&value.numerator)?;
++                let denominator = field.import_recursive(&value.denominator)?;
++                field::decided(numerator.divide(&denominator, policy)?)
++            } else {
++                let native = field::curve(value.promoted_bezier_parameter_complete(policy))?;
++                selected_field_bezier(&native, policy)
++            }
++        }
++    }
++}
++
++pub(crate) fn selected_field_query(
++    query: &PointFormSource2,
++    policy: &CurveContext,
++) -> field::Result<Value> {
++    let pulled = field::curve(point_form_source(
++        &query.source,
++        &query.numerator,
++        &query.denominator,
++        policy,
++    ))?;
++    if let CurvePointData2::Polynomial(point) = &pulled.source.0 {
++        return point.field_query(&pulled.numerator, &pulled.denominator, policy);
++    }
++    let value = field::available(field::curve(
++        super::rational_form::recursive_rational_value(
++            &pulled.source,
++            &pulled.numerator,
++            &pulled.denominator,
++            policy,
++        ),
++    )?)?;
++    let field = Field::from_recursive(value.numerator.field());
++    field::decided(
++        field
++            .import_recursive(&value.numerator)?
++            .divide(&field.import_recursive(&value.denominator)?, policy)?,
++    )
++}
+diff --git a/crates/hypercurve/src/bezier_offset/rational_form.rs b/crates/hypercurve/src/bezier_offset/rational_form.rs
+index 83c03ce0d1..a1285cbeb4 100644
+--- a/crates/hypercurve/src/bezier_offset/rational_form.rs
++++ b/crates/hypercurve/src/bezier_offset/rational_form.rs
+@@ -92,6 +92,7 @@ pub(crate) fn common_point_form_sources(
+     if first.source.shares_storage(&second.source) || first.source == second.source {
+         return Ok(Classification::Decided([first, second]));
+     }
++    let original = [first.clone(), second.clone()];
+     for form in [&mut first, &mut second] {
+         *form = match point_form_source(&form.source, &form.numerator, &form.denominator, policy)? {
+             Classification::Decided(form) => form,
+@@ -122,7 +123,38 @@ pub(crate) fn common_point_form_sources(
+     } else if constant(&second.numerator) && constant(&second.denominator) {
+         second.source = first.source.clone();
+     }
+-    Ok(match first.source.same_point(&second.source, policy) {
++    if first.source.shares_storage(&second.source) || first.source == second.source {
++        return Ok(Classification::Decided([first, second]));
++    }
++    let same_point = first.source.same_point(&second.source, policy);
++    if same_point == Classification::Decided(true) {
++        return Ok(Classification::Decided([first, second]));
++    }
++    if same_point == Classification::Uncertain(UncertaintyReason::BudgetExhausted) {
++        return Ok(Classification::Uncertain(
++            UncertaintyReason::BudgetExhausted,
++        ));
++    }
++    match crate::polynomial_point::PolynomialPoint2::from_queries(original, policy)? {
++        Classification::Decided(source) => {
++            let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
++            return Ok(Classification::Decided([
++                PointFormSource2::new(
++                    source.clone(),
++                    BivariatePolynomial::new(vec![vec![Real::zero()], vec![Real::one()]]),
++                    one.clone(),
++                ),
++                PointFormSource2::new(
++                    source,
++                    BivariatePolynomial::new(vec![vec![Real::zero(), Real::one()]]),
++                    one,
++                ),
++            ]));
++        }
++        Classification::Uncertain(UncertaintyReason::Unsupported) => {}
++        Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++    }
++    Ok(match same_point {
+         Classification::Decided(true) => Classification::Decided([first, second]),
+         Classification::Decided(false) => Classification::Uncertain(UncertaintyReason::Unsupported),
+         Classification::Uncertain(reason) => Classification::Uncertain(reason),
+@@ -1031,7 +1063,7 @@ pub(crate) fn point_rational_form_parameter(
+     }
+ }
+ 
+-fn recursive_rational_value(
++pub(super) fn recursive_rational_value(
+     source: &CurvePoint2,
+     numerator: &BivariatePolynomial,
+     denominator: &BivariatePolynomial,
+diff --git a/crates/hypercurve/src/bezier_split.rs b/crates/hypercurve/src/bezier_split.rs
+index e32a646728..19e30fa3b9 100644
+--- a/crates/hypercurve/src/bezier_split.rs
++++ b/crates/hypercurve/src/bezier_split.rs
+@@ -141,6 +141,21 @@ impl CurveParameter2 {
+         }
+     }
+ 
++    pub(crate) fn from_polynomial_query(
++        parameter: crate::selected_query_scalar::SelectedQueryScalar2,
++    ) -> Self {
++        Self::from_selected_scalar(SelectedScalar2::Polynomial(parameter))
++    }
++
++    pub(crate) fn as_polynomial_query(
++        &self,
++    ) -> Option<&crate::selected_query_scalar::SelectedQueryScalar2> {
++        match &self.data {
++            CurveParameterData2::Scalar(SelectedScalar2::Polynomial(parameter)) => Some(parameter),
++            _ => None,
++        }
++    }
++
+     pub(crate) fn from_selected_fiber(parameter: BezierAlgebraicSelectedFiberParameter2) -> Self {
+         Self::from_selected_scalar(SelectedScalar2::SelectedFiber(parameter))
+     }
+@@ -271,7 +286,9 @@ impl CurveParameter2 {
+         matches!(
+             self.data,
+             CurveParameterData2::Scalar(
+-                SelectedScalar2::SelectedFiber(_) | SelectedScalar2::RecursiveProjective(_)
++                SelectedScalar2::Polynomial(_)
++                    | SelectedScalar2::SelectedFiber(_)
++                    | SelectedScalar2::RecursiveProjective(_)
+             )
+         )
+     }
+diff --git a/crates/hypercurve/src/curve_evaluation.rs b/crates/hypercurve/src/curve_evaluation.rs
+index 8b24bc8d30..15e507d5c7 100644
+--- a/crates/hypercurve/src/curve_evaluation.rs
++++ b/crates/hypercurve/src/curve_evaluation.rs
+@@ -449,6 +449,9 @@ pub(crate) fn rational_point(
+     policy: &CurveContext,
+ ) -> ExactCurveResult<CurvePoint2> {
+     validate_rational_point(source, parameter, family, policy)?;
++    if let Some(parameter) = parameter.as_polynomial_query() {
++        return parameter.rational_point(source, policy);
++    }
+     if let Some(parameter) = parameter.as_bezier_parameter() {
+         return match parameter {
+             BezierParameter2::Exact(parameter) => {
+diff --git a/crates/hypercurve/src/curve_point/definition.rs b/crates/hypercurve/src/curve_point/definition.rs
+index a9dbc3ccf2..1a558eae0c 100644
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -20,6 +20,13 @@ pub enum CurvePointDefinition2 {
+         parameter: BezierParameter2,
+         root: hypersolve::IsolatedRootInterval,
+     },
++    /// Two rational queries, each retaining its original point and pole guard.
++    /// Replay joins their selected fields; it never projects independent coordinates.
++    RationalQueryPair {
++        sources: [CurvePoint2; 2],
++        numerators: [hypersolve::BivariatePolynomial; 2],
++        denominators: [hypersolve::BivariatePolynomial; 2],
++    },
+     /// A rational plane image with its original denominator guard.
+     RationalImage {
+         source: CurvePoint2,
+@@ -231,6 +238,37 @@ impl CurvePointDefinition2 {
+     fn replay(self, sources_checked: bool) -> ExactCurveResult<CurvePoint2> {
+         crate::policy::resolve_certified_operation(&CurveContext::STRICT, |policy| match self {
+             Self::Coordinates(point) => Ok(point.into()),
++            Self::RationalQueryPair {
++                sources,
++                numerators,
++                denominators,
++            } => {
++                let mut queries = Vec::with_capacity(2);
++                for ((source, numerator), denominator) in
++                    sources.into_iter().zip(numerators).zip(denominators)
++                {
++                    let source = if sources_checked {
++                        source
++                    } else {
++                        source.definition()?.into_point()?
++                    };
++                    queries.push(crate::bezier_offset::PointFormSource2::new(
++                        source,
++                        numerator,
++                        denominator,
++                    ));
++                }
++                ExactCurveError::decided(
++                    CurveOperation2::Construction,
++                    crate::polynomial_point::PolynomialPoint2::from_queries(
++                        queries.try_into().expect("two queries"),
++                        policy,
++                    )
++                    .map_err(|cause| {
++                        ExactCurveError::invalid_unattributed(CurveOperation2::Construction, cause)
++                    })?,
++                )
++            }
+             Self::RationalImage { source, map } => source.rational_image_with_policy(&map, policy),
+             Self::PolynomialFiber {
+                 equation,
+diff --git a/crates/hypercurve/src/lib.rs b/crates/hypercurve/src/lib.rs
+index b27b1e6608..303aafefc1 100644
+--- a/crates/hypercurve/src/lib.rs
++++ b/crates/hypercurve/src/lib.rs
+@@ -91,6 +91,8 @@ mod region_nesting;
+ mod region_pipeline_tests;
+ mod segment;
+ mod segment_metric;
++mod selected_field;
++mod selected_query_scalar;
+ mod selected_scalar;
+ mod self_intersect;
+ mod spline_periodic;
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index b0b94ad1bf..e1012e70cb 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -15,11 +15,22 @@ use crate::{
+ /// Both coordinates keep the same selected base/fiber relation.
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) struct PolynomialPoint2 {
+-    base: BezierParameter2,
+-    fiber: BezierAlgebraicSelectedFiberParameter2,
++    authority: PolynomialPointAuthority2,
+     maps: Vec<std::sync::Arc<crate::RationalMap2>>,
+ }
+ 
++#[derive(Clone, Debug, PartialEq)]
++enum PolynomialPointAuthority2 {
++    Fiber {
++        base: BezierParameter2,
++        fiber: BezierAlgebraicSelectedFiberParameter2,
++    },
++    Queries(std::sync::Arc<JointQueries2>),
++}
++
++mod joint;
++use joint::JointQueries2;
++
+ impl PolynomialPoint2 {
+     pub(crate) fn has_rational_maps(&self) -> bool {
+         !self.maps.is_empty()
+@@ -33,7 +44,14 @@ impl PolynomialPoint2 {
+         if let Some(map) = self.maps.last() {
+             (4, std::sync::Arc::as_ptr(map).cast())
+         } else {
+-            (7, std::ptr::from_ref(self.fiber.root()).cast())
++            match &self.authority {
++                PolynomialPointAuthority2::Fiber { fiber, .. } => {
++                    (7, std::ptr::from_ref(fiber.root()).cast())
++                }
++                PolynomialPointAuthority2::Queries(queries) => {
++                    (11, std::sync::Arc::as_ptr(queries).cast())
++                }
++            }
+         }
+     }
+ 
+@@ -42,21 +60,29 @@ impl PolynomialPoint2 {
+         polynomial: &BivariatePolynomial,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<hyperreal::RealSign>> {
++        let PolynomialPointAuthority2::Fiber { fiber, .. } = &self.authority else {
++            return crate::selected_field::finish(|| {
++                let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
++                crate::selected_field::decided(
++                    self.field_query(polynomial, &one, policy)?.sign(policy)?,
++                )
++            });
++        };
+         if self.maps.is_empty() {
+-            return self.fiber.predicate_sign(polynomial, policy);
++            return fiber.predicate_sign(polynomial, policy);
+         }
+         let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
+         let Some((numerator, denominator)) = self.pullback(polynomial, &one) else {
+             return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+         };
+-        let sign = match self.fiber.predicate_sign(&denominator, policy)? {
++        let sign = match fiber.predicate_sign(&denominator, policy)? {
+             Classification::Decided(sign) => sign,
+             Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+         };
+         if sign == hyperreal::RealSign::Zero {
+             return Err(CurveError::ZeroRationalPointDenominator);
+         }
+-        Ok(self.fiber.predicate_sign(&numerator, policy)?.map(|value| {
++        Ok(fiber.predicate_sign(&numerator, policy)?.map(|value| {
+             if sign == hyperreal::RealSign::Negative {
+                 match value {
+                     hyperreal::RealSign::Positive => hyperreal::RealSign::Negative,
+@@ -75,17 +101,18 @@ impl PolynomialPoint2 {
+         denominator: &BivariatePolynomial,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<CurveParameter2>> {
++        let PolynomialPointAuthority2::Fiber { fiber, .. } = &self.authority else {
++            return self.joint_parameter(numerator, denominator, policy);
++        };
+         if self.maps.is_empty() {
+-            return Ok(self
+-                .fiber
++            return Ok(fiber
+                 .rational_image_in_retained_field(numerator, denominator, policy)?
+                 .map(CurveParameter2::from_selected_fiber));
+         }
+         let Some((numerator, denominator)) = self.pullback(numerator, denominator) else {
+             return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+         };
+-        Ok(self
+-            .fiber
++        Ok(fiber
+             .rational_image_in_retained_field(&numerator, &denominator, policy)?
+             .map(CurveParameter2::from_selected_fiber))
+     }
+@@ -125,8 +152,10 @@ impl PolynomialPoint2 {
+             .into_iter()
+             .map(|fiber| {
+                 CurvePoint2(CurvePointData2::Polynomial(std::sync::Arc::new(Self {
+-                    base: base.clone(),
+-                    fiber,
++                    authority: PolynomialPointAuthority2::Fiber {
++                        base: base.clone(),
++                        fiber,
++                    },
+                     maps: Vec::new(),
+                 })))
+             })
+@@ -142,10 +171,15 @@ impl PolynomialPoint2 {
+                 map: (*map).clone(),
+             };
+         }
+-        crate::CurvePointDefinition2::PolynomialFiber {
+-            equation: self.fiber.defining_fiber().0.clone(),
+-            parameter: self.base.clone(),
+-            root: self.fiber.root().clone(),
++        match &self.authority {
++            PolynomialPointAuthority2::Fiber { base, fiber } => {
++                crate::CurvePointDefinition2::PolynomialFiber {
++                    equation: fiber.defining_fiber().0.clone(),
++                    parameter: base.clone(),
++                    root: fiber.root().clone(),
++                }
++            }
++            PolynomialPointAuthority2::Queries(queries) => queries.definition(),
+         }
+     }
+ 
+@@ -187,7 +221,8 @@ impl PolynomialPoint2 {
+         axis: Axis2,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<CurveParameter2>> {
+-        if self.maps.is_empty() {
++        if self.maps.is_empty() && matches!(self.authority, PolynomialPointAuthority2::Fiber { .. })
++        {
+             return Ok(Classification::Decided(self.source_coordinate(axis)));
+         }
+         let polynomial = match axis {
+@@ -202,9 +237,12 @@ impl PolynomialPoint2 {
+     }
+ 
+     fn source_coordinate(&self, axis: Axis2) -> CurveParameter2 {
++        let PolynomialPointAuthority2::Fiber { base, fiber } = &self.authority else {
++            unreachable!("native fiber coordinate")
++        };
+         match axis {
+-            Axis2::X => self.base.clone().into(),
+-            Axis2::Y => CurveParameter2::from_selected_fiber(self.fiber.clone()),
++            Axis2::X => base.clone().into(),
++            Axis2::Y => CurveParameter2::from_selected_fiber(fiber.clone()),
+         }
+     }
+ 
+@@ -254,7 +292,8 @@ impl PolynomialPoint2 {
+         [a, b, c]: &[Real; 3],
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<CurveParameter2>> {
+-        if !self.maps.is_empty() {
++        if !self.maps.is_empty() || matches!(self.authority, PolynomialPointAuthority2::Queries(_))
++        {
+             return self.rational_parameter(
+                 &BivariatePolynomial::new(vec![vec![c.clone(), b.clone()], vec![a.clone()]]),
+                 &BivariatePolynomial::new(vec![vec![Real::one()]]),
+@@ -274,15 +313,17 @@ impl PolynomialPoint2 {
+                 .source_coordinate(Axis2::X)
+                 .affine_image_unbounded(a, c, policy);
+         }
+-        if let BezierParameter2::Exact(base) = &self.base {
++        let PolynomialPointAuthority2::Fiber { base, fiber } = &self.authority else {
++            unreachable!("native fiber affine form")
++        };
++        if let BezierParameter2::Exact(base) = base {
+             return self.source_coordinate(Axis2::Y).affine_image_unbounded(
+                 b,
+                 &(a * base + c),
+                 policy,
+             );
+         }
+-        Ok(self
+-            .fiber
++        Ok(fiber
+             .rational_image_in_retained_field(
+                 &BivariatePolynomial::new(vec![vec![c.clone(), b.clone()], vec![a.clone()]]),
+                 &BivariatePolynomial::new(vec![vec![Real::one()]]),
+@@ -292,14 +333,17 @@ impl PolynomialPoint2 {
+     }
+ 
+     pub(crate) fn bounds(&self, steps: usize, policy: &CurveContext) -> Classification<Aabb2> {
+-        let base = self.base.clone().refined_isolating_interval(steps, policy);
++        let PolynomialPointAuthority2::Fiber { base, fiber } = &self.authority else {
++            return self.joint_bounds(steps, policy);
++        };
++        let base = base.clone().refined_isolating_interval(steps, policy);
+         let (lower, upper) = match &base {
+             BezierParameter2::Exact(value) => (value, value),
+             BezierParameter2::Algebraic(value) => {
+                 (value.interval().start(), value.interval().end())
+             }
+         };
+-        let fiber = match self.fiber.refined(steps, policy) {
++        let fiber = match fiber.refined(steps, policy) {
+             Ok(Classification::Decided(fiber)) => fiber,
+             Ok(Classification::Uncertain(reason)) => return Classification::Uncertain(reason),
+             Err(CurveError::InvalidBezierAlgebraicParameter) => {
+diff --git a/crates/hypercurve/src/polynomial_point/joint.rs b/crates/hypercurve/src/polynomial_point/joint.rs
+new file mode 100644
+index 0000000000..3ddae652a7
+--- /dev/null
++++ b/crates/hypercurve/src/polynomial_point/joint.rs
+@@ -0,0 +1,125 @@
++//! Joint query points preserve sources as well as their common scalar field.
++
++use super::*;
++use crate::bezier_offset::PointFormSource2;
++use crate::selected_field::{self as field, Value};
++use std::sync::Arc;
++
++pub(super) struct JointQueries2 {
++    sources: [PointFormSource2; 2],
++    values: [Value; 2],
++}
++
++impl std::fmt::Debug for JointQueries2 {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        // Shared operand definitions must not expand into diagnostic trees.
++        f.debug_struct("JointQueries2").finish_non_exhaustive()
++    }
++}
++
++impl PartialEq for JointQueries2 {
++    fn eq(&self, other: &Self) -> bool {
++        std::ptr::eq(self, other)
++    }
++}
++
++impl JointQueries2 {
++    pub(super) fn definition(&self) -> crate::CurvePointDefinition2 {
++        crate::CurvePointDefinition2::RationalQueryPair {
++            sources: self.sources.each_ref().map(|query| query.source.clone()),
++            numerators: self.sources.each_ref().map(|query| query.numerator.clone()),
++            denominators: self
++                .sources
++                .each_ref()
++                .map(|query| query.denominator.clone()),
++        }
++    }
++}
++
++impl PolynomialPoint2 {
++    pub(crate) fn from_queries(
++        sources: [PointFormSource2; 2],
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<CurvePoint2>> {
++        let strict = policy.strict_counterpart();
++        let policy = &strict;
++        field::finish(|| {
++            let first = crate::bezier_offset::selected_field_query(&sources[0], policy)?;
++            let second = crate::bezier_offset::selected_field_query(&sources[1], policy)?;
++            let values = field::joined(&first, &second, policy)?;
++            Ok(CurvePoint2(CurvePointData2::Polynomial(Arc::new(Self {
++                authority: PolynomialPointAuthority2::Queries(Arc::new(JointQueries2 {
++                    sources,
++                    values,
++                })),
++                maps: Vec::new(),
++            }))))
++        })
++    }
++
++    pub(crate) fn field_query(
++        &self,
++        numerator: &BivariatePolynomial,
++        denominator: &BivariatePolynomial,
++        policy: &CurveContext,
++    ) -> field::Result<Value> {
++        let (numerator, denominator) = field::available(self.pullback(numerator, denominator))?;
++        let native;
++        let values = match &self.authority {
++            PolynomialPointAuthority2::Fiber { fiber, .. } => {
++                native = crate::bezier_offset::selected_field_fiber(fiber, policy)?;
++                &native
++            }
++            PolynomialPointAuthority2::Queries(queries) => &queries.values,
++        };
++        field::query([&numerator, &denominator], values, policy)
++    }
++
++    pub(super) fn joint_parameter(
++        &self,
++        numerator: &BivariatePolynomial,
++        denominator: &BivariatePolynomial,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<CurveParameter2>> {
++        field::finish(|| {
++            let value = self.field_query(numerator, denominator, policy)?;
++            let query = PointFormSource2::new(
++                CurvePoint2(CurvePointData2::Polynomial(Arc::new(self.clone()))),
++                numerator.clone(),
++                denominator.clone(),
++            );
++            Ok(CurveParameter2::from_polynomial_query(
++                crate::selected_query_scalar::SelectedQueryScalar2::new(query, value, policy)?,
++            ))
++        })
++    }
++
++    pub(super) fn joint_bounds(
++        &self,
++        steps: usize,
++        policy: &CurveContext,
++    ) -> Classification<Aabb2> {
++        let result = field::finish(|| {
++            let coordinate = |axis| match axis {
++                Axis2::X => BivariatePolynomial::new(vec![vec![Real::zero()], vec![Real::one()]]),
++                Axis2::Y => BivariatePolynomial::new(vec![vec![Real::zero(), Real::one()]]),
++            };
++            let one = BivariatePolynomial::new(vec![vec![Real::one()]]);
++            let x = field::bounds(
++                &self.field_query(&coordinate(Axis2::X), &one, policy)?,
++                steps,
++                policy,
++            )?;
++            let y = field::bounds(
++                &self.field_query(&coordinate(Axis2::Y), &one, policy)?,
++                steps,
++                policy,
++            )?;
++            Ok(Aabb2::new_unchecked(
++                Point2::new(x.lower, y.lower),
++                Point2::new(x.upper, y.upper),
++            ))
++        });
++        result.unwrap_or(Classification::Uncertain(UncertaintyReason::Predicate))
++    }
++}
+diff --git a/crates/hypercurve/src/selected_field.rs b/crates/hypercurve/src/selected_field.rs
+new file mode 100644
+index 0000000000..da04ced881
+--- /dev/null
++++ b/crates/hypercurve/src/selected_field.rs
+@@ -0,0 +1,94 @@
++//! Adapters to Hypersolve's selected-field authority; no coordinate projection.
++
++use crate::{Classification, CurveContext, CurveError, CurveResult, Real, UncertaintyReason};
++pub(crate) use hypersolve::selected_polynomial_field::{
++    SelectedPolynomialEnclosure as Enclosure, SelectedPolynomialError as FieldError,
++    SelectedPolynomialField as Field, SelectedPolynomialValue as Value,
++};
++use hypersolve::{BivariatePolynomial, RealInterval};
++
++pub(crate) type Result<T> = std::result::Result<T, FieldError<CurveError>>;
++
++pub(crate) fn decided<T>(result: Classification<T>) -> Result<T> {
++    match result {
++        Classification::Decided(value) => Ok(value),
++        Classification::Uncertain(reason) => Err(FieldError::Uncertain(reason)),
++    }
++}
++
++pub(crate) fn curve<T>(result: CurveResult<Classification<T>>) -> Result<T> {
++    decided(result.map_err(FieldError::Context)?)
++}
++
++pub(crate) fn finish<T>(operation: impl FnOnce() -> Result<T>) -> CurveResult<Classification<T>> {
++    let result = operation();
++    if hypersolve::work_budget::exhaustion().is_some() {
++        return Ok(Classification::Uncertain(
++            UncertaintyReason::BudgetExhausted,
++        ));
++    }
++    match result {
++        Ok(value) => Ok(Classification::Decided(value)),
++        Err(FieldError::Context(error)) => Err(error),
++        Err(FieldError::Uncertain(reason)) => Ok(Classification::Uncertain(reason)),
++        Err(FieldError::Arithmetic(_)) => {
++            Ok(Classification::Uncertain(UncertaintyReason::Unsupported))
++        }
++        Err(FieldError::ZeroDenominator) => Err(CurveError::ZeroRationalPointDenominator),
++        Err(
++            FieldError::InvalidSelector
++            | FieldError::InvalidEnclosure
++            | FieldError::ZeroPolynomial
++            | FieldError::NoRoot
++            | FieldError::MultipleRoots(_),
++        ) => Err(CurveError::InvalidBezierAlgebraicParameter),
++    }
++}
++
++pub(crate) fn available<T>(value: Option<T>) -> Result<T> {
++    value.ok_or(FieldError::Uncertain(UncertaintyReason::Unsupported))
++}
++
++pub(crate) fn polynomial(coefficients: &[Real], value: &Value) -> Result<Value> {
++    let field = value.field();
++    let mut sum = field.constant(Real::zero())?;
++    for coefficient in coefficients.iter().rev() {
++        sum = sum
++            .multiply(value)?
++            .add(&field.constant(coefficient.clone())?)?;
++    }
++    Ok(sum)
++}
++
++pub(crate) fn bivariate(polynomial: &BivariatePolynomial, point: &[Value; 2]) -> Result<Value> {
++    let mut sum = point[0].field().constant(Real::zero())?;
++    for row in polynomial.coefficients.iter().rev() {
++        sum = sum
++            .multiply(&point[0])?
++            .add(&self::polynomial(row, &point[1])?)?;
++    }
++    Ok(sum)
++}
++
++pub(crate) fn query(
++    polynomials: [&BivariatePolynomial; 2],
++    point: &[Value; 2],
++    policy: &CurveContext,
++) -> Result<Value> {
++    let denominator = bivariate(polynomials[1], point)?;
++    // Division checks the original denominator even when the numerator is zero.
++    decided(bivariate(polynomials[0], point)?.divide(&denominator, policy)?)
++}
++
++pub(crate) fn joined(first: &Value, second: &Value, policy: &CurveContext) -> Result<[Value; 2]> {
++    let join = decided(first.field().joined_with(second.field(), policy)?)?;
++    Ok([join.embed(first)?, join.embed(second)?])
++}
++
++pub(crate) fn bounds(value: &Value, steps: usize, policy: &CurveContext) -> Result<RealInterval> {
++    Ok(
++        decided(decided(value.enclosed(policy)?)?.refined(steps, policy)?)?
++            .interval()
++            .clone(),
++    )
++}
+diff --git a/crates/hypercurve/src/selected_query_scalar.rs b/crates/hypercurve/src/selected_query_scalar.rs
+new file mode 100644
+index 0000000000..8d6b01b3fb
+--- /dev/null
++++ b/crates/hypercurve/src/selected_query_scalar.rs
+@@ -0,0 +1,241 @@
++//! A scalar query retains its correlated point and checked field enclosure.
++
++use crate::bezier_offset::PointFormSource2;
++use crate::selected_field::{self as field, Enclosure, Value};
++use crate::selected_scalar::SelectedScalar2;
++use crate::{Classification, CurveContext, CurveResult, Real, UncertaintyReason};
++use hypersolve::bivariate_arithmetic::{bivariate_add, bivariate_scale, bivariate_subtract};
++use hypersolve::{BivariatePolynomial, RealInterval};
++use std::{cmp::Ordering, sync::Arc};
++
++#[derive(Clone)]
++pub(crate) struct SelectedQueryScalar2 {
++    source: Arc<PointFormSource2>,
++    enclosure: Enclosure,
++    complement: bool,
++    bounds: RealInterval,
++}
++
++impl std::fmt::Debug for SelectedQueryScalar2 {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SelectedQueryScalar2")
++            .field("bounds", &self.bounds)
++            .field("complement", &self.complement)
++            .finish_non_exhaustive()
++    }
++}
++
++impl PartialEq for SelectedQueryScalar2 {
++    fn eq(&self, other: &Self) -> bool {
++        self.complement == other.complement && Arc::ptr_eq(&self.source, &other.source)
++    }
++}
++
++impl SelectedQueryScalar2 {
++    pub(crate) fn new(
++        source: PointFormSource2,
++        value: Value,
++        policy: &CurveContext,
++    ) -> field::Result<Self> {
++        let enclosure = field::decided(value.enclosed(policy)?)?;
++        Ok(Self {
++            source: Arc::new(source),
++            bounds: enclosure.interval().clone(),
++            enclosure,
++            complement: false,
++        })
++    }
++
++    #[cfg(feature = "svg")]
++    pub(crate) fn replay_storage_key(&self) -> (bool, *const ()) {
++        (self.complement, Arc::as_ptr(&self.source).cast())
++    }
++
++    pub(crate) fn value(&self) -> field::Result<Value> {
++        let value = self.enclosure.value();
++        Ok(if self.complement {
++            value.field().constant(Real::one())?.subtract(value)?
++        } else {
++            value.clone()
++        })
++    }
++
++    pub(crate) fn query(&self) -> PointFormSource2 {
++        let mut query = self.source.as_ref().clone();
++        if self.complement {
++            query.numerator = bivariate_subtract(&query.denominator, &query.numerator);
++        }
++        query
++    }
++
++    pub(crate) fn polynomial_sign(
++        &self,
++        coefficients: &[Real],
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<hyperreal::RealSign>> {
++        field::finish(|| {
++            field::decided(field::polynomial(coefficients, &self.value()?)?.sign(policy)?)
++        })
++    }
++
++    pub(crate) fn compare(
++        &self,
++        other: &SelectedScalar2,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Ordering>> {
++        field::finish(|| {
++            let [first, second] = field::joined(
++                &self.value()?,
++                &crate::bezier_offset::selected_field_scalar(other, policy)?,
++                policy,
++            )?;
++            Ok(
++                match field::decided(first.subtract(&second)?.sign(policy)?)? {
++                    hyperreal::RealSign::Negative => Ordering::Less,
++                    hyperreal::RealSign::Zero => Ordering::Equal,
++                    hyperreal::RealSign::Positive => Ordering::Greater,
++                },
++            )
++        })
++    }
++
++    pub(crate) fn isolating_bounds(&self) -> (&Real, &Real) {
++        (&self.bounds.lower, &self.bounds.upper)
++    }
++
++    pub(crate) fn unit_complement(&self) -> Self {
++        Self {
++            complement: !self.complement,
++            bounds: RealInterval {
++                lower: Real::one() - &self.bounds.upper,
++                upper: Real::one() - &self.bounds.lower,
++            },
++            ..self.clone()
++        }
++    }
++
++    pub(crate) fn refined(
++        &self,
++        steps: usize,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Self>> {
++        field::finish(|| {
++            let enclosure = field::decided(self.enclosure.refined(steps, policy)?)?;
++            let bounds = enclosure.interval().clone();
++            let value = Self {
++                source: Arc::clone(&self.source),
++                enclosure,
++                bounds,
++                complement: false,
++            };
++            Ok(if self.complement {
++                value.unit_complement()
++            } else {
++                value
++            })
++        })
++    }
++
++    pub(crate) fn affine_image_unbounded(
++        &self,
++        scale: &Real,
++        offset: &Real,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Self>> {
++        self.projective_image_unbounded(
++            &[offset.clone(), scale.clone()],
++            &[Real::one(), Real::zero()],
++            policy,
++        )
++    }
++
++    pub(crate) fn projective_image_unbounded(
++        &self,
++        numerator: &[Real; 2],
++        denominator: &[Real; 2],
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Self>> {
++        field::finish(|| {
++            let value = self.value()?;
++            let image = field::decided(
++                field::polynomial(numerator, &value)?
++                    .divide(&field::polynomial(denominator, &value)?, policy)?,
++            )?;
++            let query = self.query();
++            let map = |coefficients: &[Real; 2]| {
++                bivariate_add(
++                    &bivariate_scale(query.denominator.clone(), &coefficients[0]),
++                    &bivariate_scale(query.numerator.clone(), &coefficients[1]),
++                )
++            };
++            // Keep the original query denominator as a guard even if the chart
++            // moves it to the numerator or the image is identically constant.
++            let guard = &query.denominator;
++            let source = PointFormSource2::new(
++                query.source.clone(),
++                hypersolve::bivariate_arithmetic::bivariate_multiply(&map(numerator), guard),
++                hypersolve::bivariate_arithmetic::bivariate_multiply(&map(denominator), guard),
++            );
++            Self::new(source, image, policy)
++        })
++    }
++
++    pub(crate) fn promoted_bezier_parameter_complete(
++        &self,
++        _policy: &CurveContext,
++    ) -> CurveResult<Classification<crate::BezierParameter2>> {
++        Ok(if self.bounds.lower == self.bounds.upper {
++            Classification::Decided(crate::BezierParameter2::Exact(self.bounds.lower.clone()))
++        } else {
++            Classification::Uncertain(UncertaintyReason::Unsupported)
++        })
++    }
++
++    /// Evaluates a rational curve in this query's original joint point field.
++    pub(crate) fn rational_point(
++        &self,
++        curve: &crate::RationalBezier2,
++        policy: &CurveContext,
++    ) -> crate::ExactCurveResult<crate::CurvePoint2> {
++        let basis = curve.homogeneous_power_basis().map_err(|cause| {
++            crate::ExactCurveError::invalid_unattributed(crate::CurveOperation2::Evaluation, cause)
++        })?;
++        let query = self.query();
++        let chart = crate::RationalMap2::new(
++            [
++                query.numerator.clone(),
++                BivariatePolynomial::new(vec![vec![Real::zero()]]),
++            ],
++            query.denominator.clone(),
++        );
++        let pullback = |coefficients: &[Real]| {
++            chart.pullback(
++                &BivariatePolynomial::new(coefficients.iter().map(|c| vec![c.clone()]).collect()),
++                &BivariatePolynomial::new(basis.weight.iter().map(|c| vec![c.clone()]).collect()),
++            )
++        };
++        let Some((x, xw)) = pullback(&basis.x_numerator) else {
++            return Err(crate::ExactCurveError::blocked(
++                crate::CurveOperation2::Evaluation,
++                crate::CurveFamily2::RationalBezier,
++                UncertaintyReason::Unsupported,
++            ));
++        };
++        let Some((y, yw)) = pullback(&basis.y_numerator) else {
++            return Err(crate::ExactCurveError::blocked(
++                crate::CurveOperation2::Evaluation,
++                crate::CurveFamily2::RationalBezier,
++                UncertaintyReason::Unsupported,
++            ));
++        };
++        use hypersolve::bivariate_arithmetic::bivariate_multiply as mul;
++        let guard = &query.denominator;
++        query.source.rational_image_with_policy(
++            &crate::RationalMap2::new(
++                [mul(&mul(&x, &yw), guard), mul(&mul(&y, &xw), guard)],
++                mul(&mul(&xw, &yw), guard),
++            ),
++            policy,
++        )
++    }
++}
+diff --git a/crates/hypercurve/src/selected_scalar.rs b/crates/hypercurve/src/selected_scalar.rs
+index 80e3f9908a..3e77beb8ea 100644
+--- a/crates/hypercurve/src/selected_scalar.rs
++++ b/crates/hypercurve/src/selected_scalar.rs
+@@ -20,6 +20,7 @@ use crate::{BezierParameter2, Classification, CurveContext, CurveError, CurveRes
+ #[derive(Clone, Debug)]
+ pub(crate) enum SelectedScalar2 {
+     Bezier(BezierParameter2),
++    Polynomial(crate::selected_query_scalar::SelectedQueryScalar2),
+     SelectedFiber(BezierAlgebraicSelectedFiberParameter2),
+     RecursiveProjective(BezierRecursiveProjectiveParameter2),
+ }
+@@ -28,6 +29,7 @@ impl PartialEq for SelectedScalar2 {
+     fn eq(&self, other: &Self) -> bool {
+         match (self, other) {
+             (Self::Bezier(first), Self::Bezier(second)) => first == second,
++            (Self::Polynomial(first), Self::Polynomial(second)) => first == second,
+             (Self::SelectedFiber(first), Self::SelectedFiber(second)) => first == second,
+             (Self::RecursiveProjective(first), Self::RecursiveProjective(second)) => {
+                 first == second
+@@ -42,7 +44,7 @@ impl SelectedScalar2 {
+     pub(crate) fn scalar(&self) -> Option<&Real> {
+         match self {
+             Self::Bezier(parameter) => parameter.scalar(),
+-            Self::SelectedFiber(_) | Self::RecursiveProjective(_) => None,
++            Self::Polynomial(_) | Self::SelectedFiber(_) | Self::RecursiveProjective(_) => None,
+         }
+     }
+ 
+@@ -63,6 +65,7 @@ impl SelectedScalar2 {
+                 policy,
+             ),
+             Self::RecursiveProjective(parameter) => parameter.polynomial_sign(coefficients, policy),
++            Self::Polynomial(parameter) => parameter.polynomial_sign(coefficients, policy),
+         }
+     }
+ 
+@@ -73,6 +76,10 @@ impl SelectedScalar2 {
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<Ordering>> {
+         match (self, other) {
++            (Self::Polynomial(first), second) => first.compare(second, policy),
++            (first, Self::Polynomial(second)) => {
++                Ok(second.compare(first, policy)?.map(Ordering::reverse))
++            }
+             (Self::Bezier(first), Self::Bezier(second)) => {
+                 first.cmp_by_refinement_with_policy(second, policy)
+             }
+@@ -106,6 +113,7 @@ impl SelectedScalar2 {
+     pub(crate) fn unit_complement(&self) -> Self {
+         match self {
+             Self::Bezier(parameter) => Self::Bezier(parameter.unit_complement()),
++            Self::Polynomial(parameter) => Self::Polynomial(parameter.unit_complement()),
+             Self::SelectedFiber(parameter) => Self::SelectedFiber(parameter.unit_complement()),
+             Self::RecursiveProjective(parameter) => {
+                 Self::RecursiveProjective(parameter.unit_complement())
+@@ -122,6 +130,7 @@ impl SelectedScalar2 {
+                 (parameter.interval().start(), parameter.interval().end())
+             }
+             Self::SelectedFiber(parameter) => parameter.isolating_bounds(),
++            Self::Polynomial(parameter) => parameter.isolating_bounds(),
+             Self::RecursiveProjective(parameter) => parameter.isolating_bounds(),
+         }
+     }
+@@ -133,6 +142,9 @@ impl SelectedScalar2 {
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<Self>> {
+         match self {
++            Self::Polynomial(parameter) => Ok(parameter
++                .refined(refinement_steps, policy)?
++                .map(Self::Polynomial)),
+             Self::Bezier(parameter) => Ok(Classification::Decided(Self::Bezier(
+                 parameter
+                     .clone()
+@@ -156,6 +168,9 @@ impl SelectedScalar2 {
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<Self>> {
+         match self {
++            Self::Polynomial(parameter) => Ok(parameter
++                .affine_image_unbounded(scale, offset, policy)?
++                .map(Self::Polynomial)),
+             Self::Bezier(parameter) => Ok(parameter
+                 .affine_image_unbounded(scale, offset, policy)?
+                 .map(Self::Bezier)),
+@@ -177,6 +192,9 @@ impl SelectedScalar2 {
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<Self>> {
+         match self {
++            Self::Polynomial(parameter) => Ok(parameter
++                .projective_image_unbounded(numerator, denominator, policy)?
++                .map(Self::Polynomial)),
+             Self::Bezier(parameter) => Ok(parameter
+                 .projective_image_unbounded(numerator, denominator, policy)?
+                 .map(Self::Bezier)),
+@@ -197,6 +215,7 @@ impl SelectedScalar2 {
+     ) -> CurveResult<Classification<BezierParameter2>> {
+         match self {
+             Self::Bezier(parameter) => Ok(Classification::Decided(parameter.clone())),
++            Self::Polynomial(parameter) => parameter.promoted_bezier_parameter_complete(policy),
+             Self::SelectedFiber(parameter) => parameter.promoted_bezier_parameter_complete(policy),
+             Self::RecursiveProjective(parameter) => {
+                 parameter.promoted_bezier_parameter_complete(policy)
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index 034ac9aacb..6b8ac5a5c4 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -69,6 +69,8 @@ struct GraphWriter {
+     displacements: HashMap<*const (), (crate::CurvePoint2, u32)>,
+     point_depths: Vec<usize>,
+     max_point_depth: usize,
++    query_parameters:
++        HashMap<(bool, *const ()), (crate::selected_query_scalar::SelectedQueryScalar2, u32)>,
+     circles: HashMap<*const (), (crate::bezier_offset::BezierAlgebraicCuspSemicircle2, u32)>,
+     circle_parameters: HashMap<
+         (u32, *const ()),
+@@ -95,6 +97,7 @@ impl GraphWriter {
+             displacements: HashMap::new(),
+             point_depths: Vec::new(),
+             max_point_depth,
++            query_parameters: HashMap::new(),
+             circles: HashMap::new(),
+             circle_parameters: HashMap::new(),
+         }
+@@ -147,16 +150,12 @@ impl GraphWriter {
+             return Ok(index);
+         }
+         if let Some((source, range, reversed)) = curve.source_restriction() {
+-            let Some((start, end)) = range.as_bezier_parameters() else {
+-                return Err(SvgError::Unsupported(
+-                    "exact SVG source restrictions require a retained Bezier parameter definition"
+-                        .into(),
+-                ));
+-            };
+             let source = self.curve(source)?;
+-            let start = self.parameter(start)?;
+-            let end = self.parameter(end)?;
++            let start = self.scalar_parameter(range.start())?;
++            let end = self.scalar_parameter(range.end())?;
+             let index = self.begin(SOURCE_RESTRICTION)?;
++            self.point_depths[index as usize] =
++                self.point_depths[start as usize].max(self.point_depths[end as usize]);
+             self.writer.write_u32(source)?;
+             self.writer.write_u32(start)?;
+             self.writer.write_u32(end)?;
+@@ -245,6 +244,7 @@ impl GraphWriter {
+ enum Definition {
+     Curve(Curve2),
+     Parameter(BezierParameter2),
++    QueryParameter(crate::CurveParameter2),
+     Parallel(BezierParallel2),
+     Point(crate::CurvePoint2),
+     Chord(crate::BezierAlgebraicChord2),
+@@ -274,6 +274,19 @@ fn parameter_reference(definitions: &[Definition], index: usize) -> SvgResult<&B
+     }
+ }
+ 
++fn scalar_parameter_reference(
++    definitions: &[Definition],
++    index: usize,
++) -> SvgResult<crate::CurveParameter2> {
++    match definitions.get(index) {
++        Some(Definition::Parameter(parameter)) => Ok(parameter.clone().into()),
++        Some(Definition::QueryParameter(parameter)) => Ok(parameter.clone()),
++        _ => Err(malformed(
++            "exact path extension has an invalid scalar parameter reference",
++        )),
++    }
++}
++
+ fn certified<T>(value: CurveResult<Classification<T>>) -> SvgResult<T> {
+     let value = value.map_err(|cause| {
+         SvgError::Exact(ExactCurveError::invalid_unattributed(
+@@ -363,12 +376,15 @@ fn read_definitions(
+                         "exact path restriction must reference a native source",
+                     ));
+                 }
+-                let start = parameter_reference(&definitions, reader.read_len()?)?.clone();
+-                let end = parameter_reference(&definitions, reader.read_len()?)?.clone();
++                let start_index = reader.read_len()?;
++                let end_index = reader.read_len()?;
++                let start = scalar_parameter_reference(&definitions, start_index)?;
++                let end = scalar_parameter_reference(&definitions, end_index)?;
++                point_depth = point_depths[start_index].max(point_depths[end_index]);
+                 let reversed = reader.read_bool()?;
+                 let range = certified(CurveParameterRange2::try_new_with_policy(
+-                    start.into(),
+-                    end.into(),
++                    start,
++                    end,
+                     &CurveContext::STRICT,
+                 ))?;
+                 let curve = source.restrict_source(range).map_err(SvgError::Exact)?;
+@@ -448,7 +464,9 @@ fn read_definitions(
+             | points::SUPPORTING_LINE_POINT
+             | points::CHORD_DISPLACEMENT
+             | points::DISPLACEMENT_POINT
+-            | points::CHORD_UNIT_TANGENT) => {
++            | points::CHORD_UNIT_TANGENT
++            | points::RATIONAL_QUERY_PAIR
++            | points::QUERY_PARAMETER) => {
+                 let (definition, depth) = points::read_definition(
+                     tag,
+                     reader,
+diff --git a/crates/hypercurve/src/svg/exact/graph/points.rs b/crates/hypercurve/src/svg/exact/graph/points.rs
+index 681269abf3..cc87b61f77 100644
+--- a/crates/hypercurve/src/svg/exact/graph/points.rs
++++ b/crates/hypercurve/src/svg/exact/graph/points.rs
+@@ -17,6 +17,8 @@ pub(super) const SUPPORTING_LINE_POINT: u8 = 17;
+ pub(super) const CHORD_DISPLACEMENT: u8 = 18;
+ pub(super) const DISPLACEMENT_POINT: u8 = 19;
+ pub(super) const CHORD_UNIT_TANGENT: u8 = 25;
++pub(super) const RATIONAL_QUERY_PAIR: u8 = 26;
++pub(super) const QUERY_PARAMETER: u8 = 27;
+ 
+ fn depth_overflow() -> SvgError {
+     SvgError::SizeOverflow {
+@@ -53,11 +55,32 @@ impl GraphWriter {
+         Ok(index)
+     }
+ 
+-    fn point_parameter(&mut self, parameter: &crate::CurveParameter2) -> SvgResult<u32> {
+-        let parameter = parameter.as_bezier_parameter().ok_or_else(|| {
+-            SvgError::Unsupported("exact point replay requires a retained Bezier parameter".into())
++    pub(super) fn scalar_parameter(
++        &mut self,
++        parameter: &crate::CurveParameter2,
++    ) -> SvgResult<u32> {
++        if let Some(parameter) = parameter.as_bezier_parameter() {
++            return self.parameter(parameter);
++        }
++        let query = parameter.as_polynomial_query().ok_or_else(|| {
++            SvgError::Unsupported(
++                "exact parameter replay requires a retained source definition".into(),
++            )
+         })?;
+-        self.parameter(parameter)
++        let key = query.replay_storage_key();
++        if let Some((_, index)) = self.query_parameters.get(&key) {
++            return Ok(*index);
++        }
++        let form = query.query();
++        let source = self.point(&form.source)?;
++        let depth = next_depth(self.point_depths[source as usize], self.max_point_depth)?;
++        let index = self.begin(QUERY_PARAMETER)?;
++        self.writer.write_u32(source)?;
++        self.polynomial(&form.numerator)?;
++        self.polynomial(&form.denominator)?;
++        self.point_depths[index as usize] = depth;
++        self.query_parameters.insert(key, (query.clone(), index));
++        Ok(index)
+     }
+ 
+     pub(super) fn point(&mut self, point: &CurvePoint2) -> SvgResult<u32> {
+@@ -92,6 +115,14 @@ impl GraphWriter {
+                         Vec::new()
+                     } else {
+                         match &definition {
++                            CurvePointDefinition2::Rational { parameter, .. }
++                            | CurvePointDefinition2::Parallel { parameter, .. } => parameter
++                                .as_polynomial_query()
++                                .map(|query| vec![query.query().source])
++                                .unwrap_or_default(),
++                            CurvePointDefinition2::RationalQueryPair { sources, .. } => {
++                                sources.to_vec()
++                            }
+                             CurvePointDefinition2::RationalImage { source, .. }
+                             | CurvePointDefinition2::Similarity { source, .. } => {
+                                 vec![source.clone()]
+@@ -176,7 +207,8 @@ impl GraphWriter {
+                 }
+                 CurvePointDefinition2::Rational { source, parameter } => {
+                     let source = self.point_source(&source)?;
+-                    let parameter = self.point_parameter(&parameter)?;
++                    let parameter = self.scalar_parameter(&parameter)?;
++                    depth = self.point_depths[parameter as usize];
+                     let index = self.begin(RATIONAL_POINT)?;
+                     self.writer.write_u32(source)?;
+                     self.writer.write_u32(parameter)?;
+@@ -198,7 +230,8 @@ impl GraphWriter {
+                 }
+                 CurvePointDefinition2::Parallel { source, parameter } => {
+                     let source = self.parallel(&source)?;
+-                    let parameter = self.point_parameter(&parameter)?;
++                    let parameter = self.scalar_parameter(&parameter)?;
++                    depth = self.point_depths[parameter as usize];
+                     let index = self.begin(PARALLEL_POINT)?;
+                     self.writer.write_u32(source)?;
+                     self.writer.write_u32(parameter)?;
+@@ -221,6 +254,34 @@ impl GraphWriter {
+                     }
+                     index
+                 }
++                CurvePointDefinition2::RationalQueryPair {
++                    sources,
++                    numerators,
++                    denominators,
++                } => {
++                    let sources = sources
++                        .each_ref()
++                        .map(|source| self.point_index(source))
++                        .into_iter()
++                        .collect::<SvgResult<Vec<_>>>()?;
++                    depth = next_depth(
++                        sources
++                            .iter()
++                            .map(|source| self.point_depths[*source as usize])
++                            .max()
++                            .unwrap_or(0),
++                        self.max_point_depth,
++                    )?;
++                    let index = self.begin(RATIONAL_QUERY_PAIR)?;
++                    for ((source, numerator), denominator) in
++                        sources.into_iter().zip(numerators).zip(denominators)
++                    {
++                        self.writer.write_u32(source)?;
++                        self.polynomial(&numerator)?;
++                        self.polynomial(&denominator)?;
++                    }
++                    index
++                }
+                 CurvePointDefinition2::RationalImage { source, map } => {
+                     let source = self.point_index(&source)?;
+                     depth = next_depth(self.point_depths[source as usize], self.max_point_depth)?;
+@@ -419,6 +480,20 @@ pub(super) fn read_definition(
+     max_point_depth: usize,
+ ) -> SvgResult<(Definition, usize)> {
+     let mut depth = 0;
++    if tag == QUERY_PARAMETER {
++        let index = reader.read_len()?;
++        let source = point_reference(definitions, index)?;
++        let numerator = read_polynomial(reader)?;
++        let denominator = read_polynomial(reader)?;
++        let depth = next_depth(point_depths[index], max_point_depth)?;
++        let parameter = certified(crate::bezier_offset::point_rational_form_parameter(
++            source,
++            &numerator,
++            &denominator,
++            &CurveContext::STRICT,
++        ))?;
++        return Ok((Definition::QueryParameter(parameter), depth));
++    }
+     let point = match tag {
+         CHORD_UNIT_TANGENT => {
+             let source = reader.read_len()?;
+@@ -468,9 +543,12 @@ pub(super) fn read_definition(
+             };
+             CurvePointDefinition2::Rational {
+                 source: source.clone(),
+-                parameter: parameter_reference(definitions, reader.read_len()?)?
+-                    .clone()
+-                    .into(),
++                parameter: {
++                    let index = reader.read_len()?;
++                    let parameter = scalar_parameter_reference(definitions, index)?;
++                    depth = point_depths[index];
++                    parameter
++                },
+             }
+         }
+         RATIONAL_EXPRESSION => CurvePointDefinition2::RationalExpression {
+@@ -485,9 +563,12 @@ pub(super) fn read_definition(
+             };
+             CurvePointDefinition2::Parallel {
+                 source: source.clone(),
+-                parameter: parameter_reference(definitions, reader.read_len()?)?
+-                    .clone()
+-                    .into(),
++                parameter: {
++                    let index = reader.read_len()?;
++                    let parameter = scalar_parameter_reference(definitions, index)?;
++                    depth = point_depths[index];
++                    parameter
++                },
+             }
+         }
+         POLYNOMIAL_FIBER => {
+@@ -513,6 +594,23 @@ pub(super) fn read_definition(
+                 },
+             }
+         }
++        RATIONAL_QUERY_PAIR => {
++            let mut sources = Vec::with_capacity(2);
++            let mut numerators = Vec::with_capacity(2);
++            let mut denominators = Vec::with_capacity(2);
++            for _ in 0..2 {
++                let index = reader.read_len()?;
++                sources.push(point_reference(definitions, index)?.clone());
++                depth = depth.max(next_depth(point_depths[index], max_point_depth)?);
++                numerators.push(read_polynomial(reader)?);
++                denominators.push(read_polynomial(reader)?);
++            }
++            CurvePointDefinition2::RationalQueryPair {
++                sources: sources.try_into().expect("two sources"),
++                numerators: numerators.try_into().expect("two numerators"),
++                denominators: denominators.try_into().expect("two denominators"),
++            }
++        }
+         RATIONAL_IMAGE => {
+             let index = reader.read_len()?;
+             let source = point_reference(definitions, index)?.clone();
+diff --git a/crates/hypercurve/tests/selected_polynomial_points.rs b/crates/hypercurve/tests/selected_polynomial_points.rs
+new file mode 100644
+index 0000000000..86a98b18a1
+--- /dev/null
++++ b/crates/hypercurve/tests/selected_polynomial_points.rs
+@@ -0,0 +1,555 @@
++use hypercurve::*;
++use hypersolve::{BivariatePolynomial, IsolatedRootInterval};
++use std::cmp::Ordering;
++
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn cube_point(n: i32) -> CurvePoint2 {
++    CurvePointDefinition2::PolynomialFiber {
++        equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
++        parameter: BezierParameter2::Exact(Real::from(n)),
++        root: IsolatedRootInterval {
++            lower: 1.into(),
++            upper: 2.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++fn y(point: &CurvePoint2) -> CurvePointRationalForm2 {
++    point
++        .rational_form(polynomial(&[&[0, 1]]), polynomial(&[&[1]]))
++        .unwrap()
++}
++fn constant(point: &CurvePoint2, n: i32) -> CurvePointRationalForm2 {
++    point
++        .rational_form(polynomial(&[&[n]]), polynomial(&[&[1]]))
++        .unwrap()
++}
++#[test]
++fn independent_polynomial_point_sources_satisfy_original_equations() {
++    for n in [2, 3] {
++        let p = cube_point(n);
++        assert!(p.coordinates().is_none());
++        let relation = p
++            .rational_form(polynomial(&[&[0, 0, 0, 1], &[-1]]), polynomial(&[&[1]]))
++            .unwrap();
++        assert_eq!(
++            relation.compare_to_real(&Real::zero()).unwrap(),
++            Ordering::Equal
++        );
++        let cubic = p
++            .rational_form(polynomial(&[&[0, 0, 0, 1]]), polynomial(&[&[1]]))
++            .unwrap();
++        assert_eq!(
++            cubic.compare_to_real(&Real::from(n)).unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(
++            y(&p).compare_to_real(&Real::one()).unwrap(),
++            Ordering::Greater
++        );
++    }
++}
++#[test]
++fn independent_polynomial_point_queries_compose_and_replay() {
++    let first = cube_point(2);
++    let second = cube_point(3);
++    let sum = y(&first)
++        .add(&y(&second))
++        .expect("independent exact point fields must compose");
++    assert!(sum.operands().is_some());
++    assert_eq!(sum.compare_to_real(&2.into()).unwrap(), Ordering::Greater);
++    assert_eq!(sum.compare_to_real(&3.into()).unwrap(), Ordering::Less);
++    let cube = sum.multiply(&sum).unwrap().multiply(&sum).unwrap();
++    let shifted = cube.subtract(&constant(&first, 5)).unwrap();
++    // (a+b)^3-5=3ab(a+b), with a^3=2 and b^3=3.
++    let residual = shifted
++        .multiply(&shifted)
++        .unwrap()
++        .multiply(&shifted)
++        .unwrap()
++        .subtract(&cube.scaled(&162.into()).unwrap())
++        .unwrap();
++    assert_eq!(
++        residual.compare_to_real(&Real::zero()).unwrap(),
++        Ordering::Equal
++    );
++    let replayed_source = sum.source().definition().unwrap().into_point().unwrap();
++    let replayed = replayed_source
++        .rational_form(sum.numerator().clone(), sum.denominator().clone())
++        .unwrap();
++    assert_eq!(sum.compare(&replayed).unwrap(), Ordering::Equal);
++}
++#[test]
++fn independent_polynomial_point_zero_divisor_stays_invalid() {
++    let first = cube_point(2);
++    let second = cube_point(3);
++    let zero = second
++        .rational_form(polynomial(&[&[-3, 0, 0, 1]]), polynomial(&[&[1]]))
++        .unwrap();
++    assert!(matches!(
++        y(&first).divide(&zero),
++        Err(ExactCurveError::Invalid {
++            cause: CurveError::ZeroRationalPointDenominator,
++            ..
++        })
++    ));
++}
++
++fn q(a: i32, b: i32) -> Real {
++    (Real::from(a) / Real::from(b)).unwrap()
++}
++fn joint() -> CurvePoint2 {
++    y(&cube_point(2))
++        .add(&y(&cube_point(3)))
++        .unwrap()
++        .source()
++        .clone()
++}
++fn assert_relation(point: &CurvePoint2, relation: BivariatePolynomial) {
++    assert_eq!(
++        point
++            .rational_form(relation, polynomial(&[&[1]]))
++            .unwrap()
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++}
++
++#[test]
++fn independent_equal_selections_and_original_denominators_compose() {
++    let a = y(&cube_point(2));
++    let b = y(&cube_point(2));
++    assert_eq!(
++        a.subtract(&b)
++            .unwrap()
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++    let point = cube_point(3);
++    let denominator = polynomial(&[&[-1, 1]]);
++    let reciprocal = point
++        .rational_form(polynomial(&[&[1]]), denominator.clone())
++        .unwrap();
++    let product = a.multiply(&reciprocal).unwrap();
++    assert_eq!(
++        product
++            .multiply(
++                &point
++                    .rational_form(denominator, polynomial(&[&[1]]))
++                    .unwrap()
++            )
++            .unwrap()
++            .compare(&a)
++            .unwrap(),
++        Ordering::Equal
++    );
++    let CurvePointDefinition2::RationalQueryPair {
++        sources,
++        denominators,
++        ..
++    } = product.source().definition().unwrap()
++    else {
++        panic!("joint source")
++    };
++    assert!(sources[1].coincides_with(&point).unwrap());
++    assert_eq!(denominators[1], polynomial(&[&[-1, 1]]));
++}
++
++#[test]
++fn selected_query_parameters_feed_affine_and_rational_evaluation() {
++    let point = joint();
++    let sum = point
++        .affine_form(1.into(), 1.into(), 0.into())
++        .parameter()
++        .unwrap();
++    assert!(sum.scalar().is_none());
++    assert_eq!(
++        sum.compare(&CurveParameter2::from(Real::from(2))).unwrap(),
++        Ordering::Greater
++    );
++    assert_eq!(
++        sum.compare(&CurveParameter2::from(Real::from(3))).unwrap(),
++        Ordering::Less
++    );
++    let t = sum.affine_image(&q(1, 4), &Real::zero()).unwrap();
++    let inverse = t.affine_image(&4.into(), &Real::zero()).unwrap();
++    assert_eq!(inverse.compare(&sum).unwrap(), Ordering::Equal);
++    let image = t
++        .affine_point(4.into(), 0.into(), (-4).into(), 5.into())
++        .unwrap();
++    assert_relation(&image, polynomial(&[&[-5, 1], &[1]]));
++    assert_eq!(
++        image
++            .affine_form(1.into(), 0.into(), 0.into())
++            .parameter()
++            .unwrap()
++            .compare(&sum)
++            .unwrap(),
++        Ordering::Equal
++    );
++    // Rational quadratic t -> (t, t^2), evaluated in the same retained field.
++    let curve: Curve2 = RationalBezier2::try_new(
++        vec![
++            Point2::new(0.into(), 0.into()),
++            Point2::new(q(1, 2), 0.into()),
++            Point2::new(1.into(), 1.into()),
++        ],
++        vec![Real::one(); 3],
++    )
++    .unwrap()
++    .into();
++    let evaluated = curve.point_at(&t).unwrap();
++    assert_relation(&evaluated, polynomial(&[&[0, -1], &[], &[1]]));
++    assert_eq!(
++        evaluated
++            .affine_form(1.into(), 0.into(), 0.into())
++            .parameter()
++            .unwrap()
++            .compare(&t)
++            .unwrap(),
++        Ordering::Equal
++    );
++    let replay = evaluated.definition().unwrap().into_point().unwrap();
++    assert!(replay.coincides_with(&evaluated).unwrap());
++}
++
++#[test]
++fn mixed_algebraic_base_and_independent_fiber_keep_original_relations() {
++    let base = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![
++                (-2).into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                0.into(),
++                1.into(),
++            ])
++            .unwrap(),
++            BezierParameterInterval::try_new(1.into(), 2.into()).unwrap(),
++        )
++        .unwrap(),
++    );
++    let point = CurvePointDefinition2::PolynomialFiber {
++        equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
++        parameter: base,
++        root: IsolatedRootInterval {
++            lower: 1.into(),
++            upper: 2.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap();
++    let result = y(&point).add(&y(&cube_point(3))).unwrap();
++    let mut relation = vec![vec![Real::zero()]; 22];
++    relation[0][0] = (-2).into();
++    relation[21][0] = Real::one();
++    assert_relation(result.source(), BivariatePolynomial::new(relation));
++    assert_relation(result.source(), polynomial(&[&[-3, 0, 0, 1]]));
++    assert!(
++        result
++            .source()
++            .definition()
++            .unwrap()
++            .into_point()
++            .unwrap()
++            .coincides_with(result.source())
++            .unwrap()
++    );
++}
++
++#[test]
++fn joint_query_replay_rejects_a_zero_original_guard() {
++    let point = joint();
++    let CurvePointDefinition2::RationalQueryPair {
++        sources,
++        numerators,
++        mut denominators,
++    } = point.definition().unwrap()
++    else {
++        panic!("joint source")
++    };
++    denominators[1] = polynomial(&[&[-3, 0, 0, 1]]);
++    assert!(matches!(
++        CurvePointDefinition2::RationalQueryPair {
++            sources,
++            numerators,
++            denominators
++        }
++        .into_point(),
++        Err(ExactCurveError::Invalid {
++            cause: CurveError::ZeroRationalPointDenominator,
++            ..
++        })
++    ));
++}
++
++#[test]
++fn independent_query_budget_refusal_does_not_poison_retry() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let a = y(&cube_point(2));
++    let b = y(&cube_point(3));
++    let result = with_budget(
++        WorkBudget {
++            refinements: 4096,
++            promotions: 0,
++        },
++        || {
++            assert!(
++                matches!(a.add(&b), Err(ExactCurveError::Blocked(ref blocker)) if blocker.reason() == UncertaintyReason::BudgetExhausted)
++            );
++        },
++    );
++    assert!(result.result.is_err());
++    let result = a.add(&b).unwrap();
++    assert_eq!(
++        result.compare_to_real(&2.into()).unwrap(),
++        Ordering::Greater
++    );
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn joint_point_native_replay_in_fresh_process_then_further_queries() {
++    const INPUT: &str = "HYPERCURVE_JOINT_QUERY_REPLAY";
++    fn verify(text: &str) {
++        let replay = import_svg_document(text).unwrap();
++        let line = &replay.paths()[0].curves()[0];
++        let point = line.start();
++        assert_relation(&point, polynomial(&[&[-2], &[], &[], &[1]]));
++        assert_relation(&point, polynomial(&[&[-3, 0, 0, 1]]));
++        let sum = point
++            .rational_form(polynomial(&[&[0, 1], &[1]]), polynomial(&[&[1]]))
++            .unwrap();
++        assert_eq!(sum.compare_to_real(&2.into()).unwrap(), Ordering::Greater);
++        assert_eq!(sum.compare_to_real(&3.into()).unwrap(), Ordering::Less);
++        assert_eq!(
++            sum.add(&y(&cube_point(2)))
++                .unwrap()
++                .subtract(&sum)
++                .unwrap()
++                .compare(&y(&cube_point(2)))
++                .unwrap(),
++            Ordering::Equal
++        );
++        let end = line.end();
++        assert_eq!(
++            end.affine_form(1.into(), 0.into(), (-1).into())
++                .parameter()
++                .unwrap()
++                .compare(
++                    &point
++                        .affine_form(1.into(), 0.into(), 0.into())
++                        .parameter()
++                        .unwrap()
++                )
++                .unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(export_svg_document(&replay).unwrap(), text);
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let point = joint();
++    let end = point
++        .rational_image(&RationalMap2::new(
++            [polynomial(&[&[1], &[1]]), polynomial(&[&[0, 1]])],
++            polynomial(&[&[1]]),
++        ))
++        .unwrap();
++    let line = Curve2::try_line(point, end).unwrap();
++    let geometry = SvgGeometry2::new(
++        CurveRegion2::empty(),
++        vec![],
++        vec![CurvePath2::try_new(vec![line]).unwrap()],
++    );
++    let text = export_svg_document(&geometry).unwrap();
++    verify(&text);
++    let path = std::env::temp_dir().join(format!(
++        "hypercurve-joint-query-{}-{}.svg",
++        std::process::id(),
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_nanos()
++    ));
++    std::fs::write(&path, text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "joint_point_native_replay_in_fresh_process_then_further_queries",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
++
++#[test]
++fn joint_queries_keep_certainty_across_policy_transitions_and_transforms() {
++    let point = joint();
++    for policy in [
++        PredicatePolicy::STRICT,
++        PredicatePolicy::APPROXIMATE_512,
++        PredicatePolicy::STRICT,
++    ] {
++        let result = evaluate_under(policy, || {
++            let transform = Similarity2::try_from_real_affine(
++                0.into(),
++                (-2).into(),
++                2.into(),
++                0.into(),
++                1.into(),
++                3.into(),
++            )
++            .unwrap();
++            let transformed = CurvePointDefinition2::Similarity {
++                source: point.clone(),
++                transform,
++            }
++            .into_point()
++            .unwrap();
++            // u=1-2b and v=3+2a, with a^3=2 and b^3=3.
++            let a = transformed
++                .affine_form(0.into(), q(1, 2), q(-3, 2))
++                .parameter()
++                .unwrap();
++            let b = transformed
++                .affine_form(q(-1, 2), 0.into(), q(1, 2))
++                .parameter()
++                .unwrap();
++            assert_eq!(
++                a.compare(
++                    &point
++                        .affine_form(1.into(), 0.into(), 0.into())
++                        .parameter()
++                        .unwrap()
++                )
++                .unwrap(),
++                Ordering::Equal
++            );
++            assert_eq!(
++                b.compare(
++                    &point
++                        .affine_form(0.into(), 1.into(), 0.into())
++                        .parameter()
++                        .unwrap()
++                )
++                .unwrap(),
++                Ordering::Equal
++            );
++            let replay = transformed.definition().unwrap().into_point().unwrap();
++            assert!(replay.coincides_with(&transformed).unwrap());
++        });
++        assert_eq!(result.certainty(), CurveCertainty::Certified);
++    }
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn selected_query_restriction_reconstruction_and_native_replay() {
++    let point = joint();
++    let end = point
++        .affine_form(q(1, 4), q(1, 4), 0.into())
++        .parameter()
++        .unwrap();
++    let source: Curve2 = RationalBezier2::try_new(
++        vec![
++            Point2::new(0.into(), 0.into()),
++            Point2::new(q(1, 2), 0.into()),
++            Point2::new(1.into(), 1.into()),
++        ],
++        vec![Real::one(); 3],
++    )
++    .unwrap()
++    .into();
++    let range =
++        CurveParameterRange2::try_new(CurveParameter2::from(Real::zero()), end.clone()).unwrap();
++    let restriction = source.restrict_source(range).unwrap();
++    assert_relation(&restriction.end(), polynomial(&[&[0, -1], &[], &[1]]));
++    assert!(
++        restriction
++            .end()
++            .coincides_with(&source.point_at(&end).unwrap())
++            .unwrap()
++    );
++    let path = CurvePath2::try_new(vec![restriction]).unwrap();
++    let geometry = SvgGeometry2::new(CurveRegion2::empty(), vec![], vec![path]);
++    let small = SvgOptions {
++        max_point_definition_depth: 1,
++        ..SvgOptions::default()
++    };
++    assert!(matches!(
++        export_svg_document_with_options(&geometry, small),
++        Err(SvgError::SizeOverflow {
++            limit: "configured exact point-definition depth"
++        })
++    ));
++    let text = export_svg_document(&geometry).unwrap();
++    assert!(matches!(
++        import_svg_document_with_options(&text, small),
++        Err(SvgError::SizeOverflow {
++            limit: "configured exact point-definition depth"
++        })
++    ));
++    let replay = import_svg_document(&text).unwrap();
++    let curve = &replay.paths()[0].curves()[0];
++    assert_eq!(
++        curve.parameter_domain().end().compare(&end).unwrap(),
++        Ordering::Equal
++    );
++    let reversed = curve.reversed().unwrap();
++    assert!(
++        reversed
++            .start()
++            .coincides_with(&source.point_at(&end).unwrap())
++            .unwrap()
++    );
++    let halfway = end.affine_image(&q(1, 2), &Real::zero()).unwrap();
++    let (first, second) = curve.split_at(halfway.clone()).unwrap();
++    assert!(
++        first
++            .end()
++            .coincides_with(&source.point_at(&halfway).unwrap())
++            .unwrap()
++    );
++    assert!(second.start().coincides_with(&first.end()).unwrap());
++    let again = CurvePath2::try_new(vec![first, second]).unwrap();
++    let text = export_svg_document(&SvgGeometry2::new(
++        CurveRegion2::empty(),
++        vec![],
++        vec![again],
++    ))
++    .unwrap();
++    let replay = import_svg_document(&text).unwrap();
++    assert!(
++        replay.paths()[0]
++            .end()
++            .coincides_with(&source.point_at(&end).unwrap())
++            .unwrap()
++    );
++}
+diff --git a/crates/hypercurve/tests/svg_point_replay.rs b/crates/hypercurve/tests/svg_point_replay.rs
+index 2ea9978357..ff3f8f6e54 100644
+--- a/crates/hypercurve/tests/svg_point_replay.rs
++++ b/crates/hypercurve/tests/svg_point_replay.rs
+@@ -934,3 +934,95 @@ fn displacement_recipes_validate_references_and_share_endpoint_selections() {
+         text
+     );
+ }
++
++#[test]
++fn rational_query_pair_records_replay_both_sources_and_original_guards() {
++    let pair = |references: [u32; 2], second_denominator: BivariatePolynomial| {
++        let mut bytes = vec![26];
++        for (reference, denominator) in references
++            .into_iter()
++            .zip([polynomial(&[&[1]]), second_denominator])
++        {
++            bytes.extend_from_slice(&reference.to_be_bytes());
++            wire_polynomial(&mut bytes, &polynomial(&[&[0, 1]]));
++            wire_polynomial(&mut bytes, &denominator);
++        }
++        bytes
++    };
++    for nodes in [
++        vec![wire_parameter(0), pair([0, 0], polynomial(&[&[1]]))],
++        vec![wire_point(0, 0), pair([0, 1], polynomial(&[&[1]]))],
++        vec![
++            wire_point(0, 0),
++            pair([0, 2], polynomial(&[&[1]])),
++            wire_point(1, 1),
++        ],
++    ] {
++        assert!(matches!(
++            import_svg_document(&wire(nodes, &[])),
++            Err(SvgError::MalformedInput(_))
++        ));
++    }
++    invalid(&wire(
++        vec![wire_point(0, 2), pair([0, 0], polynomial(&[&[-2, 1]]))],
++        &[],
++    ));
++    // A valid unused record is still admitted before the nonempty path.
++    let text = wire(
++        vec![
++            wire_point(0, 2),
++            pair([0, 0], polynomial(&[&[1]])),
++            wire_point(3, 2),
++            wire_support(0, 2),
++            wire_range(3, 0, 2),
++        ],
++        &[4],
++    );
++    assert_eq!(import_svg_document(&text).unwrap().paths().len(), 1);
++}
++
++#[test]
++fn query_parameter_records_validate_references_guards_and_depth_before_use() {
++    let query = |reference: u32, denominator: BivariatePolynomial| {
++        let mut bytes = vec![27];
++        bytes.extend_from_slice(&reference.to_be_bytes());
++        wire_polynomial(&mut bytes, &polynomial(&[&[0, 1]]));
++        wire_polynomial(&mut bytes, &denominator);
++        bytes
++    };
++    for nodes in [
++        vec![wire_parameter(0), query(0, polynomial(&[&[1]]))],
++        vec![query(0, polynomial(&[&[1]]))],
++        vec![query(1, polynomial(&[&[1]])), wire_point(0, 2)],
++    ] {
++        assert!(matches!(
++            import_svg_document(&wire(nodes, &[])),
++            Err(SvgError::MalformedInput(_))
++        ));
++    }
++    invalid(&wire(
++        vec![wire_point(0, 2), query(0, polynomial(&[&[-2, 1]]))],
++        &[],
++    ));
++    let text = wire(
++        vec![
++            wire_point(0, 2),
++            query(0, polynomial(&[&[1]])),
++            wire_point(3, 2),
++            wire_support(0, 2),
++            wire_range(3, 0, 2),
++        ],
++        &[4],
++    );
++    let small = SvgOptions {
++        max_point_definition_depth: 0,
++        ..SvgOptions::default()
++    };
++    assert!(matches!(
++        import_svg_document_with_options(&text, small),
++        Err(SvgError::SizeOverflow {
++            limit: "configured exact point-definition depth"
++        })
++    ));
++    assert_eq!(import_svg_document(&text).unwrap().paths().len(), 1);
++}
+diff --git a/crates/hypersolve/src/selected_polynomial_field/join.rs b/crates/hypersolve/src/selected_polynomial_field/join.rs
+index afe4237fe0..988df0eff0 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/join.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/join.rs
+@@ -327,6 +327,29 @@ fn join_native<C: SelectedAlgebraContext>(
+     }
+     let (sources, first_axes, second_axes) =
+         recursive_quadratic_source_union(&first_base.sources, &second_base.sources);
++    // Reuse the admitted base when the union adds no source axis. Rebuilding
++    // an identical base here would destroy the first polynomial tower's
++    // ancestry, forcing later consumption of an original operand to append
++    // its generators again. Foreign radicals still use their exact embedding;
++    // a genuinely new native radical may require rebuilding the polynomial path.
++    if sources == first_base.sources && first_axes.iter().copied().eq(0..sources.len()) {
++        let (joined, foreign) = require_native(
++            recursive_embed_foreign_field(
++                second,
++                first_base.clone(),
++                second_axes,
++                first.clone(),
++                policy,
++            )
++            .map_err(SelectedPolynomialError::Context)?,
++        )?;
++        let map = NativeEmbedding {
++            source: second.clone(),
++            target: joined.clone(),
++            map: NativeMap::Foreign(foreign),
++        };
++        return Ok((joined, vec![map]));
++    }
+     let embed_speed = |polynomial| {
+         dense_tensor_embed_axes(polynomial, sources.len(), &first_axes)
+             .and_then(|polynomial| dense_reduce_selected_tuple_relations(polynomial, &sources))
+diff --git a/crates/hypersolve/tests/selected_polynomial_join_retention.rs b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+new file mode 100644
+index 0000000000..68d7169de4
+--- /dev/null
++++ b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+@@ -0,0 +1,141 @@
++#[path = "support/recursive_quadratic.rs"]
++#[allow(dead_code)]
++mod support;
++use hypersolve::classification::Classification;
++use hypersolve::recursive_quadratic_field::RecursiveQuadraticField;
++use hypersolve::selected_polynomial_field::*;
++use support::*;
++fn value<T>(v: Classification<T>) -> T {
++    match v {
++        Classification::Decided(v) => v,
++        _ => panic!("exact"),
++    }
++}
++fn root(n: i64) -> SelectedPolynomialField {
++    let field = SelectedPolynomialField::from_recursive(
++        RecursiveQuadraticField::base(
++            vec![],
++            constant_tensor(0, real(1)),
++            constant_tensor(0, real(1)),
++        )
++        .unwrap(),
++    );
++    let coeff = [(-n), 0, 0, 1]
++        .into_iter()
++        .map(|x| field.constant(real(x)).unwrap())
++        .collect();
++    value(
++        field
++            .select(coeff, real(1), real(2), &TestContext::strict())
++            .unwrap(),
++    )
++}
++fn depth(field: &SelectedPolynomialField) -> usize {
++    let mut f = field;
++    let mut n = 0;
++    while let Some(p) = f.parent() {
++        n += 1;
++        f = p;
++    }
++    n
++}
++#[test]
++fn a_native_base_already_containing_all_sources_keeps_polynomial_ancestry() {
++    let a = root(2);
++    let b = root(3);
++    let c = root(2);
++    let ab = value(a.joined_with(&b, &TestContext::strict()).unwrap());
++    assert_eq!(depth(ab.field()), 2);
++    let abc = value(ab.field().joined_with(&c, &TestContext::strict()).unwrap());
++    assert_eq!(depth(abc.field()), 3);
++    assert!(
++        abc.field().parent().unwrap().shares_authority(ab.field()),
++        "a native base with every required source must retain its already admitted polynomial ancestors"
++    );
++    let reused = value(
++        abc.field()
++            .joined_with(ab.field(), &TestContext::strict())
++            .unwrap(),
++    );
++    assert_eq!(
++        depth(reused.field()),
++        3,
++        "reconsuming the original shared operand must not append its generators again"
++    );
++    assert!(reused.field().shares_authority(abc.field()));
++}
++
++#[test]
++fn a_contained_native_axis_retains_its_original_polynomial_tower() {
++    use hyperreal::RealSign;
++    use hypersolve::recursive_quadratic_field::recursive_quadratic_rational_value;
++    let context = TestContext::strict();
++    let native = |sources: Vec<_>| {
++        let one = constant_tensor(sources.len(), real(1));
++        RecursiveQuadraticField::base(sources, one.clone(), one).unwrap()
++    };
++    let first_native = native(vec![cube_root_two(), cube_root_three()]);
++    let second_native = native(vec![cube_root_two()]);
++    let first = SelectedPolynomialField::from_recursive(first_native.clone());
++    let second = SelectedPolynomialField::from_recursive(second_native.clone());
++    let a = first
++        .import_recursive(
++            &recursive_quadratic_rational_value(
++                &base_arc(&first_native),
++                hypersolve::DenseTensorPolynomial::from_axis_polynomial(2, 0, &[real(0), real(1)])
++                    .unwrap(),
++            )
++            .unwrap(),
++        )
++        .unwrap();
++    let b = second
++        .import_recursive(
++            &recursive_quadratic_rational_value(
++                &base_arc(&second_native),
++                axis_tensor(&[real(0), real(1)]),
++            )
++            .unwrap(),
++        )
++        .unwrap();
++    let selected = value(
++        first
++            .select(
++                vec![
++                    a.scale(&real(-1)).unwrap(),
++                    first.constant(real(0)).unwrap(),
++                    first.constant(real(0)).unwrap(),
++                    first.constant(real(1)).unwrap(),
++                ],
++                real(1),
++                real(2),
++                &context,
++            )
++            .unwrap(),
++    );
++    let joined = value(selected.joined_with(&second, &context).unwrap());
++    assert!(joined.field().shares_authority(&selected));
++    assert_eq!(
++        joined
++            .embed(&a)
++            .unwrap()
++            .subtract(&joined.embed(&b).unwrap())
++            .unwrap()
++            .sign(&context)
++            .unwrap(),
++        Classification::Decided(RealSign::Zero)
++    );
++    let g = joined.embed(&selected.generator().unwrap()).unwrap();
++    assert_eq!(
++        g.multiply(&g)
++            .unwrap()
++            .multiply(&g)
++            .unwrap()
++            .subtract(&joined.embed(&b).unwrap())
++            .unwrap()
++            .sign(&context)
++            .unwrap(),
++        Classification::Decided(RealSign::Zero)
++    );
++    let replay = SelectedPolynomialDefinition::from_values(&[g], 1000).unwrap();
++    assert_eq!(value(replay.replay(1000, &context).unwrap()).len(), 1);
++}

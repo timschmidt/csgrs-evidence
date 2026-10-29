@@ -1,0 +1,366 @@
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index b7eceb5792..112de5b97d 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -57,6 +57,11 @@
+ 
+ ### Breaking
+ 
++- Independent selected-fiber rational queries now compose through distinct
++  retained generators. Callers that handled `Blocked(Unsupported)` for two
++  different selectors can receive an exact result. The opposite-root fixture
++  retains its original geometry and now requires the exact negative product,
++  separate source selections, policy certainty and replayed equations.
+ - `CurvePointDefinition2` gains `RationalQueryPair`, and `CurveError` gains
+   `UncertainFiniteCurveProjection { reason }`; exhaustive matches must handle
+   them. SVG projection preserves this cause as an `Exact` evaluation blocker.
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+index c5637cf57a..3ab072052d 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+@@ -10,17 +10,39 @@ impl BezierAlgebraicChord2 {
+         point: &CurvePoint2,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<crate::classify::LineSide>> {
+-        if ![self.start(), self.end(), point]
+-            .into_iter()
+-            .any(|point| {
+-                point_retains_joint_field(point)
+-                    || matches!(&point.0, CurvePointData2::Endpoint(_) | CurvePointData2::Similarity(_))
+-                    || matches!(&point.0, CurvePointData2::AlgebraicChordParallel(point) if point.data.source.certified_unit_tangent().is_some())
+-            })
+-        {
+-            return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+-        }
+         policy.strict_predicate_pass(|| {
++            if let Some(direction) = self.certified_axis_direction()
++                && let Some(side) = self.axis_oriented_side(point, direction, policy)
++            {
++                // A construction-certified cardinal support needs one exact
++                // coordinate comparison. Independent coordinate boxes cannot
++                // recover equality of a selected constant ordinate.
++                match side {
++                    decided @ Classification::Decided(_) => {
++                        #[cfg(feature = "dispatch-trace")]
++                        hyperreal::dispatch_trace::record(
++                            "hypercurve",
++                            "algebraic-chord-side-kernel",
++                            "cardinal-coordinate-precedence",
++                        );
++                        return Ok(decided);
++                    }
++                    exhausted @ Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                        return Ok(exhausted);
++                    }
++                    Classification::Uncertain(_) => {}
++                }
++            }
++            if ![self.start(), self.end(), point]
++                .into_iter()
++                .any(|point| {
++                    point_retains_joint_field(point)
++                        || matches!(&point.0, CurvePointData2::Endpoint(_) | CurvePointData2::Similarity(_))
++                        || matches!(&point.0, CurvePointData2::AlgebraicChordParallel(point) if point.data.source.certified_unit_tangent().is_some())
++                })
++            {
++                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++            }
+             common_point_oriented_side(self.start(), self.end(), point, policy)
+         })
+     }
+@@ -1956,20 +1978,6 @@ impl BezierAlgebraicChord2 {
+             }
+             Classification::Uncertain(_) => {}
+         }
+-        if let Some(direction) = self.certified_axis_direction()
+-            && let Some(side) = self.axis_oriented_side(point, direction, policy)
+-        {
+-            // A construction-certified cardinal support needs one exact
+-            // coordinate comparison. Independent coordinate boxes cannot
+-            // recover equality of a selected constant ordinate.
+-            match side {
+-                decided @ Classification::Decided(_) => return Ok(decided),
+-                exhausted @ Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
+-                    return Ok(exhausted);
+-                }
+-                Classification::Uncertain(_) => {}
+-            }
+-        }
+         let procedural_point = matches!(
+             point,
+             CurvePoint2(CurvePointData2::AlgebraicChordParallel(_))
+diff --git a/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs b/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
+index 7976e1e30b..fbd60c2eff 100644
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
+@@ -306,6 +306,19 @@ impl BezierAlgebraicCuspSemicircleMappedParameterData2 {
+             &(&tangent * &normal_x - &normal * &normal_y),
+             policy,
+         )?;
++        if std::env::var_os("HYPERCURVE_DEBUG_SELECTED_POINT_ORDER").is_some() {
++            let Self::IncidentPoint { point, .. } = self else {
++                unreachable!()
++            };
++            eprintln!(
++                "incident-vs-real v={parameter:?} normal=({normal_x:?},{normal_y:?}) radius={:?} raw_order={order:?} point={:?} center={:?}",
++                semicircle.radial_distance(),
++                algebraic_chord_endpoint_bounds_refined(point, 8, policy),
++                semicircle
++                    .center_point_evidence(policy)?
++                    .map(|p| algebraic_chord_endpoint_bounds_refined(&p, 8, policy))
++            );
++        }
+         Ok(match real_sign(semicircle.radial_distance(), policy) {
+             Some(RealSign::Positive) => order,
+             Some(RealSign::Negative) => order.map(Ordering::reverse),
+@@ -347,6 +360,14 @@ impl BezierAlgebraicCuspSemicircleParameter2 {
+         // cancels from this comparison, including independently replayed
+         // definitions of the same point and arbitrarily close distinct cuts.
+         let order = common_point_linear_order(first, second, &x, &y, policy)?;
++        if std::env::var_os("HYPERCURVE_DEBUG_SELECTED_POINT_ORDER").is_some() {
++            eprintln!(
++                "incident-vs-incident normal=({x:?},{y:?}) radius={:?} raw_order={order:?} first={:?} second={:?}",
++                circle.radial_distance(),
++                algebraic_chord_endpoint_bounds_refined(first, 8, policy),
++                algebraic_chord_endpoint_bounds_refined(second, 8, policy)
++            );
++        }
+         Ok(Some(match real_sign(circle.radial_distance(), policy) {
+             Some(RealSign::Positive) => order.map(Ordering::reverse),
+             Some(RealSign::Negative) => order,
+diff --git a/crates/hypercurve/src/bezier_offset/rational_form.rs b/crates/hypercurve/src/bezier_offset/rational_form.rs
+index a1285cbeb4..33eb0bc214 100644
+--- a/crates/hypercurve/src/bezier_offset/rational_form.rs
++++ b/crates/hypercurve/src/bezier_offset/rational_form.rs
+@@ -126,11 +126,23 @@ pub(crate) fn common_point_form_sources(
+     if first.source.shares_storage(&second.source) || first.source == second.source {
+         return Ok(Classification::Decided([first, second]));
+     }
+-    let same_point = first.source.same_point(&second.source, policy);
+-    if same_point == Classification::Decided(true) {
++    // Equality is only an alignment shortcut here. Query-pair coordinates
++    // already have a common selected-field route; comparing both projected
++    // coordinates first can rebuild an unnecessary tower of root decisions.
++    let query_pair = |point: &CurvePoint2| matches!(&point.0, CurvePointData2::Polynomial(point) if point.has_query_authority());
++    let same_point = if query_pair(&first.source) || query_pair(&second.source) {
++        None
++    } else {
++        Some(first.source.same_point(&second.source, policy))
++    };
++    if same_point == Some(Classification::Decided(true)) {
+         return Ok(Classification::Decided([first, second]));
+     }
+-    if same_point == Classification::Uncertain(UncertaintyReason::BudgetExhausted) {
++    if same_point
++        == Some(Classification::Uncertain(
++            UncertaintyReason::BudgetExhausted,
++        ))
++    {
+         return Ok(Classification::Uncertain(
+             UncertaintyReason::BudgetExhausted,
+         ));
+@@ -154,11 +166,15 @@ pub(crate) fn common_point_form_sources(
+         Classification::Uncertain(UncertaintyReason::Unsupported) => {}
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+     }
+-    Ok(match same_point {
+-        Classification::Decided(true) => Classification::Decided([first, second]),
+-        Classification::Decided(false) => Classification::Uncertain(UncertaintyReason::Unsupported),
+-        Classification::Uncertain(reason) => Classification::Uncertain(reason),
+-    })
++    Ok(
++        match same_point.unwrap_or_else(|| first.source.same_point(&second.source, policy)) {
++            Classification::Decided(true) => Classification::Decided([first, second]),
++            Classification::Decided(false) => {
++                Classification::Uncertain(UncertaintyReason::Unsupported)
++            }
++            Classification::Uncertain(reason) => Classification::Uncertain(reason),
++        },
++    )
+ }
+ 
+ fn point_form_difference(
+@@ -571,6 +587,22 @@ pub(super) fn common_point_circle_residual_sign(
+     radius_squared: &Real,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
++    // A native circle contact already retains a compact common field. Use
++    // that authority before constructing general query-pair coordinates.
++    match recursive_projective_point_evidence_circle_residual_sign(
++        point,
++        center,
++        radius_squared,
++        policy,
++    )? {
++        Classification::Decided(Some(sign)) => return Ok(Classification::Decided(sign)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [dx, dy] = match common_point_displacement(point, center, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+@@ -652,6 +684,18 @@ pub(super) fn common_point_oriented_side(
+     point: &CurvePoint2,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<crate::classify::LineSide>> {
++    // Preserve the original native field, including shared radicals and
++    // compact scalar witnesses, before forming new query-pair coordinates.
++    // General polynomial fields still use the source-bound fallback below.
++    match recursive_projective_point_evidence_oriented_side(start, end, point, false, policy)? {
++        Classification::Decided(Some(side)) => return Ok(Classification::Decided(side)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [ux, uy] = match common_point_displacement(end, start, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+diff --git a/crates/hypercurve/src/curve_region_boolean.rs b/crates/hypercurve/src/curve_region_boolean.rs
+index 384c447109..366d07cc13 100644
+--- a/crates/hypercurve/src/curve_region_boolean.rs
++++ b/crates/hypercurve/src/curve_region_boolean.rs
+@@ -5510,6 +5510,32 @@ fn split_algebraic_cusp_carrier(
+             Classification::Decided(Ordering::Less) => {}
+             Classification::Decided(Ordering::Equal) => continue,
+             Classification::Decided(Ordering::Greater) => {
++                if std::env::var_os("HYPERCURVE_DEBUG_SELECTED_POINT_ORDER").is_some() {
++                    let show = |parameter: &CurveParameter2| match parameter.as_algebraic_cusp() {
++                        Some(
++                            crate::bezier_offset::BezierAlgebraicCuspSemicircleParameter2::Exact(v),
++                        ) => {
++                            format!("Exact({v:?})")
++                        }
++                        Some(
++                            crate::bezier_offset::BezierAlgebraicCuspSemicircleParameter2::Mapped(
++                                v,
++                            ),
++                        ) => {
++                            format!("Mapped({:?})", std::mem::discriminant(v.as_ref()))
++                        }
++                        None => "not cusp".to_owned(),
++                    };
++                    eprintln!(
++                        "cusp contradiction reversed={} events={} carrier={}->{} pair={}->{}",
++                        carrier.reversed,
++                        events.len(),
++                        show(&carrier.start),
++                        show(&carrier.end),
++                        show(&pair[0].parameter),
++                        show(&pair[1].parameter)
++                    );
++                }
+                 return Err(CurveError::Topology(
+                     "algebraic cusp split boundaries are not increasing".into(),
+                 ));
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index 1255c95002..602b257417 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -32,6 +32,10 @@ mod joint;
+ use joint::JointQueries2;
+ 
+ impl PolynomialPoint2 {
++    pub(crate) fn has_query_authority(&self) -> bool {
++        matches!(self.authority, PolynomialPointAuthority2::Queries(_))
++    }
++
+     pub(crate) fn has_rational_maps(&self) -> bool {
+         !self.maps.is_empty()
+     }
+diff --git a/crates/hypercurve/tests/hypercurve_curve_region_promotion.rs b/crates/hypercurve/tests/hypercurve_curve_region_promotion.rs
+index 91844986a1..a99b393e36 100644
+--- a/crates/hypercurve/tests/hypercurve_curve_region_promotion.rs
++++ b/crates/hypercurve/tests/hypercurve_curve_region_promotion.rs
+@@ -6783,6 +6783,8 @@ fn algebraic_chord_expansion_merges_coupled_material_loops_exactly() {
+ 
+ #[test]
+ fn algebraic_chord_material_hole_contact_and_hole_collapse_are_exact() {
++    #[cfg(feature = "dispatch-trace")]
++    let _trace = hyperreal::dispatch_trace::recording_scope();
+     let miter = OffsetCornerStyle2::Miter {
+         limit: Real::from(2),
+     };
+@@ -6809,6 +6811,8 @@ fn algebraic_chord_material_hole_contact_and_hole_collapse_are_exact() {
+         let contacted = crate::support::under(&policy, || source
+             .offset(-q(1, 2), &miter))
+             .unwrap_or_else(|error| {
++                #[cfg(feature = "dispatch-trace")]
++                for entry in hyperreal::dispatch_trace::take().into_iter().filter(|entry| entry.layer == "hypercurve") { eprintln!("{entry:?}"); }
+                 panic!(
+                     "retained material/hole bands must regularize at coincident contact under {policy:?}, fill={fill_rule:?}, reverse={reverse}: {error:?}"
+                 )
+diff --git a/crates/hypercurve/tests/support/joint_form_arithmetic.rs b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+index 8653dc68aa..418e9d0b7c 100644
+--- a/crates/hypercurve/tests/support/joint_form_arithmetic.rs
++++ b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+@@ -204,19 +204,50 @@ pub fn different_fiber_selectors_do_not_merge() {
+         .into_point()
+         .unwrap()
+     };
+-    let negative = point(q(-3, 4), q(-1, 2));
+-    let positive = point(q(1, 2), q(3, 4));
+-    let result = form(&negative, y()).multiply(&form(&positive, y()));
+-    assert!(
+-        matches!(result,Err(ExactCurveError::Blocked(ref b)) if b.reason()==UncertaintyReason::Unsupported)
+-    );
+-    // Constant values can enter either field without identifying the roots.
+-    equal(
+-        &form(&negative, one())
+-            .multiply(&form(&positive, one()))
+-            .unwrap(),
+-        1.into(),
+-    );
++    for policy in [
++        PredicatePolicy::STRICT,
++        PredicatePolicy::APPROXIMATE_512,
++        PredicatePolicy::STRICT,
++    ] {
++        let result = evaluate_under(policy, || {
++            let negative = point(q(-3, 4), q(-1, 2));
++            let positive = point(q(1, 2), q(3, 4));
++            assert!(!negative.coincides_with(&positive).unwrap());
++            let a = form(&negative, y());
++            let b = form(&positive, y());
++            assert_eq!(a.compare_to_real(&Real::zero()).unwrap(), Ordering::Less);
++            assert_eq!(b.compare_to_real(&Real::zero()).unwrap(), Ordering::Greater);
++            // The separately selected roots are -sqrt(u) and +sqrt(u),
++            // with u positive and u^2=1/8. Joining fields must preserve
++            // both selections: their product is -u, never +u.
++            let product = a.multiply(&b).unwrap();
++            assert_eq!(
++                product.compare_to_real(&Real::zero()).unwrap(),
++                Ordering::Less
++            );
++            equal(&product.multiply(&product).unwrap(), q(1, 8));
++            equal(&product.add(&form(&negative, x())).unwrap(), Real::zero());
++            equal(&a.add(&b).unwrap(), Real::zero());
++            let (left, right) = product.operands().unwrap();
++            assert!(left.source().coincides_with(&negative).unwrap());
++            assert!(right.source().coincides_with(&positive).unwrap());
++            assert!(!left.source().coincides_with(right.source()).unwrap());
++            let source = product.source().definition().unwrap().into_point().unwrap();
++            let replayed = source
++                .rational_form(product.numerator().clone(), product.denominator().clone())
++                .unwrap();
++            equal(&replayed.add(&form(&negative, x())).unwrap(), Real::zero());
++            equal(&replayed.multiply(&replayed).unwrap(), q(1, 8));
++            // Constants still enter either field without identifying roots.
++            equal(
++                &form(&negative, one())
++                    .multiply(&form(&positive, one()))
++                    .unwrap(),
++                1.into(),
++            );
++        });
++        assert_eq!(result.certainty(), CurveCertainty::Certified);
++    }
+ }
+ 
+ pub fn policy_budget_and_finite_composition_recover() {

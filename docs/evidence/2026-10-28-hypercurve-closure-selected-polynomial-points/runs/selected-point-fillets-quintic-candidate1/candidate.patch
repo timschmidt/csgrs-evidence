@@ -1,0 +1,46 @@
+diff --git a/crates/hypercurve/src/bezier_offset/rational_form.rs b/crates/hypercurve/src/bezier_offset/rational_form.rs
+index a1285cbeb4..5fabae9c2e 100644
+--- a/crates/hypercurve/src/bezier_offset/rational_form.rs
++++ b/crates/hypercurve/src/bezier_offset/rational_form.rs
+@@ -571,6 +571,22 @@ pub(super) fn common_point_circle_residual_sign(
+     radius_squared: &Real,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
++    // A native circle contact already retains a compact common field. Use
++    // that authority before constructing general query-pair coordinates.
++    match recursive_projective_point_evidence_circle_residual_sign(
++        point,
++        center,
++        radius_squared,
++        policy,
++    )? {
++        Classification::Decided(Some(sign)) => return Ok(Classification::Decided(sign)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [dx, dy] = match common_point_displacement(point, center, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+@@ -652,6 +668,18 @@ pub(super) fn common_point_oriented_side(
+     point: &CurvePoint2,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<crate::classify::LineSide>> {
++    // Preserve the original native field, including shared radicals and
++    // compact scalar witnesses, before forming new query-pair coordinates.
++    // General polynomial fields still use the source-bound fallback below.
++    match recursive_projective_point_evidence_oriented_side(start, end, point, false, policy)? {
++        Classification::Decided(Some(side)) => return Ok(Classification::Decided(side)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [ux, uy] = match common_point_displacement(end, start, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),

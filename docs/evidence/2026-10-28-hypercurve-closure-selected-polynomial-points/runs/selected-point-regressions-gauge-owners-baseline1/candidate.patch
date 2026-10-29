@@ -1,0 +1,551 @@
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index b7eceb5792..112de5b97d 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -57,6 +57,11 @@
+ 
+ ### Breaking
+ 
++- Independent selected-fiber rational queries now compose through distinct
++  retained generators. Callers that handled `Blocked(Unsupported)` for two
++  different selectors can receive an exact result. The opposite-root fixture
++  retains its original geometry and now requires the exact negative product,
++  separate source selections, policy certainty and replayed equations.
+ - `CurvePointDefinition2` gains `RationalQueryPair`, and `CurveError` gains
+   `UncertainFiniteCurveProjection { reason }`; exhaustive matches must handle
+   them. SVG projection preserves this cause as an `Exact` evaluation blocker.
+diff --git a/crates/hypercurve/src/bezier_offset.rs b/crates/hypercurve/src/bezier_offset.rs
+index 56529c44a8..835db43cd2 100644
+--- a/crates/hypercurve/src/bezier_offset.rs
++++ b/crates/hypercurve/src/bezier_offset.rs
+@@ -38,6 +38,8 @@ mod recursive_field;
+ use recursive_field::foreign_embedding_projective_point;
+ #[cfg(test)]
+ use recursive_field::recursive_field_retained_parameter_value;
++#[cfg(test)]
++mod projective_gauge_tests;
+ mod recursive_quadratic;
+ mod represented;
+ mod selected_dense;
+@@ -13999,7 +14001,8 @@ fn recursive_projective_point_evidence_oriented_side(
+     certified_nonzero: bool,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<Option<crate::classify::LineSide>>> {
+-    let points = match recursive_projective_evidence_points(&[start, end, point], policy)? {
++    let points = match positive_recursive_projective_evidence_points(&[start, end, point], policy)?
++    {
+         Classification::Decided(Some(points)) => points,
+         Classification::Decided(None) => return Ok(Classification::Decided(None)),
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+@@ -14028,7 +14031,7 @@ fn recursive_projective_point_evidence_axis_order(
+     axis: Axis2,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<Option<std::cmp::Ordering>>> {
+-    let points = match recursive_projective_evidence_points(&[first, second], policy)? {
++    let points = match positive_recursive_projective_evidence_points(&[first, second], policy)? {
+         Classification::Decided(Some(points)) => points,
+         Classification::Decided(None) => return Ok(Classification::Decided(None)),
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+@@ -14066,7 +14069,7 @@ pub(crate) fn recursive_projective_point_evidence_equality(
+             return Ok(Classification::Decided(Some(false)));
+         }
+     }
+-    let points = match recursive_projective_evidence_points(&[first, second], policy)? {
++    let points = match positive_recursive_projective_evidence_points(&[first, second], policy)? {
+         Classification::Decided(Some(points)) => points,
+         Classification::Decided(None) => return Ok(Classification::Decided(None)),
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+index c5637cf57a..3ab072052d 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord/tangent.rs
+@@ -10,17 +10,39 @@ impl BezierAlgebraicChord2 {
+         point: &CurvePoint2,
+         policy: &CurveContext,
+     ) -> CurveResult<Classification<crate::classify::LineSide>> {
+-        if ![self.start(), self.end(), point]
+-            .into_iter()
+-            .any(|point| {
+-                point_retains_joint_field(point)
+-                    || matches!(&point.0, CurvePointData2::Endpoint(_) | CurvePointData2::Similarity(_))
+-                    || matches!(&point.0, CurvePointData2::AlgebraicChordParallel(point) if point.data.source.certified_unit_tangent().is_some())
+-            })
+-        {
+-            return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
+-        }
+         policy.strict_predicate_pass(|| {
++            if let Some(direction) = self.certified_axis_direction()
++                && let Some(side) = self.axis_oriented_side(point, direction, policy)
++            {
++                // A construction-certified cardinal support needs one exact
++                // coordinate comparison. Independent coordinate boxes cannot
++                // recover equality of a selected constant ordinate.
++                match side {
++                    decided @ Classification::Decided(_) => {
++                        #[cfg(feature = "dispatch-trace")]
++                        hyperreal::dispatch_trace::record(
++                            "hypercurve",
++                            "algebraic-chord-side-kernel",
++                            "cardinal-coordinate-precedence",
++                        );
++                        return Ok(decided);
++                    }
++                    exhausted @ Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++                        return Ok(exhausted);
++                    }
++                    Classification::Uncertain(_) => {}
++                }
++            }
++            if ![self.start(), self.end(), point]
++                .into_iter()
++                .any(|point| {
++                    point_retains_joint_field(point)
++                        || matches!(&point.0, CurvePointData2::Endpoint(_) | CurvePointData2::Similarity(_))
++                        || matches!(&point.0, CurvePointData2::AlgebraicChordParallel(point) if point.data.source.certified_unit_tangent().is_some())
++                })
++            {
++                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++            }
+             common_point_oriented_side(self.start(), self.end(), point, policy)
+         })
+     }
+@@ -1956,20 +1978,6 @@ impl BezierAlgebraicChord2 {
+             }
+             Classification::Uncertain(_) => {}
+         }
+-        if let Some(direction) = self.certified_axis_direction()
+-            && let Some(side) = self.axis_oriented_side(point, direction, policy)
+-        {
+-            // A construction-certified cardinal support needs one exact
+-            // coordinate comparison. Independent coordinate boxes cannot
+-            // recover equality of a selected constant ordinate.
+-            match side {
+-                decided @ Classification::Decided(_) => return Ok(decided),
+-                exhausted @ Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
+-                    return Ok(exhausted);
+-                }
+-                Classification::Uncertain(_) => {}
+-            }
+-        }
+         let procedural_point = matches!(
+             point,
+             CurvePoint2(CurvePointData2::AlgebraicChordParallel(_))
+diff --git a/crates/hypercurve/src/bezier_offset/projective_gauge_tests.rs b/crates/hypercurve/src/bezier_offset/projective_gauge_tests.rs
+new file mode 100644
+index 0000000000..1e845eb806
+--- /dev/null
++++ b/crates/hypercurve/src/bezier_offset/projective_gauge_tests.rs
+@@ -0,0 +1,202 @@
++//! A homogeneous sign change preserves the affine point and its predicates.
++use super::*;
++
++fn gauged_point(x_offset: i8, y: i8, gauge: i8) -> CurvePoint2 {
++    let half = (Real::one() / Real::from(2)).unwrap();
++    let parameter = BezierAlgebraicParameter2::try_isolate(
++        crate::BezierParameterPolynomial::try_new_power_basis(vec![
++            -&half,
++            Real::zero(),
++            Real::one(),
++        ])
++        .unwrap(),
++        BezierParameterInterval::try_new(half, Real::one()).unwrap(),
++    )
++    .unwrap();
++    let g = Real::from(gauge);
++    // t > 0, t^2=1/2. Coordinates are (t+x_offset,y), represented
++    // with weight g*t so the sign is selected-field data, not a flag.
++    let image = RationalBezierAlgebraicPointImage2::from_retained_expression(
++        parameter.clone(),
++        parameter_representation(&parameter, &CurveContext::STRICT),
++        vec![Real::zero(), &g * Real::from(x_offset), g.clone()],
++        vec![Real::zero(), &g * Real::from(y)],
++        vec![Real::zero(), g],
++        "projective gauge predicate regression",
++    );
++    CurvePoint2(CurvePointData2::Algebraic(image))
++}
++
++#[test]
++fn signed_algebraic_gauges_preserve_orientation_order_and_equality() {
++    use crate::classify::LineSide;
++    use std::cmp::Ordering;
++    for policy in [
++        CurveContext::STRICT,
++        CurveContext::APPROXIMATE_512,
++        CurveContext::STRICT,
++    ] {
++        for a in [-2, 1] {
++            let start = gauged_point(0, 0, a);
++            assert_eq!(
++                recursive_projective_evidence_denominator_sign(&start, &policy).unwrap(),
++                Classification::Decided(if a < 0 {
++                    RealSign::Negative
++                } else {
++                    RealSign::Positive
++                })
++            );
++            for b in [-1, 2] {
++                let end = gauged_point(1, 0, b);
++                assert_eq!(
++                    recursive_projective_point_evidence_axis_order(&start, &end, Axis2::X, &policy)
++                        .unwrap(),
++                    Classification::Decided(Some(Ordering::Less))
++                );
++                assert_eq!(
++                    recursive_projective_point_evidence_axis_order(&end, &start, Axis2::X, &policy)
++                        .unwrap(),
++                    Classification::Decided(Some(Ordering::Greater))
++                );
++                for g in [-2, 1] {
++                    let above = gauged_point(0, 1, g);
++                    let same = gauged_point(0, 0, g);
++                    for certified_nonzero in [false, true] {
++                        assert_eq!(
++                            recursive_projective_point_evidence_oriented_side(
++                                &start,
++                                &end,
++                                &above,
++                                certified_nonzero,
++                                &policy
++                            )
++                            .unwrap(),
++                            Classification::Decided(Some(LineSide::Left))
++                        );
++                        assert_eq!(
++                            recursive_projective_point_evidence_oriented_side(
++                                &end,
++                                &start,
++                                &above,
++                                certified_nonzero,
++                                &policy
++                            )
++                            .unwrap(),
++                            Classification::Decided(Some(LineSide::Right))
++                        );
++                    }
++                    assert_eq!(
++                        recursive_projective_point_evidence_oriented_side(
++                            &start, &end, &same, false, &policy
++                        )
++                        .unwrap(),
++                        Classification::Decided(Some(LineSide::On))
++                    );
++                    assert_eq!(
++                        recursive_projective_point_evidence_axis_order(
++                            &start,
++                            &same,
++                            Axis2::X,
++                            &policy
++                        )
++                        .unwrap(),
++                        Classification::Decided(Some(Ordering::Equal))
++                    );
++                    assert_eq!(
++                        recursive_projective_point_evidence_equality(&start, &same, &policy)
++                            .unwrap(),
++                        Classification::Decided(Some(true))
++                    );
++                    assert_eq!(
++                        recursive_projective_point_evidence_equality(&start, &above, &policy)
++                            .unwrap(),
++                        Classification::Decided(Some(false))
++                    );
++                }
++            }
++        }
++    }
++}
++
++fn decided<T>(value: Classification<T>) -> T {
++    match value {
++        Classification::Decided(value) => value,
++        Classification::Uncertain(reason) => panic!("exact gauge fixture: {reason:?}"),
++    }
++}
++
++#[test]
++fn reversed_support_intersections_keep_positive_recursive_weights() {
++    use crate::classify::LineSide::{Left, Right};
++    let flip = |side| match side { Left => Right, Right => Left, other => other };
++    for policy in [CurveContext::STRICT, CurveContext::APPROXIMATE_512, CurveContext::STRICT] {
++        for gauges in [[1, 1, 1, 1], [-1, 1, 1, 1], [1, -1, 1, -1], [-1, -1, -1, -1]] {
++            let horizontal = decided(BezierAlgebraicChord2::try_new(
++                gauged_point(0, 0, gauges[0]), gauged_point(2, 0, gauges[1]), &policy,
++            ).unwrap());
++            let vertical = decided(BezierAlgebraicChord2::try_new(
++                gauged_point(1, -1, gauges[2]), gauged_point(1, 1, gauges[3]), &policy,
++            ).unwrap());
++            for reverse_first in [false, true] {
++                for reverse_second in [false, true] {
++                    let first = if reverse_first { horizontal.reversed() } else { horizontal.clone() };
++                    let second = if reverse_second { vertical.reversed() } else { vertical.clone() };
++                    let mut first_sides = [Left, Right];
++                    let mut second_sides = [Right, Left];
++                    if reverse_first { first_sides.reverse(); second_sides = second_sides.map(flip); }
++                    if reverse_second { second_sides.reverse(); first_sides = first_sides.map(flip); }
++                    let cross = if reverse_first ^ reverse_second { RealSign::Negative } else { RealSign::Positive };
++                    let intersection = BezierAlgebraicChordPairPoint2::new(
++                        first, second, first_sides, second_sides, cross, &policy,
++                    );
++                    for _ in 0..2 {
++                        let point = decided(intersection.recursive_projective_point(&policy).unwrap()).unwrap();
++                        assert_eq!(point.denominator.sign_with_nonzero_certificate().unwrap(),
++                            Classification::Decided(RealSign::Positive),
++                            "gauges={gauges:?}, reversed={reverse_first}/{reverse_second}");
++                    }
++                    let intersection = CurvePoint2::from(intersection);
++                    assert_eq!(recursive_projective_point_evidence_equality(
++                        &intersection, &gauged_point(1, 0, -1), &policy,
++                    ).unwrap(), Classification::Decided(Some(true)));
++                    assert_eq!(recursive_projective_point_evidence_oriented_side(
++                        &gauged_point(0, -1, 1), &gauged_point(2, -1, 1),
++                        &intersection, true, &policy,
++                    ).unwrap(), Classification::Decided(Some(Left)));
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn cardinal_displacements_retain_the_imported_weight_sign() {
++    use crate::classify::LineSide::Left;
++    for policy in [CurveContext::STRICT, CurveContext::APPROXIMATE_512, CurveContext::STRICT] {
++        for first_gauge in [-1, 1] {
++            for second_gauge in [-1, 1] {
++                let source = decided(BezierAlgebraicChord2::try_new(
++                    gauged_point(0, 0, first_gauge), gauged_point(1, 0, second_gauge), &policy,
++                ).unwrap());
++                assert!(source.certified_axis_direction().is_some());
++                let (start, end) = BezierAlgebraicChordParallelPoint2::new_pair(
++                    source, Real::one(), Real::zero(), Real::zero(), &policy,
++                );
++                let points = [CurvePoint2::from(start), CurvePoint2::from(end)];
++                let raw = decided(recursive_projective_evidence_points(
++                    &[&points[0], &points[1]], &policy,
++                ).unwrap()).unwrap();
++                for (evidence, raw) in points.iter().zip(raw) {
++                    assert_eq!(recursive_projective_evidence_denominator_sign(evidence, &policy).unwrap(),
++                        raw.denominator.sign_with_nonzero_certificate().unwrap());
++                }
++                assert_eq!(recursive_projective_point_evidence_equality(
++                    &points[0], &gauged_point(0, 1, 1), &policy,
++                ).unwrap(), Classification::Decided(Some(true)));
++                assert_eq!(recursive_projective_point_evidence_oriented_side(
++                    &points[0], &points[1], &gauged_point(0, 2, 1), true, &policy,
++                ).unwrap(), Classification::Decided(Some(Left)));
++            }
++        }
++    }
++}
+diff --git a/crates/hypercurve/src/bezier_offset/rational_form.rs b/crates/hypercurve/src/bezier_offset/rational_form.rs
+index a1285cbeb4..33eb0bc214 100644
+--- a/crates/hypercurve/src/bezier_offset/rational_form.rs
++++ b/crates/hypercurve/src/bezier_offset/rational_form.rs
+@@ -126,11 +126,23 @@ pub(crate) fn common_point_form_sources(
+     if first.source.shares_storage(&second.source) || first.source == second.source {
+         return Ok(Classification::Decided([first, second]));
+     }
+-    let same_point = first.source.same_point(&second.source, policy);
+-    if same_point == Classification::Decided(true) {
++    // Equality is only an alignment shortcut here. Query-pair coordinates
++    // already have a common selected-field route; comparing both projected
++    // coordinates first can rebuild an unnecessary tower of root decisions.
++    let query_pair = |point: &CurvePoint2| matches!(&point.0, CurvePointData2::Polynomial(point) if point.has_query_authority());
++    let same_point = if query_pair(&first.source) || query_pair(&second.source) {
++        None
++    } else {
++        Some(first.source.same_point(&second.source, policy))
++    };
++    if same_point == Some(Classification::Decided(true)) {
+         return Ok(Classification::Decided([first, second]));
+     }
+-    if same_point == Classification::Uncertain(UncertaintyReason::BudgetExhausted) {
++    if same_point
++        == Some(Classification::Uncertain(
++            UncertaintyReason::BudgetExhausted,
++        ))
++    {
+         return Ok(Classification::Uncertain(
+             UncertaintyReason::BudgetExhausted,
+         ));
+@@ -154,11 +166,15 @@ pub(crate) fn common_point_form_sources(
+         Classification::Uncertain(UncertaintyReason::Unsupported) => {}
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+     }
+-    Ok(match same_point {
+-        Classification::Decided(true) => Classification::Decided([first, second]),
+-        Classification::Decided(false) => Classification::Uncertain(UncertaintyReason::Unsupported),
+-        Classification::Uncertain(reason) => Classification::Uncertain(reason),
+-    })
++    Ok(
++        match same_point.unwrap_or_else(|| first.source.same_point(&second.source, policy)) {
++            Classification::Decided(true) => Classification::Decided([first, second]),
++            Classification::Decided(false) => {
++                Classification::Uncertain(UncertaintyReason::Unsupported)
++            }
++            Classification::Uncertain(reason) => Classification::Uncertain(reason),
++        },
++    )
+ }
+ 
+ fn point_form_difference(
+@@ -571,6 +587,22 @@ pub(super) fn common_point_circle_residual_sign(
+     radius_squared: &Real,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<RealSign>> {
++    // A native circle contact already retains a compact common field. Use
++    // that authority before constructing general query-pair coordinates.
++    match recursive_projective_point_evidence_circle_residual_sign(
++        point,
++        center,
++        radius_squared,
++        policy,
++    )? {
++        Classification::Decided(Some(sign)) => return Ok(Classification::Decided(sign)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [dx, dy] = match common_point_displacement(point, center, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+@@ -652,6 +684,18 @@ pub(super) fn common_point_oriented_side(
+     point: &CurvePoint2,
+     policy: &CurveContext,
+ ) -> CurveResult<Classification<crate::classify::LineSide>> {
++    // Preserve the original native field, including shared radicals and
++    // compact scalar witnesses, before forming new query-pair coordinates.
++    // General polynomial fields still use the source-bound fallback below.
++    match recursive_projective_point_evidence_oriented_side(start, end, point, false, policy)? {
++        Classification::Decided(Some(side)) => return Ok(Classification::Decided(side)),
++        Classification::Uncertain(UncertaintyReason::BudgetExhausted) => {
++            return Ok(Classification::Uncertain(
++                UncertaintyReason::BudgetExhausted,
++            ));
++        }
++        Classification::Decided(None) | Classification::Uncertain(_) => {}
++    }
+     let [ux, uy] = match common_point_displacement(end, start, policy)? {
+         Classification::Decided(forms) => forms,
+         Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
+diff --git a/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs b/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs
+index 6b3a97c897..ebc3012cea 100644
+--- a/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs
++++ b/crates/hypercurve/src/bezier_offset/recursive_quadratic.rs
+@@ -1283,6 +1283,29 @@ pub(super) fn recursive_projective_evidence_points(
+     Ok(Classification::Decided(Some(represented)))
+ }
+ 
++/// Imports point evidence for predicates whose homogeneous formulas require
++/// positive denominators. Authored algebraic images can retain negative
++/// weights; transport their existing sign proof before consuming that formula.
++/// The raw importer remains available to consumers that handle signed gauges.
++pub(super) fn positive_recursive_projective_evidence_points(
++    evidence: &[&CurvePoint2],
++    policy: &CurveContext,
++) -> CurveResult<Classification<Option<Vec<BezierRecursiveQuadraticProjectivePoint2>>>> {
++    let points = match recursive_projective_evidence_points(evidence, policy)? {
++        Classification::Decided(Some(points)) => points,
++        other => return Ok(other),
++    };
++    let mut positive = Vec::with_capacity(points.len());
++    for (point, evidence) in points.into_iter().zip(evidence) {
++        let sign = match recursive_projective_evidence_denominator_sign(evidence, policy)? {
++            Classification::Decided(sign) => sign,
++            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++        };
++        positive.push(orient_recursive_projective_point_positive(point, sign)?);
++    }
++    Ok(Classification::Decided(Some(positive)))
++}
++
+ /// Imports fixed affine points through their selected coordinate witnesses
+ /// instead of constructing a primitive compositum of divergent recursive
+ /// towers.  Every coordinate remains an exact selected algebraic number; the
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index 1255c95002..602b257417 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -32,6 +32,10 @@ mod joint;
+ use joint::JointQueries2;
+ 
+ impl PolynomialPoint2 {
++    pub(crate) fn has_query_authority(&self) -> bool {
++        matches!(self.authority, PolynomialPointAuthority2::Queries(_))
++    }
++
+     pub(crate) fn has_rational_maps(&self) -> bool {
+         !self.maps.is_empty()
+     }
+diff --git a/crates/hypercurve/tests/support/joint_form_arithmetic.rs b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+index 8653dc68aa..418e9d0b7c 100644
+--- a/crates/hypercurve/tests/support/joint_form_arithmetic.rs
++++ b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+@@ -204,19 +204,50 @@ pub fn different_fiber_selectors_do_not_merge() {
+         .into_point()
+         .unwrap()
+     };
+-    let negative = point(q(-3, 4), q(-1, 2));
+-    let positive = point(q(1, 2), q(3, 4));
+-    let result = form(&negative, y()).multiply(&form(&positive, y()));
+-    assert!(
+-        matches!(result,Err(ExactCurveError::Blocked(ref b)) if b.reason()==UncertaintyReason::Unsupported)
+-    );
+-    // Constant values can enter either field without identifying the roots.
+-    equal(
+-        &form(&negative, one())
+-            .multiply(&form(&positive, one()))
+-            .unwrap(),
+-        1.into(),
+-    );
++    for policy in [
++        PredicatePolicy::STRICT,
++        PredicatePolicy::APPROXIMATE_512,
++        PredicatePolicy::STRICT,
++    ] {
++        let result = evaluate_under(policy, || {
++            let negative = point(q(-3, 4), q(-1, 2));
++            let positive = point(q(1, 2), q(3, 4));
++            assert!(!negative.coincides_with(&positive).unwrap());
++            let a = form(&negative, y());
++            let b = form(&positive, y());
++            assert_eq!(a.compare_to_real(&Real::zero()).unwrap(), Ordering::Less);
++            assert_eq!(b.compare_to_real(&Real::zero()).unwrap(), Ordering::Greater);
++            // The separately selected roots are -sqrt(u) and +sqrt(u),
++            // with u positive and u^2=1/8. Joining fields must preserve
++            // both selections: their product is -u, never +u.
++            let product = a.multiply(&b).unwrap();
++            assert_eq!(
++                product.compare_to_real(&Real::zero()).unwrap(),
++                Ordering::Less
++            );
++            equal(&product.multiply(&product).unwrap(), q(1, 8));
++            equal(&product.add(&form(&negative, x())).unwrap(), Real::zero());
++            equal(&a.add(&b).unwrap(), Real::zero());
++            let (left, right) = product.operands().unwrap();
++            assert!(left.source().coincides_with(&negative).unwrap());
++            assert!(right.source().coincides_with(&positive).unwrap());
++            assert!(!left.source().coincides_with(right.source()).unwrap());
++            let source = product.source().definition().unwrap().into_point().unwrap();
++            let replayed = source
++                .rational_form(product.numerator().clone(), product.denominator().clone())
++                .unwrap();
++            equal(&replayed.add(&form(&negative, x())).unwrap(), Real::zero());
++            equal(&replayed.multiply(&replayed).unwrap(), q(1, 8));
++            // Constants still enter either field without identifying roots.
++            equal(
++                &form(&negative, one())
++                    .multiply(&form(&positive, one()))
++                    .unwrap(),
++                1.into(),
++            );
++        });
++        assert_eq!(result.certainty(), CurveCertainty::Certified);
++    }
+ }
+ 
+ pub fn policy_budget_and_finite_composition_recover() {
