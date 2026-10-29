@@ -1,0 +1,1553 @@
+diff --git a/crates/hyperbrep/src/persistence/planar_points.rs b/crates/hyperbrep/src/persistence/planar_points.rs
+index 4043740855..93a2e552f1 100644
+--- a/crates/hyperbrep/src/persistence/planar_points.rs
++++ b/crates/hyperbrep/src/persistence/planar_points.rs
+@@ -105,7 +105,7 @@ impl GraphEncoder {
+                 root,
+             } => RawPlanarPoint::PolynomialFiber {
+                 equation: equation.coefficients,
+-                parameter: self.curve_parameter(&parameter.into())?,
++                parameter: self.curve_parameter(&parameter)?,
+                 interval: [root.lower, root.upper],
+                 exact_root: root.exact_root,
+             },
+@@ -210,7 +210,7 @@ impl SelectionGraph {
+                 exact_root,
+             } => CurvePointDefinition2::PolynomialFiber {
+                 equation: hypersolve::BivariatePolynomial::new(equation),
+-                parameter: self.bezier_parameter(parameter)?,
++                parameter: self.curve_parameter(parameter)?,
+                 root: hypersolve::IsolatedRootInterval {
+                     lower,
+                     upper,
+@@ -317,7 +317,7 @@ mod tests {
+                 vec![0.into(), 0.into(), 0.into(), 1.into()],
+                 vec![(-1).into()],
+             ]),
+-            parameter: base,
++            parameter: base.into(),
+             root: hypersolve::IsolatedRootInterval {
+                 lower: 1.into(),
+                 upper: (Real::from(3) / Real::from(2)).unwrap(),
+diff --git a/crates/hyperbrep/tests/selected_query_archive.rs b/crates/hyperbrep/tests/selected_query_archive.rs
+index cf86e6853a..3117522823 100644
+--- a/crates/hyperbrep/tests/selected_query_archive.rs
++++ b/crates/hyperbrep/tests/selected_query_archive.rs
+@@ -20,7 +20,7 @@ fn q(n: i32, d: i32) -> Real {
+ fn fiber(n: i32) -> CurvePoint2 {
+     CurvePointDefinition2::PolynomialFiber {
+         equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
+-        parameter: BezierParameter2::Exact(n.into()),
++        parameter: BezierParameter2::Exact(n.into()).into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: 2.into(),
+@@ -302,3 +302,103 @@ fn selected_query_archive_metadata_limits_count_sources_and_polynomials() {
+         }
+     }
+ }
++
++#[test]
++fn dependent_polynomial_fiber_replays_in_a_fresh_process_and_feeds_geometry() {
++    const INPUT: &str = "HYPERBREP_DEPENDENT_POLYNOMIAL_FIBER_REPLAY";
++    fn verify(text: &str) {
++        let model = replay(text);
++        let curve = model.pcurves().next().unwrap().curve().clone();
++        let point = curve.start();
++        for equation in [
++            polynomial(&[&[-2], &[], &[], &[1]]),
++            polynomial(&[&[0, 0, 1], &[-1]]),
++        ] {
++            assert_eq!(
++                point
++                    .rational_form(equation, polynomial(&[&[1]]))
++                    .unwrap()
++                    .compare_to_real(&Real::zero())
++                    .unwrap(),
++                Ordering::Equal
++            );
++        }
++        assert_eq!(
++            point
++                .affine_form(0.into(), 1.into(), 0.into())
++                .compare_to_real(&Real::one())
++                .unwrap(),
++            Ordering::Greater
++        );
++        let root = point
++            .rational_form(polynomial(&[&[0, 1]]), polynomial(&[&[1]]))
++            .unwrap()
++            .parameter()
++            .unwrap();
++        let next = root
++            .affine_point(2.into(), 1.into(), 3.into(), (-1).into())
++            .unwrap();
++        assert_eq!(
++            next.rational_form(polynomial(&[&[-5, -2], &[3]]), polynomial(&[&[1]]))
++                .unwrap()
++                .compare_to_real(&Real::zero())
++                .unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(model.to_json().unwrap(), text);
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let parameter = fiber(2)
++        .rational_form(polynomial(&[&[0, 1]]), polynomial(&[&[1]]))
++        .unwrap()
++        .parameter()
++        .unwrap();
++    let point = CurvePointDefinition2::PolynomialFiber {
++        equation: polynomial(&[&[0, 0, 1], &[-1]]),
++        parameter,
++        root: IsolatedRootInterval {
++            lower: 1.into(),
++            upper: 2.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap();
++    let end = point
++        .rational_image(&RationalMap2::new(
++            [polynomial(&[&[1], &[1]]), polynomial(&[&[0, 1]])],
++            polynomial(&[&[1]]),
++        ))
++        .unwrap();
++    let mut builder = ModelBuilder::new();
++    builder
++        .pcurve(Pcurve::new(Curve2::try_line(point, end).unwrap()))
++        .unwrap();
++    let text = builder.finish().unwrap().to_json().unwrap();
++    verify(&text);
++    let path = std::env::temp_dir().join(format!(
++        "hyperbrep-dependent-fiber-{}.json",
++        std::process::id()
++    ));
++    std::fs::write(&path, &text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "dependent_polynomial_fiber_replays_in_a_fresh_process_and_feeds_geometry",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
+diff --git a/crates/hyperbrep/tests/support/polynomial_points.rs b/crates/hyperbrep/tests/support/polynomial_points.rs
+index 9dff196e5a..e274bed9be 100644
+--- a/crates/hyperbrep/tests/support/polynomial_points.rs
++++ b/crates/hyperbrep/tests/support/polynomial_points.rs
+@@ -25,7 +25,8 @@ pub fn polynomial_point_archive_admission_and_replay() {
+                 BezierParameterInterval::try_new(1.into(), 2.into()).unwrap(),
+             )
+             .unwrap(),
+-        ),
++        )
++        .into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: (Real::from(3) / Real::from(2)).unwrap(),
+diff --git a/crates/hyperbrep/tests/support/rational_surface_evaluation.rs b/crates/hyperbrep/tests/support/rational_surface_evaluation.rs
+index a23e57b070..cfedce50bb 100644
+--- a/crates/hyperbrep/tests/support/rational_surface_evaluation.rs
++++ b/crates/hyperbrep/tests/support/rational_surface_evaluation.rs
+@@ -308,7 +308,7 @@ pub fn selected_rational_extrusions_and_knot_boundaries() {
+             vec![0.into(), 0.into(), 0.into(), 16.into()],
+             vec![(-1).into()],
+         ]),
+-        parameter: BezierParameter2::Exact(q(1, 2)),
++        parameter: BezierParameter2::Exact(q(1, 2)).into(),
+         root: hypersolve::IsolatedRootInterval {
+             lower: q(1, 4),
+             upper: q(3, 8),
+@@ -500,7 +500,7 @@ pub fn nurbs_second_span_and_final_endpoint() {
+             vec![0.into(), 0.into(), 0.into(), 16.into()],
+             vec![(-1).into()],
+         ]),
+-        parameter: BezierParameter2::Exact(1.into()),
++        parameter: BezierParameter2::Exact(1.into()).into(),
+         root: hypersolve::IsolatedRootInterval {
+             lower: q(3, 8),
+             upper: q(1, 2),
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index b6770a85eb..54997eac9c 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Polynomial graph evaluation consumes source-bound rational queries over
++  retained selected fields. Dependent fibers preserve their original equation,
++  parameter recipe and selector through further queries and native replay;
++  branch evaluation honors the configured subdivision-depth limit.
++
+ - Normalize signed homogeneous point weights before shared orientation and
+   coordinate predicates. Supporting-line intersections transport their tangent
+   certificate through retained-support reversals, and cardinal displacements
+@@ -70,6 +75,11 @@
+ 
+ ### Breaking
+ 
++- `CurvePointDefinition2::PolynomialFiber::parameter` is now `CurveParameter2`.
++  Convert existing `BezierParameter2` values with `.into()`; borrow their native
++  view with `as_bezier_parameter()` when required. SVG fiber records and HyperBRep
++  planar archives accept retained query-parameter references in that field.
++
+ - Independent selected-fiber rational queries now compose through distinct
+   retained generators. Callers that handled `Blocked(Unsupported)` for two
+   different selectors can receive an exact result. The opposite-root fixture
+diff --git a/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs b/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
+index 7976e1e30b..f0018adb40 100644
+--- a/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
++++ b/crates/hypercurve/src/bezier_offset/cusp_semicircle/incident_point.rs
+@@ -385,7 +385,8 @@ mod tests {
+                     BezierParameterInterval::try_new(q(3, 4), Real::one()).unwrap(),
+                 )
+                 .unwrap(),
+-            ),
++            )
++            .into(),
+             root: hypersolve::IsolatedRootInterval {
+                 lower: 1.into(),
+                 upper: 2.into(),
+diff --git a/crates/hypercurve/src/bezier_offset/selected_fiber/image_tests.rs b/crates/hypercurve/src/bezier_offset/selected_fiber/image_tests.rs
+index 37a795e5d4..ae0c746d04 100644
+--- a/crates/hypercurve/src/bezier_offset/selected_fiber/image_tests.rs
++++ b/crates/hypercurve/src/bezier_offset/selected_fiber/image_tests.rs
+@@ -307,7 +307,8 @@ fn affine_source_identity_survives_refinement_without_a_cycle() {
+         equation: selected.data.authority.data.incidence.clone(),
+         parameter: BezierParameter2::Algebraic(
+             selected.data.authority.data.retained_parameter.clone(),
+-        ),
++        )
++        .into(),
+         root: selected.data.root.clone(),
+     };
+     let point = definition.into_point().unwrap();
+diff --git a/crates/hypercurve/src/curve_point/definition.rs b/crates/hypercurve/src/curve_point/definition.rs
+index 1a558eae0c..d3e81d7f51 100644
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -14,10 +14,12 @@ pub enum CurvePointDefinition2 {
+     Coordinates(Point2),
+     /// A singleton of `equation(parameter, y) = 0`, retaining the selected
+     /// first parameter and the exact second-coordinate isolator together.
++    /// The parameter may retain a rational query over selected point fields;
++    /// its source relations and denominator guards remain authoritative.
+     /// Replay checks the equation and singleton; root-count flags are untrusted.
+     PolynomialFiber {
+         equation: hypersolve::BivariatePolynomial,
+-        parameter: BezierParameter2,
++        parameter: CurveParameter2,
+         root: hypersolve::IsolatedRootInterval,
+     },
+     /// Two rational queries, each retaining its original point and pole guard.
+@@ -275,10 +277,11 @@ impl CurvePointDefinition2 {
+                 parameter,
+                 root,
+             } => {
+-                let mut points = crate::polynomial_point::PolynomialPoint2::from_fiber(
++                let mut points = crate::polynomial_point::PolynomialPoint2::from_parameter_fiber(
+                     equation,
+                     parameter,
+                     &[root],
++                    policy,
+                 )?;
+                 points.pop().ok_or_else(|| {
+                     ExactCurveError::invalid_unattributed(
+diff --git a/crates/hypercurve/src/finite_projection.rs b/crates/hypercurve/src/finite_projection.rs
+index e2453d2bf1..bf29f31535 100644
+--- a/crates/hypercurve/src/finite_projection.rs
++++ b/crates/hypercurve/src/finite_projection.rs
+@@ -2029,7 +2029,7 @@ mod tests {
+                     vec![0.into(), 0.into(), 0.into(), 1.into()],
+                     vec![(-1).into()],
+                 ]),
+-                parameter: BezierParameter2::Exact(n.into()),
++                parameter: BezierParameter2::Exact(n.into()).into(),
+                 root: IsolatedRootInterval {
+                     lower: 1.into(),
+                     upper: 2.into(),
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 0bc8f0f4a7..f34af74088 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -48,7 +48,11 @@ struct PolynomialCurveSource2 {
+ /// selected algebraic parameter. Fiber pullback preserves that base, the
+ /// original denominator guard and the branch's ordered root; subsequent
+ /// abscissa queries can reuse the same source without coordinate elimination.
+-/// General dependent fibers without such a rational base chart remain blocked.
++/// Source-bound rational queries over retained selected fields also supply
++/// abscissas. Their fibers use the shared ordered-field Sturm solver and retain
++/// the original query, polynomial, singleton and branch ordinal. Native rational
++/// base charts keep their existing pullback path; no global coordinate projection
++/// is required. Geometric point-ordered charts without a scalar recipe remain blocked.
+ /// [`Curve2::point_locations`] consumes native and retained points in the
+ /// original graph chart and its invertible similarities, preserving closed
+ /// selected boundaries. Incidence validates the selected branch, so another
+@@ -911,6 +915,9 @@ impl PolynomialCurveBranch2 {
+         value: &CurveParameter2,
+         policy: &CurveContext,
+     ) -> ExactCurveResult<CurvePoint2> {
++        if value.as_polynomial_query().is_some() {
++            return self.query_fiber_point(value, policy);
++        }
+         let (base, equation, map) = if let Some(base) = value.as_bezier_parameter() {
+             (base.clone(), self.topology().equation().clone(), None)
+         } else {
+@@ -963,6 +970,35 @@ impl PolynomialCurveBranch2 {
+         }
+     }
+ 
++    fn query_fiber_point(
++        &self,
++        value: &CurveParameter2,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<CurvePoint2> {
++        let equation = self.topology().equation();
++        let report = PolynomialPoint2::query_fiber_roots(
++            equation,
++            value,
++            &self.topology().domain().second,
++            self.source.fiber_config,
++            policy,
++        )?;
++        // The source topology proves this census and ordinal on the open slab.
++        // Reject a contradictory fiber instead of choosing another branch.
++        if report.len() != self.topology().slabs()[self.slab].arcs().len() {
++            return Err(invalid(CurveError::InvalidBezierAlgebraicParameter));
++        }
++        let mut points = PolynomialPoint2::from_parameter_fiber(
++            equation.clone(),
++            value.clone(),
++            &report[self.root..=self.root],
++            policy,
++        )?;
++        points
++            .pop()
++            .ok_or_else(|| invalid(CurveError::InvalidBezierAlgebraicParameter))
++    }
++
+     fn map_point(
+         &self,
+         mut point: CurvePoint2,
+diff --git a/crates/hypercurve/src/polynomial_curve_abscissa.rs b/crates/hypercurve/src/polynomial_curve_abscissa.rs
+index 57ed843875..126668a5bf 100644
+--- a/crates/hypercurve/src/polynomial_curve_abscissa.rs
++++ b/crates/hypercurve/src/polynomial_curve_abscissa.rs
+@@ -51,7 +51,10 @@ pub(super) fn pullback(
+         };
+         return selected_fiber(
+             equation,
+-            parameter,
++            parameter
++                .as_bezier_parameter()
++                .ok_or_else(|| blocked(UncertaintyReason::Unsupported))?
++                .clone(),
+             univariate(&source.numerator)?,
+             univariate(&source.denominator)?,
+             policy,
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index 602b257417..82ea7be728 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -29,6 +29,7 @@ enum PolynomialPointAuthority2 {
+ }
+ 
+ mod joint;
++mod selected_fiber;
+ use joint::JointQueries2;
+ 
+ impl PolynomialPoint2 {
+@@ -179,7 +180,7 @@ impl PolynomialPoint2 {
+             PolynomialPointAuthority2::Fiber { base, fiber } => {
+                 crate::CurvePointDefinition2::PolynomialFiber {
+                     equation: fiber.defining_fiber().0.clone(),
+-                    parameter: base.clone(),
++                    parameter: base.clone().into(),
+                     root: fiber.root().clone(),
+                 }
+             }
+diff --git a/crates/hypercurve/src/polynomial_point/joint.rs b/crates/hypercurve/src/polynomial_point/joint.rs
+index 3ddae652a7..5127f44546 100644
+--- a/crates/hypercurve/src/polynomial_point/joint.rs
++++ b/crates/hypercurve/src/polynomial_point/joint.rs
+@@ -1,4 +1,4 @@
+-//! Joint query points preserve sources as well as their common scalar field.
++//! Joint point values retain their source recipe and common selected field.
+ 
+ use super::*;
+ use crate::bezier_offset::PointFormSource2;
+@@ -6,7 +6,7 @@ use crate::selected_field::{self as field, Value};
+ use std::sync::Arc;
+ 
+ pub(super) struct JointQueries2 {
+-    sources: [PointFormSource2; 2],
++    definition: crate::CurvePointDefinition2,
+     values: [Value; 2],
+ }
+ 
+@@ -25,18 +25,24 @@ impl PartialEq for JointQueries2 {
+ 
+ impl JointQueries2 {
+     pub(super) fn definition(&self) -> crate::CurvePointDefinition2 {
+-        crate::CurvePointDefinition2::RationalQueryPair {
+-            sources: self.sources.each_ref().map(|query| query.source.clone()),
+-            numerators: self.sources.each_ref().map(|query| query.numerator.clone()),
+-            denominators: self
+-                .sources
+-                .each_ref()
+-                .map(|query| query.denominator.clone()),
+-        }
++        self.definition.clone()
+     }
+ }
+ 
+ impl PolynomialPoint2 {
++    pub(super) fn from_joint_values(
++        definition: crate::CurvePointDefinition2,
++        values: [Value; 2],
++    ) -> CurvePoint2 {
++        CurvePoint2(CurvePointData2::Polynomial(Arc::new(Self {
++            authority: PolynomialPointAuthority2::Queries(Arc::new(JointQueries2 {
++                definition,
++                values,
++            })),
++            maps: Vec::new(),
++        })))
++    }
++
+     pub(crate) fn from_queries(
+         sources: [PointFormSource2; 2],
+         policy: &CurveContext,
+@@ -47,13 +53,12 @@ impl PolynomialPoint2 {
+             let first = crate::bezier_offset::selected_field_query(&sources[0], policy)?;
+             let second = crate::bezier_offset::selected_field_query(&sources[1], policy)?;
+             let values = field::joined(&first, &second, policy)?;
+-            Ok(CurvePoint2(CurvePointData2::Polynomial(Arc::new(Self {
+-                authority: PolynomialPointAuthority2::Queries(Arc::new(JointQueries2 {
+-                    sources,
+-                    values,
+-                })),
+-                maps: Vec::new(),
+-            }))))
++            let definition = crate::CurvePointDefinition2::RationalQueryPair {
++                sources: sources.each_ref().map(|query| query.source.clone()),
++                numerators: sources.each_ref().map(|query| query.numerator.clone()),
++                denominators: sources.each_ref().map(|query| query.denominator.clone()),
++            };
++            Ok(Self::from_joint_values(definition, values))
+         })
+     }
+ 
+diff --git a/crates/hypercurve/src/polynomial_point/selected_fiber.rs b/crates/hypercurve/src/polynomial_point/selected_fiber.rs
+new file mode 100644
+index 0000000000..33682a2b81
+--- /dev/null
++++ b/crates/hypercurve/src/polynomial_point/selected_fiber.rs
+@@ -0,0 +1,158 @@
++//! Fibers over retained query parameters share the selected-field solver.
++
++use super::*;
++use crate::selected_field::{self as field, FieldError, Value};
++use hypersolve::OrderedFieldRootIsolationStatus;
++use hypersolve::selected_polynomial_field::SelectedPolynomialContext;
++
++fn resolve<T>(operation: impl FnOnce() -> field::Result<T>) -> ExactCurveResult<T> {
++    ExactCurveError::decided(
++        CurveOperation2::Evaluation,
++        field::finish(operation).map_err(|cause| {
++            ExactCurveError::invalid(
++                CurveOperation2::Evaluation,
++                crate::CurveFamily2::ImplicitPolynomial,
++                cause,
++            )
++        })?,
++    )
++}
++
++fn coefficients(
++    equation: &BivariatePolynomial,
++    parameter: &CurveParameter2,
++    policy: &CurveContext,
++) -> field::Result<(Value, Vec<Value>)> {
++    let query = field::available(parameter.as_polynomial_query())?.query();
++    // Re-evaluate the original recipe, including its denominator. The stored
++    // enclosure and a serialized singleton flag are not selection evidence.
++    let x = crate::bezier_offset::selected_field_query(&query, policy)?;
++    let degree = equation
++        .coefficients
++        .iter()
++        .map(Vec::len)
++        .max()
++        .unwrap_or(0);
++    let coefficients = (0..degree)
++        .map(|power| {
++            let coefficients = equation
++                .coefficients
++                .iter()
++                .map(|row| row.get(power).cloned().unwrap_or_else(Real::zero))
++                .collect::<Vec<_>>();
++            field::polynomial(&coefficients, &x)
++        })
++        .collect::<field::Result<Vec<_>>>()?;
++    Ok((x, coefficients))
++}
++
++impl PolynomialPoint2 {
++    pub(crate) fn query_fiber_roots(
++        equation: &BivariatePolynomial,
++        parameter: &CurveParameter2,
++        domain: &[Real; 2],
++        config: hypersolve::AlgebraicFiberRootIsolationConfig,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<Vec<IsolatedRootInterval>> {
++        let strict = policy.strict_counterpart();
++        resolve(|| {
++            let (x, coefficients) = coefficients(equation, parameter, &strict)?;
++            let mut context = SelectedPolynomialContext {
++                field: x.field().clone(),
++                policy: &strict,
++            };
++            let report = hypersolve::isolate_ordered_field_polynomial_roots_complete_with_config(
++                coefficients,
++                &domain[0],
++                &domain[1],
++                hypersolve::OrderedFieldRootIsolationConfig {
++                    max_subdivision_depth: config.max_subdivision_depth,
++                    refinement_steps: config.refinement_steps,
++                },
++                &mut context,
++            )?;
++            match report.status {
++                OrderedFieldRootIsolationStatus::Isolated => Ok(report.intervals),
++                OrderedFieldRootIsolationStatus::BudgetExhausted => {
++                    Err(FieldError::Uncertain(UncertaintyReason::BudgetExhausted))
++                }
++                OrderedFieldRootIsolationStatus::InvalidInterval => {
++                    Err(FieldError::InvalidSelector)
++                }
++                OrderedFieldRootIsolationStatus::IdenticallyZero => Err(FieldError::ZeroPolynomial),
++                OrderedFieldRootIsolationStatus::CompleteFallbackRequired => {
++                    Err(FieldError::Uncertain(UncertaintyReason::Unsupported))
++                }
++            }
++        })
++    }
++
++    pub(crate) fn from_parameter_fiber(
++        equation: BivariatePolynomial,
++        parameter: CurveParameter2,
++        roots: &[IsolatedRootInterval],
++        policy: &CurveContext,
++    ) -> ExactCurveResult<Vec<CurvePoint2>> {
++        if let Some(base) = parameter.as_bezier_parameter() {
++            return Self::from_fiber(equation, base.clone(), roots);
++        }
++        let strict = policy.strict_counterpart();
++        resolve(|| {
++            let (x, coefficients) = coefficients(&equation, &parameter, &strict)?;
++            let parent = x.field();
++            // A zero fiber is not a singleton even with a claimed exact root.
++            let mut nonzero = false;
++            for coefficient in &coefficients {
++                nonzero |= field::decided(coefficient.sign(&strict)?)? != hyperreal::RealSign::Zero;
++            }
++            if !nonzero {
++                return Err(FieldError::ZeroPolynomial);
++            }
++            roots
++                .iter()
++                .map(|root| {
++                    let values = if let Some(exact) = &root.exact_root {
++                        for endpoint in [&root.lower, &root.upper] {
++                            match crate::classify::compare_reals(endpoint, exact, &strict) {
++                                Some(Ordering::Equal) => {}
++                                Some(_) => return Err(FieldError::InvalidSelector),
++                                None => {
++                                    return Err(FieldError::Uncertain(
++                                        UncertaintyReason::Predicate,
++                                    ));
++                                }
++                            }
++                        }
++                        let y = parent.constant(exact.clone())?;
++                        let point = [x.clone(), y];
++                        if field::decided(field::bivariate(&equation, &point)?.sign(&strict)?)?
++                            != hyperreal::RealSign::Zero
++                        {
++                            return Err(FieldError::NoRoot);
++                        }
++                        point
++                    } else {
++                        let selected = field::decided(parent.select(
++                            coefficients.clone(),
++                            root.lower.clone(),
++                            root.upper.clone(),
++                            &strict,
++                        )?)?;
++                        [selected.lift(&x)?, selected.generator()?]
++                    };
++                    Ok(Self::from_joint_values(
++                        crate::CurvePointDefinition2::PolynomialFiber {
++                            equation: equation.clone(),
++                            parameter: parameter.clone(),
++                            root: IsolatedRootInterval {
++                                distinct_root_count: 1,
++                                ..root.clone()
++                            },
++                        },
++                        values,
++                    ))
++                })
++                .collect()
++        })
++    }
++}
+diff --git a/crates/hypercurve/src/svg/exact/graph/points.rs b/crates/hypercurve/src/svg/exact/graph/points.rs
+index 0e8fba3d37..62ac3b6016 100644
+--- a/crates/hypercurve/src/svg/exact/graph/points.rs
++++ b/crates/hypercurve/src/svg/exact/graph/points.rs
+@@ -116,7 +116,8 @@ impl GraphWriter {
+                     } else {
+                         match &definition {
+                             CurvePointDefinition2::Rational { parameter, .. }
+-                            | CurvePointDefinition2::Parallel { parameter, .. } => parameter
++                            | CurvePointDefinition2::Parallel { parameter, .. }
++                            | CurvePointDefinition2::PolynomialFiber { parameter, .. } => parameter
+                                 .as_polynomial_query()
+                                 .map(|query| vec![query.query().source])
+                                 .unwrap_or_default(),
+@@ -242,7 +243,8 @@ impl GraphWriter {
+                     parameter,
+                     root,
+                 } => {
+-                    let parameter = self.parameter(&parameter)?;
++                    let parameter = self.scalar_parameter(&parameter)?;
++                    depth = self.point_depths[parameter as usize];
+                     let index = self.begin(POLYNOMIAL_FIBER)?;
+                     self.writer.write_u32(parameter)?;
+                     self.polynomial(&equation)?;
+@@ -576,7 +578,9 @@ pub(super) fn read_definition(
+             }
+         }
+         POLYNOMIAL_FIBER => {
+-            let parameter = parameter_reference(definitions, reader.read_len()?)?.clone();
++            let index = reader.read_len()?;
++            let parameter = scalar_parameter_reference(definitions, index)?;
++            depth = point_depths[index];
+             let equation = read_polynomial(reader)?;
+             let lower = reader.read_real()?;
+             let upper = reader.read_real()?;
+diff --git a/crates/hypercurve/tests/fiber_point_incidence.rs b/crates/hypercurve/tests/fiber_point_incidence.rs
+index f3ec4e9244..15dbb4c6e9 100644
+--- a/crates/hypercurve/tests/fiber_point_incidence.rs
++++ b/crates/hypercurve/tests/fiber_point_incidence.rs
+@@ -38,7 +38,8 @@ fn center() -> CurvePoint2 {
+                 BezierParameterInterval::try_new(q(3, 4), 1.into()).unwrap(),
+             )
+             .unwrap(),
+-        ),
++        )
++        .into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: 2.into(),
+diff --git a/crates/hypercurve/tests/polynomial_query_fibers.rs b/crates/hypercurve/tests/polynomial_query_fibers.rs
+new file mode 100644
+index 0000000000..777740390a
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_query_fibers.rs
+@@ -0,0 +1,444 @@
++use hypercurve::*;
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++use hypersolve::{AlgebraicFiberRootIsolationConfig, BivariatePolynomial, IsolatedRootInterval};
++use std::cmp::Ordering;
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn p(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn x() -> BivariatePolynomial {
++    p(&[&[], &[1]])
++}
++fn y() -> BivariatePolynomial {
++    p(&[&[0, 1]])
++}
++fn form(point: &CurvePoint2, numerator: BivariatePolynomial) -> CurvePointRationalForm2 {
++    point.rational_form(numerator, p(&[&[1]])).unwrap()
++}
++fn zero(point: &CurvePoint2, equation: BivariatePolynomial) {
++    assert_eq!(
++        form(point, equation)
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++}
++fn source() -> CurvePoint2 {
++    let parameter = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![q(-1, 8), 0.into(), 1.into()])
++                .unwrap(),
++            BezierParameterInterval::try_new(q(1, 3), q(1, 2)).unwrap(),
++        )
++        .unwrap(),
++    );
++    CurvePointDefinition2::PolynomialFiber {
++        equation: p(&[&[0, 0, 0, 16], &[-1]]),
++        parameter: parameter.into(),
++        root: IsolatedRootInterval {
++            lower: q(1, 4),
++            upper: q(3, 8),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++fn curves(equation: BivariatePolynomial) -> PolynomialCurveSet2 {
++    curves_with_config(equation, AlgebraicFiberRootIsolationConfig::default())
++}
++fn curves_with_config(
++    equation: BivariatePolynomial,
++    config: AlgebraicFiberRootIsolationConfig,
++) -> PolynomialCurveSet2 {
++    let topology = decompose_bivariate_curve(
++        &equation,
++        &BivariateCurveDomain {
++            first: [(-1).into(), 1.into()],
++            second: [(-2).into(), 2.into()],
++        },
++        BivariateTopologyConfig::default(),
++    )
++    .unwrap();
++    PolynomialCurveSet2::from_topology(topology, config).unwrap()
++}
++
++#[test]
++fn selected_fiber_abscissa_has_independent_exact_relations() {
++    let source = source();
++    zero(&source, p(&[&[-1], &[], &[8]]));
++    zero(&source, p(&[&[0, 0, 0, 16], &[-1]]));
++    let value = form(&source, y());
++    assert_eq!(value.compare_to_real(&q(1, 4)).unwrap(), Ordering::Greater);
++    assert_eq!(value.compare_to_real(&q(3, 8)).unwrap(), Ordering::Less);
++    let parameter = value.parameter().unwrap();
++    assert!(parameter.as_bezier_parameter().is_none());
++    assert!(parameter.rational_form_source().is_some());
++}
++
++#[test]
++fn polynomial_branch_consumes_a_nested_selected_fiber_query() {
++    let source = source();
++    let value = form(&source, y());
++    let parameter = value.parameter().unwrap();
++    let set = curves(p(&[&[0, 0, 1], &[-1]]));
++    assert_eq!(set.curves().len(), 2);
++    let branch = &set.curves()[1];
++    let point = branch
++        .point_at(&parameter)
++        .expect("the positive square-root branch must consume the selected cubic fiber query");
++    zero(&point, p(&[&[0, 0, 1], &[-1]]));
++    zero(&point, p(&[&[-1], &[], &[], &[], &[], &[], &[2048]]));
++    assert_eq!(form(&point, x()).compare(&value).unwrap(), Ordering::Equal);
++    assert_eq!(
++        form(&point, y()).compare_to_real(&Real::zero()).unwrap(),
++        Ordering::Greater
++    );
++    let CurvePointLocations2::Locations(locations) = branch.point_locations(&point).unwrap() else {
++        panic!("isolated graph preimage")
++    };
++    assert_eq!(locations.len(), 1);
++    assert_eq!(
++        locations[0]
++            .parameter()
++            .unwrap()
++            .compare(&parameter)
++            .unwrap(),
++        Ordering::Equal
++    );
++    let replay = point.definition().unwrap().into_point().unwrap();
++    assert!(replay.coincides_with(&point).unwrap());
++    let next = curves(p(&[&[0, 1], &[], &[-1]]));
++    let ordinate = form(&replay, y()).parameter().unwrap();
++    let next_point = next.curves()[0].point_at(&ordinate).unwrap();
++    assert_eq!(
++        form(&next_point, y()).compare(&value).unwrap(),
++        Ordering::Equal
++    );
++    zero(&next_point, p(&[&[0, 1], &[], &[-1]]));
++}
++
++#[test]
++fn selected_query_fiber_respects_the_configured_subdivision_limit() {
++    let parameter = form(&source(), y()).parameter().unwrap();
++    let equation = p(&[&[0, 0, 1], &[-1]]);
++    let limited = curves_with_config(
++        equation.clone(),
++        AlgebraicFiberRootIsolationConfig {
++            max_subdivision_depth: 0,
++            refinement_steps: 8,
++        },
++    );
++    let error = limited.curves()[1]
++        .point_at(&parameter)
++        .expect_err("a zero subdivision allowance must not publish a completed fiber");
++    assert!(
++        matches!(error, ExactCurveError::Blocked(blocker) if blocker.reason() == UncertaintyReason::BudgetExhausted)
++    );
++    let retry = curves(equation.clone());
++    zero(&retry.curves()[1].point_at(&parameter).unwrap(), equation);
++}
++
++#[test]
++fn selected_query_fibers_keep_opposite_roots_repeated_equations_and_exact_events() {
++    let parameter = form(&source(), y()).parameter().unwrap();
++    let repeated = p(&[&[0, 0, 0, 0, 1], &[0, 0, -2], &[1]]);
++    let make = |equation, lower, upper, exact| {
++        CurvePointDefinition2::PolynomialFiber {
++            equation,
++            parameter: parameter.clone(),
++            root: IsolatedRootInterval {
++                lower,
++                upper,
++                exact_root: exact,
++                distinct_root_count: 99,
++            },
++        }
++        .into_point()
++    };
++    let positive = make(repeated.clone(), q(1, 2), q(3, 4), None).unwrap();
++    let negative = make(repeated.clone(), q(-3, 4), q(-1, 2), None).unwrap();
++    for point in [&positive, &negative] {
++        zero(point, repeated.clone());
++        zero(point, p(&[&[0, 0, 1], &[-1]]));
++    }
++    assert!(!positive.coincides_with(&negative).unwrap());
++    assert_eq!(
++        form(&positive, y())
++            .add(&form(&negative, y()))
++            .unwrap()
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++    let exact = make(p(&[&[-1, 2]]), q(1, 2), q(1, 2), Some(q(1, 2))).unwrap();
++    assert_eq!(
++        form(&exact, y()).compare_to_real(&q(1, 2)).unwrap(),
++        Ordering::Equal
++    );
++    for result in [
++        make(repeated, (-1).into(), 1.into(), None),
++        make(p(&[&[1, 0, 1]]), 0.into(), 1.into(), None),
++        make(p(&[&[0]]), 0.into(), 0.into(), Some(0.into())),
++        make(p(&[&[-1, 2]]), 0.into(), 0.into(), Some(0.into())),
++        make(p(&[&[-1, 2]]), 0.into(), 1.into(), Some(q(1, 2))),
++        make(p(&[&[-1, 2]]), 1.into(), 0.into(), None),
++    ] {
++        assert!(matches!(result, Err(ExactCurveError::Invalid { .. })));
++    }
++}
++
++#[test]
++fn selected_query_fibers_admit_degree_seventeen_and_feed_rational_geometry() {
++    let parameter = form(&source(), y()).parameter().unwrap();
++    let mut row = vec![Real::zero(); 18];
++    row[17] = Real::one();
++    let equation = BivariatePolynomial::new(vec![row, vec![Real::from(-1)]]);
++    let point = CurvePointDefinition2::PolynomialFiber {
++        equation: equation.clone(),
++        parameter,
++        root: IsolatedRootInterval {
++            lower: 0.into(),
++            upper: 1.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap();
++    zero(&point, equation);
++    let root = form(&point, y()).parameter().unwrap();
++    let next = root
++        .affine_point(2.into(), 1.into(), 3.into(), (-1).into())
++        .unwrap();
++    // X=1+2r, Y=3r-1, so 3X-2Y=5 independently of r's degree.
++    zero(&next, p(&[&[-5, -2], &[3]]));
++    assert_eq!(
++        next.affine_form(q(1, 2), 0.into(), q(-1, 2))
++            .parameter()
++            .unwrap()
++            .compare(&root)
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(
++        point
++            .definition()
++            .unwrap()
++            .into_point()
++            .unwrap()
++            .coincides_with(&point)
++            .unwrap()
++    );
++}
++
++#[test]
++fn selected_query_fibers_preserve_trim_reversal_transform_and_certainty() {
++    let source = source();
++    // A quotient consumes both coordinates of the retained cubic fiber.
++    let query = source
++        .rational_form(p(&[&[0, 1], &[1]]), p(&[&[2], &[1]]))
++        .unwrap();
++    let parameter = query.parameter().unwrap();
++    let equation = p(&[&[0, 0, 1], &[-1]]);
++    let set = curves(equation.clone());
++    let branch = &set.curves()[1];
++    for policy in [
++        PredicatePolicy::STRICT,
++        PredicatePolicy::APPROXIMATE_512,
++        PredicatePolicy::STRICT,
++    ] {
++        let outcome = evaluate_under(policy, || {
++            let point = branch.point_at(&parameter).unwrap();
++            zero(&point, equation.clone());
++            assert_eq!(form(&point, x()).compare(&query).unwrap(), Ordering::Equal);
++            let restricted = branch
++                .restrict_source(
++                    CurveParameterRange2::try_new(parameter.clone(), q(3, 4).into()).unwrap(),
++                )
++                .unwrap();
++            assert!(restricted.start().coincides_with(&point).unwrap());
++            assert!(
++                restricted
++                    .reversed()
++                    .unwrap()
++                    .end()
++                    .coincides_with(&point)
++                    .unwrap()
++            );
++            let negative = set.curves()[0].point_at(&parameter).unwrap();
++            let CurvePointLocations2::Locations(locations) =
++                branch.point_locations(&negative).unwrap()
++            else {
++                panic!("finite preimages")
++            };
++            assert!(locations.is_empty());
++            let transform = Similarity2::try_from_real_affine(
++                0.into(),
++                (-2).into(),
++                2.into(),
++                0.into(),
++                1.into(),
++                3.into(),
++            )
++            .unwrap();
++            let transformed = CurvePointDefinition2::Similarity {
++                source: point.clone(),
++                transform,
++            }
++            .into_point()
++            .unwrap();
++            assert_eq!(
++                transformed
++                    .affine_form(0.into(), q(1, 2), q(-3, 2))
++                    .parameter()
++                    .unwrap()
++                    .compare(&parameter)
++                    .unwrap(),
++                Ordering::Equal
++            );
++            let moved = point
++                .rational_image(&RationalMap2::new([p(&[&[1], &[1]]), y()], p(&[&[1]])))
++                .unwrap();
++            assert!(!moved.coincides_with(&point).unwrap());
++            assert_eq!(
++                form(&moved, p(&[&[-1], &[1]])).compare(&query).unwrap(),
++                Ordering::Equal
++            );
++        });
++        assert_eq!(outcome.certainty(), CurveCertainty::Certified);
++    }
++}
++
++#[test]
++fn selected_query_fibers_share_work_limits_and_retry_after_exhaustion() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let parameter = form(&source(), y()).parameter().unwrap();
++    let equation = p(&[&[0, 0, 1], &[-1]]);
++    let set = curves(equation.clone());
++    let limited = with_budget(WorkBudget::ZERO, || {
++        let result = set.curves()[1].point_at(&parameter);
++        assert!(
++            matches!(result, Err(ExactCurveError::Blocked(blocker)) if blocker.reason() == UncertaintyReason::BudgetExhausted)
++        );
++    });
++    assert!(limited.result.is_err());
++    let retry = set.curves()[1].point_at(&parameter).unwrap();
++    zero(&retry, equation);
++}
++
++#[test]
++fn selected_query_fibers_consume_mixed_authored_and_generated_sources() {
++    let generated = form(&source(), y());
++    let authored: CurvePoint2 = Point2::new(q(1, 3).sqrt().unwrap(), Real::zero()).into();
++    let term = form(&authored, x()).scaled(&q(1, 4)).unwrap();
++    let mixed = generated.add(&term).unwrap();
++    assert!(mixed.operands().is_some());
++    let parameter = mixed.parameter().unwrap();
++    let set = curves(p(&[&[0, 0, 1], &[-1]]));
++    let point = set.curves()[1].point_at(&parameter).unwrap();
++    zero(&point, p(&[&[0, 0, 1], &[-1]]));
++    assert_eq!(form(&point, x()).compare(&mixed).unwrap(), Ordering::Equal);
++    let remainder = form(&point, x()).subtract(&generated).unwrap();
++    assert_eq!(
++        remainder
++            .multiply(&remainder)
++            .unwrap()
++            .compare_to_real(&q(1, 48))
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(
++        point
++            .definition()
++            .unwrap()
++            .into_point()
++            .unwrap()
++            .coincides_with(&point)
++            .unwrap()
++    );
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn selected_query_fibers_replay_in_a_fresh_process_and_remain_consumable() {
++    const INPUT: &str = "HYPERCURVE_SELECTED_QUERY_FIBER_REPLAY";
++    fn verify(text: &str) {
++        let geometry = import_svg_document(text).unwrap();
++        let line = &geometry.paths()[0].curves()[0];
++        let point = line.start();
++        zero(&point, p(&[&[0, 0, 1], &[-1]]));
++        zero(&point, p(&[&[-1], &[], &[], &[], &[], &[], &[2048]]));
++        assert_eq!(
++            form(&point, y()).compare_to_real(&Real::zero()).unwrap(),
++            Ordering::Greater
++        );
++        let next = curves(p(&[&[0, 1], &[], &[-1]]));
++        let root = form(&point, y()).parameter().unwrap();
++        let result = next.curves()[0].point_at(&root).unwrap();
++        assert_eq!(
++            form(&result, y()).compare(&form(&point, x())).unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(export_svg_document(&geometry).unwrap(), text);
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let parameter = form(&source(), y()).parameter().unwrap();
++    let set = curves(p(&[&[0, 0, 1], &[-1]]));
++    let point = set.curves()[1].point_at(&parameter).unwrap();
++    let end = point
++        .rational_image(&RationalMap2::new([p(&[&[1], &[1]]), y()], p(&[&[1]])))
++        .unwrap();
++    let line = Curve2::try_line(point, end).unwrap();
++    let geometry = SvgGeometry2::new(
++        CurveRegion2::empty(),
++        vec![],
++        vec![CurvePath2::try_new(vec![line]).unwrap()],
++    );
++    let text = export_svg_document(&geometry).unwrap();
++    verify(&text);
++    let limited = SvgOptions {
++        max_point_definition_depth: 0,
++        ..SvgOptions::default()
++    };
++    assert!(matches!(
++        import_svg_document_with_options(&text, limited),
++        Err(SvgError::SizeOverflow { .. })
++    ));
++    assert!(matches!(
++        export_svg_document_with_options(&geometry, limited),
++        Err(SvgError::SizeOverflow { .. })
++    ));
++    let path =
++        std::env::temp_dir().join(format!("hypercurve-query-fiber-{}.svg", std::process::id()));
++    std::fs::write(&path, &text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "selected_query_fibers_replay_in_a_fresh_process_and_remain_consumable",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
+diff --git a/crates/hypercurve/tests/selected_polynomial_points.rs b/crates/hypercurve/tests/selected_polynomial_points.rs
+index 3470a8bac3..9a2cf53229 100644
+--- a/crates/hypercurve/tests/selected_polynomial_points.rs
++++ b/crates/hypercurve/tests/selected_polynomial_points.rs
+@@ -12,7 +12,7 @@ fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
+ fn cube_point(n: i32) -> CurvePoint2 {
+     CurvePointDefinition2::PolynomialFiber {
+         equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
+-        parameter: BezierParameter2::Exact(Real::from(n)),
++        parameter: BezierParameter2::Exact(Real::from(n)).into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: 2.into(),
+@@ -245,7 +245,7 @@ fn mixed_algebraic_base_and_independent_fiber_keep_original_relations() {
+     );
+     let point = CurvePointDefinition2::PolynomialFiber {
+         equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
+-        parameter: base,
++        parameter: base.into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: 2.into(),
+@@ -579,7 +579,7 @@ fn nearby_polynomial_queries_remain_distinct_after_join_and_replay() {
+     let first = cube_point(2);
+     let second = CurvePointDefinition2::PolynomialFiber {
+         equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
+-        parameter: BezierParameter2::Exact(Real::from(2) + &tiny),
++        parameter: BezierParameter2::Exact(Real::from(2) + &tiny).into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: 2.into(),
+diff --git a/crates/hypercurve/tests/support/joint_form_arithmetic.rs b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+index 418e9d0b7c..52e9e6d37a 100644
+--- a/crates/hypercurve/tests/support/joint_form_arithmetic.rs
++++ b/crates/hypercurve/tests/support/joint_form_arithmetic.rs
+@@ -35,7 +35,7 @@ fn joint() -> CurvePoint2 {
+     // u²=1/8 and 16v³=u, with both positive roots selected together.
+     CurvePointDefinition2::PolynomialFiber {
+         equation: p(&[&[0, 0, 0, 16], &[-1]]),
+-        parameter: base(),
++        parameter: base().into(),
+         root: IsolatedRootInterval {
+             lower: q(1, 4),
+             upper: q(3, 8),
+@@ -193,7 +193,7 @@ pub fn different_fiber_selectors_do_not_merge() {
+     let point = |lower, upper| {
+         CurvePointDefinition2::PolynomialFiber {
+             equation: p(&[&[0, 0, 1], &[-1]]),
+-            parameter: base(),
++            parameter: base().into(),
+             root: IsolatedRootInterval {
+                 lower,
+                 upper,
+diff --git a/crates/hypercurve/tests/support/polynomial_curves.rs b/crates/hypercurve/tests/support/polynomial_curves.rs
+index 543ac8f15d..35752ae8ee 100644
+--- a/crates/hypercurve/tests/support/polynomial_curves.rs
++++ b/crates/hypercurve/tests/support/polynomial_curves.rs
+@@ -140,7 +140,10 @@ pub fn algebraic_slice_keeps_correlated_noncircular_fiber() {
+     else {
+         panic!("fiber evidence lost")
+     };
+-    assert!(matches!(base, BezierParameter2::Algebraic(_)));
++    assert!(matches!(
++        base.as_bezier_parameter(),
++        Some(BezierParameter2::Algebraic(_))
++    ));
+     assert_eq!(
+         point
+             .compare_coordinate(&p(1.into(), 1.into()), Axis2::Y)
+@@ -502,10 +505,8 @@ pub fn algebraic_events_and_tiny_loops_preserve_selected_endpoints() {
+     for (index, curve) in algebraic.curves().iter().enumerate() {
+         assert!(matches!(
+             curve.start().definition().unwrap(),
+-            CurvePointDefinition2::PolynomialFiber {
+-                parameter: BezierParameter2::Algebraic(_),
+-                ..
+-            }
++            CurvePointDefinition2::PolynomialFiber { parameter, .. }
++                if matches!(parameter.as_bezier_parameter(), Some(BezierParameter2::Algebraic(_)))
+         ));
+         assert!(
+             curve
+@@ -573,7 +574,7 @@ pub fn algebraic_events_and_tiny_loops_preserve_selected_endpoints() {
+     }
+     let invalid = CurvePointDefinition2::PolynomialFiber {
+         equation: BivariatePolynomial::new(vec![]),
+-        parameter: BezierParameter2::Exact(0.into()),
++        parameter: BezierParameter2::Exact(0.into()).into(),
+         root: hypersolve::IsolatedRootInterval {
+             lower: 0.into(),
+             upper: 1.into(),
+diff --git a/crates/hypercurve/tests/support/polynomial_sections.rs b/crates/hypercurve/tests/support/polynomial_sections.rs
+index fc3c8742f5..4f93ef18af 100644
+--- a/crates/hypercurve/tests/support/polynomial_sections.rs
++++ b/crates/hypercurve/tests/support/polynomial_sections.rs
+@@ -1208,10 +1208,8 @@ pub fn sections_survive_context_drop_budgets_and_policies() {
+     assert_eq!(topology.second()[0].curves().len(), 2);
+     assert!(matches!(
+         topology.first()[0].curves()[0].end().definition().unwrap(),
+-        CurvePointDefinition2::PolynomialFiber {
+-            parameter: BezierParameter2::Exact(_),
+-            ..
+-        }
++        CurvePointDefinition2::PolynomialFiber { parameter, .. }
++            if matches!(parameter.as_bezier_parameter(), Some(BezierParameter2::Exact(_)))
+     ));
+ }
+ 
+diff --git a/crates/hypercurve/tests/support/rational_point_forms.rs b/crates/hypercurve/tests/support/rational_point_forms.rs
+index 24cbc48243..3a1322b0df 100644
+--- a/crates/hypercurve/tests/support/rational_point_forms.rs
++++ b/crates/hypercurve/tests/support/rational_point_forms.rs
+@@ -25,7 +25,8 @@ pub fn joint_uv() -> CurvePoint2 {
+                 BezierParameterInterval::try_new(q(1, 3), q(1, 2)).unwrap(),
+             )
+             .unwrap(),
+-        ),
++        )
++        .into(),
+         root: IsolatedRootInterval {
+             lower: q(1, 4),
+             upper: q(3, 8),
+diff --git a/crates/hypercurve/tests/support/selected_fiber_images.rs b/crates/hypercurve/tests/support/selected_fiber_images.rs
+index cc3844a733..98490c8ece 100644
+--- a/crates/hypercurve/tests/support/selected_fiber_images.rs
++++ b/crates/hypercurve/tests/support/selected_fiber_images.rs
+@@ -17,7 +17,7 @@ pub fn source() -> CurvePoint2 {
+             vec![0.into(), 0.into(), 0.into(), 1.into()],
+             vec![(-1).into()],
+         ]),
+-        parameter: root(vec![(-2).into(), 0.into(), 1.into()], 1, 2),
++        parameter: root(vec![(-2).into(), 0.into(), 1.into()], 1, 2).into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: (Real::from(3) / Real::from(2)).unwrap(),
+diff --git a/crates/hypercurve/tests/svg_point_replay.rs b/crates/hypercurve/tests/svg_point_replay.rs
+index 24ba432af6..95be50e181 100644
+--- a/crates/hypercurve/tests/svg_point_replay.rs
++++ b/crates/hypercurve/tests/svg_point_replay.rs
+@@ -57,7 +57,8 @@ fn fiber() -> CurvePoint2 {
+                 BezierParameterInterval::try_new(1.into(), 2.into()).unwrap(),
+             )
+             .unwrap(),
+-        ),
++        )
++        .into(),
+         root: IsolatedRootInterval {
+             lower: 1.into(),
+             upper: q(3, 2),
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 6d2ce2e5ae..625330daff 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add configured-depth use of the complete ordered-field Sturm isolator.
++  Separation and singleton refinement share the same implementation as the
++  unrestricted API. Reached local depth limits return `BudgetExhausted` with
++  no partial roots, while shared work accounting remains active.
++
+ - Selected polynomial joins retain the first native base when the ordered
+   source union adds no axes and the existing foreign-field embedding adds no
+   radical. Subsequent joins preserve polynomial ancestors instead of appending
+diff --git a/crates/hypersolve/src/lib.rs b/crates/hypersolve/src/lib.rs
+index 25b10df914..a928af4f88 100644
+--- a/crates/hypersolve/src/lib.rs
++++ b/crates/hypersolve/src/lib.rs
+@@ -297,8 +297,8 @@ pub use ordered_field_roots::{
+     OrderedFieldPolynomialContext, OrderedFieldRootIsolationConfig,
+     OrderedFieldRootIsolationReport, OrderedFieldRootIsolationStatus,
+     isolate_ordered_field_polynomial_roots, isolate_ordered_field_polynomial_roots_complete,
+-    ordered_field_polynomial_gcd, ordered_field_polynomial_linear_quotient,
+-    ordered_field_polynomial_sign_remainder,
++    isolate_ordered_field_polynomial_roots_complete_with_config, ordered_field_polynomial_gcd,
++    ordered_field_polynomial_linear_quotient, ordered_field_polynomial_sign_remainder,
+ };
+ pub use polynomial::{
+     QuadraticLinearTerm, QuadraticResidual, QuadraticTerm, UnivariateQuadraticResidual,
+diff --git a/crates/hypersolve/src/ordered_field_roots.rs b/crates/hypersolve/src/ordered_field_roots.rs
+index f35e5223fa..331f1097ba 100644
+--- a/crates/hypersolve/src/ordered_field_roots.rs
++++ b/crates/hypersolve/src/ordered_field_roots.rs
+@@ -6,7 +6,10 @@
+ //! not be collapsed into a primitive element to replay a polynomial relation.
+ 
+ mod complete;
+-pub use complete::isolate_ordered_field_polynomial_roots_complete;
++pub use complete::{
++    isolate_ordered_field_polynomial_roots_complete,
++    isolate_ordered_field_polynomial_roots_complete_with_config,
++};
+ 
+ use std::cmp::Ordering;
+ 
+@@ -94,7 +97,8 @@ pub enum OrderedFieldRootIsolationStatus {
+     CompleteFallbackRequired,
+     /// The lower bound is not strictly below the upper bound.
+     InvalidInterval,
+-    /// The enclosing operation budget declined a required subdivision.
++    /// The enclosing work budget or configured Sturm subdivision-depth limit
++    /// declined a required subdivision. No partial roots are published.
+     BudgetExhausted,
+ }
+ 
+diff --git a/crates/hypersolve/src/ordered_field_roots/complete.rs b/crates/hypersolve/src/ordered_field_roots/complete.rs
+index 82245512e3..a26af7934c 100644
+--- a/crates/hypersolve/src/ordered_field_roots/complete.rs
++++ b/crates/hypersolve/src/ordered_field_roots/complete.rs
+@@ -13,6 +13,7 @@ struct Node {
+     upper: Real,
+     count: usize,
+     refinements: usize,
++    depth: usize,
+     lower_is_removed_root: bool,
+     upper_is_removed_root: bool,
+ }
+@@ -81,10 +82,56 @@ fn deflate<C: Clone, F: OrderedFieldPolynomialContext<C>>(
+ /// interval boundaries. Thus the caller can select each nonpoint interval
+ /// using its original equation, without discarding multiplicities or guards.
+ pub fn isolate_ordered_field_polynomial_roots_complete<C, F>(
++    polynomial: Vec<C>,
++    lower: &Real,
++    upper: &Real,
++    refinement_steps: usize,
++    field: &mut F,
++) -> Result<OrderedFieldRootIsolationReport, F::Error>
++where
++    C: Clone,
++    F: OrderedFieldPolynomialContext<C>,
++{
++    isolate(polynomial, lower, upper, refinement_steps, None, field)
++}
++
++/// Runs the same complete Sturm algorithm with a local subdivision-depth limit.
++///
++/// The configured depth applies to separation and requested refinement in each
++/// segment between discovered exact roots, as for native algebraic fibers.
++/// Discovering an exact root creates new segments; this depth limit is not a
++/// bound on total subdivisions or on arithmetic, coefficient size or memory.
++/// Shared work accounting remains active across all segments and nested calls.
++/// Reaching the depth limit returns `BudgetExhausted` without partial output;
++/// a later larger-limit retry remains valid. The unrestricted entry point keeps
++/// its existing behavior and shares this implementation.
++pub fn isolate_ordered_field_polynomial_roots_complete_with_config<C, F>(
++    polynomial: Vec<C>,
++    lower: &Real,
++    upper: &Real,
++    config: OrderedFieldRootIsolationConfig,
++    field: &mut F,
++) -> Result<OrderedFieldRootIsolationReport, F::Error>
++where
++    C: Clone,
++    F: OrderedFieldPolynomialContext<C>,
++{
++    isolate(
++        polynomial,
++        lower,
++        upper,
++        config.refinement_steps,
++        Some(config.max_subdivision_depth),
++        field,
++    )
++}
++
++fn isolate<C, F>(
+     mut polynomial: Vec<C>,
+     lower: &Real,
+     upper: &Real,
+     refinement_steps: usize,
++    depth_limit: Option<usize>,
+     field: &mut F,
+ ) -> Result<OrderedFieldRootIsolationReport, F::Error>
+ where
+@@ -144,6 +191,7 @@ where
+                 upper: upper.value.clone(),
+                 count,
+                 refinements: 0,
++                depth: 0,
+                 lower_is_removed_root: lower.exact_root,
+                 upper_is_removed_root: upper.exact_root,
+             }];
+@@ -164,6 +212,9 @@ where
+                     });
+                     continue;
+                 }
++                if depth_limit.is_some_and(|limit| node.depth >= limit) {
++                    return Ok(finish(Status::BudgetExhausted, Vec::new(), steps));
++                }
+                 if crate::work_budget::consume(crate::work_budget::WorkKind::RootRefinement, 1)
+                     .is_err()
+                 {
+@@ -202,6 +253,7 @@ where
+                     upper: node.upper,
+                     count: right_count,
+                     refinements,
++                    depth: node.depth.saturating_add(1),
+                     lower_is_removed_root: false,
+                     upper_is_removed_root: node.upper_is_removed_root,
+                 });
+@@ -210,6 +262,7 @@ where
+                     upper: middle,
+                     count: left_count,
+                     refinements,
++                    depth: node.depth.saturating_add(1),
+                     lower_is_removed_root: node.lower_is_removed_root,
+                     upper_is_removed_root: false,
+                 });
+diff --git a/crates/hypersolve/tests/selected_polynomial_root_discovery.rs b/crates/hypersolve/tests/selected_polynomial_root_discovery.rs
+index 6aa2995281..6b49548731 100644
+--- a/crates/hypersolve/tests/selected_polynomial_root_discovery.rs
++++ b/crates/hypersolve/tests/selected_polynomial_root_discovery.rs
+@@ -819,3 +819,76 @@ fn complete_discovery_admits_degree_seventeen_over_an_algebraic_field() {
+     );
+     assert!(value.field().parent().unwrap().shares_authority(a.field()));
+ }
++
++#[test]
++fn complete_discovery_enforces_local_depth_without_partial_roots_or_poisoning_retry() {
++    use hypersolve::{OrderedFieldRootIsolationConfig, OrderedFieldRootIsolationStatus as Status};
++    let field = base();
++    let policy = TestContext::strict();
++    let run = |values: &[i32], lower, upper, depth, refinements| {
++        let mut context = hypersolve::selected_polynomial_field::SelectedPolynomialContext {
++            field: field.clone(),
++            policy: &policy,
++        };
++        hypersolve::isolate_ordered_field_polynomial_roots_complete_with_config(
++            coefficients(&field, values),
++            &real(lower),
++            &real(upper),
++            OrderedFieldRootIsolationConfig {
++                max_subdivision_depth: depth,
++                refinement_steps: refinements,
++            },
++            &mut context,
++        )
++        .unwrap()
++    };
++    for (values, lower, upper, depth, refinements, steps) in [
++        (&[-2, 0, 1][..], -2, 2, 0, 0, 0),
++        (&[-2, 0, 1][..], -2, 2, 1, 2, 1),
++        (&[0, -2, 0, 1][..], 0, 2, 0, 0, 0),
++    ] {
++        let report = run(values, lower, upper, depth, refinements);
++        assert_eq!(report.status, Status::BudgetExhausted);
++        assert!(report.intervals.is_empty());
++        assert_eq!(report.subdivision_steps, steps);
++    }
++    let separated = run(&[-2, 0, 1], -2, 2, 1, 0);
++    assert_eq!(separated.status, Status::Isolated);
++    assert_eq!(separated.intervals.len(), 2);
++    assert_eq!(separated.subdivision_steps, 1);
++    for root in separated.intervals {
++        let selected = decided(
++            field
++                .select(
++                    coefficients(&field, &[-2, 0, 1]),
++                    root.lower,
++                    root.upper,
++                    &policy,
++                )
++                .unwrap(),
++        );
++        let value = selected.generator().unwrap();
++        is_zero(
++            &value
++                .multiply(&value)
++                .unwrap()
++                .subtract(&selected.constant(real(2)).unwrap())
++                .unwrap(),
++        );
++    }
++    let exact = run(&[0, -2, 0, 1], 0, 2, 32, 3);
++    assert_eq!(exact.status, Status::Isolated);
++    assert_eq!(exact.intervals.len(), 2);
++    assert_eq!(exact.intervals[0].exact_root, Some(real(0)));
++    assert!(exact.intervals[1].lower > real(0));
++    let control = discover(
++        &field,
++        coefficients(&field, &[-2, 0, 1]),
++        &real(-2),
++        &real(2),
++        0,
++        &policy,
++    );
++    assert_eq!(control.status, Status::Isolated);
++    assert_eq!(control.intervals.len(), 2);
++}
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index b8c3d3b8db..065f4f6c79 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -5,6 +5,25 @@ represented geometry or serialized artifacts. The [README](../readme.md) and
+ the API documentation describe current behavior only. A migration is a
+ deliberate contract change (P27), not a performance-only change.
+ 
++## Polynomial fibers over retained query parameters
++
++`CurvePointDefinition2::PolynomialFiber::parameter` now takes `CurveParameter2`
++so that a generated selected-field query can become the base of another fiber.
++Wrap existing `BezierParameter2` arguments with `.into()`. Code matching the
++native representation should use `parameter.as_bezier_parameter()`; absence
++of that view does not mean the exact parameter is invalid.
++
++Native SVG path graph version 4 retains its existing fiber record (tag 14),
++whose parameter reference may now name a checked query parameter (tag 27).
++The same source recipe is retained by HyperBRep's planar fiber archive field.
++Readers for the earlier restricted schema can reject these new dependencies;
++they cannot reconstruct them by extracting independent coordinates. Existing
++native-base records retain their geometry and encoding. Replay validates the
++original source guards and root selector, including the retained base field.
++
++This extends selected graph evaluation and point composition. It does not
++establish general implicit-region offsets, corner edits or topology closure.
++
+ ## Region query certainty after approximate construction
+ 
+ Geometric queries on `CurveRegion2` retain the policy required by its
+diff --git a/tests/svg_region_replay.rs b/tests/svg_region_replay.rs
+index 0d4aafea09..ac192add7c 100644
+--- a/tests/svg_region_replay.rs
++++ b/tests/svg_region_replay.rs
+@@ -102,7 +102,8 @@ fn svg_adapter_consumes_generated_selected_circle_fillet_and_offsets() {
+                 BezierParameterInterval::try_new(q(3, 4), Real::one()).unwrap(),
+             )
+             .unwrap(),
+-        ),
++        )
++        .into(),
+         root: IsolatedRootInterval {
+             lower: Real::one(),
+             upper: Real::from(2),
