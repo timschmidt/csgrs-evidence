@@ -1,0 +1,290 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index aaa409a6d8..4c2ca21ffc 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,12 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Selected-field joins retain validated source-generator correspondences.
++  Reusing either original operand or a corresponding generator from another
++  join preserves its existing authority instead of adjoining a duplicate root.
++  Definition graphs retain the join recipe and re-establish these relations
++  through strict source and selection replay.
++
+ - Selected polynomial joins retain the first native base when the ordered
+   source union adds no axes and the existing foreign-field embedding adds no
+   radical. Subsequent joins preserve polynomial ancestors instead of appending
+@@ -9,6 +15,11 @@
+ 
+ ### Breaking
+ 
++- `SelectedPolynomialDefinitionNode` gains `JoinedField`; exhaustive matches
++  and graph format owners must handle the new operation record. Existing
++  records retain their meanings. Joined fields intentionally export their
++  construction dependencies instead of an unrelated polynomial selection.
++
+ - Prepared problem objects are replaced by immediate analysis. The `prepared`
+   module and `PreparedProblem`, `PreparedProblemFacts` and
+   `PreparedConstraintFacts` become `ProblemAnalysis` (returned by the new
+diff --git a/crates/hypersolve/src/selected_polynomial_field.rs b/crates/hypersolve/src/selected_polynomial_field.rs
+index a5ec901628..f640f40e25 100644
+--- a/crates/hypersolve/src/selected_polynomial_field.rs
++++ b/crates/hypersolve/src/selected_polynomial_field.rs
+@@ -96,9 +96,21 @@ enum FieldData {
+         defining: Vec<SelectedPolynomialValue>,
+         monic: Vec<SelectedPolynomialValue>,
+         interval: IsolatedRootInterval,
++        // A join transported this original generator and revalidated its
++        // singleton selection. This is a construction relation, not a cache.
++        origin: Option<GeneratorOrigin>,
+     },
+ }
+ 
++struct GeneratorOrigin(SelectedPolynomialField);
++
++impl std::fmt::Debug for GeneratorOrigin {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        // Do not expand a shared proof graph into a diagnostic tree.
++        f.debug_struct("GeneratorOrigin").finish_non_exhaustive()
++    }
++}
++
+ /// A finite rational value retaining its selected field and denominator proof.
+ #[derive(Clone, Debug)]
+ pub struct SelectedPolynomialValue(Arc<ValueData>);
+@@ -285,6 +297,19 @@ impl SelectedPolynomialField {
+         lower: Real,
+         upper: Real,
+         policy: &C,
++    ) -> Result<Self, SelectedPolynomialError<C::Error>> {
++        self.select_strict_with_origin(coefficients, lower, upper, None, policy)
++    }
++
++    // Only a join supplies an origin, after embedding that source's original
++    // coefficients. The same open singleton below then proves correspondence.
++    fn select_strict_with_origin<C: SelectedAlgebraContext>(
++        &self,
++        coefficients: Vec<SelectedPolynomialValue>,
++        lower: Real,
++        upper: Real,
++        origin: Option<Self>,
++        policy: &C,
+     ) -> Result<Self, SelectedPolynomialError<C::Error>> {
+         match policy.real_sign(&(&upper - &lower)) {
+             Some(RealSign::Positive) => {}
+@@ -345,6 +370,7 @@ impl SelectedPolynomialField {
+             parent: self.clone(),
+             defining,
+             monic,
++            origin: origin.map(GeneratorOrigin),
+             interval: IsolatedRootInterval {
+                 lower,
+                 upper,
+diff --git a/crates/hypersolve/src/selected_polynomial_field/definition.rs b/crates/hypersolve/src/selected_polynomial_field/definition.rs
+index d55c27edcc..da3c705149 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/definition.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/definition.rs
+@@ -54,6 +54,13 @@ pub enum SelectedPolynomialDefinitionNode {
+         lower: Real,
+         upper: Real,
+     },
++    /// Replays a common-field construction, including its original selected
++    /// generator correspondences. Both references name earlier field records.
++    /// This is an operation recipe, not a trusted equality assertion.
++    JoinedField {
++        first: usize,
++        second: usize,
++    },
+     NativeValue {
+         field: usize,
+         numerator: usize,
+diff --git a/crates/hypersolve/src/selected_polynomial_field/definition/encode.rs b/crates/hypersolve/src/selected_polynomial_field/definition/encode.rs
+index 4c2814a156..f8172b3afc 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/definition/encode.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/definition/encode.rs
+@@ -32,6 +32,11 @@ impl Input {
+         match self {
+             Self::Field(v) => match v.0.as_ref() {
+                 FieldData::Recursive(field) => vec![Self::NativeField(field.clone())],
++                FieldData::Extension {
++                    parent,
++                    origin: Some(origin),
++                    ..
++                } => vec![Self::Field(parent.clone()), Self::Field(origin.0.clone())],
+                 FieldData::Extension {
+                     parent, defining, ..
+                 } => std::iter::once(Self::Field(parent.clone()))
+@@ -89,6 +94,14 @@ impl Input {
+                 FieldData::Recursive(field) => Node::NativeField {
+                     native: id(Self::NativeField(field.clone())),
+                 },
++                FieldData::Extension {
++                    parent,
++                    origin: Some(origin),
++                    ..
++                } => Node::JoinedField {
++                    first: id(Self::Field(parent.clone())),
++                    second: id(Self::Field(origin.0.clone())),
++                },
+                 FieldData::Extension {
+                     parent,
+                     defining,
+diff --git a/crates/hypersolve/src/selected_polynomial_field/definition/replay.rs b/crates/hypersolve/src/selected_polynomial_field/definition/replay.rs
+index efc7185bfa..88a137e788 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/definition/replay.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/definition/replay.rs
+@@ -239,6 +239,12 @@ impl Reader<'_> {
+                     policy,
+                 )?)
+             }
++            Node::JoinedField { first, second } => {
++                let first = self.field(*first)?;
++                let second = self.field(*second)?;
++                let joined = exact(first.joined_with(&second, policy)?)?;
++                Admitted::Field(joined.field().clone())
++            }
+             Node::NativeValue {
+                 field,
+                 numerator,
+diff --git a/crates/hypersolve/src/selected_polynomial_field/join.rs b/crates/hypersolve/src/selected_polynomial_field/join.rs
+index 988df0eff0..9fb4abb9e1 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/join.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/join.rs
+@@ -1,6 +1,6 @@
+ //! Exact common fields and retained generator correspondences.
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ 
+ use super::*;
+ use crate::recursive_quadratic_field::{
+@@ -130,6 +130,45 @@ impl SelectedPolynomialField {
+         }
+     }
+ 
++    fn generator_origin(&self) -> Option<&Self> {
++        match self.0.as_ref() {
++            FieldData::Extension {
++                origin: Some(origin),
++                ..
++            } => Some(&origin.0),
++            _ => None,
++        }
++    }
++
++    /// A source and target can name the same transported generator through
++    /// different joins. Follow only retained, validated construction links;
++    /// absence of a link says nothing about equality of their scalar values.
++    fn corresponding_generator(
++        &self,
++        source: &Self,
++    ) -> ArithmeticResult<Option<SelectedPolynomialValue>> {
++        // The owned fields keep every keyed node alive for this call. Pointer
++        // equality identifies a named proof node, never an unproved equality.
++        let mut sources = HashSet::new();
++        let mut original = Some(source);
++        while let Some(field) = original {
++            sources.insert(Arc::as_ptr(&field.0) as usize);
++            original = field.generator_origin();
++        }
++        let mut target = self;
++        while let FieldData::Extension { parent, .. } = target.0.as_ref() {
++            let mut original = Some(target);
++            while let Some(field) = original {
++                if sources.contains(&(Arc::as_ptr(&field.0) as usize)) {
++                    return Ok(Some(self.lift(&target.generator()?)?));
++                }
++                original = field.generator_origin();
++            }
++            target = parent;
++        }
++        Ok(None)
++    }
++
+     fn native_and_path(&self) -> (&RecursiveQuadraticField, Vec<Self>) {
+         let mut current = self;
+         let mut path = Vec::new();
+@@ -254,6 +293,10 @@ impl SelectedPolynomialJoin {
+         {
+             return Ok(());
+         }
++        if let Some(image) = self.field.corresponding_generator(&source)? {
++            self.generators.push(GeneratorEmbedding { source, image });
++            return Ok(());
++        }
+         let FieldData::Extension {
+             defining, interval, ..
+         } = source.0.as_ref()
+@@ -265,10 +308,11 @@ impl SelectedPolynomialJoin {
+             .iter()
+             .map(|coefficient| self.embed_inner(coefficient, &mut memo))
+             .collect::<ArithmeticResult<Vec<_>>>()?;
+-        let field = self.field.select_strict(
++        let field = self.field.select_strict_with_origin(
+             coefficients,
+             interval.lower.clone(),
+             interval.upper.clone(),
++            Some(source.clone()),
+             policy,
+         )?;
+         self.generators.push(GeneratorEmbedding {
+diff --git a/crates/hypersolve/tests/selected_polynomial_join_retention.rs b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+index 68d7169de4..5182856508 100644
+--- a/crates/hypersolve/tests/selected_polynomial_join_retention.rs
++++ b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+@@ -139,3 +139,31 @@ fn a_contained_native_axis_retains_its_original_polynomial_tower() {
+     let replay = SelectedPolynomialDefinition::from_values(&[g], 1000).unwrap();
+     assert_eq!(value(replay.replay(1000, &context).unwrap()).len(), 1);
+ }
++
++#[test]
++fn consuming_the_original_second_operand_keeps_its_certified_generator() {
++    let context = TestContext::strict();
++    let a = root(2);
++    let b = root(3);
++    let ab = value(a.joined_with(&b, &context).unwrap());
++    assert_eq!(depth(ab.field()), 2);
++    let again = value(ab.field().joined_with(&b, &context).unwrap());
++    let image = again.embed(&b.generator().unwrap()).unwrap();
++    assert_eq!(
++        image
++            .multiply(&image)
++            .unwrap()
++            .multiply(&image)
++            .unwrap()
++            .subtract(&again.field().constant(real(3)).unwrap())
++            .unwrap()
++            .sign(&context)
++            .unwrap(),
++        Classification::Decided(hyperreal::RealSign::Zero)
++    );
++    assert_eq!(
++        depth(again.field()),
++        2,
++        "a validated original generator correspondence must survive later joins"
++    );
++}
+diff --git a/crates/hypersolve/tests/support/selected_polynomial_replay.rs b/crates/hypersolve/tests/support/selected_polynomial_replay.rs
+index 3ca5868a2d..775db39b98 100644
+--- a/crates/hypersolve/tests/support/selected_polynomial_replay.rs
++++ b/crates/hypersolve/tests/support/selected_polynomial_replay.rs
+@@ -92,6 +92,7 @@ pub fn encode(graph: &SelectedPolynomialDefinition) -> String {
+                 lower.to_json(),
+                 upper.to_json()
+             ]),
++            Node::JoinedField { first, second } => json!(["join", first, second]),
+             Node::NativeValue {
+                 field,
+                 numerator,
+@@ -159,6 +160,10 @@ pub fn decode(text: &str) -> SelectedPolynomialDefinition {
+                 lower: read_real(&v[3]),
+                 upper: read_real(&v[4]),
+             },
++            "join" => Node::JoinedField {
++                first: index(&v[1]),
++                second: index(&v[2]),
++            },
+             "native-value" => Node::NativeValue {
+                 field: index(&v[1]),
+                 numerator: index(&v[2]),

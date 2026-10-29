@@ -1,0 +1,36 @@
+diff --git a/crates/hypersolve/tests/selected_polynomial_join_retention.rs b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+index 68d7169de4..5182856508 100644
+--- a/crates/hypersolve/tests/selected_polynomial_join_retention.rs
++++ b/crates/hypersolve/tests/selected_polynomial_join_retention.rs
+@@ -139,3 +139,31 @@ fn a_contained_native_axis_retains_its_original_polynomial_tower() {
+     let replay = SelectedPolynomialDefinition::from_values(&[g], 1000).unwrap();
+     assert_eq!(value(replay.replay(1000, &context).unwrap()).len(), 1);
+ }
++
++#[test]
++fn consuming_the_original_second_operand_keeps_its_certified_generator() {
++    let context = TestContext::strict();
++    let a = root(2);
++    let b = root(3);
++    let ab = value(a.joined_with(&b, &context).unwrap());
++    assert_eq!(depth(ab.field()), 2);
++    let again = value(ab.field().joined_with(&b, &context).unwrap());
++    let image = again.embed(&b.generator().unwrap()).unwrap();
++    assert_eq!(
++        image
++            .multiply(&image)
++            .unwrap()
++            .multiply(&image)
++            .unwrap()
++            .subtract(&again.field().constant(real(3)).unwrap())
++            .unwrap()
++            .sign(&context)
++            .unwrap(),
++        Classification::Decided(hyperreal::RealSign::Zero)
++    );
++    assert_eq!(
++        depth(again.field()),
++        2,
++        "a validated original generator correspondence must survive later joins"
++    );
++}
