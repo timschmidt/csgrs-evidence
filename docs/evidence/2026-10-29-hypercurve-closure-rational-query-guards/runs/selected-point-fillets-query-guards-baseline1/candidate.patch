@@ -1,0 +1,99 @@
+diff --git a/crates/hypercurve/tests/rational_query_guards.rs b/crates/hypercurve/tests/rational_query_guards.rs
+new file mode 100644
+index 0000000000..0e24782109
+--- /dev/null
++++ b/crates/hypercurve/tests/rational_query_guards.rs
+@@ -0,0 +1,93 @@
++use hypercurve::*;
++use hypersolve::{BivariatePolynomial, IsolatedRootInterval};
++use std::cmp::Ordering;
++
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++
++fn cube_point(value: i32) -> CurvePoint2 {
++    CurvePointDefinition2::PolynomialFiber {
++        equation: polynomial(&[&[0, 0, 0, 1], &[-1]]),
++        parameter: BezierParameter2::Exact(value.into()),
++        root: IsolatedRootInterval {
++            lower: 1.into(),
++            upper: 2.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++
++fn quotient() -> CurvePointRationalForm2 {
++    let source = cube_point(2);
++    let first = source
++        .rational_form(polynomial(&[&[1]]), polynomial(&[&[1, 1]]))
++        .unwrap();
++    let second = source
++        .rational_form(polynomial(&[&[1]]), polynomial(&[&[-3, 0, 0, 1]]))
++        .unwrap();
++    first.divide(&second).unwrap()
++}
++
++#[test]
++fn rational_quotient_preserves_its_exact_value() {
++    let quotient = quotient();
++    let y_plus_one = quotient
++        .source()
++        .rational_form(polynomial(&[&[1, 1]]), polynomial(&[&[1]]))
++        .unwrap();
++    assert_eq!(
++        quotient
++            .multiply(&y_plus_one)
++            .unwrap()
++            .compare_to_real(&(-1).into())
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(quotient.operands().is_some());
++    let parameter = quotient.parameter().unwrap();
++    assert_eq!(
++        parameter
++            .rational_form_source()
++            .unwrap()
++            .compare(&quotient)
++            .unwrap(),
++        Ordering::Equal
++    );
++}
++
++#[test]
++fn rational_quotient_recipe_rejects_the_original_divisor_pole() {
++    let quotient = quotient();
++    let recipe = quotient
++        .parameter()
++        .unwrap()
++        .rational_form_source()
++        .unwrap();
++    // The changed source remains a valid selected algebraic point. Its y^3=3
++    // violates the original divisor's pole guard. A serialized recipe must
++    // retain that exclusion even though cancellation yields a finite zero.
++    let result = CurvePointDefinition2::RationalQueryPair {
++        sources: [cube_point(3), Point2::from_values(0, 0).into()],
++        numerators: [recipe.numerator().clone(), polynomial(&[&[0]])],
++        denominators: [recipe.denominator().clone(), polynomial(&[&[1]])],
++    }
++    .into_point();
++    assert!(
++        matches!(
++            result,
++            Err(ExactCurveError::Invalid {
++                cause: CurveError::ZeroRationalPointDenominator,
++                ..
++            })
++        ),
++        "the original divisor pole must remain invalid: {result:?}"
++    );
++}
