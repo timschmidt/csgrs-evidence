@@ -1,0 +1,1260 @@
+diff --git a/crates/hyperbrep/src/persistence/admission/shapes.rs b/crates/hyperbrep/src/persistence/admission/shapes.rs
+index a9dfede43a..9d1459f505 100644
+--- a/crates/hyperbrep/src/persistence/admission/shapes.rs
++++ b/crates/hyperbrep/src/persistence/admission/shapes.rs
+@@ -498,6 +498,9 @@ pub(super) enum PlanarPoint {
+         map: RationalMap,
+     },
+     Coordinates(IgnoredAny),
++    SelectedPolynomialRoot {
++        coefficients: Count,
++    },
+     PolynomialFiber {
+         equation: Rows,
+     },
+@@ -549,6 +552,11 @@ impl Record for PlanarPoint {
+                 map.admit(budget)
+             }
+             Self::Coordinates(_) => Ok(()),
++            Self::SelectedPolynomialRoot { coefficients } => {
++                // Source queries are admitted once in the selected-parameter DAG.
++                budget.degree(coefficients.0.saturating_sub(1))?;
++                budget.geometry(coefficients.0)
++            }
+             Self::PolynomialFiber { equation } => {
+                 budget.degree(equation.rows.saturating_sub(1))?;
+                 budget.degree(equation.columns.saturating_sub(1))?;
+diff --git a/crates/hyperbrep/src/persistence/planar_points.rs b/crates/hyperbrep/src/persistence/planar_points.rs
+index 93a2e552f1..b81bfdadca 100644
+--- a/crates/hyperbrep/src/persistence/planar_points.rs
++++ b/crates/hyperbrep/src/persistence/planar_points.rs
+@@ -29,6 +29,11 @@ impl RawRationalMap {
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ pub(super) enum RawPlanarPoint {
+     Coordinates([Real; 2]),
++    SelectedPolynomialRoot {
++        coefficients: Vec<RawParameter>,
++        interval: [Real; 2],
++        exact_root: Option<Real>,
++    },
+     RationalImage {
+         source: Box<RawPlanarPoint>,
+         map: RawRationalMap,
+@@ -82,7 +87,16 @@ impl GraphEncoder {
+         &mut self,
+         point: &hypercurve::CurvePoint2,
+     ) -> Result<RawPlanarPoint, PersistenceError> {
+-        Ok(match point.definition().map_err(GeometryError::from)? {
++        // This call-local encoder owns the immutable identities in its memo.
++        // Identity only reuses an encoded definition; it proves no new equality.
++        if let Some((_, raw)) = self
++            .polynomial_roots
++            .iter()
++            .find(|(source, _)| source == point)
++        {
++            return Ok(raw.clone());
++        }
++        let raw = match point.definition().map_err(GeometryError::from)? {
+             CurvePointDefinition2::RationalImage { source, map } => RawPlanarPoint::RationalImage {
+                 source: Box::new(self.planar_point(&source)?),
+                 map: RawRationalMap::from_map(&map),
+@@ -99,6 +113,21 @@ impl GraphEncoder {
+                 numerators: numerators.map(|p| p.coefficients),
+                 denominators: denominators.map(|p| p.coefficients),
+             },
++            CurvePointDefinition2::SelectedPolynomialRoot { coefficients, root } => {
++                let coefficients = coefficients
++                    .iter()
++                    .map(|coefficient| {
++                        // Reuse the selected-parameter graph instead of expanding
++                        // repeated coefficient dependencies into an archive tree.
++                        self.curve_parameter(&coefficient.parameter().map_err(GeometryError::from)?)
++                    })
++                    .collect::<Result<_, PersistenceError>>()?;
++                RawPlanarPoint::SelectedPolynomialRoot {
++                    coefficients,
++                    interval: [root.lower, root.upper],
++                    exact_root: root.exact_root,
++                }
++            }
+             CurvePointDefinition2::PolynomialFiber {
+                 equation,
+                 parameter,
+@@ -177,7 +206,11 @@ impl GraphEncoder {
+                 translation,
+                 left_normal,
+             },
+-        })
++        };
++        if matches!(&raw, RawPlanarPoint::SelectedPolynomialRoot { .. }) {
++            self.polynomial_roots.push((point.clone(), raw.clone()));
++        }
++        Ok(raw)
+     }
+ }
+ 
+@@ -203,6 +236,35 @@ impl SelectionGraph {
+                     denominators: denominators.map(hypersolve::BivariatePolynomial::new),
+                 }
+             }
++            RawPlanarPoint::SelectedPolynomialRoot {
++                coefficients,
++                interval: [lower, upper],
++                exact_root,
++            } => {
++                let coefficients = coefficients
++                    .into_iter()
++                    .map(|coefficient| {
++                        let RawParameter::Selected(index) = coefficient else {
++                            return Err(GeometryError::UnrepresentableParameter.into());
++                        };
++                        self.curve_parameter(RawParameter::Selected(index))?
++                            .rational_form_source()
++                            .ok_or(PersistenceError::InvalidReference {
++                                kind: "selected polynomial coefficient",
++                                index,
++                            })
++                    })
++                    .collect::<Result<_, _>>()?;
++                CurvePointDefinition2::SelectedPolynomialRoot {
++                    coefficients,
++                    root: hypersolve::IsolatedRootInterval {
++                        lower,
++                        upper,
++                        exact_root,
++                        distinct_root_count: 1,
++                    },
++                }
++            }
+             RawPlanarPoint::PolynomialFiber {
+                 equation,
+                 parameter,
+diff --git a/crates/hyperbrep/src/persistence/selection.rs b/crates/hyperbrep/src/persistence/selection.rs
+index d88145c8e4..7336efdcc2 100644
+--- a/crates/hyperbrep/src/persistence/selection.rs
++++ b/crates/hyperbrep/src/persistence/selection.rs
+@@ -69,6 +69,7 @@ pub(super) struct GraphEncoder {
+     point_sources: HashMap<usize, RawPointSource>,
+     pcurve_sources: HashMap<String, usize>,
+     pub(super) polynomial_sources: HashMap<String, usize>,
++    pub(super) polynomial_roots: Vec<(hypercurve::CurvePoint2, RawPlanarPoint)>,
+ }
+ 
+ impl GraphEncoder {
+diff --git a/crates/hyperbrep/tests/selected_coefficient_roots.rs b/crates/hyperbrep/tests/selected_coefficient_roots.rs
+new file mode 100644
+index 0000000000..eeeaa58891
+--- /dev/null
++++ b/crates/hyperbrep/tests/selected_coefficient_roots.rs
+@@ -0,0 +1,226 @@
++use hyperbrep::{
++    ArchiveLimits, ArchiveResource, Model, ModelBuilder, Pcurve, PersistenceError, RawModel,
++};
++use hypercurve::{
++    Curve2, CurvePoint2, CurvePointDefinition2, CurvePointRationalForm2, Point2, Real,
++};
++use hypersolve::{BivariatePolynomial, IsolatedRootInterval};
++use serde_json::Value;
++use std::cmp::Ordering;
++
++fn p(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|r| r.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn form(point: &CurvePoint2, numerator: BivariatePolynomial) -> CurvePointRationalForm2 {
++    point.rational_form(numerator, p(&[&[1]])).unwrap()
++}
++fn select(coefficients: Vec<CurvePointRationalForm2>, exact: bool) -> CurvePoint2 {
++    CurvePointDefinition2::SelectedPolynomialRoot {
++        coefficients,
++        root: IsolatedRootInterval {
++            lower: if exact { 1.into() } else { 0.into() },
++            upper: if exact { 1.into() } else { 2.into() },
++            exact_root: exact.then(Real::one),
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++fn model(point: CurvePoint2) -> Model {
++    let mut builder = ModelBuilder::new();
++    builder
++        .pcurve(Pcurve::new(
++            Curve2::try_line(point, Point2::from_values(3, 1).into()).unwrap(),
++        ))
++        .unwrap();
++    builder.finish().unwrap()
++}
++fn replay(text: &str) -> Model {
++    RawModel::from_json(text, &ArchiveLimits::default())
++        .unwrap()
++        .validate()
++        .unwrap()
++}
++fn root_model() -> Model {
++    let source = CurvePointDefinition2::PolynomialFiber {
++        equation: p(&[&[0, 0, 0, 1], &[-1]]),
++        parameter: Real::from(2).into(),
++        root: IsolatedRootInterval {
++            lower: 1.into(),
++            upper: 2.into(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap();
++    model(select(
++        vec![
++            form(&source, p(&[&[0, -1]])),
++            form(&source, p(&[&[0]])),
++            form(&source, p(&[&[1]])),
++        ],
++        false,
++    ))
++}
++fn verify(text: &str) {
++    let cold = replay(text);
++    let curve = cold.pcurves().next().unwrap();
++    let point = curve.curve().start();
++    assert_eq!(
++        form(&point, p(&[&[-2], &[], &[], &[], &[], &[], &[1]]))
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert_eq!(
++        form(&point, p(&[&[], &[1]]))
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Greater
++    );
++    let parameter = form(&point, p(&[&[], &[1]])).parameter().unwrap();
++    let next = parameter
++        .affine_point(2.into(), 1.into(), 3.into(), (-1).into())
++        .unwrap();
++    assert_eq!(
++        form(&next, p(&[&[-5, -2], &[3]]))
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(
++        curve
++            .curve()
++            .reversed()
++            .unwrap()
++            .end()
++            .coincides_with(&point)
++            .unwrap()
++    );
++    assert_eq!(cold.to_json().unwrap(), text);
++}
++#[test]
++fn selected_coefficient_root_archive_replays_cold_and_feeds_geometry() {
++    const INPUT: &str = "HYPERBREP_SELECTED_COEFFICIENT_ROOT_REPLAY";
++    if let Some(path) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let text = root_model().to_json().unwrap();
++    verify(&text);
++    let path = std::env::temp_dir().join(format!(
++        "hyperbrep-coefficient-roots-{}.json",
++        std::process::id()
++    ));
++    std::fs::write(&path, &text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "selected_coefficient_root_archive_replays_cold_and_feeds_geometry",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
++fn root_record(value: &mut Value) -> Option<&mut Value> {
++    match value {
++        Value::Object(map) => {
++            if map.contains_key("SelectedPolynomialRoot") {
++                return map.get_mut("SelectedPolynomialRoot");
++            }
++            map.values_mut().find_map(root_record)
++        }
++        Value::Array(array) => array.iter_mut().find_map(root_record),
++        _ => None,
++    }
++}
++#[test]
++fn selected_coefficient_root_archives_reject_bad_references_selectors_and_guards() {
++    let text = root_model().to_json().unwrap();
++    let raw: Value = serde_json::from_str(&text).unwrap();
++    for mode in 0..4 {
++        let mut bad = raw.clone();
++        match mode {
++            0 => {
++                root_record(&mut bad).unwrap()["coefficients"][0] =
++                    serde_json::json!({"Selected":999999})
++            }
++            1 => {
++                root_record(&mut bad).unwrap()["coefficients"][0] =
++                    serde_json::json!({"Scalar":Real::zero()})
++            }
++            2 => {
++                root_record(&mut bad).unwrap()["interval"] =
++                    serde_json::json!([Real::from(3), Real::from(4)])
++            }
++            _ => {
++                let query = bad["selection"]["parameters"]
++                    .as_array_mut()
++                    .unwrap()
++                    .iter_mut()
++                    .find(|v| v.get("RationalForm").is_some())
++                    .unwrap();
++                query["RationalForm"]["denominator"] = serde_json::json!([[Real::zero()]]);
++            }
++        }
++        assert!(
++            RawModel::from_json(&bad.to_string(), &ArchiveLimits::default())
++                .unwrap()
++                .validate()
++                .is_err()
++        );
++    }
++    assert!(
++        matches!(RawModel::from_json(&text, &ArchiveLimits { degree: 1, ..ArchiveLimits::default() }), Err(PersistenceError::ResourceLimit(limit)) if limit.resource == ArchiveResource::Degree)
++    );
++}
++#[test]
++fn selected_coefficient_root_archives_share_repeated_dependencies() {
++    let mut sizes = Vec::new();
++    for depth in [6, 12] {
++        let mut point: CurvePoint2 = Point2::from_values(1, 0).into();
++        for _ in 0..depth {
++            point = select(
++                vec![
++                    form(&point, p(&[&[], &[-1]])),
++                    form(&point, p(&[&[], &[1]])),
++                ],
++                true,
++            );
++        }
++        let text = model(point).to_json().unwrap();
++        let raw: Value = serde_json::from_str(&text).unwrap();
++        assert_eq!(
++            raw["selection"]["parameters"].as_array().unwrap().len(),
++            2 * depth
++        );
++        let cold = replay(&text);
++        let point = cold.pcurves().next().unwrap().curve().start();
++        assert_eq!(
++            form(&point, p(&[&[], &[1]]))
++                .compare_to_real(&Real::one())
++                .unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(cold.to_json().unwrap(), text);
++        sizes.push(text.len());
++    }
++    assert!(
++        sizes[1] < 3 * sizes[0],
++        "doubling shared definition depth must not expand a binary expression tree: {sizes:?}"
++    );
++}
+diff --git a/crates/hypercurve/src/curve_point/definition.rs b/crates/hypercurve/src/curve_point/definition.rs
+index d3e81d7f51..b2f9b4fff2 100644
+--- a/crates/hypercurve/src/curve_point/definition.rs
++++ b/crates/hypercurve/src/curve_point/definition.rs
+@@ -22,6 +22,17 @@ pub enum CurvePointDefinition2 {
+         parameter: CurveParameter2,
+         root: hypersolve::IsolatedRootInterval,
+     },
++    /// The point `(root, 0)` for a polynomial with ascending coefficients
++    /// supplied as retained rational point queries. Independent coefficient
++    /// fields are joined without projecting coordinates. Every original source
++    /// and denominator remains authoritative, including zero coefficients.
++    /// A nonexact selector must contain exactly one distinct root in its open
++    /// interval; an exact root must equal both bounds and satisfy a nonzero
++    /// equation. Replay ignores the supplied root-count flag.
++    SelectedPolynomialRoot {
++        coefficients: Vec<crate::CurvePointRationalForm2>,
++        root: hypersolve::IsolatedRootInterval,
++    },
+     /// Two rational queries, each retaining its original point and pole guard.
+     /// Replay joins their selected fields; it never projects independent coordinates.
+     RationalQueryPair {
+@@ -240,6 +251,13 @@ impl CurvePointDefinition2 {
+     fn replay(self, sources_checked: bool) -> ExactCurveResult<CurvePoint2> {
+         crate::policy::resolve_certified_operation(&CurveContext::STRICT, |policy| match self {
+             Self::Coordinates(point) => Ok(point.into()),
++            Self::SelectedPolynomialRoot { coefficients, root } => {
++                crate::polynomial_point::PolynomialPoint2::from_selected_root(
++                    coefficients,
++                    root,
++                    policy,
++                )
++            }
+             Self::RationalQueryPair {
+                 sources,
+                 numerators,
+diff --git a/crates/hypercurve/src/polynomial_point.rs b/crates/hypercurve/src/polynomial_point.rs
+index 82ea7be728..82822baa0d 100644
+--- a/crates/hypercurve/src/polynomial_point.rs
++++ b/crates/hypercurve/src/polynomial_point.rs
+@@ -30,6 +30,7 @@ enum PolynomialPointAuthority2 {
+ 
+ mod joint;
+ mod selected_fiber;
++mod selected_root;
+ use joint::JointQueries2;
+ 
+ impl PolynomialPoint2 {
+diff --git a/crates/hypercurve/src/polynomial_point/selected_root.rs b/crates/hypercurve/src/polynomial_point/selected_root.rs
+new file mode 100644
+index 0000000000..7c8e7dd6f0
+--- /dev/null
++++ b/crates/hypercurve/src/polynomial_point/selected_root.rs
+@@ -0,0 +1,112 @@
++//! Selected roots retain every coefficient's original point query.
++
++use super::*;
++use crate::bezier_offset::PointFormSource2;
++use crate::selected_field::{self as field, FieldError, Value};
++use crate::{CurvePointDefinition2, CurvePointRationalForm2};
++
++fn coefficient_values(
++    coefficients: &[CurvePointRationalForm2],
++    policy: &CurveContext,
++) -> field::Result<Vec<Value>> {
++    let mut values: Vec<Value> = Vec::new();
++    for coefficient in coefficients {
++        // Even a zero or trailing coefficient retains its original pole guard.
++        let value = crate::bezier_offset::selected_field_query(
++            &PointFormSource2::new(
++                coefficient.source().clone(),
++                coefficient.numerator().clone(),
++                coefficient.denominator().clone(),
++            ),
++            policy,
++        )?;
++        if let Some(first) = values.first() {
++            let join = field::decided(first.field().joined_with(value.field(), policy)?)?;
++            values = values
++                .iter()
++                .map(|value| join.embed(value))
++                .collect::<Result<_, _>>()?;
++            values.push(join.embed(&value)?);
++        } else {
++            values.push(value);
++        }
++    }
++    if values.is_empty() {
++        return Err(FieldError::ZeroPolynomial);
++    }
++    Ok(values)
++}
++
++fn selected_root(
++    coefficients: Vec<Value>,
++    root: &IsolatedRootInterval,
++    policy: &CurveContext,
++) -> field::Result<Value> {
++    let parent = coefficients[0].field().clone();
++    let Some(exact) = &root.exact_root else {
++        let selected = field::decided(parent.select(
++            coefficients,
++            root.lower.clone(),
++            root.upper.clone(),
++            policy,
++        )?)?;
++        return Ok(selected.generator()?);
++    };
++    for boundary in [&root.lower, &root.upper] {
++        match crate::classify::compare_reals(boundary, exact, policy) {
++            Some(Ordering::Equal) => {}
++            Some(_) => return Err(FieldError::InvalidSelector),
++            None => return Err(FieldError::Uncertain(UncertaintyReason::Ordering)),
++        }
++    }
++    let mut nonzero = false;
++    for coefficient in &coefficients {
++        nonzero |= field::decided(coefficient.sign(policy)?)? != hyperreal::RealSign::Zero;
++    }
++    if !nonzero {
++        return Err(FieldError::ZeroPolynomial);
++    }
++    if field::decided(
++        parent
++            .evaluate_polynomial(&coefficients, exact)?
++            .sign(policy)?,
++    )? != hyperreal::RealSign::Zero
++    {
++        return Err(FieldError::NoRoot);
++    }
++    Ok(parent.constant(exact.clone())?)
++}
++
++impl PolynomialPoint2 {
++    pub(crate) fn from_selected_root(
++        coefficients: Vec<CurvePointRationalForm2>,
++        root: IsolatedRootInterval,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<CurvePoint2> {
++        let strict = policy.strict_counterpart();
++        let result = field::finish(|| {
++            let value = selected_root(coefficient_values(&coefficients, &strict)?, &root, &strict)?;
++            let zero = value.field().constant(Real::zero())?;
++            Ok(Self::from_joint_values(
++                CurvePointDefinition2::SelectedPolynomialRoot {
++                    coefficients,
++                    root: IsolatedRootInterval {
++                        distinct_root_count: 1,
++                        ..root
++                    },
++                },
++                [value, zero],
++            ))
++        });
++        ExactCurveError::decided(
++            CurveOperation2::Construction,
++            result.map_err(|cause| {
++                ExactCurveError::invalid(
++                    CurveOperation2::Construction,
++                    crate::CurveFamily2::ImplicitPolynomial,
++                    cause,
++                )
++            })?,
++        )
++    }
++}
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index c24f4eace8..f3699961ba 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -465,6 +465,7 @@ fn read_definitions(
+             | points::CHORD_DISPLACEMENT
+             | points::DISPLACEMENT_POINT
+             | points::CHORD_UNIT_TANGENT
++            | points::SELECTED_POLYNOMIAL_ROOT
+             | points::RATIONAL_QUERY_PAIR
+             | points::QUERY_PARAMETER) => {
+                 let (definition, depth) = points::read_definition(
+diff --git a/crates/hypercurve/src/svg/exact/graph/points.rs b/crates/hypercurve/src/svg/exact/graph/points.rs
+index 62ac3b6016..fd8bbbab53 100644
+--- a/crates/hypercurve/src/svg/exact/graph/points.rs
++++ b/crates/hypercurve/src/svg/exact/graph/points.rs
+@@ -19,6 +19,7 @@ pub(super) const DISPLACEMENT_POINT: u8 = 19;
+ pub(super) const CHORD_UNIT_TANGENT: u8 = 25;
+ pub(super) const RATIONAL_QUERY_PAIR: u8 = 26;
+ pub(super) const QUERY_PARAMETER: u8 = 27;
++pub(super) const SELECTED_POLYNOMIAL_ROOT: u8 = 28;
+ 
+ fn depth_overflow() -> SvgError {
+     SvgError::SizeOverflow {
+@@ -121,6 +122,12 @@ impl GraphWriter {
+                                 .as_polynomial_query()
+                                 .map(|query| vec![query.query().source])
+                                 .unwrap_or_default(),
++                            CurvePointDefinition2::SelectedPolynomialRoot {
++                                coefficients, ..
++                            } => coefficients
++                                .iter()
++                                .map(|coefficient| coefficient.source().clone())
++                                .collect(),
+                             CurvePointDefinition2::RationalQueryPair { sources, .. } => {
+                                 sources.to_vec()
+                             }
+@@ -256,6 +263,34 @@ impl GraphWriter {
+                     }
+                     index
+                 }
++                CurvePointDefinition2::SelectedPolynomialRoot { coefficients, root } => {
++                    let sources = coefficients
++                        .iter()
++                        .map(|coefficient| self.point_index(coefficient.source()))
++                        .collect::<SvgResult<Vec<_>>>()?;
++                    depth = next_depth(
++                        sources
++                            .iter()
++                            .map(|source| self.point_depths[*source as usize])
++                            .max()
++                            .unwrap_or(0),
++                        self.max_point_depth,
++                    )?;
++                    let index = self.begin(SELECTED_POLYNOMIAL_ROOT)?;
++                    self.writer.write_len(coefficients.len())?;
++                    for (coefficient, source) in coefficients.iter().zip(sources) {
++                        self.writer.write_u32(source)?;
++                        self.polynomial(coefficient.numerator())?;
++                        self.polynomial(coefficient.denominator())?;
++                    }
++                    self.writer.write_real(&root.lower)?;
++                    self.writer.write_real(&root.upper)?;
++                    self.writer.write_bool(root.exact_root.is_some())?;
++                    if let Some(exact) = root.exact_root {
++                        self.writer.write_real(&exact)?;
++                    }
++                    index
++                }
+                 CurvePointDefinition2::RationalQueryPair {
+                     sources,
+                     numerators,
+@@ -602,6 +637,38 @@ pub(super) fn read_definition(
+                 },
+             }
+         }
++        SELECTED_POLYNOMIAL_ROOT => {
++            let count = reader.read_len()?;
++            let mut coefficients = Vec::new();
++            for _ in 0..count {
++                let index = reader.read_len()?;
++                let source = point_reference(definitions, index)?;
++                depth = depth.max(next_depth(point_depths[index], max_point_depth)?);
++                let numerator = read_polynomial(reader)?;
++                let denominator = read_polynomial(reader)?;
++                coefficients.push(
++                    source
++                        .rational_form(numerator, denominator)
++                        .map_err(SvgError::Exact)?,
++                );
++            }
++            let lower = reader.read_real()?;
++            let upper = reader.read_real()?;
++            let exact_root = if reader.read_bool()? {
++                Some(reader.read_real()?)
++            } else {
++                None
++            };
++            CurvePointDefinition2::SelectedPolynomialRoot {
++                coefficients,
++                root: hypersolve::IsolatedRootInterval {
++                    lower,
++                    upper,
++                    exact_root,
++                    distinct_root_count: 1,
++                },
++            }
++        }
+         RATIONAL_QUERY_PAIR => {
+             let mut sources = Vec::with_capacity(2);
+             let mut numerators = Vec::with_capacity(2);
+diff --git a/crates/hypercurve/tests/selected_coefficient_roots.rs b/crates/hypercurve/tests/selected_coefficient_roots.rs
+new file mode 100644
+index 0000000000..a8e6b23f87
+--- /dev/null
++++ b/crates/hypercurve/tests/selected_coefficient_roots.rs
+@@ -0,0 +1,466 @@
++use hypercurve::*;
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++use hypersolve::{AlgebraicFiberRootIsolationConfig, BivariatePolynomial, IsolatedRootInterval};
++use std::cmp::Ordering;
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn p(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn x() -> BivariatePolynomial {
++    p(&[&[], &[1]])
++}
++fn y() -> BivariatePolynomial {
++    p(&[&[0, 1]])
++}
++fn form(point: &CurvePoint2, numerator: BivariatePolynomial) -> CurvePointRationalForm2 {
++    point.rational_form(numerator, p(&[&[1]])).unwrap()
++}
++fn zero(point: &CurvePoint2, equation: BivariatePolynomial) {
++    assert_eq!(
++        form(point, equation)
++            .compare_to_real(&Real::zero())
++            .unwrap(),
++        Ordering::Equal
++    );
++}
++fn source() -> CurvePoint2 {
++    let parameter = BezierParameter2::Algebraic(
++        BezierAlgebraicParameter2::try_isolate(
++            BezierParameterPolynomial::try_new_power_basis(vec![q(-1, 8), 0.into(), 1.into()])
++                .unwrap(),
++            BezierParameterInterval::try_new(q(1, 3), q(1, 2)).unwrap(),
++        )
++        .unwrap(),
++    );
++    CurvePointDefinition2::PolynomialFiber {
++        equation: p(&[&[0, 0, 0, 16], &[-1]]),
++        parameter: parameter.into(),
++        root: IsolatedRootInterval {
++            lower: q(1, 4),
++            upper: q(3, 8),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++fn curves(equation: BivariatePolynomial) -> PolynomialCurveSet2 {
++    curves_with_config(equation, AlgebraicFiberRootIsolationConfig::default())
++}
++fn curves_with_config(
++    equation: BivariatePolynomial,
++    config: AlgebraicFiberRootIsolationConfig,
++) -> PolynomialCurveSet2 {
++    let topology = decompose_bivariate_curve(
++        &equation,
++        &BivariateCurveDomain {
++            first: [(-1).into(), 1.into()],
++            second: [(-2).into(), 2.into()],
++        },
++        BivariateTopologyConfig::default(),
++    )
++    .unwrap();
++    PolynomialCurveSet2::from_topology(topology, config).unwrap()
++}
++
++fn independent_coefficient_source() -> CurvePoint2 {
++    CurvePointDefinition2::PolynomialFiber {
++        equation: p(&[&[-1, 0, 0, 0, 0, 17]]),
++        parameter: Real::zero().into(),
++        root: IsolatedRootInterval {
++            lower: q(1, 2),
++            upper: q(3, 4),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++    }
++    .into_point()
++    .unwrap()
++}
++
++fn coefficient_root() -> (
++    CurvePoint2,
++    CurvePointRationalForm2,
++    CurvePointRationalForm2,
++) {
++    let first = source();
++    let second = independent_coefficient_source();
++    let a = form(&first, x());
++    let b = form(&second, y());
++    // The independent positive selections satisfy 8a²=1 and 17b⁵=1.
++    // z³+a z-b is strictly increasing, negative at 1/2 and positive at 3/4.
++    let point = CurvePointDefinition2::SelectedPolynomialRoot {
++        coefficients: vec![
++            b.scaled(&Real::from(-1)).unwrap(),
++            a.clone(),
++            form(&Point2::new(0.into(), 0.into()).into(), p(&[&[0]])),
++            form(&Point2::new(0.into(), 0.into()).into(), p(&[&[1]])),
++        ],
++        root: IsolatedRootInterval {
++            lower: q(1, 2),
++            upper: q(3, 4),
++            exact_root: None,
++            // A supplied count is not a selection proof.
++            distinct_root_count: 999,
++        },
++    }
++    .into_point()
++    .expect("a root over independent selected coefficient queries is exact geometry");
++    (point, a, b)
++}
++
++#[test]
++fn selected_coefficient_root_preserves_its_equation_and_feeds_geometry() {
++    let (point, a, b) = coefficient_root();
++    let z = form(&point, x());
++    zero(&point, y());
++    let residual = z
++        .multiply(&z)
++        .unwrap()
++        .multiply(&z)
++        .unwrap()
++        .add(&a.multiply(&z).unwrap())
++        .unwrap()
++        .subtract(&b)
++        .unwrap();
++    assert_eq!(
++        residual.compare_to_real(&Real::zero()).unwrap(),
++        Ordering::Equal
++    );
++    assert_eq!(z.compare_to_real(&q(1, 2)).unwrap(), Ordering::Greater);
++    assert_eq!(z.compare_to_real(&q(3, 4)).unwrap(), Ordering::Less);
++    let replay = point.definition().unwrap().into_point().unwrap();
++    assert!(replay.coincides_with(&point).unwrap());
++    let parabola = curves(p(&[&[0, 0, 1], &[-1]]));
++    let lifted = parabola.curves()[1]
++        .point_at(&form(&replay, x()).parameter().unwrap())
++        .unwrap();
++    zero(&lifted, p(&[&[0, 0, 1], &[-1]]));
++    assert_eq!(form(&lifted, x()).compare(&z).unwrap(), Ordering::Equal);
++    let square = curves(p(&[&[0, 1], &[], &[-1]]));
++    let returned = square.curves()[0]
++        .point_at(&form(&lifted, y()).parameter().unwrap())
++        .unwrap();
++    assert_eq!(form(&returned, y()).compare(&z).unwrap(), Ordering::Equal);
++}
++
++fn constant(value: Real) -> CurvePointRationalForm2 {
++    form(
++        &Point2::from_values(0, 0).into(),
++        BivariatePolynomial::new(vec![vec![value]]),
++    )
++}
++fn select(
++    coefficients: Vec<CurvePointRationalForm2>,
++    lower: Real,
++    upper: Real,
++    exact_root: Option<Real>,
++) -> ExactCurveResult<CurvePoint2> {
++    CurvePointDefinition2::SelectedPolynomialRoot {
++        coefficients,
++        root: IsolatedRootInterval {
++            lower,
++            upper,
++            exact_root,
++            distinct_root_count: 999,
++        },
++    }
++    .into_point()
++}
++fn simple_root() -> CurvePoint2 {
++    let a = form(&source(), x());
++    select(
++        vec![
++            a.scaled(&(-1).into()).unwrap(),
++            constant(0.into()),
++            constant(1.into()),
++        ],
++        q(1, 2),
++        q(3, 4),
++        None,
++    )
++    .unwrap()
++}
++
++#[test]
++fn selected_coefficient_roots_keep_repeated_factors_and_opposite_selections() {
++    let a = form(&source(), x());
++    let coefficients = vec![
++        a.multiply(&a).unwrap(),
++        constant(0.into()),
++        a.scaled(&(-2).into()).unwrap(),
++        constant(0.into()),
++        constant(1.into()),
++        constant(0.into()),
++    ];
++    let positive = select(coefficients.clone(), q(1, 2), q(3, 4), None).unwrap();
++    let negative = select(coefficients.clone(), q(-3, 4), q(-1, 2), None).unwrap();
++    for point in [&positive, &negative] {
++        let z = form(point, x());
++        assert_eq!(
++            z.multiply(&z).unwrap().compare(&a).unwrap(),
++            Ordering::Equal
++        );
++        let CurvePointDefinition2::SelectedPolynomialRoot { coefficients, root } =
++            point.definition().unwrap()
++        else {
++            panic!("selected relation lost")
++        };
++        assert_eq!(coefficients.len(), 6);
++        assert_eq!(root.distinct_root_count, 1);
++        assert!(
++            select(coefficients, root.lower, root.upper, root.exact_root)
++                .unwrap()
++                .coincides_with(point)
++                .unwrap()
++        );
++    }
++    assert!(!positive.coincides_with(&negative).unwrap());
++    assert_eq!(
++        form(&positive, x())
++            .add(&form(&negative, x()))
++            .unwrap()
++            .compare_to_real(&0.into())
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(matches!(
++        select(coefficients, (-1).into(), 1.into(), None),
++        Err(ExactCurveError::Invalid { .. })
++    ));
++}
++
++#[test]
++fn selected_coefficient_roots_keep_degree_seventeen_and_nonmonic_relations() {
++    let a = form(&source(), x());
++    let mut coefficients = vec![constant(0.into()); 18];
++    coefficients[0] = a.scaled(&(-1).into()).unwrap();
++    coefficients[17] = constant(3.into());
++    let point = select(coefficients, 0.into(), 1.into(), None).unwrap();
++    let mut power = vec![vec![]; 18];
++    power[17] = vec![3.into()];
++    assert_eq!(
++        form(&point, BivariatePolynomial::new(power))
++            .compare(&a)
++            .unwrap(),
++        Ordering::Equal
++    );
++    let parameter = form(&point, x()).parameter().unwrap();
++    let image = parameter
++        .affine_point(2.into(), 1.into(), 3.into(), (-1).into())
++        .unwrap();
++    zero(&image, p(&[&[-5, -2], &[3]]));
++    assert_eq!(
++        image
++            .affine_form(q(1, 2), 0.into(), q(-1, 2))
++            .parameter()
++            .unwrap()
++            .compare(&parameter)
++            .unwrap(),
++        Ordering::Equal
++    );
++}
++
++#[test]
++fn selected_coefficient_roots_check_exact_roots_and_invalid_selectors() {
++    let a = form(&source(), x());
++    let linear = vec![a.scaled(&(-1).into()).unwrap(), a.clone()];
++    let exact = select(linear.clone(), 1.into(), 1.into(), Some(1.into())).unwrap();
++    assert_eq!(
++        form(&exact, x()).compare_to_real(&1.into()).unwrap(),
++        Ordering::Equal
++    );
++    for result in [
++        select(linear.clone(), 0.into(), 0.into(), Some(0.into())),
++        select(linear.clone(), 0.into(), 2.into(), Some(1.into())),
++        select(linear.clone(), 1.into(), 2.into(), None),
++        select(linear.clone(), 2.into(), 0.into(), None),
++        select(linear, 2.into(), 3.into(), None),
++        select(vec![], 0.into(), 1.into(), None),
++        select(
++            vec![a.subtract(&a).unwrap()],
++            0.into(),
++            0.into(),
++            Some(0.into()),
++        ),
++        select(vec![constant(1.into())], 0.into(), 1.into(), None),
++    ] {
++        assert!(matches!(result, Err(ExactCurveError::Invalid { .. })));
++    }
++}
++
++#[test]
++fn selected_coefficient_roots_distinguish_close_roots_without_tolerance() {
++    let a = form(&source(), x());
++    let epsilon = q(1, 1_000_000) * q(1, 1_000_000);
++    let quarter = &epsilon * q(1, 4);
++    let coefficients = vec![
++        a.scaled(&(Real::one() + &epsilon)).unwrap(),
++        a.scaled(&(Real::from(-2) - &epsilon)).unwrap(),
++        a,
++    ];
++    let first = select(
++        coefficients.clone(),
++        Real::one() - &quarter,
++        Real::one() + &quarter,
++        None,
++    )
++    .unwrap();
++    let second = select(
++        coefficients,
++        Real::one() + &epsilon - &quarter,
++        Real::one() + &epsilon + &quarter,
++        None,
++    )
++    .unwrap();
++    assert_eq!(
++        form(&first, x()).compare_to_real(&Real::one()).unwrap(),
++        Ordering::Equal
++    );
++    assert_eq!(
++        form(&second, x())
++            .subtract(&form(&first, x()))
++            .unwrap()
++            .compare_to_real(&epsilon)
++            .unwrap(),
++        Ordering::Equal
++    );
++    assert!(!first.coincides_with(&second).unwrap());
++}
++
++#[test]
++fn selected_coefficient_roots_retain_zero_coefficient_guards_and_retry_after_exhaustion() {
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let source: CurvePoint2 = Point2::from_values(0, 2).into();
++    let guarded = source.rational_form(p(&[&[0]]), p(&[&[-1, 0, 1]])).unwrap();
++    let coefficients = vec![constant((-1).into()), guarded, constant(1.into())];
++    let point = select(coefficients.clone(), q(1, 2), q(3, 2), None).unwrap();
++    let CurvePointDefinition2::SelectedPolynomialRoot {
++        coefficients: retained,
++        ..
++    } = point.definition().unwrap()
++    else {
++        panic!("lost coefficient definitions")
++    };
++    assert_eq!(retained[1].denominator(), coefficients[1].denominator());
++    assert!(
++        CurvePoint2::from(Point2::from_values(0, 1))
++            .rational_form(
++                retained[1].numerator().clone(),
++                retained[1].denominator().clone()
++            )
++            .is_err()
++    );
++    let limited = with_budget(WorkBudget::ZERO, || {
++        assert!(
++            matches!(select(coefficients.clone(), q(1, 2), q(3, 2), None), Err(ExactCurveError::Blocked(blocker)) if blocker.reason() == UncertaintyReason::BudgetExhausted)
++        );
++    });
++    assert!(limited.result.is_err());
++    assert!(
++        select(coefficients, q(1, 2), q(3, 2), None)
++            .unwrap()
++            .coincides_with(&point)
++            .unwrap()
++    );
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn selected_coefficient_roots_replay_in_a_fresh_process_and_feed_derivatives() {
++    const INPUT: &str = "HYPERCURVE_SELECTED_COEFFICIENT_ROOT_REPLAY";
++    fn verify(text: &str) {
++        let geometry = import_svg_document(text).unwrap();
++        let point = geometry.paths()[0].curves()[0].start();
++        // z²=a and 8a²=1; the positive selector determines the fourth root.
++        zero(&point, p(&[&[-1], &[], &[], &[], &[8]]));
++        assert_eq!(
++            form(&point, x()).compare_to_real(&0.into()).unwrap(),
++            Ordering::Greater
++        );
++        let parameter = form(&point, x()).parameter().unwrap();
++        let curve = RationalBezier2::try_new(
++            vec![
++                Point2::from_values(0, 0),
++                Point2::new(q(1, 2), 0.into()),
++                Point2::from_values(1, 1),
++            ],
++            vec![Real::one(); 3],
++        )
++        .unwrap();
++        let derivative = Curve2::from(curve)
++            .derivative_at(&parameter)
++            .unwrap()
++            .coordinate_image()
++            .unwrap();
++        assert_eq!(
++            form(&derivative, x()).compare_to_real(&1.into()).unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(
++            form(&derivative, y())
++                .scaled(&q(1, 2))
++                .unwrap()
++                .compare(&form(&point, x()))
++                .unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(export_svg_document(&geometry).unwrap(), text);
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        verify(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let point = simple_root();
++    let line = Curve2::try_line(point, Point2::from_values(1, 1).into()).unwrap();
++    let geometry = SvgGeometry2::new(
++        CurveRegion2::empty(),
++        vec![],
++        vec![CurvePath2::try_new(vec![line]).unwrap()],
++    );
++    let text = export_svg_document(&geometry).unwrap();
++    verify(&text);
++    let limited = SvgOptions {
++        max_point_definition_depth: 0,
++        ..SvgOptions::default()
++    };
++    assert!(matches!(
++        import_svg_document_with_options(&text, limited),
++        Err(SvgError::SizeOverflow { .. })
++    ));
++    assert!(matches!(
++        export_svg_document_with_options(&geometry, limited),
++        Err(SvgError::SizeOverflow { .. })
++    ));
++    let path = std::env::temp_dir().join(format!(
++        "hypercurve-coefficient-roots-{}.svg",
++        std::process::id()
++    ));
++    std::fs::write(&path, &text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "selected_coefficient_roots_replay_in_a_fresh_process_and_feed_derivatives",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
+diff --git a/crates/hypersolve/src/selected_polynomial_field.rs b/crates/hypersolve/src/selected_polynomial_field.rs
+index f640f40e25..9f353e034e 100644
+--- a/crates/hypersolve/src/selected_polynomial_field.rs
++++ b/crates/hypersolve/src/selected_polynomial_field.rs
+@@ -273,6 +273,18 @@ impl SelectedPolynomialField {
+         )
+     }
+ 
++    /// Evaluates ascending coefficients at an exact represented scalar.
++    /// Coefficients must belong to this field or an admitted ancestor. The
++    /// existing field arithmetic retains their selections and denominator
++    /// proofs; this operation makes no root-selection or nonzero claim.
++    pub fn evaluate_polynomial(
++        &self,
++        coefficients: &[SelectedPolynomialValue],
++        point: &Real,
++    ) -> ArithmeticResult<SelectedPolynomialValue> {
++        self.lift(&evaluate(coefficients, point, self)?)
++    }
++
+     /// Adjoins the unique distinct root in the supplied open interval.
+     ///
+     /// Strict Sturm root counting replays the selector; repeated and reducible
+@@ -459,6 +471,22 @@ impl SelectedPolynomialValue {
+         }
+     }
+ 
++    fn stored_one(&self) -> bool {
++        match &self.0.coordinates {
++            Coordinates::Recursive(scalar) => {
++                scalar.numerator.is_coefficientwise_stored_one()
++                    && scalar.denominator.is_coefficientwise_stored_one()
++            }
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => {
++                matches!(numerator.as_slice(), [one] if one.stored_one())
++                    && matches!(denominator.as_slice(), [one] if one.stored_one())
++            }
++        }
++    }
++
+     fn align(&self, other: &Self) -> ArithmeticResult<(SelectedPolynomialField, Self, Self)> {
+         match self.field().lift(other) {
+             Ok(other) => Ok((self.field().clone(), self.clone(), other)),
+@@ -474,6 +502,14 @@ impl SelectedPolynomialValue {
+     /// Exact addition through the common ancestor chain.
+     pub fn add(&self, other: &Self) -> ArithmeticResult<Self> {
+         let (field, left, right) = self.align(other)?;
++        // Values already own their denominator proofs. These structural
++        // identities preserve the aligned field and its selected dependencies.
++        if left.stored_zero() {
++            return Ok(right);
++        }
++        if right.stored_zero() {
++            return Ok(left);
++        }
+         match (&left.0.coordinates, &right.0.coordinates) {
+             (Coordinates::Recursive(a), Coordinates::Recursive(b)) => field.recursive_value(
+                 unavailable(
+@@ -510,6 +546,15 @@ impl SelectedPolynomialValue {
+     /// Exact multiplication with local defining-relation reduction.
+     pub fn multiply(&self, other: &Self) -> ArithmeticResult<Self> {
+         let (field, left, right) = self.align(other)?;
++        if left.stored_zero() || right.stored_zero() {
++            return field.constant(Real::zero());
++        }
++        if left.stored_one() {
++            return Ok(right);
++        }
++        if right.stored_one() {
++            return Ok(left);
++        }
+         match (&left.0.coordinates, &right.0.coordinates) {
+             (Coordinates::Recursive(a), Coordinates::Recursive(b)) => field.recursive_value(
+                 unavailable(a.numerator.multiply(&b.numerator))?,
+diff --git a/crates/hypersolve/tests/selected_polynomial_fields.rs b/crates/hypersolve/tests/selected_polynomial_fields.rs
+index 90b1de3027..ed206505de 100644
+--- a/crates/hypersolve/tests/selected_polynomial_fields.rs
++++ b/crates/hypersolve/tests/selected_polynomial_fields.rs
+@@ -408,3 +408,54 @@ fn nearby_exact_selectors_remain_distinct() {
+         );
+     }
+ }
++
++#[test]
++fn selected_field_unit_arithmetic_retains_ancestor_authority_and_guards() {
++    let base = base();
++    let first = select(&base, coefficients(&base, &[-2, 0, 0, 1]), 1, 2);
++    let a = first.generator().unwrap();
++    let second = select(
++        &first,
++        vec![
++            a.scale(&real(-1)).unwrap(),
++            first.constant(real(0)).unwrap(),
++            first.constant(real(1)).unwrap(),
++        ],
++        1,
++        2,
++    );
++    let b = second.generator().unwrap();
++    let zero = first.constant(real(0)).unwrap();
++    let one = first.constant(real(1)).unwrap();
++    for value in [
++        b.add(&zero).unwrap(),
++        zero.add(&b).unwrap(),
++        b.multiply(&one).unwrap(),
++        one.multiply(&b).unwrap(),
++    ] {
++        assert!(value.field().shares_authority(&second));
++        is_zero(&value.subtract(&b).unwrap());
++        is_zero(
++            &power(&value, 6)
++                .subtract(&second.constant(real(2)).unwrap())
++                .unwrap(),
++        );
++    }
++    let product = b.multiply(&zero).unwrap();
++    assert!(product.field().shares_authority(&second));
++    is_zero(&product);
++    assert!(matches!(
++        product.divide(&product, &TestContext::strict()),
++        Err(SelectedPolynomialError::ZeroDenominator)
++    ));
++    assert!(matches!(
++        b.divide(&product, &TestContext::strict()),
++        Err(SelectedPolynomialError::ZeroDenominator)
++    ));
++    is_zero(
++        &second
++            .evaluate_polynomial(&[a.clone(), a.scale(&real(-1)).unwrap()], &real(1))
++            .unwrap(),
++    );
++    assert!(base.evaluate_polynomial(&[a], &real(1)).is_err());
++}

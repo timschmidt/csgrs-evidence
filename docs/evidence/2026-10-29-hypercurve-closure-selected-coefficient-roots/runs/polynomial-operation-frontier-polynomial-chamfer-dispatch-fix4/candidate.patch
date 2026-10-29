@@ -1,0 +1,604 @@
+diff --git a/crates/hypercurve/src/bezier_region/corner_edit.rs b/crates/hypercurve/src/bezier_region/corner_edit.rs
+index b1a7c1b1d3..55ce446b10 100644
+--- a/crates/hypercurve/src/bezier_region/corner_edit.rs
++++ b/crates/hypercurve/src/bezier_region/corner_edit.rs
+@@ -994,6 +994,9 @@ pub(super) fn retained_corner_fragment_trim(
+             return Ok(None);
+         }
+         let source_points = match fragment {
++            BezierSplitFragment2::Polynomial(branch) => {
++                Some([branch.endpoint(!reversed), branch.endpoint(reversed)])
++            }
+             BezierSplitFragment2::SelectedFiber(selected) => Some(if reversed {
+                 [selected.end_point().clone(), selected.start_point().clone()]
+             } else {
+@@ -1579,7 +1582,9 @@ pub(super) fn retained_corner_fragment_between_cuts(
+         (next_cut, previous_cut)
+     };
+     let points = match fragment {
+-        BezierSplitFragment2::SelectedFiber(_) => Some([lower.point.clone(), upper.point.clone()]),
++        BezierSplitFragment2::SelectedFiber(_) | BezierSplitFragment2::Polynomial(_) => {
++            Some([lower.point.clone(), upper.point.clone()])
++        }
+         BezierSplitFragment2::AnalyticParallel(_)
+             if lower.parameter.is_retained_scalar() || upper.parameter.is_retained_scalar() =>
+         {
+diff --git a/crates/hypercurve/src/bezier_region/offset_spans.rs b/crates/hypercurve/src/bezier_region/offset_spans.rs
+index c2983b88a6..77d8882b44 100644
+--- a/crates/hypercurve/src/bezier_region/offset_spans.rs
++++ b/crates/hypercurve/src/bezier_region/offset_spans.rs
+@@ -1813,13 +1813,7 @@ impl<'a> CornerCarrierPreparation2<'a> {
+             return Ok(());
+         }
+         match fragment {
+-            BezierSplitFragment2::Polynomial(_) => {
+-                return Err(ExactCurveError::blocked(
+-                    operation,
+-                    CurveFamily2::ImplicitPolynomial,
+-                    UncertaintyReason::Unsupported,
+-                ));
+-            }
++            BezierSplitFragment2::Polynomial(_) => {}
+ 
+             BezierSplitFragment2::RetainedBezier { .. } => {
+                 self.evidence = if let Some(chord) =
+@@ -1889,11 +1883,9 @@ impl<'a> CornerCarrierPreparation2<'a> {
+             .fragment
+             .expect("a nonnative corner retains its fragment");
+         match fragment {
+-            BezierSplitFragment2::Polynomial(_) => Err(ExactCurveError::blocked(
+-                operation,
+-                CurveFamily2::ImplicitPolynomial,
+-                UncertaintyReason::Unsupported,
+-            )),
++            BezierSplitFragment2::Polynomial(branch) => {
++                Ok(crate::curve::ExactCornerCarrier2::Polynomial(branch))
++            }
+ 
+             BezierSplitFragment2::AlgebraicChord(chord) => {
+                 Ok(crate::curve::ExactCornerCarrier2::AlgebraicChord(chord))
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index 467c1dc851..c4180875cf 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -4220,6 +4220,7 @@ fn exact_linear_corner_line(curve: &Curve2) -> Option<&LineSeg2> {
+ }
+ 
+ pub(crate) enum ExactCornerCarrier2<'a> {
++    Polynomial(&'a crate::PolynomialCurveBranch2),
+     Line(&'a LineSeg2),
+     PromotedLine(&'a QuadraticBezier2),
+     Arc(&'a CircularArc2),
+@@ -5032,6 +5033,9 @@ pub(crate) fn exact_corner_carrier<'a>(
+     operation: CurveOperation2,
+     policy: &CurveContext,
+ ) -> ExactCurveResult<Option<ExactCornerCarrier2<'a>>> {
++    if let Some(branch) = curve.polynomial_branch() {
++        return Ok(Some(ExactCornerCarrier2::Polynomial(branch)));
++    }
+     match curve.geometry() {
+         Some(CurveGeometry2::Line(line)) => return Ok(Some(ExactCornerCarrier2::Line(line))),
+         Some(CurveGeometry2::QuadraticBezier(source))
+@@ -5080,9 +5084,11 @@ pub(crate) fn exact_corner_carrier<'a>(
+                 crate::BezierSplitFragment2::SelectedFiber(fragment) => {
+                     Some(ExactCornerCarrier2::SelectedFiber(fragment))
+                 }
++                crate::BezierSplitFragment2::Polynomial(branch) => {
++                    Some(ExactCornerCarrier2::Polynomial(branch))
++                }
+                 crate::BezierSplitFragment2::RetainedBezier { .. }
+-                | crate::BezierSplitFragment2::Materialized { .. }
+-                | crate::BezierSplitFragment2::Polynomial(_) => None,
++                | crate::BezierSplitFragment2::Materialized { .. } => None,
+             }
+         }
+         Some(CurveGeometry2::CircularArc(arc)) => Some(ExactCornerCarrier2::Arc(arc)),
+diff --git a/crates/hypercurve/src/curve_corner_cuts.rs b/crates/hypercurve/src/curve_corner_cuts.rs
+index 9d07b43f73..05c6a5872f 100644
+--- a/crates/hypercurve/src/curve_corner_cuts.rs
++++ b/crates/hypercurve/src/curve_corner_cuts.rs
+@@ -231,6 +231,16 @@ pub(super) fn corner_chamfer_cuts(
+     policy: &CurveContext,
+ ) -> ExactCurveResult<CornerCuts2> {
+     match carrier {
++        ExactCornerCarrier2::Polynomial(branch) => polynomial_chamfer_cuts(
++            branch,
++            setback,
++            setback_sign,
++            previous,
++            mode,
++            operation,
++            family,
++            policy,
++        ),
+         ExactCornerCarrier2::Line(source) => line_chamfer_cuts(
+             source,
+             setback,
+@@ -337,6 +347,71 @@ pub(super) fn corner_chamfer_cuts(
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
++fn polynomial_chamfer_cuts(
++    branch: &crate::PolynomialCurveBranch2,
++    setback: &Real,
++    setback_sign: RealSign,
++    previous: bool,
++    mode: CurveCornerMode2,
++    operation: CurveOperation2,
++    family: CurveFamily2,
++    policy: &CurveContext,
++) -> ExactCurveResult<CornerCuts2> {
++    let range = branch.parameter_range();
++    let corner_parameter = if previous != branch.is_reversed() {
++        range.end()
++    } else {
++        range.start()
++    };
++    let corner = branch.endpoint(!previous);
++    let mut cuts = CornerCuts2::default();
++    if setback_sign == RealSign::Zero {
++        cuts.push(CornerCut2 {
++            parameter: Some(corner_parameter.clone()),
++            point: corner,
++            placement: CornerPlacement2::Corner,
++        });
++        return Ok(cuts);
++    }
++    // A selected finite branch does not certify its continuation beyond the
++    // authored domain. Do not publish only the trim subset of an extension solve.
++    if mode == CurveCornerMode2::TrimOrExtend {
++        return Err(ExactCurveError::blocked(
++            operation,
++            family,
++            crate::UncertaintyReason::Unsupported,
++        ));
++    }
++    for (parameter, point) in branch
++        .selected_circle_sections(&corner, setback, policy)
++        .map_err(|error| error.with_operation(operation))?
++    {
++        let lower = curve_corner_domain::parameter_order(
++            &parameter,
++            range.start(),
++            operation,
++            family,
++            policy,
++        )?;
++        let upper = curve_corner_domain::parameter_order(
++            &parameter,
++            range.end(),
++            operation,
++            family,
++            policy,
++        )?;
++        if lower.is_gt() && upper.is_lt() {
++            cuts.push(CornerCut2 {
++                parameter: Some(parameter),
++                point,
++                placement: CornerPlacement2::Trim,
++            });
++        }
++    }
++    Ok(cuts)
++}
++
+ #[allow(clippy::too_many_arguments)]
+ pub(super) fn algebraic_cusp_chamfer_cuts(
+     fragment: &crate::BezierAlgebraicCuspSemicircleFragment2,
+diff --git a/crates/hypercurve/src/curve_corner_reconstruction.rs b/crates/hypercurve/src/curve_corner_reconstruction.rs
+index 7688ebd015..d22cd8a742 100644
+--- a/crates/hypercurve/src/curve_corner_reconstruction.rs
++++ b/crates/hypercurve/src/curve_corner_reconstruction.rs
+@@ -39,6 +39,19 @@ impl CornerSourceFragments2 {
+         operation: CurveOperation2,
+         policy: &CurveContext,
+     ) -> ExactCurveResult<Self> {
++        if let Some(branch) = curve.polynomial_branch() {
++            return Ok(Self {
++                fragments: vec![BezierSplitFragment2::Polynomial(Box::new(branch.clone()))],
++                cut_index: 0,
++                cut: cut.into_retained_evidence().ok_or_else(|| {
++                    ExactCurveError::blocked(
++                        operation,
++                        curve.family(),
++                        crate::UncertaintyReason::Unsupported,
++                    )
++                })?,
++            });
++        }
+         if let Some(fragment) = curve.retained_fragment() {
+             return Ok(Self {
+                 fragments: vec![fragment.clone()],
+diff --git a/crates/hypercurve/src/curve_fillet_centers.rs b/crates/hypercurve/src/curve_fillet_centers.rs
+index 02d31b3b7b..d594c432eb 100644
+--- a/crates/hypercurve/src/curve_fillet_centers.rs
++++ b/crates/hypercurve/src/curve_fillet_centers.rs
+@@ -402,6 +402,11 @@ impl<'a> PreparedFilletCarrier2<'a> {
+         policy: &CurveContext,
+     ) -> ExactCurveResult<Self> {
+         match carrier {
++            ExactCornerCarrier2::Polynomial(_) => Err(ExactCurveError::blocked(
++                CurveOperation2::Fillet,
++                family,
++                crate::UncertaintyReason::Unsupported,
++            )),
+             ExactCornerCarrier2::Line(source) => {
+                 let (dx, dy) = source.delta();
+                 let (unit_x, unit_y, _) =
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index c04a5cb8d8..728e850326 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -395,7 +395,7 @@ impl PolynomialCurveBranch2 {
+         Arc::ptr_eq(&self.source, &other.source)
+     }
+ 
+-    pub(super) fn endpoint(&self, start: bool) -> CurvePoint2 {
++    pub(crate) fn endpoint(&self, start: bool) -> CurvePoint2 {
+         self.endpoints[usize::from(start == self.reversed)].clone()
+     }
+ 
+@@ -1011,34 +1011,51 @@ impl PolynomialCurveBranch2 {
+         if self.maps.is_empty()
+             && let Some(query) = value.as_polynomial_query()
+         {
+-            let candidate = query.query().source;
+-            let retained = (|| {
+-                let Some(parameter) = self.point_parameter(&candidate, policy)? else {
+-                    return Ok(None);
+-                };
+-                if decided(
+-                    parameter
+-                        .cmp_by_refinement(value, policy)
+-                        .map_err(invalid)?,
+-                )? != Ordering::Equal
+-                {
+-                    return Ok(None);
++            let source = query.query().source;
++            // An affine-form parameter can pull back a similarity and retain
++            // its point in the source chart. Try both exact interpretations;
++            // each must prove branch incidence and the requested abscissa.
++            for source_chart in [false, true] {
++                if source_chart && self.transform.is_none() {
++                    continue;
++                }
++                let retained = (|| {
++                    let candidate = if source_chart {
++                        self.map_point(source.clone(), policy)?
++                    } else {
++                        source.clone()
++                    };
++                    let Some(parameter) = self.point_parameter(&candidate, policy)? else {
++                        return Ok(None);
++                    };
++                    if decided(
++                        parameter
++                            .cmp_by_refinement(value, policy)
++                            .map_err(invalid)?,
++                    )? != Ordering::Equal
++                    {
++                        return Ok(None);
++                    }
++                    Ok(Some(if source_chart {
++                        source.clone()
++                    } else {
++                        match &self.transform {
++                            Some(transform) => CurvePoint2::from(BezierSimilarityPoint2::new(
++                                candidate,
++                                transform.inverse().map_err(invalid)?,
++                                &policy.retained_object_policy(),
++                            )),
++                            None => candidate,
++                        }
++                    }))
++                })();
++                match retained {
++                    Ok(Some(point)) => return Ok(point),
++                    Ok(None) => {}
++                    Err(ExactCurveError::Blocked(blocker))
++                        if blocker.reason() != UncertaintyReason::BudgetExhausted => {}
++                    Err(error) => return Err(error),
+                 }
+-                Ok(Some(match &self.transform {
+-                    Some(transform) => CurvePoint2::from(BezierSimilarityPoint2::new(
+-                        candidate,
+-                        transform.inverse().map_err(invalid)?,
+-                        &policy.retained_object_policy(),
+-                    )),
+-                    None => candidate,
+-                }))
+-            })();
+-            match retained {
+-                Ok(Some(point)) => return Ok(point),
+-                Ok(None) => {}
+-                Err(ExactCurveError::Blocked(blocker))
+-                    if blocker.reason() != UncertaintyReason::BudgetExhausted => {}
+-                Err(error) => return Err(error),
+             }
+         }
+         let equation = self.topology().equation();
+diff --git a/crates/hypercurve/tests/polynomial_chamfer_corners.rs b/crates/hypercurve/tests/polynomial_chamfer_corners.rs
+new file mode 100644
+index 0000000000..93144e62c1
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_chamfer_corners.rs
+@@ -0,0 +1,278 @@
++//! Exact chord setbacks retain selected implicit supports and their point evidence.
++
++use hypercurve::{
++    BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
++    BezierParameterPolynomial, Curve2, CurveCornerMode2, CurveCornerNoSolution2,
++    CurveCornerSolutions2, CurveParameter2, CurveParameterRange2, CurvePath2, CurvePoint2,
++    CurvePointRationalForm2, ExactCurveError, Point2, PolynomialCurveSet2, Real, Similarity2,
++    UncertaintyReason,
++};
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyConfig, decompose_bivariate_curve,
++};
++use hypersolve::{AlgebraicFiberRootIsolationConfig, BivariatePolynomial};
++use std::cmp::Ordering;
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn form(point: &CurvePoint2, numerator: BivariatePolynomial) -> CurvePointRationalForm2 {
++    point.rational_form(numerator, polynomial(&[&[1]])).unwrap()
++}
++fn distance_squared(first: &CurvePoint2, second: &CurvePoint2) -> CurvePointRationalForm2 {
++    let dx = form(first, polynomial(&[&[], &[1]]))
++        .subtract(&form(second, polynomial(&[&[], &[1]])))
++        .unwrap();
++    let dy = form(first, polynomial(&[&[0, 1]]))
++        .subtract(&form(second, polynomial(&[&[0, 1]])))
++        .unwrap();
++    dx.multiply(&dx)
++        .unwrap()
++        .add(&dy.multiply(&dy).unwrap())
++        .unwrap()
++}
++fn source(algebraic: bool) -> CurvePath2 {
++    let equation = polynomial(&[&[-1, 0, 1], &[], &[], &[-1]]);
++    let topology = decompose_bivariate_curve(
++        &equation,
++        &BivariateCurveDomain {
++            first: [(-1).into(), 0.into()],
++            second: [(-1).into(), 1.into()],
++        },
++        BivariateTopologyConfig::default(),
++    )
++    .unwrap();
++    let set =
++        PolynomialCurveSet2::from_topology(topology, AlgebraicFiberRootIsolationConfig::default())
++            .unwrap();
++    let end: CurveParameter2 = if algebraic {
++        BezierParameter2::Algebraic(
++            BezierAlgebraicParameter2::try_isolate(
++                BezierParameterPolynomial::try_new_power_basis(vec![
++                    q(3, 4),
++                    0.into(),
++                    0.into(),
++                    1.into(),
++                ])
++                .unwrap(),
++                BezierParameterInterval::try_new((-1).into(), q(-1, 2)).unwrap(),
++            )
++            .unwrap(),
++        )
++        .into()
++    } else {
++        Real::zero().into()
++    };
++    let branch = set.curves()[1]
++        .restrict_source(CurveParameterRange2::try_new(Real::from(-1).into(), end).unwrap())
++        .unwrap();
++    let line = Curve2::try_line(
++        branch.end(),
++        Point2::new(1.into(), if algebraic { q(1, 2) } else { 1.into() }).into(),
++    )
++    .unwrap();
++    CurvePath2::try_new(vec![branch, line]).unwrap()
++}
++fn unique(source: &CurvePath2, first: Real, second: Real) -> CurvePath2 {
++    match source
++        .chamfer_vertex_by_setbacks(1, first, second, CurveCornerMode2::TrimOnly)
++        .unwrap()
++    {
++        CurveCornerSolutions2::Unique(result) => result,
++        other => panic!("one finite chord-setback solution expected: {other:?}"),
++    }
++}
++fn verify(source: &CurvePath2, result: &CurvePath2, reversed: bool, setback: &Real) {
++    assert_eq!(result.curves().len(), 3);
++    let index = if reversed { 2 } else { 0 };
++    let original = &source.curves()[if reversed { 1 } else { 0 }];
++    let retained = &result.curves()[index];
++    assert_eq!(
++        original.polynomial_branch().unwrap().topology().equation(),
++        retained.polynomial_branch().unwrap().topology().equation()
++    );
++    let corner = if reversed {
++        original.start()
++    } else {
++        original.end()
++    };
++    let cut = if reversed {
++        retained.start()
++    } else {
++        retained.end()
++    };
++    assert_eq!(
++        distance_squared(&cut, &corner)
++            .compare_to_real(&(setback * setback))
++            .unwrap(),
++        Ordering::Equal
++    );
++    let parameter = if reversed {
++        retained.parameter_endpoints().0
++    } else {
++        retained.parameter_endpoints().1
++    };
++    assert_eq!(
++        parameter
++            .compare(original.parameter_domain().start())
++            .unwrap(),
++        Ordering::Greater
++    );
++    assert_eq!(
++        parameter
++            .compare(original.parameter_domain().end())
++            .unwrap(),
++        Ordering::Less
++    );
++    assert!(
++        original
++            .point_at(parameter)
++            .unwrap()
++            .coincides_with(&cut)
++            .unwrap()
++    );
++    for pair in result.curves().windows(2) {
++        assert!(pair[0].end().coincides_with(&pair[1].start()).unwrap());
++    }
++    assert!(result.start().coincides_with(&source.start()).unwrap());
++    assert!(result.end().coincides_with(&source.end()).unwrap());
++}
++
++#[test]
++fn polynomial_chamfer_retains_algebraic_cuts_through_reversal_and_similarity() {
++    let transform = Similarity2::try_from_real_affine(
++        0.into(),
++        (-2).into(),
++        2.into(),
++        0.into(),
++        1.into(),
++        3.into(),
++    )
++    .unwrap();
++    for algebraic in [false, true] {
++        for moved in [false, true] {
++            let original = source(algebraic);
++            let original = if moved {
++                original.transform_similarity(&transform).unwrap()
++            } else {
++                original
++            };
++            for reversed in [false, true] {
++                let original = if reversed {
++                    original.reversed().unwrap()
++                } else {
++                    original.clone()
++                };
++                let setback = if moved { q(1, 32) } else { q(1, 64) };
++                let result = unique(&original, setback.clone(), setback.clone());
++                verify(&original, &result, reversed, &setback);
++                if !moved {
++                    let cut = if reversed {
++                        result.curves()[2].start()
++                    } else {
++                        result.curves()[0].end()
++                    };
++                    assert_eq!(
++                        form(&cut, polynomial(&[&[-1, 0, 1], &[], &[], &[-1]]))
++                            .compare_to_real(&Real::zero())
++                            .unwrap(),
++                        Ordering::Equal
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn polynomial_chamfer_preserves_zero_invalid_empty_and_extension_outcomes() {
++    let original = source(true);
++    let result = unique(&original, 0.into(), q(1, 64));
++    assert!(
++        result.curves()[0]
++            .end()
++            .coincides_with(&original.curves()[0].end())
++            .unwrap()
++    );
++    assert_eq!(
++        original
++            .chamfer_vertex_by_setbacks(1, 0.into(), 0.into(), CurveCornerMode2::TrimOnly)
++            .unwrap()
++            .no_solution_reason(),
++        Some(CurveCornerNoSolution2::ZeroDesignValue)
++    );
++    assert_eq!(
++        original
++            .chamfer_vertex_by_setbacks(1, 4.into(), q(1, 64), CurveCornerMode2::TrimOnly)
++            .unwrap()
++            .no_solution_reason(),
++        Some(CurveCornerNoSolution2::OutsideTrimDomain)
++    );
++    assert!(matches!(
++        original.chamfer_vertex_by_setbacks(1, (-1).into(), q(1, 64), CurveCornerMode2::TrimOnly),
++        Err(ExactCurveError::Invalid { .. })
++    ));
++    assert!(
++        matches!(original.chamfer_vertex_by_setbacks(1, q(1, 64), q(1, 64), CurveCornerMode2::TrimOrExtend), Err(ExactCurveError::Blocked(blocker)) if blocker.reason() == UncertaintyReason::Unsupported)
++    );
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn polynomial_chamfer_replays_in_a_fresh_process_and_reuses_selected_cuts() {
++    use hypercurve::{CurveRegion2, SvgGeometry2, export_svg_document, import_svg_document};
++    const INPUT: &str = "HYPERCURVE_POLYNOMIAL_CHAMFER_REPLAY";
++    fn replay(text: &str) {
++        let geometry = import_svg_document(text).unwrap();
++        verify(&geometry.paths()[0], &geometry.paths()[1], false, &q(1, 64));
++        let cut = geometry.paths()[1].curves()[0].end();
++        assert_eq!(
++            form(&cut, polynomial(&[&[-1, 0, 1], &[], &[], &[-1]]))
++                .compare_to_real(&Real::zero())
++                .unwrap(),
++            Ordering::Equal
++        );
++        assert_eq!(export_svg_document(&geometry).unwrap(), text);
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        replay(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let original = source(true);
++    let result = unique(&original, q(1, 64), q(1, 64));
++    let text = export_svg_document(&SvgGeometry2::new(
++        CurveRegion2::empty(),
++        vec![],
++        vec![original, result],
++    ))
++    .unwrap();
++    replay(&text);
++    let path = std::env::temp_dir().join(format!(
++        "hypercurve-polynomial-chamfer-{}.svg",
++        std::process::id()
++    ));
++    std::fs::write(&path, &text).unwrap();
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "polynomial_chamfer_replays_in_a_fresh_process_and_reuses_selected_cuts",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        child.status.success(),
++        "{}{}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
