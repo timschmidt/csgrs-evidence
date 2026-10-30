@@ -1,0 +1,1142 @@
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index 159c83d6d5..c1032bf074 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add `evaluate_with_cancellable_budget` and re-export `CancellationToken`.
++  A cancelled evaluation reports `WorkKind::Cancellation`, publishes no
++  partial result, and leaves no cached blocker that prevents a retry.
++
+ - Preserve typed exact failures from SVG region arrangement and region union
+   through the public importer and its adapters.
+ 
+diff --git a/crates/hypercurve/README.md b/crates/hypercurve/README.md
+index ec8d5051be..ccb5d0a74f 100644
+--- a/crates/hypercurve/README.md
++++ b/crates/hypercurve/README.md
+@@ -36,7 +36,7 @@ This README describes crate version `0.3.1`.
+ | `CurveString2`, `CurvePath2`, `Contour2` | Connected open strings, general paths, and closed line/arc contours |
+ | `CurveRegion2` | Native mixed-family filled planar region |
+ | `provisional`, `evaluate_under`, `Provisional<T>`, `CurvePreviewOptions`, `Classification<T>` | Explicitly qualified approximate evaluation, its certainty-carrying result, lossy preview adapter, and decided/uncertain result |
+-| `evaluate_with_budget`, `WorkBudget`, `BudgetOutcome<T>`, `BudgetExceeded` | Shared operation work limits, admitted usage, and typed resource exhaustion |
++| `evaluate_with_budget`, `evaluate_with_cancellable_budget`, `WorkBudget`, `BudgetOutcome<T>`, `BudgetExceeded`, `CancellationToken` | Shared operation work limits, admitted usage, typed resource exhaustion, and cooperative cancellation |
+ | `CurveError`, `ExactCurveError` | Construction and exact-topology failure information |
+ 
+ `CurveRegion2` is the sole public filled-region carrier. Native line/arc
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index 721cd32668..4dc66a698a 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -7,7 +7,7 @@
+     "Native save/reload beyond the demonstrated source and selected generated carriers remains open. Version 5 preserves the named filled-region chains. The selected-circle corner fixtures now complete chamfer or constrained fillet, reconstruction, exact replay and round dilation/contraction; named translated-circle and nonincident-line contacts and rotated overlaps also complete. General independent angular/coefficient fields, other circle frames and arbitrary implicit regions remain open.",
+     "Complete nonrational ellipse, parabola and PH offset chains, singular events and overlap correspondences.",
+     "Invalid operands paired with canonical empty, full disappearance chains and all hole/disconnected configurations.",
+-    "Total arithmetic, coefficient/system growth, retained-memory limits and cooperative cancellation.",
++    "Total arithmetic, coefficient/system growth and retained-memory limits. Cooperative cancellation is observed only at instrumented work units, so it does not bound uninstrumented arithmetic or elapsed time.",
+     "Published package and actual binding consumers for the complete declared domain.",
+     "Unrestricted repeated polynomial chord setbacks and other implicit replay/operation chains remain open. The named two-chamfer path, Boolean-generated algebraic-corner chamfer, boundary reconstruction, further Boolean and polynomial SVG replay have bounded acceptance witnesses; these finite chains do not establish unrestricted operation closure."
+   ],
+@@ -16090,6 +16090,75 @@
+       ],
+       "oracle": "For -1<=x<=1, x^2+1>=1, x-3<=-2 and (x-3)^2>=4, independently proving no zero in the entire rectangle.",
+       "timeout_seconds": 60
++    },
++    {
++      "id": "cancelled_intersection_retry",
++      "target": "work_budget",
++      "test": "cancelled_intersections_publish_nothing_and_retry_with_a_new_token",
++      "owner": "Hypersolve shared work scopes and Hypercurve explicit evaluation scopes",
++      "properties": [
++        "P15",
++        "P17",
++        "P19",
++        "P20"
++      ],
++      "domain": "Two crossing weight-(1,2,2,1) rational cubic Bezier curves whose three contacts satisfy (2t-1)(7t^2-7t+1)=0, under a cancellable unlimited work scope.",
++      "origins": [
++        "authored"
++      ],
++      "families": [
++        "RationalBezier"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Cancellation is cooperative: it is observed at instrumented work units, publishes no value and is reported as WorkKind::Cancellation. It is not an elapsed-time, total-arithmetic or memory bound.",
++      "claims": [
++        {
++          "stage": "incidence_order",
++          "outcome": "exhausted",
++          "assertion": "A cancelled token denies the first instrumented unit; the inner intersection reports only a budget-exhausted blocker and the outer receipt is Cancellation with zero admitted usage."
++        },
++        {
++          "stage": "resource_recovery",
++          "outcome": "exact_success",
++          "assertion": "A retry on the same curves with a new token completes all three certified contacts, equal to a fresh independent intersection."
++        }
++      ],
++      "oracle": "The public outer receipt kind, admitted usage, and contacts equal to an independent fresh unbudgeted intersection of newly constructed curves.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "concurrent_cancelled_intersection",
++      "target": "work_budget",
++      "test": "concurrent_cancellation_never_publishes_a_partial_intersection",
++      "owner": "Hypersolve shared work scopes and Hypercurve explicit evaluation scopes",
++      "properties": [
++        "P15",
++        "P17",
++        "P19",
++        "P20"
++      ],
++      "domain": "Two crossing weight-(1,2,2,1) rational cubic Bezier curves whose three contacts satisfy (2t-1)(7t^2-7t+1)=0, under a cancellable unlimited work scope.",
++      "origins": [
++        "authored"
++      ],
++      "families": [
++        "RationalBezier"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Cancellation is cooperative: it is observed at instrumented work units, publishes no value and is reported as WorkKind::Cancellation. It is not an elapsed-time, total-arithmetic or memory bound.",
++      "claims": [
++        {
++          "stage": "resource_recovery",
++          "outcome": "exact_success",
++          "assertion": "Each attempt cancelled from another thread either reports Cancellation or has already completed with the independent expected contacts; no partial result is published."
++        }
++      ],
++      "oracle": "The public outer receipt kind, admitted usage, and contacts equal to an independent fresh unbudgeted intersection of newly constructed curves.",
++      "timeout_seconds": 300
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/src/lib.rs b/crates/hypercurve/src/lib.rs
+index 5244649abe..501e87ffb8 100644
+--- a/crates/hypercurve/src/lib.rs
++++ b/crates/hypercurve/src/lib.rs
+@@ -236,7 +236,9 @@ pub use finite_projection::{
+ };
+ pub use fragment::{ContourFragment, ContourFragmentSet};
+ pub use hypersolve::bivariate_topology::BivariateTopologyError;
+-pub use hypersolve::work_budget::{BudgetExceeded, BudgetOutcome, WorkBudget, WorkKind, WorkUsage};
++pub use hypersolve::work_budget::{
++    BudgetExceeded, BudgetOutcome, CancellationToken, WorkBudget, WorkKind, WorkUsage,
++};
+ pub use intersect::{
+     ArcArcIntersection, ArcArcIntersectionPoint, CircleCircleRelation, IntersectionKind,
+     LineArcIntersection, LineArcIntersectionPoint, LineArcOrder, LineCircleRelation,
+@@ -248,7 +250,7 @@ pub use offset::{OffsetCap, OffsetCornerStyle2};
+ pub use point::Point2;
+ pub use policy::{
+     CurveCertainty, CurvePreviewOptions, Provisional, evaluate_under, evaluate_with_budget,
+-    provisional,
++    evaluate_with_cancellable_budget, provisional,
+ };
+ pub(crate) use policy::{CurveContext, CurveOutcome};
+ pub use polynomial_spline::PolynomialSplineCurve2;
+diff --git a/crates/hypercurve/src/policy.rs b/crates/hypercurve/src/policy.rs
+index d54541151a..d05ae36f14 100644
+--- a/crates/hypercurve/src/policy.rs
++++ b/crates/hypercurve/src/policy.rs
+@@ -199,6 +199,69 @@ pub fn evaluate_with_budget<T>(
+     hypersolve::work_budget::with_budget(budget, || evaluate_under(policy, evaluate))
+ }
+ 
++/// Evaluate under an explicit predicate policy, shared work budget and
++/// cooperative cancellation request.
++///
++/// This is [`evaluate_with_budget`] with a [`crate::CancellationToken`] that
++/// another thread may cancel. A cancelled evaluation reports
++/// [`crate::WorkKind::Cancellation`] in the outer result and publishes no
++/// value; it is never an approximate or partial success. Cancellation is
++/// observed at instrumented work units, so it is not a wall-clock deadline.
++/// A retry needs a new token. Pass [`crate::WorkBudget::UNLIMITED`] to limit
++/// the evaluation by cancellation alone.
++///
++/// ```
++/// use hypercurve::{
++///     BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
++///     BezierParameterPolynomial, CancellationToken, PredicatePolicy, Real, WorkBudget, WorkKind,
++///     evaluate_with_cancellable_budget,
++/// };
++///
++/// // The root of 2t^2 - 1 in [2/3, 3/4] is 1/sqrt(2); ordering it against a
++/// // nearby rational needs root refinement.
++/// let polynomial = BezierParameterPolynomial::try_new_power_basis(
++///     [-1, 0, 2].into_iter().map(Real::from).collect(),
++/// )?;
++/// let interval = BezierParameterInterval::try_new(
++///     (Real::from(2) / Real::from(3))?,
++///     (Real::from(3) / Real::from(4))?,
++/// )?;
++/// let root = BezierParameter2::Algebraic(BezierAlgebraicParameter2::try_isolate(
++///     polynomial, interval,
++/// )?);
++/// let nearby = BezierParameter2::Exact((Real::from(353_553) / Real::from(500_000))?);
++/// let compare = || nearby.cmp_by_refinement(&root);
++///
++/// let cancelled = CancellationToken::new();
++/// cancelled.cancel();
++/// let attempt = evaluate_with_cancellable_budget(
++///     PredicatePolicy::STRICT,
++///     WorkBudget::UNLIMITED,
++///     &cancelled,
++///     compare,
++/// );
++/// assert_eq!(attempt.result.unwrap_err().kind, WorkKind::Cancellation);
++///
++/// let retry = evaluate_with_cancellable_budget(
++///     PredicatePolicy::STRICT,
++///     WorkBudget::UNLIMITED,
++///     &CancellationToken::new(),
++///     compare,
++/// );
++/// assert!(retry.result?.certified().is_some());
++/// # Ok::<(), Box<dyn std::error::Error>>(())
++/// ```
++pub fn evaluate_with_cancellable_budget<T>(
++    policy: hyperlimit::PredicatePolicy,
++    budget: crate::WorkBudget,
++    cancellation: &crate::CancellationToken,
++    evaluate: impl FnOnce() -> T,
++) -> crate::BudgetOutcome<Provisional<T>> {
++    hypersolve::work_budget::with_cancellable_budget(budget, cancellation, || {
++        evaluate_under(policy, evaluate)
++    })
++}
++
+ /// The policy of a principal operation on this thread: STRICT, or
+ /// `APPROXIMATE_512` inside [`provisional`]. Inside
+ /// [`CurvePreviewOptions::evaluate`] it is the adapter's edge-preview context.
+diff --git a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+index 834070985b..8f374332f0 100644
+--- a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
++++ b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+@@ -1342,3 +1342,70 @@ fn corner_seed(first: u8) -> Seed {
+         weight: 1,
+     }
+ }
++
++/// Cooperative cancellation reaches the stalled bevel stroke of a filleted
++/// hyperbola pair above. Its band regularization spends minutes in dense
++/// two-radical signs: tensor products, pseudo-quotient matrices and Bareiss
++/// determinants that admit no counted work units. Those loops observe the
++/// request between steps, so the operation reports `Cancellation` promptly
++/// instead of finishing its current sign.
++#[test]
++fn cancellation_stops_the_stalled_filleted_hyperbola_bevel_stroke() {
++    use std::sync::mpsc;
++    use std::time::{Duration, Instant};
++
++    let token = hypercurve::CancellationToken::new();
++    let (sender, receiver) = mpsc::channel();
++    {
++        let token = token.clone();
++        std::thread::Builder::new()
++            .stack_size(256 << 20)
++            .spawn(move || {
++                let seed = Seed {
++                    x: 3,
++                    y: 8,
++                    edges: vec![
++                        Edge {
++                            family: 4,
++                            dx: 6,
++                            dy: -1,
++                            outward: -1,
++                        },
++                        Edge {
++                            family: 4,
++                            dx: 6,
++                            dy: 0,
++                            outward: -2,
++                        },
++                    ],
++                    weight: 2,
++                };
++                let outcome = hypercurve::evaluate_with_cancellable_budget(
++                    STRICT,
++                    hypercurve::WorkBudget::UNLIMITED,
++                    &token,
++                    || run_sequence(&seed, &[Step::Fillet(2, 2), Step::Stroke(3, 1)]).is_ok(),
++                );
++                let _ = sender.send((
++                    outcome.result.map(|value| value.into_unverified()),
++                    Instant::now(),
++                ));
++            })
++            .unwrap();
++    }
++    // Release replies take well under a second. Without checkpoints in those
++    // loops the same request took 21 s at this point, and never returned
++    // within twenty minutes when issued after one minute.
++    let bound = Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 10 });
++    std::thread::sleep(Duration::from_secs(3));
++    let cancelled = Instant::now();
++    token.cancel();
++    let (result, finished) = receiver
++        .recv_timeout(bound)
++        .expect("the stroke did not observe cancellation within its bound");
++    eprintln!(
++        "cancellation latency {:?}",
++        finished.saturating_duration_since(cancelled)
++    );
++    assert_eq!(result.unwrap_err().kind, hypercurve::WorkKind::Cancellation);
++}
+diff --git a/crates/hypercurve/tests/work_budget.rs b/crates/hypercurve/tests/work_budget.rs
+index 41a7bd1322..83ec597873 100644
+--- a/crates/hypercurve/tests/work_budget.rs
++++ b/crates/hypercurve/tests/work_budget.rs
+@@ -2,9 +2,9 @@ use std::cmp::Ordering;
+ 
+ use hypercurve::{
+     BezierAlgebraicParameter2, BezierParameter2, BezierParameterInterval,
+-    BezierParameterPolynomial, BudgetExceeded, Curve2, CurveCertainty, ExactCurveError, Point2,
+-    PredicatePolicy, RationalBezier2, Real, UncertaintyReason, WorkBudget, WorkKind, WorkUsage,
+-    evaluate_with_budget,
++    BezierParameterPolynomial, BudgetExceeded, CancellationToken, Curve2, CurveCertainty,
++    ExactCurveError, Point2, PredicatePolicy, RationalBezier2, Real, UncertaintyReason, WorkBudget,
++    WorkKind, WorkUsage, evaluate_with_budget, evaluate_with_cancellable_budget,
+ };
+ 
+ fn rational(numerator: i32, denominator: i32) -> Real {
+@@ -185,3 +185,106 @@ fn polynomial_isolation_shares_a_total_subdivision_budget() {
+         expected
+     );
+ }
++
++fn crossing_rational_cubics() -> (Curve2, Curve2) {
++    let curve = |points: [(i32, i32); 4]| {
++        Curve2::from(
++            RationalBezier2::try_new(
++                points
++                    .into_iter()
++                    .map(|(x, y)| Point2::from_values(x, y))
++                    .collect(),
++                [1, 2, 2, 1].into_iter().map(Real::from).collect(),
++            )
++            .unwrap(),
++        )
++    };
++    (
++        curve([(0, 0), (0, 1), (1, 0), (1, 1)]),
++        curve([(0, 1), (0, 0), (1, 1), (1, 0)]),
++    )
++}
++
++#[test]
++fn cancelled_intersections_publish_nothing_and_retry_with_a_new_token() {
++    let (first, second) = crossing_rational_cubics();
++    let cancelled = CancellationToken::new();
++    cancelled.cancel();
++    let denied = evaluate_with_cancellable_budget(
++        PredicatePolicy::STRICT,
++        WorkBudget::UNLIMITED,
++        &cancelled,
++        || {
++            // Inner consumers see an ordinary resource blocker, never contacts.
++            match first.intersect_curve(&second) {
++                Ok(partial) => {
++                    assert!(!partial.is_complete());
++                    assert!(partial.contacts().is_empty());
++                }
++                Err(ExactCurveError::Blocked(blocker)) => {
++                    assert_eq!(blocker.reason(), UncertaintyReason::BudgetExhausted);
++                }
++                Err(other) => panic!("unexpected failure {other:?}"),
++            }
++        },
++    );
++    assert_eq!(denied.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(denied.usage, WorkUsage::default());
++    // A cancelled attempt leaves no cached blocker on these curves.
++    let retry = evaluate_with_cancellable_budget(
++        PredicatePolicy::STRICT,
++        WorkBudget::UNLIMITED,
++        &CancellationToken::new(),
++        || first.intersect_curve(&second),
++    );
++    assert!(retry.usage.promotions > 0);
++    let retry = retry.result.unwrap().certified().unwrap().unwrap();
++    assert!(retry.is_complete());
++    // Equal x parameters reduce y=1-y to (2t-1)(7t^2-7t+1)=0.
++    assert_eq!(retry.contacts().len(), 3);
++    let (fresh_first, fresh_second) = crossing_rational_cubics();
++    let expected = fresh_first.intersect_curve(&fresh_second).unwrap();
++    assert_eq!(retry.contacts(), expected.contacts());
++    assert_eq!(retry.overlaps(), expected.overlaps());
++}
++
++/// Another thread cancels while fresh intersections run. Each attempt either
++/// observes the request and publishes nothing, or completed first with the
++/// independent expected contacts; it never publishes a partial result.
++#[test]
++fn concurrent_cancellation_never_publishes_a_partial_intersection() {
++    let (first, second) = crossing_rational_cubics();
++    let expected = first.intersect_curve(&second).unwrap();
++    let mut outcomes = [0_usize; 2];
++    for delay in [0_u64, 1, 5, 20] {
++        let token = CancellationToken::new();
++        let worker = {
++            let token = token.clone();
++            std::thread::spawn(move || {
++                let (first, second) = crossing_rational_cubics();
++                evaluate_with_cancellable_budget(
++                    PredicatePolicy::STRICT,
++                    WorkBudget::UNLIMITED,
++                    &token,
++                    || first.intersect_curve(&second),
++                )
++            })
++        };
++        std::thread::sleep(std::time::Duration::from_millis(delay));
++        token.cancel();
++        let outcome = worker.join().unwrap();
++        match outcome.result {
++            Err(exceeded) => {
++                assert_eq!(exceeded.kind, WorkKind::Cancellation);
++                outcomes[0] += 1;
++            }
++            Ok(provisional) => {
++                let actual = provisional.certified().unwrap().unwrap();
++                assert!(actual.is_complete());
++                assert_eq!(actual.contacts(), expected.contacts());
++                outcomes[1] += 1;
++            }
++        }
++    }
++    assert_eq!(outcomes.iter().sum::<usize>(), 4);
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 103aa08b00..e758b48d93 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,14 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add cooperative cancellation to work-budget scopes. `CancellationToken` can be
++  cancelled from any thread; `with_cancellable_budget` then fails the next
++  instrumented unit or exhaustion check with `WorkKind::Cancellation` and
++  publishes no value. Outer tokens stop nested scopes; inner tokens do not
++  poison their parents. `WorkBudget::UNLIMITED` bounds a scope by cancellation
++  alone. Cancellation is not a wall-clock deadline: uninstrumented arithmetic
++  between checks still runs to completion.
++
+ - Reuse one prepared Sturm chain for complete root-isolation counts until the
+   temporary polynomial changes by exact deflation, preserving remainder and
+   refinement limits.
+diff --git a/crates/hypersolve/FUTURE_WORK.md b/crates/hypersolve/FUTURE_WORK.md
+index 5b27b76f23..39c64384a7 100644
+--- a/crates/hypersolve/FUTURE_WORK.md
++++ b/crates/hypersolve/FUTURE_WORK.md
+@@ -228,3 +228,43 @@ This is empty-support admission. Actual vertical components and algebraic
+ coefficient topology remain open. Existing work counters do not bound total
+ arithmetic, coefficient growth, retained memory or cancellation. Command timing
+ and process RSS include builds; no performance improvement is claimed.
++
++## Cooperative cancellation (2026-10-30)
++
++Closure-plan M4 requires cooperative cancellation that releases temporary
++state and does not poison a retry. Before this change, `work_budget` had no
++cancellation. A request could only take the form of a reached unit limit, and
++the stalled Hypercurve bevel stroke of a filleted hyperbola pair spends minutes
++in loops that charge no units.
++
++`CancellationToken`, `with_cancellable_budget` and `WorkBudget::UNLIMITED`
++add a thread-safe request to the existing scope stack. The next admitted unit
++or `exhaustion()` check observes it as `WorkKind::Cancellation`, and the scope
++publishes no value. Outer tokens stop nested scopes; nested tokens leave their
++parents running. Integer polynomial Bareiss determinants, pseudo-quotient
++multiplication matrices and dense tensor products now check `exhaustion()`
++between steps and return their existing "unavailable" outcome. Dense
++square-root sum signs label that outcome `BudgetExhausted` rather than
++`Unsupported`. Hypercurve exposes `evaluate_with_cancellable_budget`.
++
++Measured on the stalled stroke (release, Rust 1.99.1): before these
++checkpoints, a request issued after 60 s had not been honored after 21 minutes,
++and one issued after 3 s took 21 s. With them, requests issued after 3, 5, 20,
++60 and 150 s returned `Cancellation` within 0.16-0.45 s. A counting allocator
++shows warm cancelled attempts leave 24-2,520 bytes of a 4.7 MB peak; the first
++attempts initialize about 1.2 MiB of bounded process-wide tables.
++
++Witnesses: five `work_budget` owner tests (pre-cancelled, mid-operation,
++nesting, another thread, cancelled native refinement then retry), the Bareiss
++unit test, `cancelled_intersections_publish_nothing_and_retry_with_a_new_token`,
++`concurrent_cancellation_never_publishes_a_partial_intersection`,
++`cancellation_stops_the_stalled_filleted_hyperbola_bevel_stroke` and
++`cancelled_stalled_stroke_releases_its_temporary_heap`. The stalled-stroke
++witness fails its 10 s bound without the three checkpoint sites.
++
++Remaining limits: cancellation is observed only at instrumented units and
++these checkpoints. One large integer product, scalar precision refinement and
++other uninstrumented loops still run to completion, so this is not an
++elapsed-time bound. Total arithmetic, coefficient growth and retained-memory
++limits remain open. Cancellation does not cross threads by itself: a worker
++joins a request by entering its own scope with a cloned token.
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index b79f0fe8a1..ec0069e3da 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -28,7 +28,7 @@ This README describes crate version `0.3.1`.
+ | `AffineResidual`, `QuadraticResidual`, `UnivariateQuadraticResidual` | Recognized exact subproblems |
+ | `CandidateCertificationReport`, `CandidateDomainReport` | Candidate proof, violation, uncertainty, and domain evidence |
+ | `AlgebraicRootRepresentation` | Isolated exact algebraic root carrier |
+-| `work_budget::{WorkBudget, BudgetOutcome, BudgetExceeded}` | Shared synchronous refinement/promotion accounting with typed exhaustion |
++| `work_budget::{WorkBudget, BudgetOutcome, BudgetExceeded, CancellationToken}` | Shared synchronous refinement/promotion accounting with typed exhaustion and cooperative cancellation |
+ | `SolverConfig`, `SolverState`, `SolveReport` | Explicit proposal-engine state and diagnostics |
+ | `SketchSolveProblem`, `SketchConstraintBuildReport` | Sketch-specific equation construction and reports |
+ 
+@@ -49,8 +49,11 @@ instrumentation and does not change the mathematical API.
+ promotion attempts across nested synchronous operations. Exhaustion is a typed
+ resource failure and never authorizes approximation. The counters do not yet
+ cover every solver path or bound scalar arithmetic, coefficient sizes,
+-allocation, or elapsed time. See the [module contract](src/work_budget.rs) for
+-the current coverage, cache behavior, and thread-local scope rules.
++allocation, or elapsed time. `work_budget::with_cancellable_budget` adds a
++`CancellationToken` that another thread can cancel; the operation stops at its
++next instrumented unit with a typed `Cancellation` failure. See the
++[module contract](src/work_budget.rs) for the current coverage, cache behavior,
++and thread-local scope rules.
+ 
+ ## Quick start
+ 
+diff --git a/crates/hypersolve/algebraic_fiber_benchmarks.md b/crates/hypersolve/algebraic_fiber_benchmarks.md
+index 23c994b0c6..3ea995d57d 100644
+--- a/crates/hypersolve/algebraic_fiber_benchmarks.md
++++ b/crates/hypersolve/algebraic_fiber_benchmarks.md
+@@ -4,12 +4,12 @@ Generated automatically by `cargo bench --bench algebraic_fiber`. These are dete
+ 
+ | Benchmark | Iterations | Total | Mean per iteration | Validation checksum |
+ | --- | ---: | ---: | ---: | --- |
+-| `algebraic_fiber_even_multiplicity` | 1000 | 0.015 s | 14.88 us | root=1000; refinement=4000 |
+-| `algebraic_fiber_eight_independent_intervals` | 1000 | 0.084 s | 84.01 us | root=4000 |
+-| `algebraic_fiber_eight_batched_intervals` | 1000 | 0.045 s | 44.77 us | root=4000 |
+-| `algebraic_common_fiber_degree_drop` | 1000 | 0.038 s | 38.31 us | root=1000; refinement=4000 |
+-| `algebraic_image_policy_zero_content` | 1000 | 0.005 s | 5.35 us | coefficient=2000 |
+-| `rational_quadratic_common_fiber_two_components` | 1000 | 0.104 s | 103.58 us | component=4000 |
+-| `implicit_quadratic_common_fiber` | 1000 | 0.058 s | 57.77 us | component=5000 |
+-| `implicit_quadratic_high_cofactor` | 1000 | 0.174 s | 174.15 us | component=7000 |
+-| `rational_repeated_cubic_common_fiber_three_components` | 1000 | 0.221 s | 221.11 us | component=6000 |
++| `algebraic_fiber_even_multiplicity` | 1000 | 0.171 s | 171.05 us | root=1000; refinement=4000 |
++| `algebraic_fiber_eight_independent_intervals` | 1000 | 1.216 s | 1.22 ms | root=4000 |
++| `algebraic_fiber_eight_batched_intervals` | 1000 | 0.550 s | 550.46 us | root=4000 |
++| `algebraic_common_fiber_degree_drop` | 1000 | 0.297 s | 296.79 us | root=1000; refinement=4000 |
++| `algebraic_image_policy_zero_content` | 1000 | 0.082 s | 81.52 us | coefficient=2000 |
++| `rational_quadratic_common_fiber_two_components` | 1000 | 0.727 s | 727.37 us | component=4000 |
++| `implicit_quadratic_common_fiber` | 1000 | 0.417 s | 416.73 us | component=5000 |
++| `implicit_quadratic_high_cofactor` | 1000 | 1.344 s | 1.34 ms | component=7000 |
++| `rational_repeated_cubic_common_fiber_three_components` | 1000 | 1.658 s | 1.66 ms | component=6000 |
+diff --git a/crates/hypersolve/dispatch_trace.md b/crates/hypersolve/dispatch_trace.md
+index 1476700ec6..ff85bc143a 100644
+--- a/crates/hypersolve/dispatch_trace.md
++++ b/crates/hypersolve/dispatch_trace.md
+@@ -9,7 +9,7 @@ Generated by `cargo bench --bench dispatch_trace --features dispatch-trace`. Eac
+ | `affine_krawczyk_certification` | 113 | 8 | 0 | 71 | 0 | 0 | 0 | 0 | 41 | 0 | 0 |
+ | `algebraic_comparison` | 512 | 46 | 0 | 342 | 0 | 0 | 20 | 3 | 195 | 0 | 7 |
+ | `algebraic_evaluation` | 86 | 7 | 0 | 59 | 0 | 0 | 18 | 1 | 66 | 0 | 0 |
+-| `algebraic_rational_images` | 941 | 108 | 0 | 782 | 0 | 0 | 75 | 0 | 304 | 0 | 0 |
++| `algebraic_rational_images` | 951 | 113 | 0 | 790 | 0 | 0 | 75 | 0 | 307 | 0 | 0 |
+ | `candidate_batch_and_active_set` | 3983 | 0 | 0 | 2520 | 0 | 0 | 0 | 0 | 1201 | 0 | 0 |
+ | `direct_and_fraction_free_linear` | 449 | 0 | 0 | 306 | 0 | 0 | 11 | 0 | 146 | 0 | 0 |
+ | `domain_certification` | 7 | 2 | 0 | 3 | 0 | 0 | 0 | 0 | 5 | 0 | 0 |
+@@ -115,10 +115,10 @@ Generated by `cargo bench --bench dispatch_trace --features dispatch-trace`. Eac
+ | `algebraic_evaluation` | `real` | `sqrt` | `rational-sqrt-special-form` | 1 |
+ | `algebraic_evaluation` | `real` | `structural_facts` | `exact-rational` | 2 |
+ | `algebraic_evaluation` | `real` | `structural_facts` | `scaled-computable` | 1 |
+-| `algebraic_rational_images` | `hyperlimit` | `compare_reals` | `exact-rational` | 103 |
++| `algebraic_rational_images` | `hyperlimit` | `compare_reals` | `exact-rational` | 108 |
+ | `algebraic_rational_images` | `hyperlimit` | `resolve_real_sign_direct` | `structural-real-facts` | 5 |
+ | `algebraic_rational_images` | `hypersolve-benchmark` | `algebraic_rational_images` | `recorded-workload` | 1 |
+-| `algebraic_rational_images` | `rational` | `add` | `word-sized` | 38 |
++| `algebraic_rational_images` | `rational` | `add` | `word-sized` | 39 |
+ | `algebraic_rational_images` | `rational` | `arithmetic-reuse` | `first-observation` | 27 |
+ | `algebraic_rational_images` | `rational` | `average_pair` | `word-sized` | 8 |
+ | `algebraic_rational_images` | `rational` | `common-scale` | `primitive-bigint-ratio` | 17 |
+@@ -150,11 +150,11 @@ Generated by `cargo bench --bench dispatch_trace --features dispatch-trace`. Eac
+ | `algebraic_rational_images` | `real` | `average_pair` | `same-symbolic-basis` | 8 |
+ | `algebraic_rational_images` | `real` | `certified_sign_until` | `structural-facts` | 5 |
+ | `algebraic_rational_images` | `real` | `constructor` | `one` | 14 |
+-| `algebraic_rational_images` | `real` | `constructor` | `rational` | 169 |
+-| `algebraic_rational_images` | `real` | `constructor` | `zero` | 96 |
++| `algebraic_rational_images` | `real` | `constructor` | `rational` | 170 |
++| `algebraic_rational_images` | `real` | `constructor` | `zero` | 98 |
+ | `algebraic_rational_images` | `real` | `inverse_ref` | `prechecked-one` | 17 |
+ | `algebraic_rational_images` | `real` | `mul` | `exact-rational` | 30 |
+-| `algebraic_rational_images` | `real` | `polynomial` | `eval-poly-exact-rational` | 10 |
++| `algebraic_rational_images` | `real` | `polynomial` | `eval-poly-exact-rational` | 11 |
+ | `algebraic_rational_images` | `real` | `polynomial` | `eval-poly-unit-argument` | 2 |
+ | `algebraic_rational_images` | `real` | `structural_facts` | `exact-rational` | 5 |
+ | `algebraic_rational_images` | `real` | `sub` | `exact-rational-assign` | 10 |
+diff --git a/crates/hypersolve/src/bareiss.rs b/crates/hypersolve/src/bareiss.rs
+index 92a9a9f32f..97244faf80 100644
+--- a/crates/hypersolve/src/bareiss.rs
++++ b/crates/hypersolve/src/bareiss.rs
+@@ -1536,6 +1536,11 @@ pub(crate) fn determinant_integer_polynomial_matrix(
+         let pivot_value = matrix[pivot * dimension + pivot].clone();
+         for row in pivot + 1..dimension {
+             for column in pivot + 1..dimension {
++                // A cancelled or exhausted scope stops between entry updates;
++                // the unavailable determinant is never a zero result.
++                if crate::work_budget::exhaustion().is_some() {
++                    return None;
++                }
+                 let numerator = cross_difference(
+                     &pivot_value,
+                     &matrix[row * dimension + column],
+@@ -2324,4 +2329,47 @@ mod tests {
+             prop_assert!(report.sparse_residual_replay.accepted);
+         }
+     }
++
++    #[test]
++    fn cancelled_polynomial_determinant_is_unavailable_not_zero() {
++        use crate::work_budget::{
++            CancellationToken, WorkBudget, WorkKind, with_budget, with_cancellable_budget,
++        };
++        // [[t, 1, 0], [1, t, 1], [0, 1, t]] has determinant t^3 - 2t.
++        let int = |values: &[i64]| values.iter().copied().map(BigInt::from).collect::<Vec<_>>();
++        let entries = vec![
++            int(&[0, 1]),
++            int(&[1]),
++            int(&[]),
++            int(&[1]),
++            int(&[0, 1]),
++            int(&[1]),
++            int(&[]),
++            int(&[1]),
++            int(&[0, 1]),
++        ];
++        let expected = int(&[0, -2, 0, 1]);
++        assert_eq!(
++            determinant_integer_polynomial_matrix(&entries, 3),
++            Some(expected.clone())
++        );
++        let token = CancellationToken::new();
++        token.cancel();
++        // The determinant itself reports unavailability, never a zero value.
++        let cancelled = with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++            assert_eq!(determinant_integer_polynomial_matrix(&entries, 3), None);
++        });
++        assert_eq!(cancelled.result.unwrap_err().kind, WorkKind::Cancellation);
++        // An exhausted scope stops too, before charging any new unit.
++        let exhausted = with_budget(WorkBudget::ZERO, || {
++            assert!(crate::work_budget::consume(WorkKind::RootRefinement, 1).is_err());
++            assert_eq!(determinant_integer_polynomial_matrix(&entries, 3), None);
++        });
++        assert_eq!(exhausted.result.unwrap_err().kind, WorkKind::RootRefinement);
++        let fresh =
++            with_cancellable_budget(WorkBudget::UNLIMITED, &CancellationToken::new(), || {
++                determinant_integer_polynomial_matrix(&entries, 3)
++            });
++        assert_eq!(fresh.result.unwrap(), Some(expected));
++    }
+ }
+diff --git a/crates/hypersolve/src/represented_root.rs b/crates/hypersolve/src/represented_root.rs
+index bd95aa0dd3..22aff86ca5 100644
+--- a/crates/hypersolve/src/represented_root.rs
++++ b/crates/hypersolve/src/represented_root.rs
+@@ -2250,7 +2250,13 @@ pub fn dense_positive_square_root_sum_sign<C: SelectedAlgebraContext>(
+             "dense-positive-root-sign-blocker",
+             "magnitude-construction",
+         );
+-        return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++        return Ok(Classification::Uncertain(
++            if crate::work_budget::exhaustion().is_some() {
++                UncertaintyReason::BudgetExhausted
++            } else {
++                UncertaintyReason::Unsupported
++            },
++        ));
+     };
+     let magnitude_sign = dense_polynomial_tuple_sign(&magnitude, sources, policy)?;
+     Ok(positive_root_sum_sign_from_components(
+diff --git a/crates/hypersolve/src/resultant.rs b/crates/hypersolve/src/resultant.rs
+index 3136d3c729..d66d483d6d 100644
+--- a/crates/hypersolve/src/resultant.rs
++++ b/crates/hypersolve/src/resultant.rs
+@@ -684,6 +684,10 @@ fn pseudo_quotient_multiplication_matrix(
+             product[column + power] = coefficient.clone();
+         }
+         for power in (degree..product_len).rev() {
++            // Stop a cancelled or exhausted scope between elimination steps.
++            if crate::work_budget::exhaustion().is_some() {
++                return None;
++            }
+             let eliminand = product[power].clone();
+             let shift = power - degree;
+             if !leading.is_one() {
+@@ -734,6 +738,10 @@ fn pseudo_quotient_multiplication_matrix_real(
+             product[column + power] = coefficient.clone();
+         }
+         for power in (degree..product_len).rev() {
++            // Stop a cancelled or exhausted scope between elimination steps.
++            if crate::work_budget::exhaustion().is_some() {
++                return None;
++            }
+             let eliminand = product[power].clone();
+             let shift = power - degree;
+             if leading != &Real::one() {
+diff --git a/crates/hypersolve/src/tensor_resultant.rs b/crates/hypersolve/src/tensor_resultant.rs
+index 24771edd90..e7172b3714 100644
+--- a/crates/hypersolve/src/tensor_resultant.rs
++++ b/crates/hypersolve/src/tensor_resultant.rs
+@@ -278,8 +278,14 @@ impl DenseTensorPolynomial {
+         let target_strides = row_major_strides(&dimensions)?;
+         let left_terms = embedded_nonzero_terms(self, &target_strides)?;
+         let mut result = Self::zero(dimensions)?;
++        // A cancelled or exhausted scope stops between rows of the product;
++        // the unavailable product is never published as a partial sum.
++        let interrupted = || crate::work_budget::exhaustion().is_some();
+         if std::ptr::eq(self, other) {
+             for (position, (left_index, left)) in left_terms.iter().enumerate() {
++                if interrupted() {
++                    return None;
++                }
+                 result.coefficients[left_index.checked_add(*left_index)?] += *left * *left;
+                 for (right_index, right) in &left_terms[position + 1..] {
+                     let target = left_index.checked_add(*right_index)?;
+@@ -292,6 +298,9 @@ impl DenseTensorPolynomial {
+         }
+         let right_terms = embedded_nonzero_terms(other, &target_strides)?;
+         for (left_index, left) in left_terms {
++            if interrupted() {
++                return None;
++            }
+             for (right_index, right) in &right_terms {
+                 result.coefficients[left_index.checked_add(*right_index)?] += left * *right;
+             }
+diff --git a/crates/hypersolve/src/work_budget.rs b/crates/hypersolve/src/work_budget.rs
+index 3f699af079..884998177a 100644
+--- a/crates/hypersolve/src/work_budget.rs
++++ b/crates/hypersolve/src/work_budget.rs
+@@ -84,9 +84,32 @@
+ //! Scopes are thread-local and restore on return and unwinding. They do not
+ //! follow a future or propagate to spawned threads; configure each synchronous
+ //! worker explicitly.
++//!
++//! A scope can also carry a [`CancellationToken`]. Cancellation is cooperative:
++//! the computing thread observes it at its next admitted unit or exhaustion
++//! check, never inside one exact arithmetic step, so the delay before an
++//! instrumented operation stops is bounded by its longest uninstrumented
++//! stretch, not by a time limit. A cancelled scope then behaves as an exhausted
++//! one with [`WorkKind::Cancellation`]: it publishes no value and its callers
++//! unwind through their ordinary typed resource failures. Cancelling an
++//! enclosing scope's token stops every nested scope; cancelling a nested
++//! scope's token leaves its parent free to continue. Tokens are `Send` and
++//! `Sync`, so another thread may cancel, and a worker can join the same request
++//! by entering its own scope with a clone. A cancelled token stays cancelled;
++//! a retry uses a new token and repeats the work its earlier attempt had not
++//! retained as a proof.
++//!
++//! Some long loops charge no units but still observe [`exhaustion`] between
++//! steps, so cancelled or exhausted scopes leave them promptly: integer
++//! polynomial Bareiss determinants, pseudo-quotient multiplication matrices and
++//! dense tensor products. They report their existing "unavailable" outcome,
++//! never a zero or partial value. Other uninstrumented arithmetic, such as one
++//! large integer product or a scalar refinement, still runs to completion.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::fmt;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ /// Maximum admitted work of each kind in a synchronous operation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -103,6 +126,37 @@ impl WorkBudget {
+         refinements: 0,
+         promotions: 0,
+     };
++
++    /// Admit any number of instrumented units, for scopes that are limited only
++    /// by a [`CancellationToken`].
++    pub const UNLIMITED: Self = Self {
++        refinements: usize::MAX,
++        promotions: usize::MAX,
++    };
++}
++
++/// A cooperative request to stop one or more budgeted operations.
++///
++/// Clones share the request. See the [module documentation](self) for when
++/// cancellation is observed and how it nests.
++#[derive(Clone, Debug, Default)]
++pub struct CancellationToken(Arc<AtomicBool>);
++
++impl CancellationToken {
++    /// A token that has not been cancelled.
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Request that every scope carrying this token stop at its next check.
++    pub fn cancel(&self) {
++        self.0.store(true, Ordering::Release);
++    }
++
++    /// Whether [`cancel`](Self::cancel) has been called on this token or a clone.
++    pub fn is_cancelled(&self) -> bool {
++        self.0.load(Ordering::Acquire)
++    }
+ }
+ 
+ /// Actual work admitted by a budget, including nested operations.
+@@ -121,9 +175,14 @@ pub enum WorkKind {
+     RootRefinement,
+     /// One algebraic projection/promotion attempt.
+     AlgebraicPromotion,
++    /// Any further work after the scope's [`CancellationToken`] was cancelled.
++    Cancellation,
+ }
+ 
+ /// A denied work request, before any of its units were performed.
++///
++/// A [`WorkKind::Cancellation`] failure has zero `limit` and `used`; it
++/// reports only the size of the request that observed the cancellation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct BudgetExceeded {
+     /// Work that the operation attempted to perform.
+@@ -136,8 +195,26 @@ pub struct BudgetExceeded {
+     pub requested: usize,
+ }
+ 
++impl BudgetExceeded {
++    const fn cancelled(requested: usize) -> Self {
++        Self {
++            kind: WorkKind::Cancellation,
++            limit: 0,
++            used: 0,
++            requested,
++        }
++    }
++}
++
+ impl fmt::Display for BudgetExceeded {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if self.kind == WorkKind::Cancellation {
++            return write!(
++                formatter,
++                "work cancelled; {} more units requested",
++                self.requested
++            );
++        }
+         write!(
+             formatter,
+             "{:?} budget exhausted: {} of {} units used; {} more requested",
+@@ -163,6 +240,7 @@ struct Frame {
+     budget: WorkBudget,
+     usage: WorkUsage,
+     exhausted: Option<BudgetExceeded>,
++    cancellation: Option<CancellationToken>,
+ }
+ 
+ impl Frame {
+@@ -170,6 +248,7 @@ impl Frame {
+         match kind {
+             WorkKind::RootRefinement => (self.budget.refinements, self.usage.refinements),
+             WorkKind::AlgebraicPromotion => (self.budget.promotions, self.usage.promotions),
++            WorkKind::Cancellation => (0, 0),
+         }
+     }
+ 
+@@ -177,10 +256,27 @@ impl Frame {
+         match kind {
+             WorkKind::RootRefinement => self.usage.refinements += amount,
+             WorkKind::AlgebraicPromotion => self.usage.promotions += amount,
++            WorkKind::Cancellation => {}
+         }
+     }
+ }
+ 
++// The outermost cancelled scope exhausts itself and every nested scope; its
++// parents are unaffected, as with a smaller inner budget.
++fn observe_cancellation(frames: &mut [Frame], requested: usize) -> Option<BudgetExceeded> {
++    let index = frames.iter().position(|frame| {
++        frame
++            .cancellation
++            .as_ref()
++            .is_some_and(CancellationToken::is_cancelled)
++    })?;
++    let error = BudgetExceeded::cancelled(requested);
++    for frame in &mut frames[index..] {
++        frame.exhausted.get_or_insert(error);
++    }
++    frames.last().and_then(|frame| frame.exhausted)
++}
++
+ std::thread_local! {
+     // The common unbudgeted path need not initialize or borrow the frame stack.
+     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+@@ -202,7 +298,12 @@ pub fn exhaustion() -> Option<BudgetExceeded> {
+     if !is_active() {
+         return None;
+     }
+-    FRAMES.with_borrow(|frames| frames.last().and_then(|frame| frame.exhausted))
++    FRAMES.with_borrow_mut(|frames| {
++        frames
++            .last()
++            .and_then(|frame| frame.exhausted)
++            .or_else(|| observe_cancellation(frames, 0))
++    })
+ }
+ 
+ /// Admit work before performing it, charging every active enclosing budget.
+@@ -221,6 +322,9 @@ pub fn consume(kind: WorkKind, amount: usize) -> Result<(), BudgetExceeded> {
+         if let Some(error) = frames.last().and_then(|frame| frame.exhausted) {
+             return Err(error);
+         }
++        if let Some(error) = observe_cancellation(frames, amount) {
++            return Err(error);
++        }
+         for index in 0..frames.len() {
+             let (limit, used) = frames[index].available(kind);
+             if amount > limit - used {
+@@ -250,6 +354,30 @@ pub fn consume(kind: WorkKind, amount: usize) -> Result<(), BudgetExceeded> {
+ /// return type. Panic unwinding restores the enclosing scope without refunding
+ /// work already admitted by that scope.
+ pub fn with_budget<T>(budget: WorkBudget, operation: impl FnOnce() -> T) -> BudgetOutcome<T> {
++    enter(budget, None, operation)
++}
++
++/// Evaluate one synchronous operation with a work budget and a cancellation token.
++///
++/// This is [`with_budget`] with cooperative cancellation: once `cancellation`
++/// is cancelled, from any thread, the operation's next admitted unit or
++/// exhaustion check fails with [`WorkKind::Cancellation`] and no value is
++/// published. A value completed before any check observed the request is
++/// returned normally. Use [`WorkBudget::UNLIMITED`] to bound the operation by
++/// cancellation alone.
++pub fn with_cancellable_budget<T>(
++    budget: WorkBudget,
++    cancellation: &CancellationToken,
++    operation: impl FnOnce() -> T,
++) -> BudgetOutcome<T> {
++    enter(budget, Some(cancellation.clone()), operation)
++}
++
++fn enter<T>(
++    budget: WorkBudget,
++    cancellation: Option<CancellationToken>,
++    operation: impl FnOnce() -> T,
++) -> BudgetOutcome<T> {
+     struct Scope(bool);
+ 
+     impl Scope {
+@@ -280,6 +408,7 @@ pub fn with_budget<T>(budget: WorkBudget, operation: impl FnOnce() -> T) -> Budg
+             budget,
+             usage: WorkUsage::default(),
+             exhausted,
++            cancellation,
+         });
+         ACTIVE.with(|active| active.set(true));
+     });
+diff --git a/crates/hypersolve/src/work_budget/tests.rs b/crates/hypersolve/src/work_budget/tests.rs
+index c6f33828ce..30716b084c 100644
+--- a/crates/hypersolve/src/work_budget/tests.rs
++++ b/crates/hypersolve/src/work_budget/tests.rs
+@@ -1,5 +1,6 @@
+ use super::{
+-    BudgetExceeded, WorkBudget, WorkKind, WorkUsage, consume, exhaustion, is_active, with_budget,
++    BudgetExceeded, CancellationToken, WorkBudget, WorkKind, WorkUsage, consume, exhaustion,
++    is_active, with_budget, with_cancellable_budget,
+ };
+ 
+ #[test]
+@@ -224,3 +225,170 @@ fn native_root_refinements_share_the_outer_operation_budget() {
+         );
+     }
+ }
++
++#[test]
++fn cancelled_token_denies_work_and_publishes_no_value() {
++    let token = CancellationToken::new();
++    token.cancel();
++    let outcome = with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++        assert_eq!(
++            consume(WorkKind::RootRefinement, 3),
++            Err(BudgetExceeded {
++                kind: WorkKind::Cancellation,
++                limit: 0,
++                used: 0,
++                requested: 3,
++            })
++        );
++        // Every later request, of either kind, observes the same failure.
++        assert_eq!(
++            consume(WorkKind::AlgebraicPromotion, 1).unwrap_err().kind,
++            WorkKind::Cancellation
++        );
++        assert_eq!(exhaustion().unwrap().kind, WorkKind::Cancellation);
++        true
++    });
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert!(!is_active());
++    assert_eq!(
++        outcome.result.unwrap_err().to_string(),
++        "work cancelled; 3 more units requested"
++    );
++}
++
++#[test]
++fn cancellation_during_an_operation_stops_its_next_check() {
++    let token = CancellationToken::new();
++    let outcome = with_cancellable_budget(
++        WorkBudget {
++            refinements: 10,
++            promotions: 10,
++        },
++        &token,
++        || {
++            consume(WorkKind::RootRefinement, 2).unwrap();
++            assert_eq!(exhaustion(), None);
++            token.cancel();
++            // A caller that only polls exhaustion still stops.
++            assert_eq!(exhaustion().unwrap().kind, WorkKind::Cancellation);
++            assert_eq!(
++                consume(WorkKind::AlgebraicPromotion, 1).unwrap_err().kind,
++                WorkKind::Cancellation
++            );
++        },
++    );
++    assert_eq!(outcome.result.unwrap_err().requested, 0);
++    assert_eq!(
++        outcome.usage,
++        WorkUsage {
++            refinements: 2,
++            promotions: 0
++        }
++    );
++}
++
++#[test]
++fn outer_cancellation_stops_nested_scopes_but_inner_cancellation_does_not_poison_the_parent() {
++    let outer = CancellationToken::new();
++    let outcome = with_cancellable_budget(WorkBudget::UNLIMITED, &outer, || {
++        let inner_token = CancellationToken::new();
++        let inner = with_cancellable_budget(WorkBudget::UNLIMITED, &inner_token, || {
++            consume(WorkKind::RootRefinement, 1).unwrap();
++            inner_token.cancel();
++            consume(WorkKind::RootRefinement, 1)
++        });
++        assert_eq!(inner.result.unwrap_err().kind, WorkKind::Cancellation);
++        assert_eq!(inner.usage.refinements, 1);
++        // The parent keeps working and its usage includes the nested unit.
++        assert_eq!(exhaustion(), None);
++        consume(WorkKind::RootRefinement, 1).unwrap();
++        // An ordinary nested budget still sees the enclosing token.
++        let nested = with_budget(WorkBudget::UNLIMITED, || {
++            consume(WorkKind::RootRefinement, 1).unwrap();
++            outer.cancel();
++            consume(WorkKind::RootRefinement, 1)
++        });
++        assert_eq!(nested.result.unwrap_err().kind, WorkKind::Cancellation);
++        assert_eq!(exhaustion().unwrap().kind, WorkKind::Cancellation);
++    });
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage.refinements, 3);
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_from_another_thread_reaches_a_running_operation() {
++    use std::sync::{Arc, Barrier};
++
++    let token = CancellationToken::new();
++    let started = Arc::new(Barrier::new(2));
++    let cancelled = Arc::new(Barrier::new(2));
++    let worker = {
++        let token = token.clone();
++        let (started, cancelled) = (Arc::clone(&started), Arc::clone(&cancelled));
++        std::thread::spawn(move || {
++            with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++                consume(WorkKind::RootRefinement, 1).unwrap();
++                started.wait();
++                cancelled.wait();
++                let mut admitted = 1;
++                while consume(WorkKind::RootRefinement, 1).is_ok() {
++                    admitted += 1;
++                }
++                admitted
++            })
++        })
++    };
++    started.wait();
++    token.cancel();
++    cancelled.wait();
++    let outcome = worker.join().unwrap();
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage.refinements, 1);
++    // The caller's thread never entered a scope.
++    assert!(!is_active());
++}
++
++#[test]
++fn cancelled_root_refinement_retries_with_a_new_token() {
++    use crate::{
++        IsolatedRootInterval, IsolatedRootRefinementStatus, PredicatePolicy, RootIsolationConfig,
++        refine_isolated_univariate_polynomial_interval,
++    };
++    use hyperreal::Real;
++
++    let polynomial = [Real::from(-2), Real::zero(), Real::one()];
++    let interval = IsolatedRootInterval {
++        lower: Real::one(),
++        upper: Real::from(2),
++        exact_root: None,
++        distinct_root_count: 1,
++    };
++    let refine = || {
++        refine_isolated_univariate_polynomial_interval(
++            &polynomial,
++            &interval,
++            RootIsolationConfig {
++                policy: PredicatePolicy::STRICT,
++                max_interval_width: None,
++                max_refinement_steps: 3,
++            },
++        )
++    };
++    let baseline = refine();
++    assert_eq!(baseline.status, IsolatedRootRefinementStatus::Refined);
++
++    let cancelled = CancellationToken::new();
++    cancelled.cancel();
++    let denied = with_cancellable_budget(WorkBudget::UNLIMITED, &cancelled, refine);
++    assert_eq!(denied.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(denied.usage, WorkUsage::default());
++
++    let fresh = CancellationToken::new();
++    let retry = with_cancellable_budget(WorkBudget::UNLIMITED, &fresh, refine);
++    assert_eq!(retry.usage.refinements, 3);
++    let report = retry.result.unwrap();
++    assert_eq!(report.status, IsolatedRootRefinementStatus::Refined);
++    assert_eq!(report.refined_interval, baseline.refined_interval);
++}
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 1590e15bf1..70e3a9a3f4 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -5,6 +5,17 @@ represented geometry or serialized artifacts. The [README](../readme.md) and
+ the API documentation describe current behavior only. A migration is a
+ deliberate contract change (P27), not a performance-only change.
+ 
++## Cooperative cancellation of budgeted work
++
++`WorkKind` has a new `Cancellation` variant; exhaustive matches on it must
++handle that case. It appears only in scopes entered with
++`work_budget::with_cancellable_budget` or Hypercurve's
++`evaluate_with_cancellable_budget`, after their `CancellationToken` is
++cancelled. Such a `BudgetExceeded` has zero `limit` and `used`. Code that only
++uses `with_budget` or `evaluate_with_budget` sees no new outcome. Inner
++operations report a cancelled request through their existing budget-exhausted
++blockers; the outer result's kind distinguishes it from a reached limit.
++
+ ## Reusing selected points and equal field generators
+ 
+ Polynomial branch evaluation may return an already selected point after proving
