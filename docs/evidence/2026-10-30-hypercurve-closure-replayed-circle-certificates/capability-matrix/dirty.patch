@@ -1,0 +1,348 @@
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index 5808ea758e..e939d83e94 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Keep circle certificates through exact SVG graph replay. A rational
++  quadratic that retains its circle now writes graph definition tag 31 with
++  the center and radius squared; import checks the circle identity exactly
++  before attaching it. Replayed round joins again support further offsets
++  that depend on their circles. Older readers reject documents containing
++  the new tag.
++
+ - Fix dilation of regions with holes. A hole dilated to or past its
+   half-width, a channel that should close between surviving parts of a hole,
+   or a convex hole edge that vanishes first stayed open because the crossed
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index a0cc23e52b..589d31236f 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3501,15 +3501,30 @@ Exact SVG replay of these outputs preserves the set: the ellipse-hole dilation
+ by 1/4 and the dumbbell dilation by 3/2 both replay with an empty symmetric
+ difference, and the replayed ellipse result erodes further. Dilating the
+ replayed dumbbell result by another 1/2, where each lobe collapses exactly,
+-is `Blocked(Offset, Line, RealSign)`, while the same dilation of the
+-unreplayed region succeeds with one loop. Its band arrangement compares
+-coincident contacts (`algebraic_chord_point_coordinate_order`, circular
+-carrier `same_value`) whose equal coordinates were rebuilt as independent
+-scalar expressions; strict sign refinement cannot prove their difference
+-zero. Replay keeps the geometry but not the shared scalar identity those
+-contact decisions used. Interning byte-identical scalar encodings during
+-decode did not change the outcome, so the equal values are not serialized
+-identically; the replay graph would need to retain their defining relation.
++was `Blocked(Offset, Line, RealSign)`, while the same dilation of the
++unreplayed region succeeds with one loop. The cause was the joins' circle
++certificate, not scalar sharing. Each join is a rational quadratic that
++retains its circle (center, radius squared, tangent contacts); the graph wrote
++only the native controls and weights. Without the circle, further offsets of
++the replayed joins used general conic machinery: the undecided contact
++comparisons held scalars of 1 to 128 MB once serialized. Interning decoded
++scalars or whole points by their bytes did not help. Recognizing the circle
++again from the controls gives center expressions of about 500 KB and stays
++blocked. Attaching the original center and radius alone, without tangent
++contacts, completes the dilation.
++
++Graph tag 31 now carries a circular rational quadratic with its center and
++radius squared. Replay re-establishes the circle only after proving that the
++homogeneous parameterization satisfies `|X - cW|^2 = r^2 W^2` identically: five
++exact zero tests on the degree-four Bernstein coefficients, and `r^2 > 0`. A
++refuted certificate is malformed input; an undecided one is a typed blocker.
++`replayed_circular_joins_support_further_offsets_through_collapse`
++(`svg_region_replay`) replays the 3/2 dilation, dilates it by 1/2 and compares
++with one dilation by 2; it fails on the previous source with the blocker
++above. Tangent contacts are not serialized: they reference parallel
++constructions that would need their own checked records, and this witness
++does not need them. Version 3 single-path metadata still writes native
++controls only. HyperBRep persistence of circular conics is unexamined.
+ 
+ Open: holes that are neither circular nor convex polygonal, and curved
+ non-circular holes, take the slower band route even when they survive; their
+diff --git a/crates/hypercurve/README.md b/crates/hypercurve/README.md
+index ccb5d0a74f..a65ec50a90 100644
+--- a/crates/hypercurve/README.md
++++ b/crates/hypercurve/README.md
+@@ -571,7 +571,10 @@ exact signatures.
+   checks every definition and closed path before reconstructing the region
+   through the existing arrangement; stored roles or success flags are unnecessary.
+   The named fresh-process annulus retains its joint selected center through
+-  further round offsets and exact set identities. Metadata is independent of
++  further round offsets and exact set identities. A rational quadratic that
++  retains its supporting circle replays it only after an exact check of the
++  circle identity, so replayed round joins keep supporting further offsets;
++  their tangent contacts are not serialized. Metadata is independent of
+   display tolerance. Reached byte/depth limits permit larger retries. A zero-root
+   compound imports and exports as canonical empty. Entirely empty documents
+   export with that exact graph and a unit display viewport that adds no
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index 8bae68d6cd..2444d502dd 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -16654,6 +16654,47 @@
+       ],
+       "oracle": "Independently authored lobes bounded by lines and unit arcs about the mouth corners meeting at axis cusps, and the composition identity of disk erosions.",
+       "timeout_seconds": 180
++    },
++    {
++      "id": "replayed_circular_join_further_offset",
++      "target": "svg_region_replay",
++      "test": "replayed_circular_joins_support_further_offsets_through_collapse",
++      "owner": "Hypercurve native SVG graph codec, retained rational-quadratic circle certificates and exact region offsets",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20"
++      ],
++      "domain": "A 20x20 square frame with a dumbbell hole of two 4x4 lobes and a width-2 channel, dilated by 3/2, replayed through version 5 metadata, then dilated by 1/2.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "RationalQuadraticBezier"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Graph metadata retains each round join's circle center and radius squared; import attaches them only after the exact circle identity of the native rational quadratic is proved. Tangent contacts are not serialized.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "The replayed 3/2 dilation has an empty symmetric difference with the original."
++        },
++        {
++          "stage": "repeated_offsets",
++          "outcome": "exact_success",
++          "assertion": "Dilating the replayed region by 1/2 collapses both lobes, leaving one loop equal to the direct dilation by 2."
++        }
++      ],
++      "oracle": "Exact symmetric difference against the original and against an independent single dilation by 2; the Minkowski identity (A + B_r) + B_s = A + B_(r+s) fixes the expected set.",
++      "timeout_seconds": 300
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/src/rational_bezier.rs b/crates/hypercurve/src/rational_bezier.rs
+index 43afb441eb..3e96457a38 100644
+--- a/crates/hypercurve/src/rational_bezier.rs
++++ b/crates/hypercurve/src/rational_bezier.rs
+@@ -417,6 +417,62 @@ impl RationalQuadraticBezier2 {
+         self.circular_conic.as_ref()
+     }
+ 
++    /// Re-establishes a replayed circle certificate from the curve itself.
++    ///
++    /// The homogeneous parameterization lies on the circle iff
++    /// `|X - c W|^2 - r^2 W^2` vanishes identically. With
++    /// `G_ij = w_i w_j ((P_i - c) . (P_j - c) - r^2)`, its degree-four
++    /// Bernstein coefficients are proportional to `G_00`, `G_01`,
++    /// `G_02 + 2 G_11`, `G_12` and `G_22`. `Decided(None)` refutes the
++    /// certificate. Tangent contacts are construction evidence that this
++    /// identity does not re-establish, so none are attached.
++    pub(crate) fn with_checked_circle_certificate(
++        &self,
++        center: Point2,
++        radius_squared: Real,
++        policy: &CurveContext,
++    ) -> Classification<Option<Self>> {
++        match real_sign(&radius_squared, policy) {
++            Some(RealSign::Positive) => {}
++            Some(_) => return Classification::Decided(None),
++            None => return Classification::Uncertain(UncertaintyReason::RealSign),
++        }
++        let controls = [
++            (&self.start, &self.start_weight),
++            (&self.control, &self.control_weight),
++            (&self.end, &self.end_weight),
++        ];
++        let g = |i: usize, j: usize| {
++            let ((first, first_weight), (second, second_weight)) = (controls[i], controls[j]);
++            let dot = (first.x() - center.x()) * (second.x() - center.x())
++                + (first.y() - center.y()) * (second.y() - center.y());
++            first_weight * second_weight * (dot - &radius_squared)
++        };
++        let coefficients = [
++            g(0, 0),
++            g(0, 1),
++            g(0, 2) + Real::from(2) * g(1, 1),
++            g(1, 2),
++            g(2, 2),
++        ];
++        for coefficient in &coefficients {
++            match is_zero(coefficient, policy) {
++                Some(true) => {}
++                Some(false) => return Classification::Decided(None),
++                None => return Classification::Uncertain(UncertaintyReason::RealSign),
++            }
++        }
++        let circle = Arc::new(RationalQuadraticCircle2 {
++            center,
++            radius_squared,
++            tangent_contacts: None,
++        });
++        Classification::Decided(Some(self.clone().with_retained_conic_provenance(
++            Some(circle.implicit_coefficients()),
++            Some(circle),
++        )))
++    }
++
+     pub(crate) fn with_retained_conic_provenance(
+         mut self,
+         implicit_quadratic_conic: Option<Arc<[Real; 6]>>,
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index c99bbd1484..59ac6a4bde 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -14,6 +14,8 @@ use crate::{
+ };
+ use std::collections::HashMap;
+ 
++#[cfg(test)]
++mod circle_certificate_tests;
+ mod circles;
+ mod points;
+ mod polynomial;
+@@ -29,6 +31,7 @@ const PARAMETER_IMAGE: u8 = 3;
+ const SOURCE_RESTRICTION: u8 = 4;
+ const PARALLEL_SUPPORT: u8 = 5;
+ const PARALLEL_RANGE: u8 = 6;
++const CIRCULAR_CONIC: u8 = 31;
+ 
+ pub(super) fn encode_path(
+     path: &CurvePath2,
+@@ -180,8 +183,23 @@ impl GraphWriter {
+         if let Some(index) = self.sources.get(&key) {
+             return Ok(*index);
+         }
+-        let index = self.begin(NATIVE_CURVE)?;
++        // A retained circle is construction evidence, not a cache: later
++        // offsets use its exact center and radius instead of reconstructing
++        // them from the controls. Replay checks it against the native curve.
++        let circle = match geometry {
++            CurveGeometry2::RationalQuadraticBezier(conic) => conic.retained_circular_conic(),
++            _ => None,
++        };
++        let index = self.begin(if circle.is_some() {
++            CIRCULAR_CONIC
++        } else {
++            NATIVE_CURVE
++        })?;
+         self.writer.write_curve(curve)?;
++        if let Some(circle) = circle {
++            self.writer.write_point(&circle.center)?;
++            self.writer.write_real(&circle.radius_squared)?;
++        }
+         self.sources.insert(key, index);
+         Ok(index)
+     }
+@@ -347,6 +365,23 @@ fn read_definitions(
+         let mut point_depth = 0;
+         let definition = match reader.read_u8()? {
+             NATIVE_CURVE => Definition::Curve(reader.read_curve()?),
++            CIRCULAR_CONIC => {
++                let curve = reader.read_curve()?;
++                let Some(CurveGeometry2::RationalQuadraticBezier(conic)) = curve.geometry() else {
++                    return Err(malformed(
++                        "exact circle certificate requires a rational quadratic",
++                    ));
++                };
++                let center = reader.read_point()?;
++                let radius_squared = reader.read_real()?;
++                let conic = certified(Ok(conic.with_checked_circle_certificate(
++                    center,
++                    radius_squared,
++                    &CurveContext::STRICT,
++                )))?
++                .ok_or_else(|| malformed("exact circle certificate does not hold for its curve"))?;
++                Definition::Curve(Curve2::from(conic))
++            }
+             SCALAR_PARAMETER => Definition::Parameter(BezierParameter2::Exact(reader.read_real()?)),
+             SELECTED_ROOT => {
+                 let coefficients = reader.read_reals()?;
+diff --git a/crates/hypercurve/tests/svg_region_replay.rs b/crates/hypercurve/tests/svg_region_replay.rs
+index 3aa3615912..458a1b6749 100644
+--- a/crates/hypercurve/tests/svg_region_replay.rs
++++ b/crates/hypercurve/tests/svg_region_replay.rs
+@@ -827,3 +827,55 @@ fn qualified_empty_boolean_batches_keep_each_result_receipt() {
+         }
+     }
+ }
++
++/// Dilating a frame around a dumbbell hole by 3/2 closes the channel and
++/// leaves two lobe holes bounded by lines and circular joins about the
++/// channel corners. Replay keeps each join's circle (center and radius),
++/// rechecked against its native rational quadratic. A further dilation by
++/// 1/2 then decides the exact collapse of both lobes, as one dilation by 2
++/// does. Without the circle the replayed joins fell back to general conic
++/// offsets whose coincident contacts were undecided.
++#[test]
++fn replayed_circular_joins_support_further_offsets_through_collapse() {
++    let corners = [
++        (-6, 2),
++        (-2, 2),
++        (-2, 1),
++        (2, 1),
++        (2, 2),
++        (6, 2),
++        (6, -2),
++        (2, -2),
++        (2, -1),
++        (-2, -1),
++        (-2, -2),
++        (-6, -2),
++    ];
++    let dumbbell = CurvePath2::try_new(
++        (0..corners.len())
++            .map(|i| {
++                let ((x0, y0), (x1, y1)) = (corners[i], corners[(i + 1) % corners.len()]);
++                Curve2::try_line(point(x0, y0).into(), point(x1, y1).into()).unwrap()
++            })
++            .collect(),
++    )
++    .unwrap();
++    let framed = geometry(&[rectangle(-10, -10, 20, 20), dumbbell])
++        .region()
++        .clone();
++    let dilated = framed.offset(q(3, 2), &OffsetCornerStyle2::Round).unwrap();
++    assert_eq!(dilated.boundary_loops().len(), 3);
++    let text = export_svg_document(&SvgGeometry2::new(dilated.clone(), vec![], vec![])).unwrap();
++    let restored = import_svg_document(&text).unwrap().region().clone();
++    assert_same_set(&restored, &dilated);
++    let further = restored
++        .offset(q(1, 2), &OffsetCornerStyle2::Round)
++        .unwrap();
++    assert_eq!(further.boundary_loops().len(), 1);
++    assert_same_set(
++        &further,
++        &framed
++            .offset(Real::from(2), &OffsetCornerStyle2::Round)
++            .unwrap(),
++    );
++}
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index b4dc4a8967..689581e406 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -327,6 +327,16 @@ These changes alter represented sets, coordinates, file lengths or checksums.
+   wire version. Other frame and point-image carriers and general region admission
+   remain open; these fixtures do not establish universal operation closure.
+ 
++- **Exact SVG circle certificates (2026-10-30).** Graph metadata (versions 4
++  and 5) writes a rational quadratic that retains its supporting circle as
++  definition tag 31: the native curve, then the center and radius squared.
++  Import attaches the circle only after five exact zero tests prove that the
++  curve lies on it, and requires a positive radius squared; a refuted
++  certificate is malformed and an undecided one is a typed blocker. Tangent
++  contacts stay unserialized. Filled exports with round joins change bytes, and
++  older Hypercurve readers reject them as an unknown definition tag. Version 3
++  single-path metadata is unchanged.
++
+ - **Exact filled-region SVG replay (2026-10-27).** Filled exports now carry
+   version 5 compound path roots over the existing checked definition graph.
+   One SVG path contains all regularized material/hole boundaries with even-odd
