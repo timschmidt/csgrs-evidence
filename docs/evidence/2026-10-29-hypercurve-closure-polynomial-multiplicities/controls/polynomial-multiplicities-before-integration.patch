@@ -1,0 +1,1787 @@
+diff --git a/crates/hyperbrep/src/geometry.rs b/crates/hyperbrep/src/geometry.rs
+index 993624c04a..7bbfec51a3 100644
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -2101,6 +2101,7 @@ pub struct SurfaceIntersectionCurve {
+     first_pcurve: SurfaceIntersectionPcurve,
+     second_pcurve: SurfaceIntersectionPcurve,
+     image_certificates: [bool; 2],
++    polynomial_contact_exponent: Option<usize>,
+     first_boundary_contacts: SurfaceIntersectionBoundaryContacts,
+     second_boundary_contacts: SurfaceIntersectionBoundaryContacts,
+ }
+@@ -2305,6 +2306,7 @@ impl SurfaceIntersectionCurve {
+             first_pcurve,
+             second_pcurve,
+             image_certificates: [true, true],
++            polynomial_contact_exponent: None,
+             first_boundary_contacts: SurfaceIntersectionBoundaryContacts::default(),
+             second_boundary_contacts: SurfaceIntersectionBoundaryContacts::default(),
+         }
+@@ -2539,6 +2541,7 @@ impl SurfaceIntersectionCurve {
+                 first_pcurve: self.first_pcurve.subcurve(range.start(), range.end())?,
+                 second_pcurve: self.second_pcurve.subcurve(range.start(), range.end())?,
+                 image_certificates: self.image_certificates,
++                polynomial_contact_exponent: self.polynomial_contact_exponent,
+                 first_boundary_contacts: contacts(&self.first_boundary_contacts),
+                 second_boundary_contacts: contacts(&self.second_boundary_contacts),
+             })
+@@ -2575,6 +2578,7 @@ impl SurfaceIntersectionCurve {
+                 first_pcurve,
+                 second_pcurve,
+                 image_certificates: self.image_certificates,
++                polynomial_contact_exponent: self.polynomial_contact_exponent,
+                 first_boundary_contacts: SurfaceIntersectionBoundaryContacts {
+                     start: if retain_start {
+                         self.first_boundary_contacts.start.clone()
+@@ -2612,6 +2616,7 @@ impl SurfaceIntersectionCurve {
+                 first_pcurve: self.first_pcurve.reversed()?,
+                 second_pcurve: self.second_pcurve.reversed()?,
+                 image_certificates: self.image_certificates,
++                polynomial_contact_exponent: self.polynomial_contact_exponent,
+                 first_boundary_contacts: SurfaceIntersectionBoundaryContacts {
+                     start: self.first_boundary_contacts.end.clone(),
+                     end: self.first_boundary_contacts.start.clone(),
+diff --git a/crates/hyperbrep/src/geometry/plane_tensor.rs b/crates/hyperbrep/src/geometry/plane_tensor.rs
+index c4d4c1bca7..f03e1d7cf9 100644
+--- a/crates/hyperbrep/src/geometry/plane_tensor.rs
++++ b/crates/hyperbrep/src/geometry/plane_tensor.rs
+@@ -106,11 +106,14 @@ pub(super) fn intersect(
+             source_scale: Real::one(),
+             source_offset: Real::zero(),
+         })?;
+-        curves.push(SurfaceIntersectionCurve::from_certified_exact_pcurves(
+-            curve,
+-            projected,
+-            uv.clone(),
+-        )?);
++        let mut section =
++            SurfaceIntersectionCurve::from_certified_exact_pcurves(curve, projected, uv.clone())?;
++        section.polynomial_contact_exponent = Some(
++            uv.polynomial_branch()
++                .expect("topology supplies a selected graph")
++                .defining_exponent(),
++        );
++        curves.push(section);
+     }
+     let plane = Surface::plane(plane.origin.clone(), plane.u.clone(), plane.v.clone())?;
+     let mut points = set
+@@ -195,8 +198,11 @@ impl Surface {
+             v: image.v.clone(),
+         };
+         let (equation, map) = pullback(&plane, surface)?;
+-        if hypersolve::divide_bivariate_polynomial_exact(&equation, branch.topology().equation())
+-            .is_none()
++        if hypersolve::divide_bivariate_polynomial_exact(
++            &equation,
++            branch.topology().geometric_equation(),
++        )
++        .is_none()
+         {
+             return Ok(false);
+         }
+@@ -213,3 +219,17 @@ impl Surface {
+         image.parameterization_equals(&expected)
+     }
+ }
++
++impl SurfaceIntersectionCurve {
++    /// Defining-factor exponent of a checked plane/tensor pullback branch.
++    ///
++    /// On its regular open arc, even exponents describe contact without a side
++    /// change, while odd exponents change side. An exponent above one does not
++    /// certify transversality. This is not a local order at a singular endpoint.
++    /// `None` means this evidence was not established for the construction.
++    /// Restrictions, reversal and operand exchange preserve it. Native pcurves
++    /// retain the source polynomial and reconstruct its factor evidence on replay.
++    pub const fn polynomial_contact_exponent(&self) -> Option<usize> {
++        self.polynomial_contact_exponent
++    }
++}
+diff --git a/crates/hyperbrep/tests/support/plane_tensor_sections.rs b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+index 1cb1e709ad..df0ee93b6d 100644
+--- a/crates/hyperbrep/tests/support/plane_tensor_sections.rs
++++ b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+@@ -749,17 +749,55 @@ pub fn empty_contained_boundary_and_solver_frontier() {
+             Real::one(),
+             "upper-boundary-section",
+         ),
++        (
++            polynomial(vec![vec![q(1, 4), (-1).into(), 1.into()]]),
++            q(1, 2),
++            "repeated-tangent-section",
++        ),
+     ] {
+         let surface = tensor([x(), y(), equation], one());
+         let sections = branches(plane().intersect_surface(&surface).unwrap());
+         assert_eq!(sections.len(), 1);
+         let section = &sections[0];
++        let exponent = if tag == "repeated-tangent-section" {
++            2
++        } else {
++            1
++        };
++        assert_eq!(section.polynomial_contact_exponent(), Some(exponent));
++        let swapped = branches(surface.intersect_surface(&plane()).unwrap());
++        assert_eq!(swapped[0].polynomial_contact_exponent(), Some(exponent));
++        let materialized = section.second_pcurve().materialize().unwrap();
++        assert_eq!(
++            materialized
++                .curve()
++                .polynomial_branch()
++                .unwrap()
++                .defining_exponent(),
++            exponent
++        );
++        if exponent == 2 {
++            // The original tangent fixture stays on the positive side of the
++            // plane on both sides of v=1/2. Its section is not a crossing.
++            for v in [q(1, 4), q(3, 4)] {
++                let point = surface
++                    .point_at(&hypercurve::Point2::new(q(1, 2), v).into())
++                    .unwrap();
++                assert_eq!(
++                    point
++                        .compare_linear_form(&Vector3::z(), &Real::zero())
++                        .unwrap(),
++                    Ordering::Greater
++                );
++            }
++        }
+         check_correspondence(section, &plane(), &surface);
+         let restricted = section
+             .subcurve(&q(1, 4), &q(3, 4))
+             .unwrap()
+             .reversed()
+             .unwrap();
++        assert_eq!(restricted.polynomial_contact_exponent(), Some(exponent));
+         check_correspondence(&restricted, &plane(), &surface);
+         let restored = model_and_replay(&[restricted], &surface, tag);
+         let cutting = Surface::plane(
+@@ -789,16 +827,10 @@ pub fn empty_contained_boundary_and_solver_frontier() {
+             );
+         }
+     }
+-    for (equation, expected) in [
+-        (
+-            polynomial(vec![vec![q(-1, 2)], vec![1.into()]]),
+-            BivariateTopologyError::VerticalComponent,
+-        ),
+-        (
+-            polynomial(vec![vec![q(1, 4), (-1).into(), 1.into()]]),
+-            BivariateTopologyError::RepeatedComponent,
+-        ),
+-    ] {
++    for (equation, expected) in [(
++        polynomial(vec![vec![q(-1, 2)], vec![1.into()]]),
++        BivariateTopologyError::VerticalComponent,
++    )] {
+         let surface = tensor([x(), y(), equation], one());
+         assert!(
+             matches!(plane().intersect_surface(&surface),Err(GeometryError::PolynomialTopology(error)) if error==expected)
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 6e1ec35c9f..06a8fa773e 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -320,6 +320,24 @@ impl PolynomialCurveBranch2 {
+     pub fn topology(&self) -> &BivariateCurveTopology {
+         &self.source.topology
+     }
++    /// Exponent of this open branch's factor in the original equation.
++    ///
++    /// This defining multiplicity is preserved through restriction, reversal,
++    /// image maps and replay. It is not a local singularity or contact order at
++    /// an endpoint, nor a winding multiplicity for a filled region.
++    pub fn defining_exponent(&self) -> usize {
++        let arc = &self.topology().slabs()[self.slab].arcs()[self.root];
++        match arc.repeated_factor_index() {
++            Some(index) => self
++                .topology()
++                .repeated_factorization()
++                .expect("a checked repeated branch retains its factors")
++                .factors()[index]
++                .exponent(),
++            None => 1,
++        }
++    }
++
+     /// Index of the source projection slab.
+     pub fn slab_index(&self) -> usize {
+         self.slab
+@@ -367,8 +385,11 @@ impl PolynomialCurveBranch2 {
+             // Every original denominator was certified over the whole source
+             // box at construction. Cross multiplication therefore preserves
+             // the domain, including removable factors retained by each map.
+-            if hypersolve::divide_bivariate_polynomial_exact(&residual, self.topology().equation())
+-                .is_none()
++            if hypersolve::divide_bivariate_polynomial_exact(
++                &residual,
++                self.topology().geometric_equation(),
++            )
++            .is_none()
+             {
+                 return false;
+             }
+@@ -593,7 +614,7 @@ impl PolynomialCurveBranch2 {
+             let slope = (&dy / &dx).map_err(|cause| invalid(cause.into()))?;
+             let offset = y0 - &slope * x0;
+             let mut substituted = bivariate_substitute_second_equal_affine_first(
+-                self.topology().equation(),
++                self.topology().geometric_equation(),
+                 &slope,
+                 &offset,
+             );
+@@ -612,7 +633,7 @@ impl PolynomialCurveBranch2 {
+                     vec![-slope.clone()],
+                 ]);
+                 let residual = hypersolve::divide_bivariate_polynomial_exact(
+-                    self.topology().equation(),
++                    self.topology().geometric_equation(),
+                     &component,
+                 )
+                 .ok_or_else(|| blocked(UncertaintyReason::Predicate))?;
+@@ -636,7 +657,7 @@ impl PolynomialCurveBranch2 {
+             forms.get_or_init(|| {
+                 let equation = residual_equation
+                     .as_ref()
+-                    .unwrap_or_else(|| self.topology().equation());
++                    .unwrap_or_else(|| self.topology().geometric_equation());
+                 let fy = derivative(equation, CurveResultantParameter::Second);
+                 // Where F_y != 0, t x d has the sign of (dy F_y + dx F_x) F_y;
+                 // for a vertical line, that of dy.
+@@ -780,7 +801,13 @@ impl PolynomialCurveBranch2 {
+         &self,
+         policy: &CurveContext,
+     ) -> ExactCurveResult<bool> {
+-        for row in self.topology().equation().coefficients.iter().skip(1) {
++        for row in self
++            .topology()
++            .geometric_equation()
++            .coefficients
++            .iter()
++            .skip(1)
++        {
+             if !polynomial_is_zero(row, policy)? {
+                 return Ok(false);
+             }
+diff --git a/crates/hypercurve/src/polynomial_curve_differential.rs b/crates/hypercurve/src/polynomial_curve_differential.rs
+index 907adc89ab..39664836d0 100644
+--- a/crates/hypercurve/src/polynomial_curve_differential.rs
++++ b/crates/hypercurve/src/polynomial_curve_differential.rs
+@@ -159,7 +159,7 @@ impl PolynomialCurveBranch2 {
+         if max_order == 0 {
+             return Ok(result);
+         }
+-        let d = GraphDifferential::new(self.topology().equation());
++        let d = GraphDifferential::new(self.topology().geometric_equation());
+         if point
+             .rational_form(d.fy.clone(), one())?
+             .compare_to_real(&Real::zero())?
+@@ -203,7 +203,7 @@ impl PolynomialCurveBranch2 {
+     pub fn tangent_direction_at(&self, value: &CurveParameter2) -> ExactCurveResult<CurveVector2> {
+         let policy = crate::policy::principal_context();
+         let point = self.differential_source_point(value, &policy)?;
+-        let d = GraphDifferential::new(self.topology().equation());
++        let d = GraphDifferential::new(self.topology().geometric_equation());
+         let zero = Real::zero();
+         let fy_order = point
+             .rational_form(d.fy.clone(), one())?
+diff --git a/crates/hypercurve/src/polynomial_curve_pair.rs b/crates/hypercurve/src/polynomial_curve_pair.rs
+index c64bffbdac..71b5e76a17 100644
+--- a/crates/hypercurve/src/polynomial_curve_pair.rs
++++ b/crates/hypercurve/src/polynomial_curve_pair.rs
+@@ -288,8 +288,8 @@ pub(super) fn intersect(
+     }
+ 
+     let original = [
+-        a.topology().equation().clone(),
+-        b.topology().equation().clone(),
++        a.topology().geometric_equation().clone(),
++        b.topology().geometric_equation().clone(),
+     ];
+     // Distinct roots of one checked slab can meet only at its retained event
+     // incidences. Do not rebuild the opposite branch at an algebraic trim that
+diff --git a/crates/hypercurve/src/polynomial_curve_projection.rs b/crates/hypercurve/src/polynomial_curve_projection.rs
+index 463b04c15a..0ac3c8e27a 100644
+--- a/crates/hypercurve/src/polynomial_curve_projection.rs
++++ b/crates/hypercurve/src/polynomial_curve_projection.rs
+@@ -77,7 +77,7 @@ impl PolynomialCurveBranch2 {
+             lower: anchor.clone(),
+             upper: anchor.clone(),
+         };
+-        let equation = self.topology().equation();
++        let equation = self.topology().geometric_equation();
+         // At most twice the ordinate degree can make an edge pass through
+         // another root of the anchor fiber. The admitted finite fiber is not
+         // identically zero. Try distinct positive margins inside the requested
+diff --git a/crates/hypercurve/src/polynomial_curve_rational.rs b/crates/hypercurve/src/polynomial_curve_rational.rs
+index 2fbfa941a1..5e055a89d4 100644
+--- a/crates/hypercurve/src/polynomial_curve_rational.rs
++++ b/crates/hypercurve/src/polynomial_curve_rational.rs
+@@ -257,7 +257,7 @@ pub(super) fn intersect(
+             Some(inverse) => rational.transform_similarity(inverse),
+             None => rational,
+         };
+-        let section = Section::new(branch.topology().equation(), &rational)?;
++        let section = Section::new(branch.topology().geometric_equation(), &rational)?;
+         let range = if matches!(span.fragment, BezierSplitFragment2::Materialized { .. }) {
+             CurveParameterRange2::unit()
+         } else {
+diff --git a/crates/hypercurve/src/polynomial_curve_selected_chord.rs b/crates/hypercurve/src/polynomial_curve_selected_chord.rs
+index a7414ee44d..5848b94847 100644
+--- a/crates/hypercurve/src/polynomial_curve_selected_chord.rs
++++ b/crates/hypercurve/src/polynomial_curve_selected_chord.rs
+@@ -149,7 +149,7 @@ impl PolynomialCurveBranch2 {
+         }
+         let section = self
+             .topology()
+-            .equation()
++            .geometric_equation()
+             .coefficients
+             .iter()
+             .map(|row| row.first().cloned().unwrap_or_else(Real::zero))
+@@ -222,11 +222,11 @@ impl PolynomialCurveBranch2 {
+         let dx = bx.subtract(&ax)?;
+         let dy = by.subtract(&ay)?;
+         let fx = bivariate_parameter_derivative(
+-            self.topology().equation(),
++            self.topology().geometric_equation(),
+             CurveResultantParameter::First,
+         );
+         let fy = bivariate_parameter_derivative(
+-            self.topology().equation(),
++            self.topology().geometric_equation(),
+             CurveResultantParameter::Second,
+         );
+         let tangent = |point: &CurvePoint2| -> ExactCurveResult<Option<RealSign>> {
+@@ -283,7 +283,7 @@ impl PolynomialCurveBranch2 {
+             }
+         }
+         let coefficients = substitute(
+-            self.topology().equation(),
++            self.topology().geometric_equation(),
+             &start,
+             &[ax.clone(), dx.clone()],
+             &[ay.clone(), dy.clone()],
+diff --git a/crates/hypercurve/src/polynomial_curve_selected_circle.rs b/crates/hypercurve/src/polynomial_curve_selected_circle.rs
+index e0ff71521d..7328e9beff 100644
+--- a/crates/hypercurve/src/polynomial_curve_selected_circle.rs
++++ b/crates/hypercurve/src/polynomial_curve_selected_circle.rs
+@@ -161,7 +161,7 @@ impl PolynomialCurveBranch2 {
+         let mut contacts = Vec::new();
+         for left in [false, true] {
+             let coefficients = coefficients(
+-                self.topology().equation(),
++                self.topology().geometric_equation(),
+                 &local_center,
+                 &local_radius,
+                 left,
+@@ -460,8 +460,13 @@ mod tests {
+         let center = curve.end();
+         let center_value = x_value(&center);
+         let radius = q(1, 64);
+-        let coefficients =
+-            coefficients(branch.topology().equation(), &center, &radius, true).unwrap();
++        let coefficients = coefficients(
++            branch.topology().geometric_equation(),
++            &center,
++            &radius,
++            true,
++        )
++        .unwrap();
+         let roots = PolynomialPoint2::selected_root_candidates(
+             coefficients,
+             [(-1).into(), 1.into()],
+diff --git a/crates/hypercurve/tests/polynomial_multiplicities.rs b/crates/hypercurve/tests/polynomial_multiplicities.rs
+new file mode 100644
+index 0000000000..81ba96c7bf
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_multiplicities.rs
+@@ -0,0 +1,431 @@
++//! Repeated defining factors retain source evidence through geometric consumers.
++use hypercurve::{
++    BooleanOp, Curve2, CurveParameter2, CurveParameterRange2, CurvePath2, CurveRegion2, FillRule,
++    LineSeg2, Point2, PolynomialCurveSet2, Real, RegionPointLocation,
++};
++use hypersolve::BivariatePolynomial;
++use hypersolve::bivariate_arithmetic::bivariate_multiply;
++use hypersolve::bivariate_topology::{BivariateCurveDomain, decompose_bivariate_curve};
++
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|r| r.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn power(p: &BivariatePolynomial, n: usize) -> BivariatePolynomial {
++    (0..n).fold(polynomial(&[&[1]]), |a, _| bivariate_multiply(&a, p))
++}
++fn curves(equation: &BivariatePolynomial) -> PolynomialCurveSet2 {
++    let topology = decompose_bivariate_curve(
++        equation,
++        &BivariateCurveDomain {
++            first: [(-1).into(), 1.into()],
++            second: [(-2).into(), 2.into()],
++        },
++        Default::default(),
++    )
++    .unwrap();
++    assert_eq!(topology.equation(), equation);
++    PolynomialCurveSet2::from_topology(topology, Default::default()).unwrap()
++}
++fn line(x0: Real, y0: Real, x1: Real, y1: Real) -> Curve2 {
++    LineSeg2::try_new(Point2::new(x0, y0), Point2::new(x1, y1))
++        .unwrap()
++        .into()
++}
++fn has_source(curve: &Curve2, original: &BivariatePolynomial, exponent: usize) {
++    let branch = curve.polynomial_branch().unwrap();
++    assert_eq!(branch.defining_exponent(), exponent);
++    let topology = branch.topology();
++    assert_eq!(topology.equation(), original);
++    let factors = topology.repeated_factorization().unwrap().factors();
++    assert_eq!(factors.len(), 1);
++    assert_eq!(factors[0].exponent(), exponent);
++}
++
++#[test]
++fn repeated_graph_keeps_geometric_jets_and_transverse_contacts() {
++    let support = polynomial(&[&[0, 1], &[], &[-1]]); // y=x²
++    for exponent in [2, 3] {
++        let original = power(&support, exponent);
++        let set = curves(&original);
++        assert_eq!(set.curves().len(), 1);
++        let curve = &set.curves()[0];
++        let parameter: CurveParameter2 = q(1, 2).into();
++        for piece in [curve.clone(), curve.reversed().unwrap()] {
++            let jets = piece.derivatives_at(&parameter, 2).unwrap();
++            for (jet, expected) in jets
++                .iter()
++                .zip([Point2::from_values(1, 1), Point2::from_values(0, 2)])
++            {
++                assert!(
++                    jet.coordinate_image()
++                        .unwrap()
++                        .coincides_with(&expected.into())
++                        .unwrap()
++                );
++            }
++            let cut = line((-1).into(), q(1, 4), 1.into(), q(1, 4));
++            let result = piece.intersect_curve(&cut).unwrap();
++            assert!(result.is_complete() && result.overlaps().is_empty());
++            assert_eq!(result.contacts().len(), 2);
++            for contact in result.contacts() {
++                assert!(contact.is_certified_transverse());
++                assert!(
++                    contact
++                        .point()
++                        .rational_form(support.clone(), polynomial(&[&[1]]))
++                        .unwrap()
++                        .compare_to_real(&Real::zero())
++                        .unwrap()
++                        .is_eq()
++                );
++            }
++            let split = piece.intersection_topology(&cut).unwrap();
++            assert_eq!(split.first().len(), 3);
++            for part in split.first() {
++                has_source(part, &original, exponent);
++                assert!(part.intersect_curve(&cut).unwrap().is_complete());
++            }
++        }
++    }
++}
++
++#[test]
++fn repeated_circle_keeps_vertical_event_tangents() {
++    let original = power(&polynomial(&[&[-1, 0, 1], &[], &[1]]), 3);
++    let set = curves(&original);
++    assert_eq!(set.curves().len(), 2);
++    for (index, curve) in set.curves().iter().enumerate() {
++        let branch = curve.polynomial_branch().unwrap();
++        let tangent = branch.tangent_direction_at(&Real::from(-1).into()).unwrap();
++        let point = tangent.coordinate_image().unwrap();
++        assert!(
++            point
++                .affine_form(1.into(), 0.into(), 0.into())
++                .compare_to_real(&Real::zero())
++                .unwrap()
++                .is_eq()
++        );
++        let side = point
++            .affine_form(0.into(), 1.into(), 0.into())
++            .compare_to_real(&Real::zero())
++            .unwrap();
++        assert_eq!(
++            side,
++            if index == 0 {
++                std::cmp::Ordering::Less
++            } else {
++                std::cmp::Ordering::Greater
++            }
++        );
++        let (left, right) = curve.split_at(Real::zero().into()).unwrap();
++        assert!(left.end().coincides_with(&right.start()).unwrap());
++        has_source(&left, &original, 3);
++        has_source(&right, &original, 3);
++    }
++}
++
++#[test]
++fn mixed_factor_powers_preserve_component_overlaps_and_other_contacts() {
++    let parabola = polynomial(&[&[0, 1], &[], &[-1]]);
++    let diagonal = polynomial(&[&[0, 1], &[-1]]);
++    let original = bivariate_multiply(&power(&parabola, 2), &power(&diagonal, 3));
++    let set = curves(&original);
++    let cut = line((-1).into(), (-1).into(), 1.into(), 1.into());
++    let mut overlaps = 0;
++    let mut finite_contacts = 0;
++    for curve in set.curves() {
++        let result = curve.intersect_curve(&cut).unwrap();
++        assert!(result.is_complete());
++        overlaps += result.overlaps().len();
++        if result.overlaps().is_empty() {
++            finite_contacts += result.contacts().len();
++            for contact in result.contacts() {
++                let point = contact.point();
++                // The only finite contacts solve x²=x, so x is exactly 0 or 1.
++                assert!(
++                    point
++                        .coincides_with(&Point2::from_values(0, 0).into())
++                        .unwrap()
++                        || point
++                            .coincides_with(&Point2::from_values(1, 1).into())
++                            .unwrap()
++                );
++            }
++        }
++        assert_eq!(
++            curve.polynomial_branch().unwrap().topology().equation(),
++            &original
++        );
++    }
++    assert_eq!(overlaps, 2);
++    assert_eq!(finite_contacts, 3);
++}
++
++fn parabola_region(exponent: usize) -> (CurveRegion2, BivariatePolynomial) {
++    let original = power(&polynomial(&[&[0, 0, 1], &[-1]]), exponent);
++    let set = curves(&original);
++    assert_eq!(set.curves().len(), 2);
++    let range = CurveParameterRange2::try_new(Real::zero().into(), q(1, 4).into()).unwrap();
++    let path = CurvePath2::try_new(vec![
++        set.curves()[0].restrict_source(range.clone()).unwrap(),
++        line(q(1, 4), q(-1, 2), q(1, 4), q(1, 2)),
++        set.curves()[1]
++            .restrict_source(range)
++            .unwrap()
++            .reversed()
++            .unwrap(),
++    ])
++    .unwrap();
++    (
++        CurveRegion2::try_from_boundary_paths(&[path], FillRule::NonZero).unwrap(),
++        original,
++    )
++}
++
++fn check_region(region: &CurveRegion2, original: &BivariatePolynomial) {
++    assert_eq!(region.boundary_paths().unwrap().len(), 1);
++    for curve in region.boundary_paths().unwrap()[0].curves() {
++        if curve.polynomial_branch().is_some() {
++            has_source(curve, original, 2);
++            let point = curve.point_at(&q(1, 8).into()).unwrap();
++            // The retained point satisfies the independent reduced relation y²=x.
++            assert!(
++                point
++                    .rational_form(polynomial(&[&[0, 0, 1], &[-1]]), polynomial(&[&[1]]))
++                    .unwrap()
++                    .compare_to_real(&Real::zero())
++                    .unwrap()
++                    .is_eq()
++            );
++        }
++    }
++    for (x, y, location) in [
++        (q(1, 8), q(0, 1), RegionPointLocation::Inside),
++        (q(1, 8), q(1, 2), RegionPointLocation::Outside),
++        (q(1, 4), q(0, 1), RegionPointLocation::Boundary),
++    ] {
++        assert_eq!(
++            region.classify_point(&Point2::new(x, y).into()).unwrap(),
++            location
++        );
++    }
++    let (simple, _) = parabola_region(1);
++    assert!(
++        region
++            .boolean_region(&simple, BooleanOp::Xor)
++            .unwrap()
++            .is_empty()
++    );
++    let rebuilt =
++        CurveRegion2::try_from_boundary_paths(&region.boundary_paths().unwrap(), FillRule::EvenOdd)
++            .unwrap();
++    let empty = rebuilt
++        .boolean_region(region, BooleanOp::Difference)
++        .unwrap();
++    assert!(empty.is_empty());
++    let restored = empty.boolean_region(&rebuilt, BooleanOp::Union).unwrap();
++    assert_eq!(restored.boundary_paths().unwrap()[0].curves().len(), 3);
++}
++
++#[test]
++fn repeated_boundary_uses_the_same_filled_set_and_arrangement() {
++    let (region, original) = parabola_region(2);
++    check_region(&region, &original);
++}
++
++#[cfg(feature = "svg")]
++#[test]
++fn repeated_source_replays_in_a_fresh_process_and_composes() {
++    use hypercurve::{SvgGeometry2, export_svg_document, import_svg_document};
++    const INPUT: &str = "HYPERCURVE_MULTIPLICITY_REPLAY_INPUT";
++    if let Some(path) = std::env::var_os(INPUT) {
++        let text = std::fs::read_to_string(path).unwrap();
++        let restored = import_svg_document(&text).unwrap();
++        let original = power(&polynomial(&[&[0, 0, 1], &[-1]]), 2);
++        check_region(restored.region(), &original);
++        assert_eq!(export_svg_document(&restored).unwrap(), text);
++        return;
++    }
++    let (region, original) = parabola_region(2);
++    check_region(&region, &original);
++    let text = export_svg_document(&SvgGeometry2::new(region, vec![], vec![])).unwrap();
++    let path = std::env::temp_dir().join(format!(
++        "hypercurve-multiplicities-{}.svg",
++        std::process::id()
++    ));
++    std::fs::write(&path, text).unwrap();
++    let result = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "repeated_source_replays_in_a_fresh_process_and_composes",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(&path).unwrap();
++    assert!(
++        result.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&result.stdout),
++        String::from_utf8_lossy(&result.stderr)
++    );
++}
++
++#[test]
++fn repeated_circle_consumes_an_authored_rational_overlap() {
++    let original = power(&polynomial(&[&[-1, 0, 1], &[], &[1]]), 2);
++    let set = curves(&original);
++    let rational: Curve2 = hypercurve::RationalQuadraticBezier2::try_new(
++        Point2::from_values(1, 0),
++        Point2::from_values(1, -1),
++        Point2::from_values(0, -1),
++        1.into(),
++        1.into(),
++        2.into(),
++    )
++    .unwrap()
++    .into();
++    let lower = &set.curves()[0];
++    for (first, second) in [(lower, &rational), (&rational, lower)] {
++        let result = first.intersect_curve(second).unwrap();
++        assert!(result.is_complete());
++        assert_eq!(result.overlaps().len(), 1);
++        for overlap in result.overlaps() {
++            for (a, b) in [
++                (
++                    overlap.first_range().start(),
++                    overlap.second_range().start(),
++                ),
++                (overlap.first_range().end(), overlap.second_range().end()),
++            ] {
++                assert!(
++                    first
++                        .point_at(a)
++                        .unwrap()
++                        .coincides_with(&second.point_at(b).unwrap())
++                        .unwrap()
++                );
++            }
++        }
++        let split = first.intersection_topology(second).unwrap();
++        for part in split.first() {
++            assert!(part.intersect_curve(second).unwrap().is_complete());
++        }
++    }
++}
++
++#[test]
++fn repeated_parabola_consumes_a_generated_selected_chord() {
++    let original = power(&polynomial(&[&[0, 0, 1], &[-1]]), 2);
++    let set = curves(&original);
++    let positive = &set.curves()[1];
++    let constant = curves(&polynomial(&[&[-1, 0, 0, 128]]));
++    let source = &constant.curves()[0];
++    let map = hypercurve::RationalMap2::new(
++        [polynomial(&[&[], &[1]]), polynomial(&[&[0, 1], &[1]])],
++        polynomial(&[&[1]]),
++    );
++    let generated = Curve2::try_line(
++        source.start().rational_image(&map).unwrap(),
++        source.end().rational_image(&map).unwrap(),
++    )
++    .unwrap();
++    for piece in [positive.clone(), positive.reversed().unwrap()] {
++        let result = piece.intersect_curve(&generated).unwrap();
++        assert!(result.is_complete() && result.overlaps().is_empty());
++        assert_eq!(result.contacts().len(), 2);
++        for contact in result.contacts() {
++            assert!(contact.is_certified_transverse());
++            let point = contact.point();
++            assert!(
++                point
++                    .rational_form(polynomial(&[&[0, 0, 1], &[-1]]), polynomial(&[&[1]]))
++                    .unwrap()
++                    .compare_to_real(&Real::zero())
++                    .unwrap()
++                    .is_eq()
++            );
++            // Original chord definition: (y-x)^3=1/128, without rounding alpha.
++            let delta = point.affine_form((-1).into(), 1.into(), 0.into());
++            assert!(
++                delta
++                    .multiply(&delta)
++                    .unwrap()
++                    .multiply(&delta)
++                    .unwrap()
++                    .compare_to_real(&q(1, 128))
++                    .unwrap()
++                    .is_eq()
++            );
++        }
++        has_source(&piece, &original, 2);
++    }
++}
++
++#[test]
++fn repeated_branch_chamfer_retains_circle_setback_and_source() {
++    use hypercurve::{CurveCornerMode2, CurveCornerSolutions2};
++    let original = power(&polynomial(&[&[-1, 0, 1], &[], &[], &[-1]]), 2);
++    let set = curves(&original);
++    let branch = set.curves()[1]
++        .restrict_source(
++            CurveParameterRange2::try_new(Real::from(-1).into(), Real::zero().into()).unwrap(),
++        )
++        .unwrap();
++    let corner = branch.end();
++    let path = CurvePath2::try_new(vec![
++        branch,
++        Curve2::try_line(corner.clone(), Point2::from_values(1, 1).into()).unwrap(),
++    ])
++    .unwrap();
++    let setback = q(1, 8);
++    let CurveCornerSolutions2::Unique(result) = path
++        .chamfer_vertex_by_setbacks(
++            1,
++            setback.clone(),
++            setback.clone(),
++            CurveCornerMode2::TrimOnly,
++        )
++        .unwrap()
++    else {
++        panic!("unique trim-only chord setbacks");
++    };
++    assert_eq!(result.curves().len(), 3);
++    has_source(&result.curves()[0], &original, 2);
++    for cut in [result.curves()[0].end(), result.curves()[2].start()] {
++        let dx = cut
++            .affine_form(1.into(), 0.into(), 0.into())
++            .subtract(&corner.affine_form(1.into(), 0.into(), 0.into()))
++            .unwrap();
++        let dy = cut
++            .affine_form(0.into(), 1.into(), 0.into())
++            .subtract(&corner.affine_form(0.into(), 1.into(), 0.into()))
++            .unwrap();
++        let distance = dx
++            .multiply(&dx)
++            .unwrap()
++            .add(&dy.multiply(&dy).unwrap())
++            .unwrap();
++        assert!(
++            distance
++                .compare_to_real(&(&setback * &setback))
++                .unwrap()
++                .is_eq()
++        );
++    }
++    let contact = result.curves()[0]
++        .intersect_curve(&result.curves()[1])
++        .unwrap();
++    assert!(contact.is_complete());
++    assert_eq!(contact.contacts().len(), 1);
++    assert!(result.start().coincides_with(&path.start()).unwrap());
++    assert!(result.end().coincides_with(&path.end()).unwrap());
++}
+diff --git a/crates/hypersolve/src/bivariate_topology.rs b/crates/hypersolve/src/bivariate_topology.rs
+index 1b00f0e0d5..bcb06c8fdb 100644
+--- a/crates/hypersolve/src/bivariate_topology.rs
++++ b/crates/hypersolve/src/bivariate_topology.rs
+@@ -10,9 +10,10 @@
+ //!
+ //! This is a set-topology package, not a planar geometry carrier or an
+ //! intersection multiplicity classifier. The exact defining polynomial is
+-//! retained for those consumers. Horizontal boundary components remain in
+-//! the closed fibers; vertical components and repeated generic fibers have
+-//! explicit blockers.
++//! retained for those consumers. Repeated factors retain a checked exact
++//! factorization while topology uses their reduced support. Horizontal boundary
++//! components remain in the closed fibers; vertical components have an explicit
++//! blocker.
+ //! Degree and refinement controls, and the shared work budget, do not bound
+ //! every scalar operation, coefficient bit size, allocation or elapsed time.
+ 
+@@ -43,6 +44,9 @@ use crate::root_isolation::{
+ };
+ use crate::work_budget::{self, WorkKind};
+ 
++mod multiplicity;
++pub use multiplicity::{BivariateMultiplicityFactor, BivariateRepeatedFactorization};
++
+ const STRICT: PredicatePolicy = PredicatePolicy::STRICT;
+ const FIRST: CurveResultantParameter = CurveResultantParameter::First;
+ 
+@@ -92,7 +96,8 @@ pub enum BivariateTopologyError {
+     ZeroPolynomial,
+     /// A complete vertical fiber vanishes; component extraction is required.
+     VerticalComponent,
+-    /// The generic fiber and its derivative share a component.
++    /// Legacy blocker for a repeated generic fiber. The checked decomposition
++    /// now reduces repeated factors and retains their exact defining exponents.
+     RepeatedComponent,
+     /// Legacy blocker for an entire horizontal boundary belonging to the curve.
+     /// The checked decomposition now retains these finite-fiber components.
+@@ -112,6 +117,7 @@ pub enum BivariateTopologyError {
+ pub struct BivariateCurveFiber {
+     parameter: AlgebraicRootRepresentation,
+     roots: Vec<IsolatedRootInterval>,
++    factor_indices: Option<Vec<Vec<usize>>>,
+ }
+ 
+ impl BivariateCurveFiber {
+@@ -124,6 +130,15 @@ impl BivariateCurveFiber {
+     pub fn roots(&self) -> &[IsolatedRootInterval] {
+         &self.roots
+     }
++
++    /// Multiplicity-factor indices for each selected root, in root order.
++    ///
++    /// Present exactly when the topology retained a repeated factorization.
++    /// Several factors may meet at an event, including an isolated point.
++    /// These are defining-factor memberships, not local intersection orders.
++    pub fn repeated_factor_indices(&self) -> Option<&[Vec<usize>]> {
++        self.factor_indices.as_deref()
++    }
+ }
+ 
+ /// One ordered branch over an open interval between consecutive events.
+@@ -131,6 +146,7 @@ impl BivariateCurveFiber {
+ pub struct BivariateCurveArc {
+     left_root: usize,
+     right_root: usize,
++    factor_index: Option<usize>,
+ }
+ 
+ impl BivariateCurveArc {
+@@ -143,6 +159,13 @@ impl BivariateCurveArc {
+     pub fn right_root(&self) -> usize {
+         self.right_root
+     }
++
++    /// Index of this open branch's factor in the topology's repeated
++    /// factorization, when one was required. A checked slab cannot cross a
++    /// different factor before its event boundary.
++    pub const fn repeated_factor_index(&self) -> Option<usize> {
++        self.factor_index
++    }
+ }
+ 
+ /// Complete ordered root graphs on one open projection cell.
+@@ -224,6 +247,7 @@ impl BivariateConnectionStrip {
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct BivariateCurveTopology {
+     equation: BivariatePolynomial,
++    repeated: Option<BivariateRepeatedFactorization>,
+     domain: BivariateCurveDomain,
+     config: BivariateTopologyConfig,
+     projection: Vec<Real>,
+@@ -245,6 +269,26 @@ impl BivariateCurveTopology {
+         &self.equation
+     }
+ 
++    /// Equation used for geometric topology and differential queries.
++    ///
++    /// When generic fibers are repeated, this is their checked square-free
++    /// support. The original defining multiplicities remain in [`Self::equation`]
++    /// and [`Self::repeated_factorization`]. Otherwise the original is reused;
++    /// this does not assert that every factor outside the domain is square-free.
++    pub fn geometric_equation(&self) -> &BivariatePolynomial {
++        self.repeated
++            .as_ref()
++            .map_or(&self.equation, |f| f.support())
++    }
++
++    /// Checked multiplicity evidence when repeated generic fibers were reduced.
++    ///
++    /// `None` means the original equation already admitted finite-fiber topology
++    /// without this reduction; it is not a claim of global square-freeness.
++    pub fn repeated_factorization(&self) -> Option<&BivariateRepeatedFactorization> {
++        self.repeated.as_ref()
++    }
++
+     /// Complete queried domain.
+     pub fn domain(&self) -> &BivariateCurveDomain {
+         &self.domain
+@@ -294,9 +338,16 @@ impl BivariateCurveTopology {
+                 return Err(BivariateTopologyError::ParameterOutsideDomain);
+             }
+             let parameter = AlgebraicRootRepresentation::from_exact_value(&parameter);
++            let roots = isolate(&self.equation, &parameter, &self.domain.second, config)?;
++            let factor_indices = self
++                .repeated
++                .as_ref()
++                .map(|f| multiplicity::root_factors(f, &parameter, &roots))
++                .transpose()?;
+             Ok(BivariateCurveFiber {
+-                roots: isolate(&self.equation, &parameter, &self.domain.second, config)?,
++                roots,
+                 parameter,
++                factor_indices,
+             })
+         })();
+         if work_budget::exhaustion().is_some() {
+@@ -406,7 +457,15 @@ fn decompose(
+             _ => return Err(BivariateTopologyError::Undecided),
+         }
+         if is_zero(&resultant.resultant_coefficients) {
+-            return Err(BivariateTopologyError::RepeatedComponent);
++            let repeated = multiplicity::factor(&equation, config)?;
++            let mut topology = decompose(repeated.support(), &domain, config)?;
++            if topology.repeated.is_some() {
++                return Err(BivariateTopologyError::Undecided);
++            }
++            multiplicity::assign(&mut topology, &repeated)?;
++            topology.equation = equation;
++            topology.repeated = Some(repeated);
++            return Ok(topology);
+         }
+         add_projection(&mut projection, &resultant.resultant_coefficients, config)?;
+         let leading: Vec<_> = equation
+@@ -468,6 +527,7 @@ fn decompose(
+             Ok(BivariateCurveFiber {
+                 roots: isolate(&equation, &parameter, &domain.second, config.fiber)?,
+                 parameter,
++                factor_indices: None,
+             })
+         })
+         .collect::<Result<Vec<_>, BivariateTopologyError>>()?;
+@@ -510,6 +570,7 @@ fn decompose(
+             .map(|(left_root, right_root)| BivariateCurveArc {
+                 left_root,
+                 right_root,
++                factor_index: None,
+             })
+             .collect();
+         slabs.push(BivariateCurveSlab {
+@@ -521,6 +582,7 @@ fn decompose(
+     }
+     Ok(BivariateCurveTopology {
+         equation,
++        repeated: None,
+         domain,
+         config,
+         projection,
+diff --git a/crates/hypersolve/src/bivariate_topology/multiplicity.rs b/crates/hypersolve/src/bivariate_topology/multiplicity.rs
+new file mode 100644
+index 0000000000..e48475540a
+--- /dev/null
++++ b/crates/hypersolve/src/bivariate_topology/multiplicity.rs
+@@ -0,0 +1,385 @@
++//! Checked square-free factors for a previously repeated finite-fiber source.
++use super::*;
++use crate::bivariate_arithmetic::{
++    bivariate_multiply, bivariate_outer_product, bivariate_storage_bidegree_sum,
++};
++use crate::bivariate_components::rational_parameter_component_support;
++use crate::curve_resultant::{
++    BivariatePolynomialAxisFactorStatus, BivariatePolynomialComponentStatus,
++    extract_bivariate_polynomial_system_axis_factors,
++    parameter_component_bivariate_polynomial_system,
++};
++use std::sync::Arc;
++
++/// A product of distinct irreducible factors with one defining exponent.
++///
++/// This exponent is not a local contact or intersection multiplicity. Different
++/// branches can belong to the same factor, and singular points need their own
++/// incidence analysis. Factors need not be irreducible individually.
++#[derive(Clone, Debug, PartialEq)]
++pub struct BivariateMultiplicityFactor {
++    equation: Arc<BivariatePolynomial>,
++    exponent: usize,
++}
++
++impl BivariateMultiplicityFactor {
++    /// Exact supporting polynomial for this multiplicity group.
++    pub fn equation(&self) -> &BivariatePolynomial {
++        &self.equation
++    }
++
++    /// Exponent in the original defining polynomial.
++    pub const fn exponent(&self) -> usize {
++        self.exponent
++    }
++}
++
++/// Exact factorization retained when generic repeated fibers need reduction.
++///
++/// The original polynomial equals `scale * product(factor^exponent)`. The
++/// support has one copy of each factor. This checked live value is reconstructed
++/// from the original polynomial on replay; serialized flags are not proof.
++#[derive(Clone, Debug, PartialEq)]
++pub struct BivariateRepeatedFactorization {
++    support: Arc<BivariatePolynomial>,
++    scale: Real,
++    factors: Vec<BivariateMultiplicityFactor>,
++}
++
++impl BivariateRepeatedFactorization {
++    /// Square-free support of the original zero set.
++    pub fn support(&self) -> &BivariatePolynomial {
++        &self.support
++    }
++
++    /// Nonzero rational scalar in the exact reconstruction identity.
++    pub const fn scale(&self) -> &Real {
++        &self.scale
++    }
++
++    /// Coprime square-free factors, grouped by increasing positive exponent.
++    pub fn factors(&self) -> &[BivariateMultiplicityFactor] {
++        &self.factors
++    }
++}
++
++type Result<T> = std::result::Result<T, BivariateTopologyError>;
++
++fn canonical(polynomial: &BivariatePolynomial) -> Result<BivariatePolynomial> {
++    let mut rows = polynomial
++        .coefficients
++        .iter()
++        .map(|row| {
++            let mut row = row
++                .iter()
++                .map(|value| {
++                    value
++                        .exact_rational_normal_form()
++                        .map(Real::new)
++                        .ok_or(BivariateTopologyError::Undecided)
++                })
++                .collect::<Result<Vec<_>>>()?;
++            while row.last().is_some_and(Real::definitely_zero) {
++                row.pop();
++            }
++            Ok(row)
++        })
++        .collect::<Result<Vec<_>>>()?;
++    while rows.last().is_some_and(Vec::is_empty) {
++        rows.pop();
++    }
++    Ok(BivariatePolynomial::new(rows))
++}
++
++fn one() -> BivariatePolynomial {
++    BivariatePolynomial::new(vec![vec![Real::one()]])
++}
++
++fn constant(polynomial: &BivariatePolynomial) -> bool {
++    polynomial.coefficients.len() <= 1
++        && polynomial
++            .coefficients
++            .first()
++            .is_none_or(|row| row.len() <= 1)
++}
++
++fn monic(polynomial: &BivariatePolynomial) -> Result<BivariatePolynomial> {
++    let mut polynomial = canonical(polynomial)?;
++    let Some(leading) = polynomial
++        .coefficients
++        .last()
++        .and_then(|row| row.last())
++        .cloned()
++    else {
++        return Ok(polynomial);
++    };
++    let inverse = (Real::one() / leading).map_err(|_| BivariateTopologyError::Undecided)?;
++    for coefficient in polynomial.coefficients.iter_mut().flatten() {
++        *coefficient *= &inverse;
++    }
++    canonical(&polynomial)
++}
++
++fn quotient(
++    first: &BivariatePolynomial,
++    second: &BivariatePolynomial,
++) -> Result<BivariatePolynomial> {
++    crate::divide_bivariate_polynomial_exact(first, second)
++        .ok_or(BivariateTopologyError::Undecided)
++        .and_then(|result| canonical(&result))
++}
++
++fn product(
++    first: &BivariatePolynomial,
++    second: &BivariatePolynomial,
++) -> Result<BivariatePolynomial> {
++    canonical(&bivariate_multiply(first, second))
++}
++
++fn gcd(
++    first: &BivariatePolynomial,
++    second: &BivariatePolynomial,
++    config: BivariateTopologyConfig,
++) -> Result<BivariatePolynomial> {
++    work_budget::consume(WorkKind::AlgebraicPromotion, 1)
++        .map_err(|_| BivariateTopologyError::BudgetExhausted)?;
++    let mut pair = [monic(first)?, monic(second)?];
++    if pair[0].coefficients.is_empty() {
++        return Ok(pair[1].clone());
++    }
++    if pair[1].coefficients.is_empty() {
++        return Ok(pair[0].clone());
++    }
++    if constant(&pair[0]) || constant(&pair[1]) {
++        return Ok(one());
++    }
++    for (dividend, divisor) in [(0, 1), (1, 0)] {
++        if crate::divide_bivariate_polynomial_exact(&pair[dividend], &pair[divisor]).is_some() {
++            return Ok(pair[divisor].clone());
++        }
++    }
++    let mut common = one();
++    let bounded = CurveIntersectionResultantConfig {
++        max_resultant_degree: config.max_projection_degree,
++        ..Default::default()
++    };
++    loop {
++        let axes = extract_bivariate_polynomial_system_axis_factors(&pair[0], &pair[1]);
++        match axes.status {
++            BivariatePolynomialAxisFactorStatus::Primitive => {}
++            BivariatePolynomialAxisFactorStatus::Reduced => {
++                let factor = bivariate_outer_product(
++                    &axes.first_parameter_factor,
++                    &axes.second_parameter_factor,
++                );
++                // Recheck the reported factor by exact division. Its entire
++                // zero set stays in the accumulated gcd, including axis fibers.
++                pair = [quotient(&pair[0], &factor)?, quotient(&pair[1], &factor)?];
++                common = product(&common, &factor)?;
++            }
++            BivariatePolynomialAxisFactorStatus::BudgetExhausted => {
++                return Err(BivariateTopologyError::BudgetExhausted);
++            }
++            _ => return Err(BivariateTopologyError::Undecided),
++        }
++        if pair
++            .iter()
++            .any(|p| p.coefficients.iter().all(|row| row.len() <= 1))
++        {
++            // Any common factor of a first-axis polynomial was covered by the
++            // exact axis-content gcd. No generic lifted factor can remain.
++            return monic(&common);
++        }
++        let resultant = resultant_bivariate_polynomial_system(&pair[0], &pair[1], FIRST, bounded);
++        match resultant.status {
++            CurveIntersectionResultantStatus::Constructed => {}
++            CurveIntersectionResultantStatus::BudgetExhausted => {
++                return Err(BivariateTopologyError::BudgetExhausted);
++            }
++            CurveIntersectionResultantStatus::DegreeBoundExceeded => {
++                return Err(BivariateTopologyError::DegreeLimit);
++            }
++            _ => return Err(BivariateTopologyError::Undecided),
++        }
++        if !is_zero(&resultant.resultant_coefficients) {
++            // A nonzero resultant proves generic coprimality. Common axis
++            // factors were already retained above, so the full gcd is known.
++            return monic(&common);
++        }
++        let report =
++            parameter_component_bivariate_polynomial_system(&pair[0], &pair[1], FIRST, bounded);
++        let component = match report.status {
++            BivariatePolynomialComponentStatus::Rational => rational_parameter_component_support(
++                FIRST,
++                &report.numerator_coefficients,
++                &report.denominator_coefficients,
++            ),
++            BivariatePolynomialComponentStatus::Implicit => report.implicit_component,
++            BivariatePolynomialComponentStatus::BudgetExhausted => {
++                return Err(BivariateTopologyError::BudgetExhausted);
++            }
++            BivariatePolynomialComponentStatus::DegreeBoundExceeded => {
++                return Err(BivariateTopologyError::DegreeLimit);
++            }
++            _ => return Err(BivariateTopologyError::Undecided),
++        }
++        .ok_or(BivariateTopologyError::Undecided)?;
++        let next = [
++            quotient(&pair[0], &component)?,
++            quotient(&pair[1], &component)?,
++        ];
++        if next
++            .iter()
++            .map(bivariate_storage_bidegree_sum)
++            .sum::<usize>()
++            >= pair
++                .iter()
++                .map(bivariate_storage_bidegree_sum)
++                .sum::<usize>()
++        {
++            return Err(BivariateTopologyError::Undecided);
++        }
++        common = product(&common, &component)?;
++        pair = next;
++    }
++}
++
++pub(super) fn factor(
++    original: &BivariatePolynomial,
++    config: BivariateTopologyConfig,
++) -> Result<BivariateRepeatedFactorization> {
++    let canonical_original = canonical(original)?;
++    let scale = canonical_original
++        .coefficients
++        .last()
++        .and_then(|row| row.last())
++        .cloned()
++        .ok_or(BivariateTopologyError::ZeroPolynomial)?;
++    let normalized = monic(original)?;
++    let dx = bivariate_parameter_derivative(&normalized, FIRST);
++    let dy = bivariate_parameter_derivative(&normalized, CurveResultantParameter::Second);
++    let mut repeated = gcd(&gcd(&normalized, &dy, config)?, &dx, config)?;
++    let mut remaining = quotient(&normalized, &repeated)?;
++    let mut exponent = 1_usize;
++    let mut factors = Vec::new();
++    while !constant(&remaining) {
++        let common = gcd(&remaining, &repeated, config)?;
++        let factor = quotient(&remaining, &common)?;
++        if !constant(&factor) {
++            factors.push(BivariateMultiplicityFactor {
++                equation: Arc::new(factor),
++                exponent,
++            });
++        }
++        let next_repeated = quotient(&repeated, &common)?;
++        if bivariate_storage_bidegree_sum(&common) + bivariate_storage_bidegree_sum(&next_repeated)
++            >= bivariate_storage_bidegree_sum(&remaining)
++                + bivariate_storage_bidegree_sum(&repeated)
++        {
++            return Err(BivariateTopologyError::Undecided);
++        }
++        remaining = common;
++        repeated = next_repeated;
++        exponent = exponent
++            .checked_add(1)
++            .ok_or(BivariateTopologyError::DegreeLimit)?;
++    }
++    if !constant(&repeated) || factors.is_empty() {
++        return Err(BivariateTopologyError::Undecided);
++    }
++    let mut rebuilt = BivariatePolynomial::new(vec![vec![scale.clone()]]);
++    let mut support = one();
++    for factor in &factors {
++        support = product(&support, factor.equation())?;
++        for _ in 0..factor.exponent {
++            rebuilt = product(&rebuilt, factor.equation())?;
++        }
++    }
++    if canonical(&rebuilt)? != canonical_original
++        || bivariate_storage_bidegree_sum(&support)
++            >= bivariate_storage_bidegree_sum(&canonical_original)
++    {
++        return Err(BivariateTopologyError::Undecided);
++    }
++    let support = if factors.len() == 1 {
++        Arc::clone(&factors[0].equation)
++    } else {
++        Arc::new(support)
++    };
++    Ok(BivariateRepeatedFactorization {
++        support,
++        scale,
++        factors,
++    })
++}
++
++/// Bind each selected root to the retained multiplicity factors. Every factor
++/// divides the reduced support, so a root in one of its singleton isolators is
++/// the same selected root, including coincident factors at an event.
++pub(super) fn root_factors(
++    evidence: &BivariateRepeatedFactorization,
++    parameter: &AlgebraicRootRepresentation,
++    roots: &[IsolatedRootInterval],
++) -> Result<Vec<Vec<usize>>> {
++    if evidence.factors.len() == 1 {
++        return Ok(roots.iter().map(|_| vec![0]).collect());
++    }
++    roots
++        .iter()
++        .map(|root| {
++            let mut indices = Vec::new();
++            for (index, factor) in evidence.factors.iter().enumerate() {
++                if let Some(exact) = &root.exact_root {
++                    if fiber_sign(factor.equation(), parameter, exact)? == Ordering::Equal {
++                        indices.push(index);
++                    }
++                    continue;
++                }
++                let report = count_bivariate_fiber_roots_at_algebraic_parameter_closed(
++                    factor.equation(),
++                    FIRST,
++                    parameter,
++                    &root.lower,
++                    &root.upper,
++                    STRICT,
++                );
++                if report.status != AlgebraicFiberRootCountStatus::Counted
++                    || report.certainty != Certainty::Exact
++                {
++                    return Err(BivariateTopologyError::Undecided);
++                }
++                match report.distinct_root_count {
++                    Some(1) => indices.push(index),
++                    Some(0) => {}
++                    _ => return Err(BivariateTopologyError::Undecided),
++                }
++            }
++            if indices.is_empty() {
++                return Err(BivariateTopologyError::Undecided);
++            }
++            Ok(indices)
++        })
++        .collect()
++}
++
++pub(super) fn assign(
++    topology: &mut BivariateCurveTopology,
++    evidence: &BivariateRepeatedFactorization,
++) -> Result<()> {
++    for event in &mut topology.events {
++        event.factor_indices = Some(root_factors(evidence, &event.parameter, &event.roots)?);
++    }
++    for slab in &mut topology.slabs {
++        let parameter = AlgebraicRootRepresentation::from_exact_value(&slab.sample);
++        let factors = root_factors(evidence, &parameter, &slab.roots)?;
++        for (arc, factors) in slab.arcs.iter_mut().zip(factors) {
++            // Distinct square-free factors cannot meet inside a projection
++            // slab; their intersections are events of the reduced support.
++            let [index] = factors.as_slice() else {
++                return Err(BivariateTopologyError::Undecided);
++            };
++            arc.factor_index = Some(*index);
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/hypersolve/tests/bivariate_boundary_components.rs b/crates/hypersolve/tests/bivariate_boundary_components.rs
+index c3d2741213..075aa137a5 100644
+--- a/crates/hypersolve/tests/bivariate_boundary_components.rs
++++ b/crates/hypersolve/tests/bivariate_boundary_components.rs
+@@ -380,13 +380,26 @@ fn boundary_components_preserve_budget_failure_and_retry() {
+ }
+ 
+ #[test]
+-fn boundary_support_does_not_admit_repeated_or_vertical_components() {
++fn boundary_repetition_keeps_multiplicity_and_vertical_rejection() {
+     let rectangle = rectangle(-1, 1, 0, 1);
++    let equation = polynomial(&[&[0, 0, 1]]);
++    let topology = decompose_bivariate_curve(&equation, &rectangle, Default::default()).unwrap();
++    assert_eq!(topology.equation(), &equation);
++    assert_eq!(
++        topology
++            .events()
++            .iter()
++            .map(|e| e.roots().len())
++            .collect::<Vec<_>>(),
++        vec![1, 1]
++    );
++    assert_eq!(topology.slabs().len(), 1);
++    assert_eq!(topology.slabs()[0].arcs().len(), 1);
++    assert_eq!(
++        topology.repeated_factorization().unwrap().factors()[0].exponent(),
++        2
++    );
+     for (equation, error) in [
+-        (
+-            polynomial(&[&[0, 0, 1]]),
+-            BivariateTopologyError::RepeatedComponent,
+-        ),
+         (
+             polynomial(&[&[], &[0, 1]]),
+             BivariateTopologyError::VerticalComponent,
+diff --git a/crates/hypersolve/tests/bivariate_multiplicities.rs b/crates/hypersolve/tests/bivariate_multiplicities.rs
+new file mode 100644
+index 0000000000..e8023726ed
+--- /dev/null
++++ b/crates/hypersolve/tests/bivariate_multiplicities.rs
+@@ -0,0 +1,315 @@
++//! Repeated defining factors keep their original authority and reduced geometry.
++use hyperlimit::PredicatePolicy;
++use hyperreal::Real;
++use hypersolve::bivariate_arithmetic::{bivariate_multiply, bivariate_specialize_first};
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateCurveTopology, BivariateTopologyConfig,
++    decompose_bivariate_curve,
++};
++use hypersolve::{BivariatePolynomial, UnivariateSturmSequence};
++
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn power(source: &BivariatePolynomial, exponent: usize) -> BivariatePolynomial {
++    (0..exponent).fold(polynomial(&[&[1]]), |value, _| {
++        bivariate_multiply(&value, source)
++    })
++}
++fn rectangle() -> BivariateCurveDomain {
++    BivariateCurveDomain {
++        first: [(-2).into(), 2.into()],
++        second: [(-2).into(), 2.into()],
++    }
++}
++fn config() -> BivariateTopologyConfig {
++    BivariateTopologyConfig {
++        max_axis_degree: 12,
++        max_projection_degree: 256,
++        ..Default::default()
++    }
++}
++fn build(source: &BivariatePolynomial) -> BivariateCurveTopology {
++    decompose_bivariate_curve(source, &rectangle(), config()).unwrap()
++}
++fn layout(topology: &BivariateCurveTopology) -> (Vec<usize>, Vec<Vec<(usize, usize)>>) {
++    (
++        topology
++            .events()
++            .iter()
++            .map(|event| event.roots().len())
++            .collect(),
++        topology
++            .slabs()
++            .iter()
++            .map(|slab| {
++                slab.arcs()
++                    .iter()
++                    .map(|arc| (arc.left_root(), arc.right_root()))
++                    .collect()
++            })
++            .collect(),
++    )
++}
++
++fn verify_fibers(topology: &BivariateCurveTopology, support: &BivariatePolynomial) {
++    // Independent univariate counts on the known reduced support validate
++    // each reported selector and the complete closed fiber. Original repeated
++    // coefficients and the graph incidence are checked separately.
++    for x in [-2, -1, 0, 1, 2].map(Real::from) {
++        let row = bivariate_specialize_first(support, &x);
++        let sequence = UnivariateSturmSequence::new(&row, PredicatePolicy::STRICT).unwrap();
++        let fiber = topology.rational_fiber(&x, config().fiber).unwrap();
++        let expected = sequence
++            .count_distinct_roots(&Real::from(-2), &Real::from(2), PredicatePolicy::STRICT)
++            .unwrap()
++            + usize::from(Real::eval_poly(&row, &Real::from(-2)).definitely_zero());
++        assert_eq!(fiber.roots().len(), expected);
++        for root in fiber.roots() {
++            if let Some(value) = &root.exact_root {
++                assert!(Real::eval_poly(&row, value).definitely_zero());
++            } else {
++                let count = sequence
++                    .count_distinct_roots(&root.lower, &root.upper, PredicatePolicy::STRICT)
++                    .unwrap()
++                    + usize::from(Real::eval_poly(&row, &root.lower).definitely_zero());
++                assert_eq!(count, 1);
++            }
++        }
++    }
++}
++
++fn assert_polynomial_eq(first: &BivariatePolynomial, second: &BivariatePolynomial) {
++    for i in 0..first.coefficients.len().max(second.coefficients.len()) {
++        let a = first.coefficients.get(i).map_or(&[][..], Vec::as_slice);
++        let b = second.coefficients.get(i).map_or(&[][..], Vec::as_slice);
++        for j in 0..a.len().max(b.len()) {
++            let a = a.get(j).cloned().unwrap_or_else(Real::zero);
++            let b = b.get(j).cloned().unwrap_or_else(Real::zero);
++            assert!((a - b).definitely_zero());
++        }
++    }
++}
++
++fn verify_factors(topology: &BivariateCurveTopology, expected: &[(&BivariatePolynomial, usize)]) {
++    let evidence = topology.repeated_factorization().unwrap();
++    assert_eq!(evidence.factors().len(), expected.len());
++    let mut rebuilt = BivariatePolynomial::new(vec![vec![evidence.scale().clone()]]);
++    let mut support = polynomial(&[&[1]]);
++    for (factor, &(known, exponent)) in evidence.factors().iter().zip(expected) {
++        assert_eq!(factor.exponent(), exponent);
++        // Normalize the independent expected factor in the same lexicographic
++        // order, without invoking the factor-discovery or gcd implementation.
++        let leading = known
++            .coefficients
++            .iter()
++            .rev()
++            .find_map(|r| r.iter().rev().find(|c| !c.definitely_zero()))
++            .unwrap();
++        let normalized = BivariatePolynomial::new(
++            known
++                .coefficients
++                .iter()
++                .map(|row| row.iter().map(|c| (c / leading).unwrap()).collect())
++                .collect(),
++        );
++        assert_polynomial_eq(factor.equation(), &normalized);
++        support = bivariate_multiply(&support, factor.equation());
++        rebuilt = bivariate_multiply(&rebuilt, &power(factor.equation(), exponent));
++    }
++    assert_polynomial_eq(&rebuilt, topology.equation());
++    assert_polynomial_eq(&support, topology.geometric_equation());
++    assert_eq!(topology.geometric_equation(), evidence.support());
++    for slab in topology.slabs() {
++        for (arc, root) in slab.arcs().iter().zip(slab.roots()) {
++            let selected = arc.repeated_factor_index().unwrap();
++            for (index, &(known, _)) in expected.iter().enumerate() {
++                let row = bivariate_specialize_first(known, slab.sample());
++                let belongs = if let Some(exact) = &root.exact_root {
++                    Real::eval_poly(&row, exact).definitely_zero()
++                } else {
++                    let sturm =
++                        UnivariateSturmSequence::new(&row, PredicatePolicy::STRICT).unwrap();
++                    let count = sturm
++                        .count_distinct_roots(&root.lower, &root.upper, PredicatePolicy::STRICT)
++                        .unwrap()
++                        + usize::from(Real::eval_poly(&row, &root.lower).definitely_zero());
++                    assert!(count <= 1);
++                    count == 1
++                };
++                assert_eq!(belongs, index == selected);
++            }
++        }
++    }
++    for event in topology.events() {
++        let memberships = event.repeated_factor_indices().unwrap();
++        assert_eq!(memberships.len(), event.roots().len());
++        assert!(memberships.iter().all(|indices| !indices.is_empty()));
++    }
++}
++
++fn check_powers(support: BivariatePolynomial) {
++    let control = build(&support);
++    verify_fibers(&control, &support);
++    assert!(control.repeated_factorization().is_none());
++    for exponent in [2, 3] {
++        for scale in [1, -3] {
++            let mut original = power(&support, exponent);
++            for coefficient in original.coefficients.iter_mut().flatten() {
++                *coefficient *= Real::from(scale);
++            }
++            let topology = build(&original);
++            assert_eq!(topology.equation(), &original);
++            verify_factors(&topology, &[(&support, exponent)]);
++            assert_eq!(topology.domain(), &rectangle());
++            assert_eq!(layout(&topology), layout(&control));
++            verify_fibers(&topology, &support);
++        }
++    }
++}
++
++#[test]
++fn repeated_circle_keeps_both_selected_branches() {
++    let circle = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    let control = build(&circle);
++    assert_eq!(layout(&control).0, vec![0, 1, 1, 0]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![0, 2, 0]
++    );
++    check_powers(circle);
++}
++
++#[test]
++fn repeated_parabola_keeps_its_two_sided_critical_fiber() {
++    check_powers(polynomial(&[&[0, 0, 1], &[-1]]));
++}
++
++#[test]
++fn repeated_node_keeps_all_four_incident_half_branches() {
++    let node = polynomial(&[&[0, 0, 1], &[], &[-1]]);
++    let control = build(&node);
++    assert_eq!(layout(&control).0, vec![2, 1, 2]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![2, 2]
++    );
++    check_powers(node);
++}
++
++#[test]
++fn repeated_cusp_keeps_its_selected_one_sided_branches() {
++    check_powers(polynomial(&[&[0, 0, 1], &[], &[], &[-1]]));
++}
++
++#[test]
++fn repeated_isolated_point_is_not_an_empty_curve() {
++    let isolated = polynomial(&[&[0, 0, 1], &[], &[1]]);
++    let control = build(&isolated);
++    assert!(!control.is_empty());
++    assert_eq!(layout(&control).0, vec![0, 1, 0]);
++    assert!(control.slabs().iter().all(|slab| slab.arcs().is_empty()));
++    check_powers(isolated);
++}
++
++#[test]
++fn different_factor_multiplicities_keep_the_original_crossings() {
++    let circle = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    let line = polynomial(&[&[0, 1]]);
++    let support = bivariate_multiply(&circle, &line);
++    let control = build(&support);
++    assert_eq!(layout(&control).0, vec![1, 1, 1, 1]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![1, 3, 1]
++    );
++    let original = bivariate_multiply(&power(&circle, 2), &power(&line, 3));
++    let topology = build(&original);
++    assert_eq!(topology.equation(), &original);
++    assert_eq!(layout(&topology), layout(&control));
++    verify_fibers(&topology, &support);
++    verify_factors(&topology, &[(&circle, 2), (&line, 3)]);
++    assert_eq!(
++        topology
++            .events()
++            .iter()
++            .map(|event| event.repeated_factor_indices().unwrap().to_vec())
++            .collect::<Vec<_>>(),
++        vec![
++            vec![vec![1]],
++            vec![vec![0, 1]],
++            vec![vec![0, 1]],
++            vec![vec![1]]
++        ]
++    );
++}
++
++#[test]
++fn rootless_axis_factors_keep_their_defining_powers() {
++    let circle = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    for axis in [polynomial(&[&[1], &[], &[1]]), polynomial(&[&[-3], &[1]])] {
++        let original = bivariate_multiply(&power(&axis, 2), &power(&circle, 3));
++        let support = bivariate_multiply(&axis, &circle);
++        let topology = build(&original);
++        assert_eq!(topology.equation(), &original);
++        verify_factors(&topology, &[(&axis, 2), (&circle, 3)]);
++        assert_eq!(layout(&topology), layout(&build(&support)));
++        verify_fibers(&topology, &support);
++    }
++}
++
++#[test]
++fn repeated_components_preserve_degree_budget_and_retry() {
++    use hypersolve::bivariate_topology::BivariateTopologyError;
++    use hypersolve::work_budget::{WorkBudget, with_budget};
++    let original = power(&polynomial(&[&[-1, 0, 1], &[], &[1]]), 3);
++    for limits in [
++        BivariateTopologyConfig {
++            max_axis_degree: 5,
++            ..config()
++        },
++        BivariateTopologyConfig {
++            max_projection_degree: 2,
++            ..config()
++        },
++    ] {
++        assert_eq!(
++            decompose_bivariate_curve(&original, &rectangle(), limits),
++            Err(BivariateTopologyError::DegreeLimit)
++        );
++    }
++    let denied = with_budget(WorkBudget::ZERO, || {
++        assert_eq!(
++            decompose_bivariate_curve(&original, &rectangle(), config()),
++            Err(BivariateTopologyError::BudgetExhausted)
++        );
++    });
++    assert!(denied.result.is_err());
++    let retry = with_budget(
++        WorkBudget {
++            promotions: 100_000,
++            refinements: 1_000_000,
++        },
++        || build(&original),
++    );
++    let restored = retry.result.unwrap();
++    assert_eq!(restored.equation(), &original);
++    assert_eq!(layout(&restored), layout(&build(&original)));
++    assert!(retry.usage.promotions > 1);
++}
+diff --git a/crates/hypersolve/tests/support/bivariate_topology.rs b/crates/hypersolve/tests/support/bivariate_topology.rs
+index 3a257d896a..b8ff1abd00 100644
+--- a/crates/hypersolve/tests/support/bivariate_topology.rs
++++ b/crates/hypersolve/tests/support/bivariate_topology.rs
+@@ -438,16 +438,21 @@ pub fn explicit_dimension_degeneracy_budget_and_recovery() {
+             polynomial(&[&[0], &[1]]),
+             BivariateTopologyError::VerticalComponent,
+         ),
+-        (
+-            polynomial(&[&[0, 0, 1]]),
+-            BivariateTopologyError::RepeatedComponent,
+-        ),
+     ] {
+         assert_eq!(
+             decompose_bivariate_curve(&source, &rectangle, config),
+             Err(expected)
+         );
+     }
++    let repeated = polynomial(&[&[0, 0, 1]]);
++    let topology = build(&repeated, &rectangle);
++    assert_eq!(topology.equation(), &repeated);
++    assert_eq!(topology.events().len(), 2);
++    assert_eq!(incidence(&topology), vec![vec![(0, 1)], vec![(1, 0)]]);
++    assert_eq!(
++        topology.repeated_factorization().unwrap().factors()[0].exponent(),
++        2
++    );
+     // The original boundary-component fixture now retains the complete
+     // horizontal graph, with the same equation and closed rectangle.
+     let boundary = polynomial(&[&[2, 1]]);

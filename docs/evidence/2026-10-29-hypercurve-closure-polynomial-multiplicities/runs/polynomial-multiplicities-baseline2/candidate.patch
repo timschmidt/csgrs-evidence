@@ -1,0 +1,182 @@
+diff --git a/crates/hypersolve/tests/bivariate_multiplicities.rs b/crates/hypersolve/tests/bivariate_multiplicities.rs
+new file mode 100644
+index 0000000000..97ddf062aa
+--- /dev/null
++++ b/crates/hypersolve/tests/bivariate_multiplicities.rs
+@@ -0,0 +1,176 @@
++//! Repeated defining factors keep their original authority and reduced geometry.
++use hyperlimit::PredicatePolicy;
++use hyperreal::Real;
++use hypersolve::bivariate_arithmetic::{bivariate_multiply, bivariate_specialize_first};
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateCurveTopology, BivariateTopologyConfig,
++    decompose_bivariate_curve,
++};
++use hypersolve::{BivariatePolynomial, UnivariateSturmSequence};
++
++fn polynomial(rows: &[&[i32]]) -> BivariatePolynomial {
++    BivariatePolynomial::new(
++        rows.iter()
++            .map(|row| row.iter().copied().map(Real::from).collect())
++            .collect(),
++    )
++}
++fn power(source: &BivariatePolynomial, exponent: usize) -> BivariatePolynomial {
++    (0..exponent).fold(polynomial(&[&[1]]), |value, _| {
++        bivariate_multiply(&value, source)
++    })
++}
++fn rectangle() -> BivariateCurveDomain {
++    BivariateCurveDomain {
++        first: [(-2).into(), 2.into()],
++        second: [(-2).into(), 2.into()],
++    }
++}
++fn config() -> BivariateTopologyConfig {
++    BivariateTopologyConfig {
++        max_axis_degree: 12,
++        max_projection_degree: 256,
++        ..Default::default()
++    }
++}
++fn build(source: &BivariatePolynomial) -> BivariateCurveTopology {
++    decompose_bivariate_curve(source, &rectangle(), config()).unwrap()
++}
++fn layout(topology: &BivariateCurveTopology) -> (Vec<usize>, Vec<Vec<(usize, usize)>>) {
++    (
++        topology
++            .events()
++            .iter()
++            .map(|event| event.roots().len())
++            .collect(),
++        topology
++            .slabs()
++            .iter()
++            .map(|slab| {
++                slab.arcs()
++                    .iter()
++                    .map(|arc| (arc.left_root(), arc.right_root()))
++                    .collect()
++            })
++            .collect(),
++    )
++}
++
++fn verify_fibers(topology: &BivariateCurveTopology, support: &BivariatePolynomial) {
++    // Independent univariate counts on the known reduced support validate
++    // each reported selector and the complete closed fiber. Original repeated
++    // coefficients and the graph incidence are checked separately.
++    for x in [-2, -1, 0, 1, 2].map(Real::from) {
++        let row = bivariate_specialize_first(support, &x);
++        let sequence = UnivariateSturmSequence::new(&row, PredicatePolicy::STRICT).unwrap();
++        let fiber = topology.rational_fiber(&x, config().fiber).unwrap();
++        let expected = sequence
++            .count_distinct_roots(&Real::from(-2), &Real::from(2), PredicatePolicy::STRICT)
++            .unwrap()
++            + usize::from(Real::eval_poly(&row, &Real::from(-2)).definitely_zero());
++        assert_eq!(fiber.roots().len(), expected);
++        for root in fiber.roots() {
++            if let Some(value) = &root.exact_root {
++                assert!(Real::eval_poly(&row, value).definitely_zero());
++            } else {
++                let count = sequence
++                    .count_distinct_roots(&root.lower, &root.upper, PredicatePolicy::STRICT)
++                    .unwrap()
++                    + usize::from(Real::eval_poly(&row, &root.lower).definitely_zero());
++                assert_eq!(count, 1);
++            }
++        }
++    }
++}
++
++fn check_powers(support: BivariatePolynomial) {
++    let control = build(&support);
++    verify_fibers(&control, &support);
++    for exponent in [2, 3] {
++        for scale in [1, -3] {
++            let mut original = power(&support, exponent);
++            for coefficient in original.coefficients.iter_mut().flatten() {
++                *coefficient *= Real::from(scale);
++            }
++            let topology = build(&original);
++            assert_eq!(topology.equation(), &original);
++            assert_eq!(topology.domain(), &rectangle());
++            assert_eq!(layout(&topology), layout(&control));
++            verify_fibers(&topology, &support);
++        }
++    }
++}
++
++#[test]
++fn repeated_circle_keeps_both_selected_branches() {
++    let circle = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    let control = build(&circle);
++    assert_eq!(layout(&control).0, vec![0, 1, 1, 0]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![0, 2, 0]
++    );
++    check_powers(circle);
++}
++
++#[test]
++fn repeated_parabola_keeps_its_two_sided_critical_fiber() {
++    check_powers(polynomial(&[&[0, 0, 1], &[-1]]));
++}
++
++#[test]
++fn repeated_node_keeps_all_four_incident_half_branches() {
++    let node = polynomial(&[&[0, 0, 1], &[], &[-1]]);
++    let control = build(&node);
++    assert_eq!(layout(&control).0, vec![2, 1, 2]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![2, 2]
++    );
++    check_powers(node);
++}
++
++#[test]
++fn repeated_cusp_keeps_its_selected_one_sided_branches() {
++    check_powers(polynomial(&[&[0, 0, 1], &[], &[], &[-1]]));
++}
++
++#[test]
++fn repeated_isolated_point_is_not_an_empty_curve() {
++    let isolated = polynomial(&[&[0, 0, 1], &[], &[1]]);
++    let control = build(&isolated);
++    assert!(!control.is_empty());
++    assert_eq!(layout(&control).0, vec![0, 1, 0]);
++    assert!(control.slabs().iter().all(|slab| slab.arcs().is_empty()));
++    check_powers(isolated);
++}
++
++#[test]
++fn different_factor_multiplicities_keep_the_original_crossings() {
++    let circle = polynomial(&[&[-1, 0, 1], &[], &[1]]);
++    let line = polynomial(&[&[0, 1]]);
++    let support = bivariate_multiply(&circle, &line);
++    let control = build(&support);
++    assert_eq!(layout(&control).0, vec![1, 1, 1, 1]);
++    assert_eq!(
++        control
++            .slabs()
++            .iter()
++            .map(|s| s.arcs().len())
++            .collect::<Vec<_>>(),
++        vec![1, 3, 1]
++    );
++    let original = bivariate_multiply(&power(&circle, 2), &power(&line, 3));
++    let topology = build(&original);
++    assert_eq!(topology.equation(), &original);
++    assert_eq!(layout(&topology), layout(&control));
++    verify_fibers(&topology, &support);
++}
