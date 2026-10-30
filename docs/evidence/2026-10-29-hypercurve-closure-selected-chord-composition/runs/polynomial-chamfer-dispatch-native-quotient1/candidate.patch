@@ -1,0 +1,98 @@
+diff --git a/crates/hypersolve/src/recursive_quadratic_field.rs b/crates/hypersolve/src/recursive_quadratic_field.rs
+index f88dd3013a..26e720274a 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field.rs
+@@ -3118,6 +3118,70 @@ pub struct RecursiveQuadraticProjectiveScalar {
+ }
+ 
+ impl RecursiveQuadraticProjectiveScalar {
++    /// Optionally removes a globally invertible rational polynomial denominator
++    /// over one native source. The shared modular helper checks its Bezout
++    /// identity against the unchanged defining equation before publication.
++    /// Nonunits on other components retain their valid selected-local quotient.
++    pub(crate) fn normalized_rational_quotient(&self) -> Option<Self> {
++        if self.denominator.is_coefficientwise_stored_one() {
++            return None;
++        }
++        let (
++            RecursiveQuadraticValueData::Base {
++                field,
++                expression: numerator,
++                ..
++            },
++            RecursiveQuadraticValueData::Base {
++                field: denominator_field,
++                expression: denominator,
++                ..
++            },
++        ) = (self.numerator.data.as_ref(), self.denominator.data.as_ref())
++        else {
++            return None;
++        };
++        if !Arc::ptr_eq(field, denominator_field) || field.sources.len() != 1 {
++            return None;
++        }
++        let stored_zero = |polynomial: &DenseTensorPolynomial| {
++            polynomial.coefficients().iter().all(|coefficient| {
++                coefficient
++                    .exact_rational_ref()
++                    .is_some_and(|value| value.is_zero())
++            })
++        };
++        if [numerator, denominator].iter().any(|expression| {
++            ![&expression.first, &expression.second, &expression.product]
++                .iter()
++                .all(|polynomial| stored_zero(polynomial))
++        }) {
++            return None;
++        }
++        let modulus = &field.sources[0].polynomial_coefficients;
++        let inverse = match denominator.rational.coefficients() {
++            [constant] if constant.exact_rational_ref().is_some() => {
++                vec![(Real::one() / constant).ok()?]
++            }
++            coefficients => crate::integer_interpolation::rational_polynomial_inverse_modulo(
++                coefficients,
++                modulus,
++            )?,
++        };
++        let coefficients = crate::integer_interpolation::rational_polynomial_product_modulo(
++            numerator.rational.coefficients(),
++            &inverse,
++            modulus,
++        )?;
++        let mut expression = numerator.clone();
++        expression.rational =
++            DenseTensorPolynomial::try_new(vec![coefficients.len()], coefficients)?;
++        Some(Self {
++            numerator: RecursiveQuadraticValue::from_base(field.clone(), expression)?,
++            denominator: RecursiveQuadraticField::Base(field.clone()).constant(Real::one())?,
++        })
++    }
++
+     pub fn interval(&self, refinement_steps: usize) -> Option<RealInterval> {
+         self.numerator
+             .interval(refinement_steps)?
+diff --git a/crates/hypersolve/src/selected_polynomial_field.rs b/crates/hypersolve/src/selected_polynomial_field.rs
+index 0938d2f2d2..086bc0d48b 100644
+--- a/crates/hypersolve/src/selected_polynomial_field.rs
++++ b/crates/hypersolve/src/selected_polynomial_field.rs
+@@ -406,12 +406,14 @@ impl SelectedPolynomialField {
+         let mut pair = [numerator, denominator];
+         RecursiveQuadraticValue::normalize_positive_scale(&mut pair);
+         let [numerator, denominator] = pair;
++        let scalar = RecursiveQuadraticProjectiveScalar {
++            numerator,
++            denominator,
++        };
++        let scalar = scalar.normalized_rational_quotient().unwrap_or(scalar);
+         Ok(SelectedPolynomialValue(Arc::new(ValueData {
+             field: self.clone(),
+-            coordinates: Coordinates::Recursive(RecursiveQuadraticProjectiveScalar {
+-                numerator,
+-                denominator,
+-            }),
++            coordinates: Coordinates::Recursive(scalar),
+         })))
+     }
+ 

@@ -1,0 +1,745 @@
+diff --git a/crates/hypersolve/src/recursive_quadratic_field.rs b/crates/hypersolve/src/recursive_quadratic_field.rs
+index f88dd3013a..8d0fd7901c 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field.rs
+@@ -1096,7 +1096,27 @@ impl RecursiveQuadraticValue {
+                 let stride = polynomial.dimensions()[axis + 1..]
+                     .iter()
+                     .try_fold(1_usize, |stride, dimension| stride.checked_mul(*dimension))?;
+-                let value = values[axis].as_ref()?;
++                let Some(value) = values[axis].as_ref() else {
++                    // Positive powers with stored zero coefficients do not
++                    // depend on this generator, even when the tensor retains
++                    // its full axis dimension after selected-root reduction.
++                    let start = base_index.checked_add(stride)?;
++                    let end = base_index
++                        .checked_add(polynomial.dimensions()[axis].checked_mul(stride)?)?;
++                    if polynomial
++                        .coefficients()
++                        .get(start..end)?
++                        .iter()
++                        .all(|coefficient| {
++                            coefficient
++                                .exact_rational_ref()
++                                .is_some_and(|value| value.is_zero())
++                        })
++                    {
++                        return evaluate_axis(polynomial, values, axis + 1, base_index);
++                    }
++                    return None;
++                };
+                 let mut result = Real::zero();
+                 for power in (0..polynomial.dimensions()[axis]).rev() {
+                     result = result * value
+@@ -3118,6 +3138,70 @@ pub struct RecursiveQuadraticProjectiveScalar {
+ }
+ 
+ impl RecursiveQuadraticProjectiveScalar {
++    /// Optionally removes a globally invertible rational polynomial denominator
++    /// over one native source. The shared modular helper checks its Bezout
++    /// identity against the unchanged defining equation before publication.
++    /// Nonunits on other components retain their valid selected-local quotient.
++    pub(crate) fn normalized_rational_quotient(&self) -> Option<Self> {
++        if self.denominator.is_coefficientwise_stored_one() {
++            return None;
++        }
++        let (
++            RecursiveQuadraticValueData::Base {
++                field,
++                expression: numerator,
++                ..
++            },
++            RecursiveQuadraticValueData::Base {
++                field: denominator_field,
++                expression: denominator,
++                ..
++            },
++        ) = (self.numerator.data.as_ref(), self.denominator.data.as_ref())
++        else {
++            return None;
++        };
++        if !Arc::ptr_eq(field, denominator_field) || field.sources.len() != 1 {
++            return None;
++        }
++        let stored_zero = |polynomial: &DenseTensorPolynomial| {
++            polynomial.coefficients().iter().all(|coefficient| {
++                coefficient
++                    .exact_rational_ref()
++                    .is_some_and(|value| value.is_zero())
++            })
++        };
++        if [numerator, denominator].iter().any(|expression| {
++            ![&expression.first, &expression.second, &expression.product]
++                .iter()
++                .all(|polynomial| stored_zero(polynomial))
++        }) {
++            return None;
++        }
++        let modulus = &field.sources[0].polynomial_coefficients;
++        let inverse = match denominator.rational.coefficients() {
++            [constant] if constant.exact_rational_ref().is_some() => {
++                vec![(Real::one() / constant).ok()?]
++            }
++            coefficients => crate::integer_interpolation::rational_polynomial_inverse_modulo(
++                coefficients,
++                modulus,
++            )?,
++        };
++        let coefficients = crate::integer_interpolation::rational_polynomial_product_modulo(
++            numerator.rational.coefficients(),
++            &inverse,
++            modulus,
++        )?;
++        let mut expression = numerator.clone();
++        expression.rational =
++            DenseTensorPolynomial::try_new(vec![coefficients.len()], coefficients)?;
++        Some(Self {
++            numerator: RecursiveQuadraticValue::from_base(field.clone(), expression)?,
++            denominator: RecursiveQuadraticField::Base(field.clone()).constant(Real::one())?,
++        })
++    }
++
+     pub fn interval(&self, refinement_steps: usize) -> Option<RealInterval> {
+         self.numerator
+             .interval(refinement_steps)?
+diff --git a/crates/hypersolve/src/selected_polynomial_field.rs b/crates/hypersolve/src/selected_polynomial_field.rs
+index 0938d2f2d2..67948bf926 100644
+--- a/crates/hypersolve/src/selected_polynomial_field.rs
++++ b/crates/hypersolve/src/selected_polynomial_field.rs
+@@ -21,7 +21,9 @@ pub use definition::{
+ };
+ 
+ mod filter;
++mod inverse;
+ mod normalize;
++mod witness;
+ 
+ mod bounds;
+ pub use bounds::SelectedPolynomialEnclosure;
+@@ -378,10 +380,14 @@ impl SelectedPolynomialField {
+             .last()
+             .expect("a nonconstant relation has a leading term");
+         let inverse = leading.reciprocal_strict(policy)?;
+-        let monic = reduced
++        let mut monic = reduced
+             .iter()
+             .map(|value| value.multiply(&inverse))
+             .collect::<ArithmeticResult<Vec<_>>>()?;
++        if let Some(image) = witness::parent_image(self, &defining, &monic, &lower, &upper, policy)?
++        {
++            monic = vec![image.scale(&Real::from(-1))?, self.constant(Real::one())?];
++        }
+         Ok(Self(Arc::new(FieldData::Extension {
+             parent: self.clone(),
+             defining,
+@@ -406,12 +412,14 @@ impl SelectedPolynomialField {
+         let mut pair = [numerator, denominator];
+         RecursiveQuadraticValue::normalize_positive_scale(&mut pair);
+         let [numerator, denominator] = pair;
++        let scalar = RecursiveQuadraticProjectiveScalar {
++            numerator,
++            denominator,
++        };
++        let scalar = scalar.normalized_rational_quotient().unwrap_or(scalar);
+         Ok(SelectedPolynomialValue(Arc::new(ValueData {
+             field: self.clone(),
+-            coordinates: Coordinates::Recursive(RecursiveQuadraticProjectiveScalar {
+-                numerator,
+-                denominator,
+-            }),
++            coordinates: Coordinates::Recursive(scalar),
+         })))
+     }
+ 
+@@ -622,6 +630,18 @@ impl SelectedPolynomialValue {
+             RealSign::Positive => Real::one(),
+             RealSign::Negative => Real::from(-1),
+         };
++        // A global inverse can keep the selected quotient compact. Nonunits
++        // elsewhere retain their original local quotient and denominator proof.
++        match inverse::reciprocal(self, policy) {
++            Ok(Some(value)) => return Ok(value),
++            Ok(None)
++            | Err(SelectedPolynomialError::Arithmetic(
++                SelectedPolynomialArithmeticError::ConstructionUnavailable,
++            )) => {}
++            Err(SelectedPolynomialError::Uncertain(reason))
++                if reason != UncertaintyReason::BudgetExhausted => {}
++            Err(error) => return Err(error),
++        }
+         Ok(match &self.0.coordinates {
+             Coordinates::Recursive(scalar) => self.field().recursive_value(
+                 unavailable(scalar.denominator.scale(&scale))?,
+@@ -663,6 +683,24 @@ impl SelectedPolynomialValue {
+         if let Some(sign) = self.sign_from_selection_bounds() {
+             return Ok(sign);
+         }
++        if let Coordinates::Extension { numerator, .. } = &self.0.coordinates {
++            if let [constant] = numerator.as_slice() {
++                return constant.sign_strict(policy);
++            }
++            if !self.has_rational_sign_coefficients() {
++                for steps in [4, 8, 16, 32] {
++                    let sign = self.sign_from_refined_selection_bounds(steps);
++                    if crate::work_budget::exhaustion().is_some() {
++                        return Err(SelectedPolynomialError::Uncertain(
++                            UncertaintyReason::BudgetExhausted,
++                        ));
++                    }
++                    if let Some(sign) = sign {
++                        return Ok(sign);
++                    }
++                }
++            }
++        }
+         match (&self.field().0.as_ref(), &self.0.coordinates) {
+             (_, Coordinates::Recursive(scalar)) => match scalar
+                 .numerator
+@@ -683,9 +721,6 @@ impl SelectedPolynomialValue {
+                 },
+                 Coordinates::Extension { numerator, .. },
+             ) => {
+-                if let [constant] = numerator.as_slice() {
+-                    return constant.sign_strict(policy);
+-                }
+                 let mut context = SelectedPolynomialContext {
+                     field: parent.clone(),
+                     policy,
+diff --git a/crates/hypersolve/src/selected_polynomial_field/filter.rs b/crates/hypersolve/src/selected_polynomial_field/filter.rs
+index 82b6aaf9f0..05c1d75b5e 100644
+--- a/crates/hypersolve/src/selected_polynomial_field/filter.rs
++++ b/crates/hypersolve/src/selected_polynomial_field/filter.rs
+@@ -52,6 +52,21 @@ fn enclose(value: &SelectedPolynomialValue, memo: &mut Memo) -> Option<RealInter
+ }
+ 
+ impl SelectedPolynomialValue {
++    pub(super) fn has_rational_sign_coefficients(&self) -> bool {
++        let (FieldData::Extension { defining, .. }, Coordinates::Extension { numerator, .. }) =
++            (self.field().0.as_ref(), &self.0.coordinates)
++        else {
++            return false;
++        };
++        // The existing exact remainder chain already decides rational data
++        // without root refinement. Preserve that path and its resource cost,
++        // including coefficients lifted through otherwise selected fields.
++        defining.iter().chain(numerator).all(|coefficient| {
++            witness::represented(coefficient)
++                .is_some_and(|value| value.exact_rational_ref().is_some())
++        })
++    }
++
+     pub(super) fn sign_from_selection_bounds(&self) -> Option<RealSign> {
+         let (FieldData::Extension { interval, .. }, Coordinates::Extension { numerator, .. }) =
+             (self.field().0.as_ref(), &self.0.coordinates)
+@@ -70,3 +85,136 @@ impl SelectedPolynomialValue {
+         polynomial(numerator, &argument, &mut Memo::new())?.strict_nonzero_sign()
+     }
+ }
++
++// All memo keys borrow the immutable field/value graph owned by the query.
++// They identify proof inputs for this call, never mathematical equality, and
++// no failed interval attempt survives a retry under a larger resource budget.
++#[derive(Default)]
++struct RefinedFilter {
++    values: HashMap<(*const ValueData, usize), Option<RealInterval>>,
++    fields: HashMap<(*const FieldData, usize), Option<RealInterval>>,
++}
++
++fn interval_polynomial(
++    coefficients: &[RealInterval],
++    argument: &RealInterval,
++) -> Option<RealInterval> {
++    let mut result = RealInterval {
++        lower: Real::zero(),
++        upper: Real::zero(),
++    };
++    for coefficient in coefficients.iter().rev() {
++        result = result.multiply(argument)?.add(coefficient);
++    }
++    Some(result)
++}
++
++impl RefinedFilter {
++    fn coefficients(
++        &mut self,
++        values: &[SelectedPolynomialValue],
++        steps: usize,
++    ) -> Option<Vec<RealInterval>> {
++        values
++            .iter()
++            .map(|value| self.value(value, steps))
++            .collect()
++    }
++
++    fn field(&mut self, field: &SelectedPolynomialField, steps: usize) -> Option<RealInterval> {
++        let key = (Arc::as_ptr(&field.0), steps);
++        if let Some(bounds) = self.fields.get(&key) {
++            return bounds.clone();
++        }
++        let FieldData::Extension {
++            monic, interval, ..
++        } = field.0.as_ref()
++        else {
++            return None;
++        };
++        let mut bounds = RealInterval {
++            lower: interval.lower.clone(),
++            upper: interval.upper.clone(),
++        };
++        let parent_steps = steps.saturating_mul(2).min(256);
++        let coefficients = self.coefficients(monic, parent_steps)?;
++        if let [constant, _] = coefficients.as_slice() {
++            // The private monic relation is proved at the original selection.
++            // A parent image can bound its generator without materializing it.
++            bounds = RealInterval {
++                lower: -constant.upper.clone(),
++                upper: -constant.lower.clone(),
++            };
++        } else {
++            let point = |value: &Real| RealInterval {
++                lower: value.clone(),
++                upper: value.clone(),
++            };
++            let lower_sign =
++                interval_polynomial(&coefficients, &point(&bounds.lower))?.strict_nonzero_sign();
++            let upper_sign =
++                interval_polynomial(&coefficients, &point(&bounds.upper))?.strict_nonzero_sign();
++            if matches!(
++                (lower_sign, upper_sign),
++                (Some(RealSign::Negative), Some(RealSign::Positive))
++                    | (Some(RealSign::Positive), Some(RealSign::Negative))
++            ) {
++                for _ in 0..steps {
++                    crate::work_budget::consume(crate::work_budget::WorkKind::RootRefinement, 1)
++                        .ok()?;
++                    let middle = Real::average_pair(&bounds.lower, &bounds.upper);
++                    let value = interval_polynomial(&coefficients, &point(&middle))?;
++                    if value.lower.definitely_zero() && value.upper.definitely_zero() {
++                        bounds = point(&middle);
++                        break;
++                    }
++                    match value.strict_nonzero_sign() {
++                        Some(sign) if Some(sign) == lower_sign => bounds.lower = middle,
++                        Some(sign) if Some(sign) == upper_sign => bounds.upper = middle,
++                        _ => break,
++                    }
++                }
++            }
++        }
++        self.fields.insert(key, Some(bounds.clone()));
++        Some(bounds)
++    }
++
++    fn value(&mut self, value: &SelectedPolynomialValue, steps: usize) -> Option<RealInterval> {
++        let key = (Arc::as_ptr(&value.0), steps);
++        if let Some(bounds) = self.values.get(&key) {
++            return bounds.clone();
++        }
++        let bounds = match &value.0.coordinates {
++            Coordinates::Recursive(scalar) => scalar.interval(steps),
++            Coordinates::Extension {
++                numerator,
++                denominator,
++            } => {
++                let argument = self.field(value.field(), steps)?;
++                let parent_steps = steps.saturating_mul(2).min(256);
++                interval_polynomial(&self.coefficients(numerator, parent_steps)?, &argument)?
++                    .divide(&interval_polynomial(
++                        &self.coefficients(denominator, parent_steps)?,
++                        &argument,
++                    )?)
++            }
++        };
++        self.values.insert(key, bounds.clone());
++        bounds
++    }
++}
++
++impl SelectedPolynomialValue {
++    pub(super) fn sign_from_refined_selection_bounds(&self, steps: usize) -> Option<RealSign> {
++        let Coordinates::Extension { numerator, .. } = &self.0.coordinates else {
++            return None;
++        };
++        let mut filter = RefinedFilter::default();
++        let argument = filter.field(self.field(), steps)?;
++        let coefficients = filter.coefficients(numerator, steps.saturating_mul(2).min(256))?;
++        // Only a definite nonzero sign is consumed. Exact zeros and failed
++        // separation retain the complete selected-root sign algorithm.
++        interval_polynomial(&coefficients, &argument)?.strict_nonzero_sign()
++    }
++}
+diff --git a/crates/hypersolve/src/selected_polynomial_field/inverse.rs b/crates/hypersolve/src/selected_polynomial_field/inverse.rs
+new file mode 100644
+index 0000000000..a2d9ac7bf0
+--- /dev/null
++++ b/crates/hypersolve/src/selected_polynomial_field/inverse.rs
+@@ -0,0 +1,104 @@
++//! Optional Bezout inverses over the retained selected coefficient field.
++
++use super::*;
++
++fn trim<C: SelectedAlgebraContext>(
++    polynomial: &mut Vec<SelectedPolynomialValue>,
++    policy: &C,
++) -> Result<(), SelectedPolynomialError<C::Error>> {
++    while let Some(leading) = polynomial.last() {
++        if leading.sign_strict(policy)? != RealSign::Zero {
++            break;
++        }
++        polynomial.pop();
++    }
++    Ok(())
++}
++
++// `divisor` is monic by the caller's exact reciprocal proof. Removing the
++// highest coefficient is therefore an exact cancellation, not a zero guess.
++fn monic_div_rem(
++    mut polynomial: Vec<SelectedPolynomialValue>,
++    divisor: &[SelectedPolynomialValue],
++    parent: &SelectedPolynomialField,
++) -> ArithmeticResult<(Vec<SelectedPolynomialValue>, Vec<SelectedPolynomialValue>)> {
++    let degree = divisor.len() - 1;
++    let count = polynomial.len().saturating_sub(degree).max(1);
++    let mut quotient = vec![parent.constant(Real::zero())?; count];
++    while polynomial.len() > degree {
++        let leading = polynomial
++            .pop()
++            .expect("a leading coefficient is eliminated");
++        let shift = polynomial.len() - degree;
++        quotient[shift] = leading.clone();
++        if leading.stored_zero() {
++            continue;
++        }
++        for (index, coefficient) in divisor[..degree].iter().enumerate() {
++            polynomial[shift + index] =
++                polynomial[shift + index].subtract(&leading.multiply(coefficient)?)?;
++        }
++    }
++    Ok((quotient, polynomial))
++}
++
++pub(super) fn reciprocal<C: SelectedAlgebraContext>(
++    value: &SelectedPolynomialValue,
++    policy: &C,
++) -> Result<Option<SelectedPolynomialValue>, SelectedPolynomialError<C::Error>> {
++    let FieldData::Extension { parent, monic, .. } = value.field().0.as_ref() else {
++        return Ok(None);
++    };
++    let Coordinates::Extension {
++        numerator,
++        denominator,
++    } = &value.0.coordinates
++    else {
++        return Ok(None);
++    };
++    // Constant numerators still need their parent-field inverse. In particular,
++    // a proved parent image can leave a selected field with a linear relation;
++    // keeping projective denominators there would undo normalization below it.
++    let one = parent.constant(Real::one())?;
++    let mut previous = monic.clone();
++    let mut current = numerator.clone();
++    let mut previous_coefficient = vec![parent.constant(Real::zero())?];
++    let mut current_coefficient = vec![one.clone()];
++    loop {
++        trim(&mut current, policy)?;
++        let Some(leading) = current.last() else {
++            // A nonconstant gcd need not vanish at the selected real root.
++            // Decline global inversion and keep its original local quotient.
++            return Ok(None);
++        };
++        let inverse = leading.reciprocal_strict(policy)?;
++        for coefficient in current.iter_mut().chain(&mut current_coefficient) {
++            *coefficient = coefficient.multiply(&inverse)?;
++        }
++        // Both the remainder and its Bezout coefficient received the same
++        // nonzero factor. Their relation modulo the original polynomial holds.
++        *current.last_mut().expect("the row is nonzero") = one.clone();
++        if current.len() == 1 {
++            let inverse = value.field().reduce(current_coefficient)?;
++            let product = multiply(denominator, &inverse, parent)?;
++            return value
++                .field()
++                .extension_value(product, vec![one])
++                .map(Some)
++                .map_err(Into::into);
++        }
++        let (quotient, remainder) = monic_div_rem(previous, &current, parent)?;
++        let product = multiply(&quotient, &current_coefficient, parent)?;
++        let negative = product
++            .iter()
++            .map(|coefficient| coefficient.scale(&Real::from(-1)))
++            .collect::<ArithmeticResult<Vec<_>>>()?;
++        let next = value
++            .field()
++            .reduce(add(&previous_coefficient, &negative, parent)?)?;
++        previous = current;
++        current = remainder;
++        previous_coefficient = current_coefficient;
++        current_coefficient = next;
++    }
++}
+diff --git a/crates/hypersolve/src/selected_polynomial_field/witness.rs b/crates/hypersolve/src/selected_polynomial_field/witness.rs
+new file mode 100644
+index 0000000000..613a60ec38
+--- /dev/null
++++ b/crates/hypersolve/src/selected_polynomial_field/witness.rs
+@@ -0,0 +1,94 @@
++//! Optional native witnesses retain the original selected-field authority.
++
++use super::*;
++use crate::{
++    AlgebraicRootRepresentation, AlgebraicRootValidationReport, AlgebraicRootValidationStatus,
++};
++
++pub(super) fn represented(value: &SelectedPolynomialValue) -> Option<Real> {
++    match &value.0.coordinates {
++        Coordinates::Recursive(scalar) => (scalar
++            .numerator
++            .exact_real_value_with_retained_witnesses()?
++            / scalar
++                .denominator
++                .exact_real_value_with_retained_witnesses()?)
++        .ok(),
++        Coordinates::Extension {
++            numerator,
++            denominator,
++        } => {
++            let ([numerator], [denominator]) = (numerator.as_slice(), denominator.as_slice())
++            else {
++                return None;
++            };
++            (represented(numerator)? / represented(denominator)?).ok()
++        }
++    }
++}
++
++pub(super) fn parent_image<C: SelectedAlgebraContext>(
++    parent: &SelectedPolynomialField,
++    defining: &[SelectedPolynomialValue],
++    monic: &[SelectedPolynomialValue],
++    lower: &Real,
++    upper: &Real,
++    policy: &C,
++) -> Result<Option<SelectedPolynomialValue>, SelectedPolynomialError<C::Error>> {
++    if !(2..=3).contains(&monic.len()) {
++        return Ok(None);
++    }
++    let Some(coefficients) = monic.iter().map(represented).collect::<Option<Vec<_>>>() else {
++        return Ok(None);
++    };
++    let mut source = AlgebraicRootRepresentation {
++        constraint_index: 0,
++        symbol: crate::SymbolId(0),
++        interval_index: 0,
++        polynomial_coefficients: coefficients,
++        interval: IsolatedRootInterval {
++            lower: lower.clone(),
++            upper: upper.clone(),
++            exact_root: None,
++            distinct_root_count: 1,
++        },
++        validation: AlgebraicRootValidationReport {
++            status: AlgebraicRootValidationStatus::Undecided,
++            message: None,
++        },
++    };
++    source.validation =
++        crate::validate_algebraic_root_representation(&source, hyperlimit::PredicatePolicy::STRICT);
++    let Some(compact) = crate::compact_algebraic_root_low_degree_witness(&source) else {
++        return Ok(None);
++    };
++    let Some(value) = compact.exact_point_witness() else {
++        return Ok(None);
++    };
++    if policy.real_sign(&(value - lower)) != Some(RealSign::Positive)
++        || policy.real_sign(&(upper - value)) != Some(RealSign::Positive)
++    {
++        return Ok(None);
++    }
++    // Recognition is optional. The consumed proof always checks the original
++    // field equation and original open selector, retaining every parent source.
++    let attempt = || {
++        Ok(
++            (evaluate(defining, value, parent)?.sign_strict(policy)? == RealSign::Zero)
++                .then(|| parent.constant(value.clone()))
++                .transpose()?,
++        )
++    };
++    match attempt() {
++        Ok(image) => Ok(image),
++        Err(SelectedPolynomialError::Arithmetic(
++            SelectedPolynomialArithmeticError::ConstructionUnavailable,
++        )) => Ok(None),
++        Err(SelectedPolynomialError::Uncertain(reason))
++            if reason != UncertaintyReason::BudgetExhausted =>
++        {
++            Ok(None)
++        }
++        Err(error) => Err(error),
++    }
++}
+diff --git a/crates/hypersolve/tests/selected_polynomial_fields.rs b/crates/hypersolve/tests/selected_polynomial_fields.rs
+index 00f279c9ab..c680d2e2c0 100644
+--- a/crates/hypersolve/tests/selected_polynomial_fields.rs
++++ b/crates/hypersolve/tests/selected_polynomial_fields.rs
+@@ -514,3 +514,160 @@ fn selector_enclosures_preserve_exact_zero_nearby_signs_and_budget_retry() {
+         Classification::Decided(RealSign::Positive)
+     );
+ }
++
++#[path = "support/selected_polynomial_replay.rs"]
++mod inverse_codec;
++
++#[test]
++fn polynomial_inverse_over_selected_coefficients_keeps_replay() {
++    use hypersolve::selected_polynomial_field::SelectedPolynomialDefinition;
++    let q = base();
++    let parent = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let a = parent.generator().unwrap();
++    for repeated in [false, true] {
++        let mut equation = coefficients(&parent, &[0, 0, 0, 1]);
++        equation[0] = a.scale(&real(-1)).unwrap();
++        if repeated {
++            equation = coefficients(&parent, &[0, 0, 0, 0, 0, 0, 1]);
++            equation[0] = power(&a, 2);
++            equation[3] = a.scale(&real(-2)).unwrap();
++        }
++        let degree = equation.len() - 1;
++        let selected = select(&parent, equation, 1, 2);
++        let t = selected.generator().unwrap();
++        let one = selected.constant(real(1)).unwrap();
++        for sign in [-1, 1] {
++            let denominator = power(&t, 2).add(&one).unwrap().scale(&real(sign)).unwrap();
++            let inverse = decided(one.divide(&denominator, &TestContext::strict()).unwrap());
++            assert!(inverse.field().shares_authority(&selected));
++            assert_eq!(selected.defining_polynomial().unwrap().len(), degree + 1);
++            // (t^2+1)(t^4-t^2+1)=t^6+1=a^2+1, independently of
++            // the inverse's polynomial basis or the original multiplicity.
++            let scale = selected.lift(&power(&a, 2)).unwrap().add(&one).unwrap();
++            let expected = power(&t, 4)
++                .subtract(&power(&t, 2))
++                .unwrap()
++                .add(&one)
++                .unwrap()
++                .scale(&real(sign))
++                .unwrap();
++            is_zero(
++                &inverse
++                    .multiply(&scale)
++                    .unwrap()
++                    .subtract(&expected)
++                    .unwrap(),
++            );
++            is_zero(
++                &inverse
++                    .multiply(&denominator)
++                    .unwrap()
++                    .subtract(&one)
++                    .unwrap(),
++            );
++            let graph = SelectedPolynomialDefinition::from_values(
++                &[t.clone(), denominator, inverse, selected.lift(&a).unwrap()],
++                10000,
++            )
++            .unwrap();
++            eprintln!(
++                "inverse repeated={repeated} sign={sign} graph_nodes={}",
++                graph.nodes.len()
++            );
++            let path = std::env::temp_dir().join(format!(
++                "hypersolve-field-inverse-{}-{}-{sign}-{repeated}.json",
++                std::process::id(),
++                std::time::SystemTime::now()
++                    .duration_since(std::time::UNIX_EPOCH)
++                    .unwrap()
++                    .as_nanos(),
++            ));
++            std::fs::write(&path, inverse_codec::encode(&graph)).unwrap();
++            let child = std::process::Command::new(std::env::current_exe().unwrap())
++                .args([
++                    "--exact",
++                    "selected_polynomial_inverse_replay_child",
++                    "--nocapture",
++                ])
++                .env("HYPERSOLVE_FIELD_INVERSE_REPLAY", &path)
++                .output();
++            std::fs::remove_file(path).unwrap();
++            let child = child.unwrap();
++            assert!(
++                child.status.success(),
++                "{}{}",
++                String::from_utf8_lossy(&child.stdout),
++                String::from_utf8_lossy(&child.stderr)
++            );
++        }
++    }
++}
++
++#[test]
++fn selected_polynomial_inverse_replay_child() {
++    let Some(path) = std::env::var_os("HYPERSOLVE_FIELD_INVERSE_REPLAY") else {
++        return;
++    };
++    let graph = inverse_codec::decode(&std::fs::read_to_string(path).unwrap());
++    let values = decided(graph.replay(10000, &TestContext::strict()).unwrap());
++    let [t, denominator, inverse, a] = values.as_slice() else {
++        panic!("four retained values");
++    };
++    let one = t.field().constant(real(1)).unwrap();
++    is_zero(&power(t, 3).subtract(a).unwrap());
++    is_zero(
++        &power(a, 3)
++            .subtract(&t.field().constant(real(2)).unwrap())
++            .unwrap(),
++    );
++    is_zero(
++        &inverse
++            .multiply(denominator)
++            .unwrap()
++            .subtract(&one)
++            .unwrap(),
++    );
++    let divisor = inverse.add(&one).unwrap();
++    let next = decided(one.divide(&divisor, &TestContext::strict()).unwrap());
++    is_zero(&next.multiply(&divisor).unwrap().subtract(&one).unwrap());
++}
++
++#[test]
++fn polynomial_reciprocal_composition_retains_its_original_field() {
++    let q = base();
++    let parent = select(&q, coefficients(&q, &[-2, 0, 0, 1]), 1, 2);
++    let a = parent.generator().unwrap();
++    let mut equation = coefficients(&parent, &[0, 0, 0, 1]);
++    equation[0] = a.scale(&real(-1)).unwrap();
++    let field = select(&parent, equation, 1, 2);
++    let t = field.generator().unwrap();
++    let one = field.constant(real(1)).unwrap();
++    let fibonacci = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34];
++    let mut value = t.clone();
++    for step in 1..=8 {
++        value = decided(
++            one.divide(&value.add(&one).unwrap(), &TestContext::strict())
++                .unwrap(),
++        );
++        let numerator = t
++            .scale(&real(fibonacci[step - 1]))
++            .unwrap()
++            .add(&field.constant(real(fibonacci[step])).unwrap())
++            .unwrap();
++        let denominator = t
++            .scale(&real(fibonacci[step]))
++            .unwrap()
++            .add(&field.constant(real(fibonacci[step + 1])).unwrap())
++            .unwrap();
++        is_zero(
++            &value
++                .multiply(&denominator)
++                .unwrap()
++                .subtract(&numerator)
++                .unwrap(),
++        );
++        assert!(value.field().shares_authority(&field));
++    }
++    assert!(field.parent().unwrap().shares_authority(&parent));
++    assert_eq!(field.defining_polynomial().unwrap().len(), 4);
++}

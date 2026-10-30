@@ -1,0 +1,33 @@
+diff --git a/crates/hypersolve/src/recursive_quadratic_field.rs b/crates/hypersolve/src/recursive_quadratic_field.rs
+index f88dd3013a..d3c67031e6 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field.rs
+@@ -1096,7 +1096,27 @@ impl RecursiveQuadraticValue {
+                 let stride = polynomial.dimensions()[axis + 1..]
+                     .iter()
+                     .try_fold(1_usize, |stride, dimension| stride.checked_mul(*dimension))?;
+-                let value = values[axis].as_ref()?;
++                let Some(value) = values[axis].as_ref() else {
++                    // Positive powers with stored zero coefficients do not
++                    // depend on this generator, even when the tensor retains
++                    // its full axis dimension after selected-root reduction.
++                    let start = base_index.checked_add(stride)?;
++                    let end = base_index
++                        .checked_add(polynomial.dimensions()[axis].checked_mul(stride)?)?;
++                    if polynomial
++                        .coefficients()
++                        .get(start..end)?
++                        .iter()
++                        .all(|coefficient| {
++                            coefficient
++                                .exact_rational_ref()
++                                .is_some_and(|value| value.is_zero())
++                        })
++                    {
++                        return evaluate_axis(polynomial, values, axis + 1, base_index);
++                    }
++                    return None;
++                };
+                 let mut result = Real::zero();
+                 for power in (0..polynomial.dimensions()[axis]).rev() {
+                     result = result * value

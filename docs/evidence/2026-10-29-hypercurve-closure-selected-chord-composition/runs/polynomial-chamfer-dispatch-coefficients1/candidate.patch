@@ -1,0 +1,144 @@
+diff --git a/crates/hypercurve/src/polynomial_point/diagnostic_capture.rs b/crates/hypercurve/src/polynomial_point/diagnostic_capture.rs
+new file mode 100644
+index 0000000000..d39a2d54f9
+--- /dev/null
++++ b/crates/hypercurve/src/polynomial_point/diagnostic_capture.rs
+@@ -0,0 +1,115 @@
++//! Temporary diagnostic wire capture, removed before retaining production code.
++use hyperreal::Real;
++use hypersolve::DenseTensorPolynomial;
++use hypersolve::selected_polynomial_field::{
++    SelectedPolynomialDefinition, SelectedPolynomialDefinitionNode as Node, SelectedPolynomialValue,
++};
++fn reals(values: &[Real]) -> String {
++    format!(
++        "[{}]",
++        values
++            .iter()
++            .map(|r| format!("{:?}", r.to_json()))
++            .collect::<Vec<_>>()
++            .join(",")
++    )
++}
++fn tensor(value: &DenseTensorPolynomial) -> String {
++    format!("[{:?},{}]", value.dimensions(), reals(value.coefficients()))
++}
++fn encode(graph: &SelectedPolynomialDefinition) -> String {
++    let nodes = graph
++        .nodes
++        .iter()
++        .map(|node| match node {
++            Node::NativeBase {
++                sources,
++                first_speed_squared,
++                second_speed_squared,
++            } => {
++                let roots = sources
++                    .iter()
++                    .map(|root| {
++                        format!(
++                            "[{},{},{},{},{:?},{:?},{}]",
++                            root.constraint_index,
++                            root.symbol.0,
++                            root.interval_index,
++                            reals(&root.polynomial),
++                            root.lower.to_json(),
++                            root.upper.to_json(),
++                            root.exact_root
++                                .as_ref()
++                                .map_or_else(|| "null".into(), |r| format!("{:?}", r.to_json()))
++                        )
++                    })
++                    .collect::<Vec<_>>()
++                    .join(",");
++                format!(
++                    "[\"base\",[{}],{},{}]",
++                    roots,
++                    tensor(first_speed_squared),
++                    tensor(second_speed_squared)
++                )
++            }
++            Node::NativeExtension { parent, radicand } => {
++                format!("[\"radical\",{parent},{radicand}]")
++            }
++            Node::NativeBaseValue { field, expression } => format!(
++                "[\"base-value\",{field},{},{},{},{}]",
++                tensor(&expression.rational),
++                tensor(&expression.first),
++                tensor(&expression.second),
++                tensor(&expression.product)
++            ),
++            Node::NativeExtensionValue {
++                field,
++                retained,
++                radical,
++            } => format!("[\"radical-value\",{field},{retained},{radical}]"),
++            Node::NativeField { native } => format!("[\"native\",{native}]"),
++            Node::PolynomialField {
++                parent,
++                coefficients,
++                lower,
++                upper,
++            } => format!(
++                "[\"polynomial\",{parent},{coefficients:?},{:?},{:?}]",
++                lower.to_json(),
++                upper.to_json()
++            ),
++            Node::JoinedField { first, second } => format!("[\"join\",{first},{second}]"),
++            Node::NativeValue {
++                field,
++                numerator,
++                denominator,
++            } => format!("[\"native-value\",{field},{numerator},{denominator}]"),
++            Node::PolynomialValue {
++                field,
++                numerator,
++                denominator,
++            } => format!("[\"value\",{field},{numerator:?},{denominator:?}]"),
++        })
++        .collect::<Vec<_>>()
++        .join(",");
++    format!("[[{nodes}],{:?}]", graph.roots)
++}
++pub(super) fn capture(values: &[SelectedPolynomialValue]) {
++    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++    let Some(path) = std::env::var_os("HYPERCURVE_CAPTURE_COEFFICIENTS") else {
++        return;
++    };
++    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    if call != 2 {
++        return;
++    }
++    let graph = SelectedPolynomialDefinition::from_values(values, 100_000).unwrap();
++    eprintln!(
++        "CAPTURE call={call} nodes={} roots={}",
++        graph.nodes.len(),
++        graph.roots.len()
++    );
++    let path = std::path::Path::new(&path).join(format!("coefficients-{call}.json"));
++    std::fs::write(&path, encode(&graph)).unwrap();
++    eprintln!("CAPTURE saved {}", path.display());
++}
+diff --git a/crates/hypercurve/src/polynomial_point/selected_root.rs b/crates/hypercurve/src/polynomial_point/selected_root.rs
+index b39e389049..d2a9800f96 100644
+--- a/crates/hypercurve/src/polynomial_point/selected_root.rs
++++ b/crates/hypercurve/src/polynomial_point/selected_root.rs
+@@ -1,5 +1,9 @@
+ //! Selected roots retain every coefficient's original point query.
+ 
++#[cfg(feature = "svg")]
++#[path = "diagnostic_capture.rs"]
++mod diagnostic_capture;
++
+ use super::*;
+ use crate::bezier_offset::PointFormSource2;
+ use crate::selected_field::{self as field, FieldError, Value};
+@@ -126,6 +130,8 @@ impl PolynomialPoint2 {
+                 return Ok(None);
+             }
+             let values = coefficient_values(&coefficients, &strict)?;
++            #[cfg(feature = "svg")]
++            diagnostic_capture::capture(&values);
+             let mut context = hypersolve::selected_polynomial_field::SelectedPolynomialContext {
+                 field: values[0].field().clone(),
+                 policy: &strict,
