@@ -1,0 +1,107 @@
+diff --git a/crates/hypercurve/src/bezier_region.rs b/crates/hypercurve/src/bezier_region.rs
+index 15b8e9f388..b7e0b758d4 100644
+--- a/crates/hypercurve/src/bezier_region.rs
++++ b/crates/hypercurve/src/bezier_region.rs
+@@ -310,6 +310,17 @@ impl CurveRegionFragmentSource2 {
+ #[derive(Clone)]
+ pub struct CurveRegion2 {
+     data: Arc<CurveRegionData2>,
++    // The source of a round offset that produced this exact set, so that a
++    // further offset of the same sign can apply one combined disk instead.
++    round_offset: Option<Arc<RoundOffsetSource2>>,
++}
++
++/// `region` offset by `distance` with round corners, a nonzero exact distance.
++/// Disk dilations compose, `(A + D_a) + D_b = A + D_(a+b)`, as do disk
++/// erosions, and both identities survive regularization.
++struct RoundOffsetSource2 {
++    region: CurveRegion2,
++    distance: Real,
+ }
+ 
+ struct CurveRegionData2 {
+@@ -417,6 +428,7 @@ impl Default for CurveRegion2 {
+     fn default() -> Self {
+         Self {
+             data: shared_empty_curve_region_data(),
++            round_offset: None,
+         }
+     }
+ }
+@@ -2373,6 +2385,7 @@ impl CurveRegion2 {
+             .certify(Some(LineArcRegion2::new(material_contours, hole_contours)));
+         Ok(Self {
+             data: Arc::new(data),
++            round_offset: None,
+         })
+     }
+ 
+@@ -2860,6 +2873,7 @@ impl CurveRegion2 {
+         }
+         Self {
+             data: Arc::new(CurveRegionData2::new(boundary_loops)),
++            round_offset: None,
+         }
+     }
+ 
+@@ -2939,6 +2953,7 @@ impl CurveRegion2 {
+             .certify(Arc::from(vec![true; data.boundary_loops.len()]));
+         Self {
+             data: Arc::new(data),
++            round_offset: None,
+         }
+     }
+ 
+@@ -3721,6 +3736,7 @@ impl CurveRegion2 {
+                         .certify(Arc::from(vec![true; loop_count]));
+                     Self {
+                         data: Arc::new(data),
++                        round_offset: None,
+                     }
+                 })
+                 .collect())
+@@ -4703,6 +4719,44 @@ impl CurveRegion2 {
+                 return Ok(Classification::Uncertain(reason));
+             }
+         }
++        if !matches!(corner_style, OffsetCornerStyle2::Round) {
++            return self.offset_unrecorded_raw(distance, corner_style, policy);
++        }
++        let sign = real_sign(&distance, policy);
++        // A further round offset of the same sign is one offset of the
++        // original source by the combined distance: an exact set identity that
++        // avoids offsetting the generated parallels and corners again.
++        if let Some(source) = &self.round_offset
++            && matches!(sign, Some(RealSign::Positive | RealSign::Negative))
++            && real_sign(&source.distance, policy) == sign
++        {
++            eprintln!("ROUND-OFFSET-COMPOSE {}", std::thread::current().name().unwrap_or("?"));
++            return source
++                .region
++                .offset_raw(&source.distance + &distance, corner_style, policy);
++        }
++        let result = self.offset_unrecorded_raw(distance.clone(), corner_style, policy)?;
++        Ok(match (result, sign) {
++            (
++                Classification::Decided(mut region),
++                Some(RealSign::Positive | RealSign::Negative),
++            ) => {
++                region.round_offset = Some(Arc::new(RoundOffsetSource2 {
++                    region: self.clone(),
++                    distance,
++                }));
++                Classification::Decided(region)
++            }
++            (result, _) => result,
++        })
++    }
++
++    fn offset_unrecorded_raw(
++        &self,
++        distance: Real,
++        corner_style: &OffsetCornerStyle2,
++        policy: &CurveContext,
++    ) -> ExactCurveResult<Classification<Self>> {
+         if matches!(corner_style, OffsetCornerStyle2::Round)
+             && !self.data.boundary_loops.is_empty()
+             && real_sign(&distance, policy) == Some(RealSign::Negative)

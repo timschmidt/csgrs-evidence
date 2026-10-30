@@ -1,0 +1,877 @@
+From 874df73de8644a75fd795cc61634a1cb8336b25b Mon Sep 17 00:00:00 2001
+From: Timothy Schmidt <timschmidt@gmail.com>
+Date: Fri, 30 Oct 2026 09:35:50 -0400
+Subject: [PATCH 1/3] Record the replay identity gap after closing-hole
+ dilation
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/hypercurve/FUTURE_WORK.md | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index 24e38764e9..50c6c06a6e 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3497,6 +3497,20 @@ the queried range contains interior cusps:
+ `selected_parallel_arrangement_splits_interior_cusps` regularized to an empty
+ region. It was replaced before commit. The witness adds distance 1/2.
+ 
++Exact SVG replay of these outputs preserves the set: the ellipse-hole dilation
++by 1/4 and the dumbbell dilation by 3/2 both replay with an empty symmetric
++difference, and the replayed ellipse result erodes further. Dilating the
++replayed dumbbell result by another 1/2, where each lobe collapses exactly,
++is `Blocked(Offset, Line, RealSign)`, while the same dilation of the
++unreplayed region succeeds with one loop. Its band arrangement compares
++coincident contacts (`algebraic_chord_point_coordinate_order`, circular
++carrier `same_value`) whose equal coordinates were rebuilt as independent
++scalar expressions; strict sign refinement cannot prove their difference
++zero. Replay keeps the geometry but not the shared scalar identity those
++contact decisions used. Interning byte-identical scalar encodings during
++decode did not change the outcome, so the equal values are not serialized
++identically; the replay graph would need to retain their defining relation.
++
+ Open: holes that are neither circular nor convex polygonal, and curved
+ non-circular holes, take the slower band route even when they survive; their
+ cost on larger workloads is unmeasured. Disappearance chains through Bezier,
+-- 
+2.56.0
+
+
+From 3c2c0519574dae94b7323299d019ef9823a30e35 Mon Sep 17 00:00:00 2001
+From: Timothy Schmidt <timschmidt@gmail.com>
+Date: Fri, 30 Oct 2026 10:08:48 -0400
+Subject: [PATCH 2/3] Qualify PH region offsets against convex disk identities
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/hypercurve/FUTURE_WORK.md              |  19 +++
+ .../qualification/capabilities.json           |  75 ++++++++++
+ .../tests/repeated_offset_identities.rs       | 130 ++++++++++++++++++
+ 3 files changed, 224 insertions(+)
+ create mode 100644 crates/hypercurve/tests/repeated_offset_identities.rs
+
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index 50c6c06a6e..8a4c1a44e9 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3516,3 +3516,22 @@ non-circular holes, take the slower band route even when they survive; their
+ cost on larger workloads is unmeasured. Disappearance chains through Bezier,
+ conic and implicit holes, invalid operands paired with empty regions, and
+ nested islands inside closing holes are not yet in the corpus.
++
++## Pythagorean-hodograph region offsets (2026-10-30)
++
++Closure-plan corpus item "PH curve offset: exact rational specialization
++equals retained parallel; repeat offset with both orientations". The region
++bounded by the PH cubic `P(t) = (t - t^3/3, t^2)` and its chord is convex, so
++disk offsets obey exact identities. `tests/repeated_offset_identities.rs`
++checks that two dilations by 1/8 equal one by 1/4, that closing by 1/8 returns
++the region, and that dilating by 1/4 then eroding by 1/8 equals dilating by
++1/8. It also rebuilds the 1/8 dilation from the materialized rational PH
++offset, the chord moved along `(-3, 2)/sqrt 13` and two round joins, and finds
++an empty symmetric difference with the procedural result. Both pass on the
++current source in about a second; no source change was needed.
++
++Open: eroding the 1/16 erosion by another 1/16 did not finish within 10
++minutes. A sample sits in `RecursiveQuadraticValue::sign` through the dense
++two-radical leaves of section 1, reached from algebraic chord/rational pair
++intersections while the second erosion's band difference is built. The
++erosion-composition identity therefore remains unqualified for this region.
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index b0abc1b134..f2c36e6820 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -16469,6 +16469,81 @@
+       ],
+       "oracle": "Independently authored rounded squares for the closed cases; for surviving holes, exact Boolean identities between the dilated region and the separately eroded ellipse (disjoint, union equal to the dilated frame).",
+       "timeout_seconds": 180
++    },
++    {
++      "id": "ph_convex_offset_identities",
++      "target": "repeated_offset_identities",
++      "test": "ph_region_offsets_obey_convex_disk_identities",
++      "owner": "Hypercurve exact region offsets, analytic parallels and Pythagorean-hodograph specialization",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19"
++      ],
++      "domain": "The convex region bounded by the PH cubic P(t) = (t - t^3/3, t^2) on [0, 1] and its chord, offset by 1/16, 1/8 and 1/4 with round corners.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "CubicBezier",
++        "Line",
++        "AnalyticParallel",
++        "CircularArc"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Disk offsets of a convex set compose: two dilations by 1/8 equal one by 1/4, closing by 1/8 returns the set, and dilating by 1/4 then eroding by 1/8 equals dilating by 1/8.",
++      "claims": [
++        {
++          "stage": "repeated_offsets",
++          "outcome": "exact_success",
++          "assertion": "Both dilation orders and the closing identities hold exactly; the 1/16 erosion is nonempty."
++        }
++      ],
++      "oracle": "Exact set identities of Minkowski operations on convex sets, compared by empty symmetric difference.",
++      "timeout_seconds": 120
++    },
++    {
++      "id": "ph_rational_offset_boundary",
++      "target": "repeated_offset_identities",
++      "test": "ph_dilation_matches_its_rational_offset_boundary",
++      "owner": "Hypercurve exact region offsets, analytic parallels and Pythagorean-hodograph specialization",
++      "properties": [
++        "P12",
++        "P15",
++        "P17",
++        "P18",
++        "P19"
++      ],
++      "domain": "The convex region bounded by the PH cubic P(t) = (t - t^3/3, t^2) on [0, 1] and its chord, offset by 1/16, 1/8 and 1/4 with round corners.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "CubicBezier",
++        "RationalBezier",
++        "Line",
++        "CircularArc",
++        "AnalyticParallel"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "The procedural dilation by 1/8 equals the region bounded by the materialized exact rational PH offset, the chord moved along its unit normal (-3, 2)/sqrt 13 and two round joins.",
++      "claims": [
++        {
++          "stage": "offsets",
++          "outcome": "exact_success",
++          "assertion": "The dilated region and the rational-boundary region have an empty symmetric difference."
++        }
++      ],
++      "oracle": "An independently assembled boundary from the certified rational PH offset curve and exact sqrt 13 join endpoints.",
++      "timeout_seconds": 120
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/tests/repeated_offset_identities.rs b/crates/hypercurve/tests/repeated_offset_identities.rs
+new file mode 100644
+index 0000000000..ce4f34ad0a
+--- /dev/null
++++ b/crates/hypercurve/tests/repeated_offset_identities.rs
+@@ -0,0 +1,130 @@
++//! Repeated offsets of a convex region bounded by a Pythagorean-hodograph
++//! cubic and its chord. Disk offsets of a convex set obey exact identities:
++//! dilations compose, closing returns the set, and a dilation followed by a
++//! smaller erosion is the difference dilation. The dilated boundary is also
++//! rebuilt independently from the materialized rational PH offset.
++mod support;
++
++use hypercurve::{
++    BooleanOp, CircularArc2, Classification, CubicBezier2, Curve2, CurvePath2, CurveRegion2,
++    FillRule, LineSeg2, OffsetCornerStyle2, Point2, PredicatePolicy, Real,
++};
++
++const STRICT: PredicatePolicy = PredicatePolicy::STRICT;
++
++fn fraction(numerator: i64, denominator: i64) -> Real {
++    (Real::from(numerator) / Real::from(denominator)).unwrap()
++}
++
++/// P(t) = (t - t^3/3, t^2) on [0, 1], with P'(t) = (1 - t^2, 2t) and
++/// |P'(t)| = 1 + t^2. It turns left everywhere, so with the chord back to the
++/// origin it bounds a convex region traversed counterclockwise.
++fn ph_cubic() -> CubicBezier2 {
++    CubicBezier2::new(
++        Point2::new(Real::zero(), Real::zero()),
++        Point2::new(fraction(1, 3), Real::zero()),
++        Point2::new(fraction(2, 3), fraction(1, 3)),
++        Point2::new(fraction(2, 3), Real::one()),
++    )
++}
++
++fn line(start: &Point2, end: &Point2) -> Curve2 {
++    Curve2::from(LineSeg2::try_new(start.clone(), end.clone()).unwrap())
++}
++
++fn region(paths: &[CurvePath2]) -> CurveRegion2 {
++    support::under(&STRICT, || {
++        CurveRegion2::try_from_boundary_paths(paths, FillRule::NonZero)
++    })
++    .unwrap()
++    .into_value()
++}
++
++fn ph_region() -> CurveRegion2 {
++    let end = Point2::new(fraction(2, 3), Real::one());
++    region(&[CurvePath2::try_new(vec![
++        Curve2::from(ph_cubic()),
++        line(&end, &Point2::new(Real::zero(), Real::zero())),
++    ])
++    .unwrap()])
++}
++
++fn offset(region: &CurveRegion2, distance: Real) -> CurveRegion2 {
++    support::under(&STRICT, || {
++        region.offset(distance, &OffsetCornerStyle2::Round)
++    })
++    .unwrap()
++    .into_value()
++}
++
++fn assert_same_set(label: &str, actual: &CurveRegion2, expected: &CurveRegion2) {
++    let difference = support::under(&STRICT, || actual.boolean_region(expected, BooleanOp::Xor))
++        .unwrap()
++        .into_value();
++    assert!(difference.is_empty(), "{label}: the regions differ");
++}
++
++#[test]
++fn ph_region_offsets_obey_convex_disk_identities() {
++    let source = ph_region();
++    let eighth = offset(&source, fraction(1, 8));
++    let quarter = offset(&source, fraction(1, 4));
++    assert_same_set(
++        "dilations compose",
++        &offset(&eighth, fraction(1, 8)),
++        &quarter,
++    );
++    assert_same_set("closing", &offset(&eighth, -fraction(1, 8)), &source);
++    assert_same_set(
++        "dilation then smaller erosion",
++        &offset(&quarter, -fraction(1, 8)),
++        &eighth,
++    );
++    assert!(!offset(&source, -fraction(1, 16)).is_empty());
++}
++
++/// The dilation by 1/8 is bounded by the cubic's right parallel, which is the
++/// exact rational PH offset; the chord moved by 1/8 along its right unit
++/// normal `(-3, 2)/sqrt 13`; and round joins about both corners.
++#[test]
++fn ph_dilation_matches_its_rational_offset_boundary() {
++    let distance = fraction(1, 8);
++    let parallel = ph_cubic().parallel_left(-distance.clone()).unwrap();
++    let rational = match support::under_classified_result(&STRICT, || {
++        parallel.exact_pythagorean_hodograph_offset()
++    })
++    .unwrap()
++    {
++        Classification::Decided(Some(exact)) => exact.curve().clone(),
++        other => panic!("the PH cubic has an exact rational offset: {other:?}"),
++    };
++    let sqrt13 = Real::from(13).sqrt().unwrap();
++    let (nx, ny) = (
++        (Real::from(-3) * &distance / &sqrt13).unwrap(),
++        (Real::from(2) * &distance / &sqrt13).unwrap(),
++    );
++    let origin = Point2::new(Real::zero(), Real::zero());
++    let corner = Point2::new(fraction(2, 3), Real::one());
++    let cubic_start = Point2::new(Real::zero(), -distance.clone());
++    let cubic_end = Point2::new(fraction(2, 3) + &distance, Real::one());
++    let chord_start = Point2::new(fraction(2, 3) + &nx, Real::one() + &ny);
++    let chord_end = Point2::new(nx, ny);
++    let arc = |start: &Point2, end: &Point2, center: &Point2| {
++        Curve2::from(
++            CircularArc2::try_from_center(start.clone(), end.clone(), center.clone(), false)
++                .unwrap(),
++        )
++    };
++    let expected = region(&[CurvePath2::try_new(vec![
++        Curve2::from(rational),
++        arc(&cubic_end, &chord_start, &corner),
++        line(&chord_start, &chord_end),
++        arc(&chord_end, &cubic_start, &origin),
++    ])
++    .unwrap()]);
++    assert_same_set(
++        "rational PH boundary",
++        &offset(&ph_region(), distance),
++        &expected,
++    );
++}
+-- 
+2.56.0
+
+
+From 090a5b23ca06893fa22301a5864d4a17fc3d4a5d Mon Sep 17 00:00:00 2001
+From: Timothy Schmidt <timschmidt@gmail.com>
+Date: Fri, 30 Oct 2026 11:07:02 -0400
+Subject: [PATCH 3/3] Bound instrumented coefficient growth deterministically
+
+Closure-plan M4 asks for coefficient-growth limits separate from work units
+and cancellation. with_coefficient_bit_limit pushes a work scope with a bit
+limit, and observe_coefficient_bits fails the outermost exceeded scope and
+its nested scopes with WorkKind::CoefficientGrowth. Integer polynomial
+Bareiss entries, pseudo-quotient matrix entries and exact rational dense
+tensor products report their sizes while a scope is active and fail
+through their existing unavailable outcome.
+
+The stalled hyperbola bevel stroke stops on its first coefficient above
+1,024 bits after the same 24,238 refinements and 30 promotions in every
+run. Other coefficient arithmetic is not measured, so this is not a
+memory bound. WorkKind gains a variant; docs/MIGRATIONS.md records it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../qualification/capabilities.json           | 36 +++++++-
+ .../hypercurve_open_path_compositions.rs      | 36 ++++++++
+ crates/hypersolve/CHANGELOG.md                |  7 ++
+ crates/hypersolve/FUTURE_WORK.md              | 24 +++++
+ crates/hypersolve/README.md                   |  5 +-
+ crates/hypersolve/src/bareiss.rs              | 28 ++++++
+ crates/hypersolve/src/resultant.rs            | 10 +++
+ crates/hypersolve/src/tensor_resultant.rs     | 22 ++++-
+ crates/hypersolve/src/work_budget.rs          | 87 +++++++++++++++++--
+ crates/hypersolve/src/work_budget/tests.rs    | 59 ++++++++++++-
+ docs/MIGRATIONS.md                            |  9 ++
+ 11 files changed, 313 insertions(+), 10 deletions(-)
+
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index f2c36e6820..523b8cc6d3 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -7,7 +7,7 @@
+     "Native save/reload beyond the demonstrated source and selected generated carriers remains open. Version 5 preserves the named filled-region chains. The selected-circle corner fixtures now complete chamfer or constrained fillet, reconstruction, exact replay and round dilation/contraction; named translated-circle and nonincident-line contacts and rotated overlaps also complete. General independent angular/coefficient fields, other circle frames and arbitrary implicit regions remain open.",
+     "Complete nonrational ellipse, parabola and PH offset chains, singular events and overlap correspondences.",
+     "Invalid operands paired with canonical empty, disappearance chains beyond the named circle, polygon and dumbbell witnesses, and all hole/disconnected configurations.",
+-    "Total arithmetic, coefficient/system growth and retained-memory limits. Cooperative cancellation is observed only at instrumented work units, so it does not bound uninstrumented arithmetic or elapsed time.",
++    "Total arithmetic, projected-system size and retained-memory limits. Coefficient-growth limits cover only Bareiss, pseudo-quotient and dense tensor constructions, and cooperative cancellation is observed only at instrumented work units; neither bounds uninstrumented arithmetic or elapsed time.",
+     "Published package and actual binding consumers for the complete declared domain.",
+     "Unrestricted repeated polynomial chord setbacks and other implicit replay/operation chains remain open. The named two-chamfer path, Boolean-generated algebraic-corner chamfer, boundary reconstruction, further Boolean and polynomial SVG replay have bounded acceptance witnesses; these finite chains do not establish unrestricted operation closure."
+   ],
+@@ -16544,6 +16544,40 @@
+       ],
+       "oracle": "An independently assembled boundary from the certified rational PH offset curve and exact sqrt 13 join endpoints.",
+       "timeout_seconds": 120
++    },
++    {
++      "id": "coefficient_limit_stalled_stroke",
++      "target": "hypercurve_open_path_compositions",
++      "test": "coefficient_bit_limit_stops_the_stalled_filleted_hyperbola_bevel_stroke",
++      "owner": "Hypersolve work scopes with Bareiss, pseudo-quotient and dense tensor constructions",
++      "properties": [
++        "P19",
++        "P20"
++      ],
++      "domain": "The fillet and bevel stroke of two weight-2/3 hyperbolas that otherwise stalls in dense two-radical signs, under a 1,024-bit coefficient limit.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "RationalQuadraticBezier",
++        "AnalyticParallel",
++        "CircularArc",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "An exact coefficient above the scope's bit limit fails the operation with CoefficientGrowth before it is used; no partial region is published.",
++      "claims": [
++        {
++          "stage": "resource_recovery",
++          "outcome": "exhausted",
++          "assertion": "The stroke returns CoefficientGrowth with limit 1,024 and a larger requested bit length."
++        }
++      ],
++      "oracle": "The public outer receipt of the limit scope.",
++      "timeout_seconds": 180
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+index 8f374332f0..9ab297e3cf 100644
+--- a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
++++ b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+@@ -1409,3 +1409,39 @@ fn cancellation_stops_the_stalled_filleted_hyperbola_bevel_stroke() {
+     );
+     assert_eq!(result.unwrap_err().kind, hypercurve::WorkKind::Cancellation);
+ }
++
++/// A coefficient bit limit stops the same stalled stroke deterministically:
++/// its dense two-radical signs build Bareiss and tensor coefficients of
++/// thousands of bits, and the first one above 1,024 bits fails the scope with
++/// `CoefficientGrowth` instead of being used.
++#[test]
++fn coefficient_bit_limit_stops_the_stalled_filleted_hyperbola_bevel_stroke() {
++    let seed = Seed {
++        x: 3,
++        y: 8,
++        edges: vec![
++            Edge {
++                family: 4,
++                dx: 6,
++                dy: -1,
++                outward: -1,
++            },
++            Edge {
++                family: 4,
++                dx: 6,
++                dy: 0,
++                outward: -2,
++            },
++        ],
++        weight: 2,
++    };
++    let outcome = hypersolve::work_budget::with_coefficient_bit_limit(1024, || {
++        hypercurve::evaluate_under(STRICT, || {
++            run_sequence(&seed, &[Step::Fillet(2, 2), Step::Stroke(3, 1)]).is_ok()
++        })
++    });
++    let exceeded = outcome.result.unwrap_err();
++    assert_eq!(exceeded.kind, hypercurve::WorkKind::CoefficientGrowth);
++    assert_eq!(exceeded.limit, 1024);
++    assert!(exceeded.requested > 1024);
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index e758b48d93..38e07efaa6 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add `with_coefficient_bit_limit` and `observe_coefficient_bits`. Integer
++  polynomial Bareiss entries, pseudo-quotient multiplication matrix entries and
++  exact rational dense tensor products report their bit lengths, and one above
++  an active limit fails the scope with `WorkKind::CoefficientGrowth` instead of
++  being used. The bound is deterministic but covers only these constructions;
++  it is not a memory bound.
++
+ - Add cooperative cancellation to work-budget scopes. `CancellationToken` can be
+   cancelled from any thread; `with_cancellable_budget` then fails the next
+   instrumented unit or exhaustion check with `WorkKind::Cancellation` and
+diff --git a/crates/hypersolve/FUTURE_WORK.md b/crates/hypersolve/FUTURE_WORK.md
+index 23e4b21654..d8efed748b 100644
+--- a/crates/hypersolve/FUTURE_WORK.md
++++ b/crates/hypersolve/FUTURE_WORK.md
+@@ -287,3 +287,27 @@ other uninstrumented loops still run to completion, so this is not an
+ elapsed-time bound. Total arithmetic, coefficient growth and retained-memory
+ limits remain open. Cancellation does not cross threads by itself: a worker
+ joins a request by entering its own scope with a cloned token.
++
++## Coefficient growth limits (2026-10-30)
++
++Closure-plan M4 also asks for separately defined coefficient-growth limits.
++`with_coefficient_bit_limit` pushes a scope frame with a bit limit;
++`observe_coefficient_bits` checks every enclosing limit, and the outermost one
++exceeded fails with `WorkKind::CoefficientGrowth` for itself and its nested
++scopes, as a smaller inner budget does. Integer polynomial Bareiss entries,
++pseudo-quotient matrix entries and exact rational dense tensor product
++coefficients report their sizes only while a scope is active, and fail through
++their existing "unavailable" outcome.
++
++On the stalled hyperbola bevel stroke, limits of 1,024 and 4,096 bits both fail
++on a 7,950-bit coefficient and 16,384 bits on a 23,826-bit one, each after the
++same 24,238 refinements and 30 promotions (release, Rust 1.99.1; 9.7, 13.7 and
++55.6 s under concurrent load). Unlike cancellation the stopping point does not
++depend on timing. Witnesses: two `work_budget` owner tests, a Bareiss unit test
++(`t^2 - 2^80` fails at 64 bits and succeeds at 128) and
++`coefficient_bit_limit_stops_the_stalled_filleted_hyperbola_bevel_stroke`.
++
++Open: subresultant and Sturm sequences, recursive field arithmetic and scalar
++approximations do not report sizes, so the limit does not bound all coefficient
++growth or memory. Arithmetic work, projected-system size and retained memory
++remain without limits.
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index ec0069e3da..6fdbf86e17 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -51,7 +51,10 @@ resource failure and never authorizes approximation. The counters do not yet
+ cover every solver path or bound scalar arithmetic, coefficient sizes,
+ allocation, or elapsed time. `work_budget::with_cancellable_budget` adds a
+ `CancellationToken` that another thread can cancel; the operation stops at its
+-next instrumented unit with a typed `Cancellation` failure. See the
++next instrumented unit with a typed `Cancellation` failure.
++`work_budget::with_coefficient_bit_limit` bounds the exact coefficients that
++Bareiss determinants, pseudo-quotient matrices and dense tensor products
++produce, failing deterministically with `CoefficientGrowth`. See the
+ [module contract](src/work_budget.rs) for the current coverage, cache behavior,
+ and thread-local scope rules.
+ 
+diff --git a/crates/hypersolve/src/bareiss.rs b/crates/hypersolve/src/bareiss.rs
+index 97244faf80..f6afc2f88a 100644
+--- a/crates/hypersolve/src/bareiss.rs
++++ b/crates/hypersolve/src/bareiss.rs
+@@ -1549,6 +1549,12 @@ pub(crate) fn determinant_integer_polynomial_matrix(
+                 )?;
+                 let mut quotient = integer_polynomial_exact_quotient(&numerator, &previous_pivot)?;
+                 trim(&mut quotient);
++                if crate::work_budget::is_active() {
++                    let bits = quotient.iter().map(BigInt::bits).max().unwrap_or(0);
++                    if crate::work_budget::observe_coefficient_bits(bits).is_err() {
++                        return None;
++                    }
++                }
+                 matrix[row * dimension + column] = quotient;
+             }
+             matrix[row * dimension + pivot].clear();
+@@ -2330,6 +2336,28 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn determinant_beyond_a_coefficient_bit_limit_is_unavailable() {
++        use crate::work_budget::{WorkKind, with_coefficient_bit_limit};
++        // [[t, 2^40], [2^40, t]] has determinant t^2 - 2^80; the Bareiss
++        // cross term needs 81 bits.
++        let big = BigInt::from(1_u64 << 40);
++        let entries = vec![
++            vec![BigInt::zero(), BigInt::one()],
++            vec![big.clone()],
++            vec![big.clone()],
++            vec![BigInt::zero(), BigInt::one()],
++        ];
++        let expected = vec![-(&big * &big), BigInt::zero(), BigInt::one()];
++        let denied = with_coefficient_bit_limit(64, || {
++            assert_eq!(determinant_integer_polynomial_matrix(&entries, 2), None);
++        });
++        assert_eq!(denied.result.unwrap_err().kind, WorkKind::CoefficientGrowth);
++        let allowed =
++            with_coefficient_bit_limit(128, || determinant_integer_polynomial_matrix(&entries, 2));
++        assert_eq!(allowed.result.unwrap(), Some(expected));
++    }
++
+     #[test]
+     fn cancelled_polynomial_determinant_is_unavailable_not_zero() {
+         use crate::work_budget::{
+diff --git a/crates/hypersolve/src/resultant.rs b/crates/hypersolve/src/resultant.rs
+index d66d483d6d..5335075efa 100644
+--- a/crates/hypersolve/src/resultant.rs
++++ b/crates/hypersolve/src/resultant.rs
+@@ -701,6 +701,16 @@ fn pseudo_quotient_multiplication_matrix(
+             }
+             product[power] = BigInt::zero();
+         }
++        if crate::work_budget::is_active() {
++            let bits = product[..degree]
++                .iter()
++                .map(BigInt::bits)
++                .max()
++                .unwrap_or(0);
++            if crate::work_budget::observe_coefficient_bits(bits).is_err() {
++                return None;
++            }
++        }
+         for row in 0..degree {
+             matrix[row * degree + column] = std::mem::take(&mut product[row]);
+         }
+diff --git a/crates/hypersolve/src/tensor_resultant.rs b/crates/hypersolve/src/tensor_resultant.rs
+index e7172b3714..4a501e9f2c 100644
+--- a/crates/hypersolve/src/tensor_resultant.rs
++++ b/crates/hypersolve/src/tensor_resultant.rs
+@@ -258,6 +258,24 @@ impl DenseTensorPolynomial {
+         .then(|| flat_index(&self.dimensions, exponents))
+     }
+ 
++    // Reports the largest exact rational coefficient to an active coefficient
++    // bit limit; an oversized product is unavailable, never truncated.
++    fn within_coefficient_bit_limit(self) -> Option<Self> {
++        if !crate::work_budget::is_active() {
++            return Some(self);
++        }
++        let bits = self
++            .coefficients
++            .iter()
++            .filter_map(Real::exact_rational_ref)
++            .map(|value| value.numerator().bits() + value.denominator().bits())
++            .max()
++            .unwrap_or(0);
++        crate::work_budget::observe_coefficient_bits(bits)
++            .ok()
++            .map(|()| self)
++    }
++
+     /// Multiplies two tensors by exact multidimensional convolution.
+     pub fn multiply(&self, other: &Self) -> Option<Self> {
+         if self.dimensions.len() != other.dimensions.len() {
+@@ -294,7 +312,7 @@ impl DenseTensorPolynomial {
+                     result.coefficients[target] += product;
+                 }
+             }
+-            return Some(result);
++            return result.within_coefficient_bit_limit();
+         }
+         let right_terms = embedded_nonzero_terms(other, &target_strides)?;
+         for (left_index, left) in left_terms {
+@@ -305,7 +323,7 @@ impl DenseTensorPolynomial {
+                 result.coefficients[left_index.checked_add(*right_index)?] += left * *right;
+             }
+         }
+-        Some(result)
++        result.within_coefficient_bit_limit()
+     }
+ 
+     /// Multiplies by one power of a selected tensor variable.
+diff --git a/crates/hypersolve/src/work_budget.rs b/crates/hypersolve/src/work_budget.rs
+index 884998177a..8eec07a685 100644
+--- a/crates/hypersolve/src/work_budget.rs
++++ b/crates/hypersolve/src/work_budget.rs
+@@ -105,6 +105,15 @@
+ //! dense tensor products. They report their existing "unavailable" outcome,
+ //! never a zero or partial value. Other uninstrumented arithmetic, such as one
+ //! large integer product or a scalar refinement, still runs to completion.
++//!
++//! [`with_coefficient_bit_limit`] bounds the size of exact coefficients that
++//! those same constructions produce: Bareiss entries, pseudo-quotient matrix
++//! entries and exact rational dense tensor product coefficients report their
++//! bit length through [`observe_coefficient_bits`], and a larger one fails
++//! with [`WorkKind::CoefficientGrowth`] before it is used. Unlike cancellation
++//! the bound is deterministic. It covers only these constructions: other
++//! coefficient arithmetic, such as subresultant and Sturm sequences or scalar
++//! approximations, is not measured, so it is not a memory bound.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::fmt;
+@@ -177,12 +186,16 @@ pub enum WorkKind {
+     AlgebraicPromotion,
+     /// Any further work after the scope's [`CancellationToken`] was cancelled.
+     Cancellation,
++    /// An instrumented exact coefficient larger than the scope's bit limit.
++    CoefficientGrowth,
+ }
+ 
+ /// A denied work request, before any of its units were performed.
+ ///
+ /// A [`WorkKind::Cancellation`] failure has zero `limit` and `used`; it
+-/// reports only the size of the request that observed the cancellation.
++/// reports only the size of the request that observed the cancellation. A
++/// [`WorkKind::CoefficientGrowth`] failure reports the bit limit as `limit`,
++/// zero `used`, and the observed coefficient's bit length as `requested`.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct BudgetExceeded {
+     /// Work that the operation attempted to perform.
+@@ -208,6 +221,13 @@ impl BudgetExceeded {
+ 
+ impl fmt::Display for BudgetExceeded {
+     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        if self.kind == WorkKind::CoefficientGrowth {
++            return write!(
++                formatter,
++                "coefficient growth limit exceeded: {} bits against a limit of {}",
++                self.requested, self.limit
++            );
++        }
+         if self.kind == WorkKind::Cancellation {
+             return write!(
+                 formatter,
+@@ -241,6 +261,7 @@ struct Frame {
+     usage: WorkUsage,
+     exhausted: Option<BudgetExceeded>,
+     cancellation: Option<CancellationToken>,
++    max_coefficient_bits: Option<u64>,
+ }
+ 
+ impl Frame {
+@@ -248,7 +269,7 @@ impl Frame {
+         match kind {
+             WorkKind::RootRefinement => (self.budget.refinements, self.usage.refinements),
+             WorkKind::AlgebraicPromotion => (self.budget.promotions, self.usage.promotions),
+-            WorkKind::Cancellation => (0, 0),
++            WorkKind::Cancellation | WorkKind::CoefficientGrowth => (0, 0),
+         }
+     }
+ 
+@@ -256,7 +277,7 @@ impl Frame {
+         match kind {
+             WorkKind::RootRefinement => self.usage.refinements += amount,
+             WorkKind::AlgebraicPromotion => self.usage.promotions += amount,
+-            WorkKind::Cancellation => {}
++            WorkKind::Cancellation | WorkKind::CoefficientGrowth => {}
+         }
+     }
+ }
+@@ -354,7 +375,7 @@ pub fn consume(kind: WorkKind, amount: usize) -> Result<(), BudgetExceeded> {
+ /// return type. Panic unwinding restores the enclosing scope without refunding
+ /// work already admitted by that scope.
+ pub fn with_budget<T>(budget: WorkBudget, operation: impl FnOnce() -> T) -> BudgetOutcome<T> {
+-    enter(budget, None, operation)
++    enter(budget, None, None, operation)
+ }
+ 
+ /// Evaluate one synchronous operation with a work budget and a cancellation token.
+@@ -370,12 +391,67 @@ pub fn with_cancellable_budget<T>(
+     cancellation: &CancellationToken,
+     operation: impl FnOnce() -> T,
+ ) -> BudgetOutcome<T> {
+-    enter(budget, Some(cancellation.clone()), operation)
++    enter(budget, Some(cancellation.clone()), None, operation)
++}
++
++/// Evaluate one synchronous operation whose instrumented exact coefficients
++/// may not exceed `bits` bits.
++///
++/// The scope admits any number of work units; nest it inside [`with_budget`]
++/// or [`with_cancellable_budget`] to combine limits. An observed coefficient
++/// larger than `bits` fails with [`WorkKind::CoefficientGrowth`] and no value
++/// is published. A nested limit that fails leaves its parent running. See the
++/// [module documentation](self) for the constructions that report sizes.
++pub fn with_coefficient_bit_limit<T>(bits: u64, operation: impl FnOnce() -> T) -> BudgetOutcome<T> {
++    enter(WorkBudget::UNLIMITED, None, Some(bits), operation)
++}
++
++/// Report the bit length of an exact coefficient that an instrumented
++/// construction has produced, before it is used.
++///
++/// Fails, exhausting the outermost scope whose limit it exceeds and every
++/// scope nested in it, when the coefficient is larger than an active limit.
++/// An already exhausted or cancelled scope also fails. Without an active
++/// scope this is a no-op.
++#[inline]
++pub fn observe_coefficient_bits(bits: u64) -> Result<(), BudgetExceeded> {
++    if !is_active() {
++        return Ok(());
++    }
++    FRAMES.with_borrow_mut(|frames| {
++        if let Some(error) = frames.last().and_then(|frame| frame.exhausted) {
++            return Err(error);
++        }
++        if let Some(error) = observe_cancellation(frames, 0) {
++            return Err(error);
++        }
++        let Some(index) = frames
++            .iter()
++            .position(|frame| frame.max_coefficient_bits.is_some_and(|limit| bits > limit))
++        else {
++            return Ok(());
++        };
++        let limit = frames[index].max_coefficient_bits.unwrap_or(0);
++        let error = BudgetExceeded {
++            kind: WorkKind::CoefficientGrowth,
++            limit: usize::try_from(limit).unwrap_or(usize::MAX),
++            used: 0,
++            requested: usize::try_from(bits).unwrap_or(usize::MAX),
++        };
++        for frame in &mut frames[index..] {
++            frame.exhausted.get_or_insert(error);
++        }
++        Err(frames
++            .last()
++            .and_then(|frame| frame.exhausted)
++            .unwrap_or(error))
++    })
+ }
+ 
+ fn enter<T>(
+     budget: WorkBudget,
+     cancellation: Option<CancellationToken>,
++    max_coefficient_bits: Option<u64>,
+     operation: impl FnOnce() -> T,
+ ) -> BudgetOutcome<T> {
+     struct Scope(bool);
+@@ -409,6 +485,7 @@ fn enter<T>(
+             usage: WorkUsage::default(),
+             exhausted,
+             cancellation,
++            max_coefficient_bits,
+         });
+         ACTIVE.with(|active| active.set(true));
+     });
+diff --git a/crates/hypersolve/src/work_budget/tests.rs b/crates/hypersolve/src/work_budget/tests.rs
+index 30716b084c..8c7debcfbc 100644
+--- a/crates/hypersolve/src/work_budget/tests.rs
++++ b/crates/hypersolve/src/work_budget/tests.rs
+@@ -1,6 +1,7 @@
+ use super::{
+     BudgetExceeded, CancellationToken, WorkBudget, WorkKind, WorkUsage, consume, exhaustion,
+-    is_active, with_budget, with_cancellable_budget,
++    is_active, observe_coefficient_bits, with_budget, with_cancellable_budget,
++    with_coefficient_bit_limit,
+ };
+ 
+ #[test]
+@@ -392,3 +393,59 @@ fn cancelled_root_refinement_retries_with_a_new_token() {
+     assert_eq!(report.status, IsolatedRootRefinementStatus::Refined);
+     assert_eq!(report.refined_interval, baseline.refined_interval);
+ }
++
++#[test]
++fn coefficient_bit_limit_denies_larger_coefficients_only() {
++    let outcome = with_coefficient_bit_limit(64, || {
++        observe_coefficient_bits(64).unwrap();
++        consume(WorkKind::RootRefinement, 5).unwrap();
++        assert_eq!(
++            observe_coefficient_bits(65),
++            Err(BudgetExceeded {
++                kind: WorkKind::CoefficientGrowth,
++                limit: 64,
++                used: 0,
++                requested: 65,
++            })
++        );
++        // Later work in the exhausted scope also fails.
++        assert_eq!(
++            consume(WorkKind::RootRefinement, 1).unwrap_err().kind,
++            WorkKind::CoefficientGrowth
++        );
++    });
++    assert_eq!(
++        outcome.result.unwrap_err().kind,
++        WorkKind::CoefficientGrowth
++    );
++    assert_eq!(outcome.usage.refinements, 5);
++    assert_eq!(
++        outcome.result.unwrap_err().to_string(),
++        "coefficient growth limit exceeded: 65 bits against a limit of 64"
++    );
++    // Without a limit, observations are free.
++    assert!(observe_coefficient_bits(u64::MAX).is_ok());
++    assert!(
++        with_budget(WorkBudget::ZERO, || observe_coefficient_bits(u64::MAX))
++            .result
++            .unwrap()
++            .is_ok()
++    );
++}
++
++#[test]
++fn coefficient_bit_limits_nest_like_budgets() {
++    let outcome = with_coefficient_bit_limit(100, || {
++        // A tighter nested limit fails alone.
++        let inner = with_coefficient_bit_limit(10, || observe_coefficient_bits(50));
++        assert_eq!(inner.result.unwrap_err().kind, WorkKind::CoefficientGrowth);
++        assert_eq!(exhaustion(), None);
++        observe_coefficient_bits(50).unwrap();
++        // The enclosing limit applies inside an ordinary nested budget.
++        let nested = with_budget(WorkBudget::UNLIMITED, || observe_coefficient_bits(101));
++        assert_eq!(nested.result.unwrap_err().limit, 100);
++        assert_eq!(exhaustion().unwrap().kind, WorkKind::CoefficientGrowth);
++    });
++    assert_eq!(outcome.result.unwrap_err().limit, 100);
++    assert!(!is_active());
++}
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 4680bd066d..b4dc4a8967 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -5,6 +5,15 @@ represented geometry or serialized artifacts. The [README](../readme.md) and
+ the API documentation describe current behavior only. A migration is a
+ deliberate contract change (P27), not a performance-only change.
+ 
++## Coefficient growth limits
++
++`WorkKind` has a new `CoefficientGrowth` variant; exhaustive matches on it must
++handle that case. It appears only inside `work_budget::with_coefficient_bit_limit`
++scopes, when an instrumented construction produces an exact coefficient larger
++than the limit. Such a `BudgetExceeded` reports the limit as `limit` and the
++observed bit length as `requested`. Code that does not enter these scopes sees
++no new outcome.
++
+ ## Dilation of regions with holes
+ 
+ `CurveRegion2::offset` with a positive distance now builds the result from the
+-- 
+2.56.0
+

@@ -1,0 +1,131 @@
+#![cfg(feature = "svg")]
+//! Features that disappear under regularized offsets, followed by further
+//! operations on the result. Each expected set is authored independently and
+//! compared through an exact empty symmetric difference.
+mod support;
+// Evidence probe for the replay identity gap (not committed).
+
+use hypercurve::{
+    BooleanOp, CircularArc2, Curve2, CurvePath2, CurveRegion2, FillRule, LineSeg2,
+    OffsetCornerStyle2, Point2, PredicatePolicy, Real,
+};
+
+const STRICT: PredicatePolicy = PredicatePolicy::STRICT;
+
+fn fraction(numerator: i64, denominator: i64) -> Real {
+    (Real::from(numerator) / Real::from(denominator)).unwrap()
+}
+
+fn p(x: i64, y: i64) -> Point2 {
+    Point2::new(Real::from(x), Real::from(y))
+}
+
+fn line(start: &Point2, end: &Point2) -> Curve2 {
+    Curve2::from(LineSeg2::try_new(start.clone(), end.clone()).unwrap())
+}
+
+fn arc(start: &Point2, end: &Point2, center: &Point2, clockwise: bool) -> Curve2 {
+    Curve2::from(
+        CircularArc2::try_from_center(start.clone(), end.clone(), center.clone(), clockwise)
+            .unwrap(),
+    )
+}
+
+/// A full circle as two half arcs, counterclockwise unless `clockwise`.
+fn circle(cx: i64, cy: i64, radius: i64, clockwise: bool) -> CurvePath2 {
+    let (east, west, center) = (p(cx + radius, cy), p(cx - radius, cy), p(cx, cy));
+    CurvePath2::try_new(vec![
+        arc(&east, &west, &center, clockwise),
+        arc(&west, &east, &center, clockwise),
+    ])
+    .unwrap()
+}
+
+/// A closed polygon through integer vertices.
+fn polygon(points: &[(i64, i64)]) -> CurvePath2 {
+    CurvePath2::try_new(
+        (0..points.len())
+            .map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                line(&p(a.0, a.1), &p(b.0, b.1))
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+/// The counterclockwise square `[-half, half]^2`.
+fn square(half: i64) -> CurvePath2 {
+    polygon(&[(-half, -half), (half, -half), (half, half), (-half, half)])
+}
+
+fn reversed(path: &CurvePath2) -> CurvePath2 {
+    support::under(&STRICT, || path.reversed())
+        .unwrap()
+        .into_value()
+}
+
+/// The square `[-half, half]^2` dilated by `distance` with round corners.
+fn rounded_square(half: &Real, distance: &Real) -> CurvePath2 {
+    let (near, far) = (half.clone(), half + distance);
+    let (nn, nf) = (-near.clone(), -far.clone());
+    let q = |x: &Real, y: &Real| Point2::new(x.clone(), y.clone());
+    CurvePath2::try_new(vec![
+        line(&q(&nn, &nf), &q(&near, &nf)),
+        arc(&q(&near, &nf), &q(&far, &nn), &q(&near, &nn), false),
+        line(&q(&far, &nn), &q(&far, &near)),
+        arc(&q(&far, &near), &q(&near, &far), &q(&near, &near), false),
+        line(&q(&near, &far), &q(&nn, &far)),
+        arc(&q(&nn, &far), &q(&nf, &near), &q(&nn, &near), false),
+        line(&q(&nf, &near), &q(&nf, &nn)),
+        arc(&q(&nf, &nn), &q(&nn, &nf), &q(&nn, &nn), false),
+    ])
+    .unwrap()
+}
+
+fn region(paths: &[CurvePath2]) -> CurveRegion2 {
+    support::under(&STRICT, || {
+        CurveRegion2::try_from_boundary_paths(paths, FillRule::NonZero)
+    })
+    .unwrap()
+    .into_value()
+}
+
+fn offset_with(region: &CurveRegion2, distance: Real, style: &OffsetCornerStyle2) -> CurveRegion2 {
+    support::under(&STRICT, || region.offset(distance, style))
+        .unwrap()
+        .into_value()
+}
+
+fn offset(region: &CurveRegion2, distance: Real) -> CurveRegion2 {
+    offset_with(region, distance, &OffsetCornerStyle2::Round)
+}
+
+fn boolean(left: &CurveRegion2, right: &CurveRegion2, op: BooleanOp) -> CurveRegion2 {
+    support::under(&STRICT, || left.boolean_region(right, op))
+        .unwrap()
+        .into_value()
+}
+
+fn assert_same_set(label: &str, actual: &CurveRegion2, expected: &CurveRegion2) {
+    assert!(
+        boolean(actual, expected, BooleanOp::Xor).is_empty(),
+        "{label}: the regions differ"
+    );
+}
+
+
+#[test]
+#[ignore]
+fn replay_gap_probe() {
+    let dumbbell = reversed(&polygon(&[(-6, -2), (-2, -2), (-2, -1), (2, -1), (2, -2), (6, -2), (6, 2), (2, 2), (2, 1), (-2, 1), (-2, 2), (-6, 2)]));
+    let framed = region(&[square(10), dumbbell]);
+    let dilated = offset(&framed, fraction(3, 2));
+    let direct = support::under(&STRICT, || dilated.offset(fraction(1, 2), &OffsetCornerStyle2::Round)).map(|o| o.into_value().boundary_loops().len());
+    eprintln!("PROBE direct further dilation by 1/2: {direct:?}");
+    let text = hypercurve::export_svg_document(&hypercurve::SvgGeometry2::new(dilated.clone(), vec![], vec![])).unwrap();
+    let restored = hypercurve::import_svg_document(&text).unwrap().region().clone();
+    eprintln!("PROBE replayed set equal: {}", boolean(&restored, &dilated, BooleanOp::Xor).is_empty());
+    let replayed = support::under(&STRICT, || restored.offset(fraction(1, 2), &OffsetCornerStyle2::Round)).map(|o| o.into_value().boundary_loops().len());
+    eprintln!("PROBE replayed further dilation by 1/2: {replayed:?}");
+}
