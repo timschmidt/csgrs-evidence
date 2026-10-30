@@ -1,0 +1,239 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 4988194209..a6a1fcf04d 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Exact scalar witnesses ignore structurally zero tensor padding after selected
++  source reduction. Constants and mixed tensors no longer require witnesses
++  for unused generators; their native fields and source selections stay intact.
++
+ - Evaluate polynomial coefficients from admitted selected fields at represented
+   scalars without projecting their dependencies. Exact arithmetic reuses stored
+   zero and unit identities after field alignment; division still validates its
+diff --git a/crates/hypersolve/src/recursive_quadratic_field.rs b/crates/hypersolve/src/recursive_quadratic_field.rs
+index f88dd3013a..d3c67031e6 100644
+--- a/crates/hypersolve/src/recursive_quadratic_field.rs
++++ b/crates/hypersolve/src/recursive_quadratic_field.rs
+@@ -1096,7 +1096,27 @@ impl RecursiveQuadraticValue {
+                 let stride = polynomial.dimensions()[axis + 1..]
+                     .iter()
+                     .try_fold(1_usize, |stride, dimension| stride.checked_mul(*dimension))?;
+-                let value = values[axis].as_ref()?;
++                let Some(value) = values[axis].as_ref() else {
++                    // Positive powers with stored zero coefficients do not
++                    // depend on this generator, even when the tensor retains
++                    // its full axis dimension after selected-root reduction.
++                    let start = base_index.checked_add(stride)?;
++                    let end = base_index
++                        .checked_add(polynomial.dimensions()[axis].checked_mul(stride)?)?;
++                    if polynomial
++                        .coefficients()
++                        .get(start..end)?
++                        .iter()
++                        .all(|coefficient| {
++                            coefficient
++                                .exact_rational_ref()
++                                .is_some_and(|value| value.is_zero())
++                        })
++                    {
++                        return evaluate_axis(polynomial, values, axis + 1, base_index);
++                    }
++                    return None;
++                };
+                 let mut result = Real::zero();
+                 for power in (0..polynomial.dimensions()[axis]).rev() {
+                     result = result * value
+diff --git a/crates/hypersolve/tests/recursive_quadratic_field_signs.rs b/crates/hypersolve/tests/recursive_quadratic_field_signs.rs
+index 5f2fb1b3b9..a4aef00ac1 100644
+--- a/crates/hypersolve/tests/recursive_quadratic_field_signs.rs
++++ b/crates/hypersolve/tests/recursive_quadratic_field_signs.rs
+@@ -3,8 +3,8 @@
+ //! Expected signs come from independently built `Real` closed forms under
+ //! STRICT predicates, or from equalities known by construction (for example
+ //! `2*sqrt(2) == sqrt(8)` and `sqrt(c^2) == c` for positive `c`). Values over
+-//! `2^(1/3)` have no compact witness, so they exercise the dense interval,
+-//! norm and projected-zero authorities rather than scalar replay.
++//! `2^(1/3)` that still use that axis have no compact witness, so they
++//! exercise the dense interval, norm and projected-zero authorities.
+ 
+ #[path = "support/recursive_quadratic.rs"]
+ #[allow(dead_code)]
+@@ -33,7 +33,7 @@ fn cube(field: &RecursiveQuadraticField) -> RecursiveQuadraticValue {
+ }
+ 
+ /// `2*sqrt2 - sqrt8` over the cube-root tuple: zero by construction, with
+-/// no stored cancellation and no compact scalar witness.
++/// no coefficientwise stored cancellation. The source axis cancels exactly.
+ fn hidden_zero(field: &RecursiveQuadraticField) -> RecursiveQuadraticValue {
+     let first = axis_value(
+         field,
+@@ -221,13 +221,16 @@ fn bounded_signs_separate_transverse_values_only() {
+         below.bounded_or_exact_real_witness_sign(),
+         Some(RealSign::Negative)
+     );
+-    // A hidden zero never separates to a nonzero sign and has no witness.
++    // The unused source axis cancels, exposing the exact zero witness.
+     let zero = hidden_zero(&field_with_dependent_speeds());
+     assert!(matches!(
+         zero.bounded_interval_sign(0..=16),
+         None | Some(RealSign::Zero)
+     ));
+-    assert_eq!(zero.exact_real_witness_sign_through(-128), None);
++    assert_eq!(
++        zero.exact_real_witness_sign_through(-128),
++        Some(RealSign::Zero)
++    );
+     // A structural zero is decided without refinement.
+     let stored = field.constant(Real::zero()).unwrap();
+     assert_eq!(
+@@ -306,7 +309,8 @@ fn hidden_base_zeros_are_decided_exactly() {
+     let field = field_with_dependent_speeds();
+     let zero = hidden_zero(&field);
+     assert!(!zero.is_structurally_zero());
+-    assert!(zero.exact_real_value_with_retained_witnesses().is_none());
++    assert_value(&zero, &real(0));
++    assert!(zero.field().same_field(&field));
+     assert_sign(zero.sign(&policy), RealSign::Zero);
+     // An approximate context first completes the strict replay; no
+     // approximation may be consumed for an exactly decidable zero.
+@@ -322,6 +326,23 @@ fn hidden_base_zeros_are_decided_exactly() {
+     assert_zero_or_undecided(policy.bounded_exact_predicate_pass(|| zero.sign(&policy)));
+ }
+ 
++#[test]
++fn hidden_base_zeros_with_used_source_axes_retain_exact_sign_fallback() {
++    let field = field_with_dependent_speeds();
++    // 2*c*sqrt(2) - c*sqrt(8) is zero, but both coefficients still use c.
++    let zero = hidden_zero(&field).multiply(&cube(&field)).unwrap();
++    assert!(!zero.is_structurally_zero());
++    assert!(zero.exact_real_value_with_retained_witnesses().is_none());
++    assert!(zero.real_witness().get().is_none());
++    let policy = TestContext::strict();
++    assert_sign(zero.sign(&policy), RealSign::Zero);
++    assert_sign(
++        zero.sign_with_projected_zero_fallback(&policy),
++        RealSign::Zero,
++    );
++    assert!(zero.field().same_field(&field));
++}
++
+ #[test]
+ fn hidden_extension_zeros_are_decided_by_their_magnitude() {
+     let policy = TestContext::strict();
+diff --git a/crates/hypersolve/tests/recursive_quadratic_witnesses.rs b/crates/hypersolve/tests/recursive_quadratic_witnesses.rs
+new file mode 100644
+index 0000000000..b889942544
+--- /dev/null
++++ b/crates/hypersolve/tests/recursive_quadratic_witnesses.rs
+@@ -0,0 +1,108 @@
++//! Exact zero padding must not require unused selected-source witnesses.
++
++#[path = "support/recursive_quadratic.rs"]
++#[allow(dead_code)]
++mod support;
++
++use std::cmp::Ordering;
++
++use hyperlimit::{PredicatePolicy, compare_reals};
++use hyperreal::Real;
++use hypersolve::radical_expression::TwoSquareRootExpression;
++use hypersolve::recursive_quadratic_field::{RecursiveQuadraticField, RecursiveQuadraticValue};
++use hypersolve::{AlgebraicRootRepresentation, DenseTensorPolynomial};
++use support::{constant_tensor, cube_root_two, real, sqrt_two_root};
++
++fn field(sources: Vec<AlgebraicRootRepresentation>) -> RecursiveQuadraticField {
++    let one = constant_tensor(sources.len(), real(1));
++    RecursiveQuadraticField::base(sources, one.clone(), one).unwrap()
++}
++
++fn value(
++    field: &RecursiveQuadraticField,
++    dimensions: Vec<usize>,
++    coefficients: Vec<Real>,
++) -> RecursiveQuadraticValue {
++    let RecursiveQuadraticField::Base(base) = field else {
++        unreachable!()
++    };
++    RecursiveQuadraticValue::from_base(
++        base.clone(),
++        TwoSquareRootExpression::from_rational(
++            DenseTensorPolynomial::try_new(dimensions, coefficients).unwrap(),
++        )
++        .unwrap(),
++    )
++    .unwrap()
++}
++
++fn witness(value: &RecursiveQuadraticValue, expected: Real) {
++    let actual = value
++        .exact_real_value_with_retained_witnesses()
++        .expect("zero-padded unused axes must not require a source witness");
++    assert_eq!(
++        compare_reals(&actual, &expected, PredicatePolicy::STRICT).value(),
++        Some(Ordering::Equal)
++    );
++    assert_eq!(value.real_witness().get(), Some(&actual));
++}
++
++#[test]
++fn padded_constants_preserve_the_unwitnessed_selected_source() {
++    let field = field(vec![cube_root_two()]);
++    let RecursiveQuadraticField::Base(base) = &field else {
++        unreachable!()
++    };
++    assert!(base.source_real_witnesses[0].is_none());
++    let quarter = (real(1) / real(4)).unwrap();
++    for expected in [real(0), quarter, real(-7)] {
++        let value = value(&field, vec![3], vec![expected.clone(), real(0), real(0)]);
++        witness(&value, expected);
++        assert!(value.field().same_field(&field));
++    }
++}
++
++#[test]
++fn selected_relation_reduction_can_remove_every_generator_dependency() {
++    let field = field(vec![cube_root_two()]);
++    // The original source relation is a^3=2, so 1+a^3 is exactly 3.
++    let value = value(&field, vec![4], vec![real(1), real(0), real(0), real(1)]);
++    witness(&value, real(3));
++    assert!(value.field().same_field(&field));
++}
++
++#[test]
++fn mixed_tensor_axis_orders_keep_every_nonzero_dependency() {
++    let root = real(2).sqrt().unwrap();
++    let outer_unknown = field(vec![cube_root_two(), sqrt_two_root()]);
++    witness(
++        &value(
++            &outer_unknown,
++            vec![3, 2],
++            vec![real(0), real(1), real(0), real(0), real(0), real(0)],
++        ),
++        root.clone(),
++    );
++    let inner_unknown = field(vec![sqrt_two_root(), cube_root_two()]);
++    witness(
++        &value(
++            &inner_unknown,
++            vec![2, 3],
++            vec![real(1), real(0), real(0), real(2), real(0), real(0)],
++        ),
++        real(1) + real(2) * root,
++    );
++    let mut epsilon = real(1);
++    for _ in 0..80 {
++        epsilon = (epsilon / real(2)).unwrap();
++    }
++    for coefficients in [
++        vec![real(0), real(1), real(0), epsilon.clone(), real(0), real(0)],
++        vec![real(0), real(1), real(0), real(0), epsilon, real(0)],
++    ] {
++        let value = value(&outer_unknown, vec![3, 2], coefficients);
++        assert!(value.exact_real_value_with_retained_witnesses().is_none());
++        assert!(value.real_witness().get().is_none());
++        assert!(value.field().same_field(&outer_unknown));
++    }
++}
