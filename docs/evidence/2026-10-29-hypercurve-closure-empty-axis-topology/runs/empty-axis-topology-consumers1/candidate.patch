@@ -1,0 +1,350 @@
+diff --git a/crates/hyperbrep/tests/empty_plane_sections.rs b/crates/hyperbrep/tests/empty_plane_sections.rs
+new file mode 100644
+index 0000000000..1a02024005
+--- /dev/null
++++ b/crates/hyperbrep/tests/empty_plane_sections.rs
+@@ -0,0 +1,115 @@
++//! Disjoint plane/tensor sources remain disjoint after exact native replay.
++use hyperbrep::*;
++
++fn half(value: i32) -> Real {
++    (Real::from(value) / Real::from(2)).unwrap()
++}
++
++fn graph(heights: [Real; 3]) -> Surface {
++    let points = (0..3)
++        .map(|j| {
++            (0..3)
++                .map(|i| Point3::new(half(i), half(j), heights[i as usize].clone()))
++                .collect()
++        })
++        .collect();
++    Surface::rational_bezier(points, vec![vec![Real::one(); 3]; 3]).unwrap()
++}
++
++fn check_model(model: &Model) {
++    let surfaces = model.surfaces().map(|s| s.geometry()).collect::<Vec<_>>();
++    assert_eq!(surfaces.len(), 2);
++    assert!(matches!(
++        surfaces[0].intersect_surface(surfaces[1]).unwrap(),
++        SurfaceSurfaceIntersection::None
++    ));
++    assert!(matches!(
++        surfaces[1].intersect_surface(surfaces[0]).unwrap(),
++        SurfaceSurfaceIntersection::None
++    ));
++}
++
++fn check_archive(archive: &str) {
++    let model = RawModel::from_json(archive, &ArchiveLimits::default())
++        .unwrap()
++        .validate()
++        .unwrap();
++    check_model(&model);
++    assert_eq!(model.to_json().unwrap(), archive);
++    // This nonsingular affine map preserves disjointness, without assuming it
++    // commutes with any Euclidean offset operation.
++    let transform = Matrix4::from_row_major([
++        1.into(),
++        1.into(),
++        0.into(),
++        2.into(),
++        0.into(),
++        2.into(),
++        0.into(),
++        (-1).into(),
++        1.into(),
++        0.into(),
++        1.into(),
++        3.into(),
++        0.into(),
++        0.into(),
++        0.into(),
++        1.into(),
++    ]);
++    let transformed = model.transformed(&transform).unwrap();
++    check_model(&transformed);
++    let bytes = transformed.to_json().unwrap();
++    let replayed = RawModel::from_json(&bytes, &ArchiveLimits::default())
++        .unwrap()
++        .validate()
++        .unwrap();
++    check_model(&replayed);
++    assert_eq!(replayed.to_json().unwrap(), bytes);
++}
++
++#[test]
++fn empty_axis_sections_replay_in_a_fresh_process_and_intersect_again() {
++    const CHILD: &str = "HYPERBREP_EMPTY_AXIS_SECTION_CHILD";
++    if let Ok(archive) = std::env::var(CHILD) {
++        check_archive(&archive);
++        return;
++    }
++    // Quadratic Bernstein coefficients independently describe u^2+1, u-3,
++    // and (u-2)^2. Their values never vanish on the full [0,1]^2 source box.
++    for heights in [
++        [1.into(), 1.into(), 2.into()],
++        [(-3).into(), half(-5), (-2).into()],
++        [4.into(), 2.into(), 1.into()],
++    ] {
++        let surface = graph(heights);
++        let plane = Surface::plane(Point3::origin(), Vector3::x(), Vector3::y()).unwrap();
++        assert!(matches!(
++            plane.intersect_surface(&surface).unwrap(),
++            SurfaceSurfaceIntersection::None
++        ));
++        assert!(matches!(
++            surface.intersect_surface(&plane).unwrap(),
++            SurfaceSurfaceIntersection::None
++        ));
++        let mut builder = ModelBuilder::new();
++        builder.surface(surface).unwrap();
++        builder.surface(plane).unwrap();
++        let model = builder.finish().unwrap();
++        let archive = model.to_json().unwrap();
++        let result = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "empty_axis_sections_replay_in_a_fresh_process_and_intersect_again",
++                "--exact",
++                "--nocapture",
++            ])
++            .env(CHILD, &archive)
++            .output()
++            .unwrap();
++        assert!(
++            result.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&result.stdout),
++            String::from_utf8_lossy(&result.stderr)
++        );
++    }
++}
+diff --git a/crates/hypercurve/tests/polynomial_empty_axis.rs b/crates/hypercurve/tests/polynomial_empty_axis.rs
+new file mode 100644
+index 0000000000..9d859c3200
+--- /dev/null
++++ b/crates/hypercurve/tests/polynomial_empty_axis.rs
+@@ -0,0 +1,41 @@
++//! Empty original polynomial sources remain complete native curve sets.
++use hypercurve::PolynomialCurveSet2;
++use hypersolve::BivariatePolynomial;
++use hypersolve::bivariate_topology::{BivariateCurveDomain, decompose_bivariate_curve};
++
++#[test]
++fn empty_axis_topology_enters_the_native_curve_set() {
++    let domain = BivariateCurveDomain {
++        first: [(-1_i32).into(), 1_i32.into()],
++        second: [(-2_i32).into(), 2_i32.into()],
++    };
++    // Strict positivity or an excluded exact root proves emptiness independently.
++    for coefficients in [vec![1, 0, 1], vec![-3, 1], vec![9, -6, 1]] {
++        let equation =
++            BivariatePolynomial::new(coefficients.into_iter().map(|c| vec![c.into()]).collect());
++        let topology = decompose_bivariate_curve(&equation, &domain, Default::default()).unwrap();
++        assert!(topology.is_empty());
++        assert_eq!(topology.equation(), &equation);
++        assert_eq!(topology.domain(), &domain);
++        let curves =
++            PolynomialCurveSet2::from_topology(topology.clone(), Default::default()).unwrap();
++        assert!(curves.is_empty());
++        assert!(curves.curves().is_empty());
++        assert!(curves.isolated_points().is_empty());
++        assert!(
++            topology
++                .rational_fiber(&0_i32.into(), Default::default())
++                .unwrap()
++                .roots()
++                .is_empty()
++        );
++        let reconstructed =
++            decompose_bivariate_curve(topology.equation(), topology.domain(), Default::default())
++                .unwrap();
++        assert!(
++            PolynomialCurveSet2::from_topology(reconstructed, Default::default())
++                .unwrap()
++                .is_empty()
++        );
++    }
++}
+diff --git a/crates/hypersolve/src/bivariate_topology.rs b/crates/hypersolve/src/bivariate_topology.rs
+index 1b00f0e0d5..7316bb4c1a 100644
+--- a/crates/hypersolve/src/bivariate_topology.rs
++++ b/crates/hypersolve/src/bivariate_topology.rs
+@@ -378,13 +378,9 @@ fn decompose(
+         &[-domain.first[0].clone(), Real::one()],
+         &[-domain.first[1].clone(), Real::one()],
+     );
+-    if degree == 1 {
+-        // A nonconstant first-only polynomial consists of vertical components.
+-        let axis = bivariate_specialize_second(&equation, &Real::zero());
+-        if polynomial_trim_structural_zeros(axis).len() > 1 {
+-            return Err(BivariateTopologyError::VerticalComponent);
+-        }
+-    } else {
++    // First-coordinate-only equations also need the closed projection census.
++    // A live root yields an identically zero fiber below; no roots means empty.
++    if degree > 1 {
+         let derivative = bivariate_parameter_derivative(&equation, CurveResultantParameter::Second);
+         let resultant = resultant_bivariate_polynomial_system(
+             &equation,
+diff --git a/crates/hypersolve/tests/bivariate_empty_axis.rs b/crates/hypersolve/tests/bivariate_empty_axis.rs
+new file mode 100644
+index 0000000000..f48a00f3b0
+--- /dev/null
++++ b/crates/hypersolve/tests/bivariate_empty_axis.rs
+@@ -0,0 +1,155 @@
++use hypersolve::BivariatePolynomial;
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateTopologyError, decompose_bivariate_curve,
++};
++
++fn domain() -> BivariateCurveDomain {
++    BivariateCurveDomain {
++        first: [(-1_i32).into(), 1_i32.into()],
++        second: [(-2_i32).into(), 2_i32.into()],
++    }
++}
++
++fn assert_empty(equation: BivariatePolynomial) {
++    let rectangle = domain();
++    let topology = decompose_bivariate_curve(&equation, &rectangle, Default::default())
++        .expect("the equation has no real zero in the closed rectangle");
++    assert_eq!(topology.equation(), &equation);
++    assert_eq!(topology.domain(), &rectangle);
++    assert!(
++        topology
++            .events()
++            .iter()
++            .all(|event| event.roots().is_empty())
++    );
++    assert!(topology.slabs().iter().all(|slab| slab.arcs().is_empty()));
++    for x in [-1_i32, 0, 1] {
++        assert!(
++            topology
++                .rational_fiber(&x.into(), Default::default())
++                .unwrap()
++                .roots()
++                .is_empty()
++        );
++    }
++}
++
++#[test]
++fn positive_axis_polynomial_has_empty_topology() {
++    // x^2 + 1 >= 1 for every real x, independently of the solver.
++    assert_empty(BivariatePolynomial::new(vec![
++        vec![1_i32.into()],
++        vec![],
++        vec![1_i32.into()],
++    ]));
++}
++
++#[test]
++fn excluded_axis_root_has_empty_topology() {
++    // The sole zero of x - 3 is outside the closed x-domain [-1, 1].
++    assert_empty(BivariatePolynomial::new(vec![
++        vec![(-3_i32).into()],
++        vec![1_i32.into()],
++    ]));
++}
++
++#[test]
++fn existing_constant_empty_and_live_vertical_outcomes_stay_distinct() {
++    assert_empty(BivariatePolynomial::new(vec![vec![2_i32.into()]]));
++    for offset in [-1_i32, 0, 1] {
++        let equation = BivariatePolynomial::new(vec![vec![offset.into()], vec![1_i32.into()]]);
++        assert_eq!(
++            decompose_bivariate_curve(&equation, &domain(), Default::default()),
++            Err(BivariateTopologyError::VerticalComponent)
++        );
++    }
++}
++
++#[test]
++fn malformed_domain_is_not_hidden_by_empty_geometry() {
++    let equation = BivariatePolynomial::new(vec![vec![2_i32.into()]]);
++    let mut rectangle = domain();
++    rectangle.first = [1_i32.into(), (-1_i32).into()];
++    assert_eq!(
++        decompose_bivariate_curve(&equation, &rectangle, Default::default()),
++        Err(BivariateTopologyError::InvalidDomain)
++    );
++}
++
++#[test]
++fn repeated_and_higher_degree_axis_sources_keep_empty_domains() {
++    // (x-3)^2, x^6+1 and x^2-2 have no zero in [-1, 1].
++    for coefficients in [vec![9, -6, 1], vec![1, 0, 0, 0, 0, 0, 1], vec![-2, 0, 1]] {
++        assert_empty(BivariatePolynomial::new(
++            coefficients.into_iter().map(|c| vec![c.into()]).collect(),
++        ));
++    }
++}
++
++#[test]
++fn algebraic_and_repeated_boundary_roots_remain_live_vertical_components() {
++    let mut rectangle = domain();
++    rectangle.first = [(-2_i32).into(), 2_i32.into()];
++    let irrational =
++        BivariatePolynomial::new(vec![vec![(-2_i32).into()], vec![], vec![1_i32.into()]]);
++    assert_eq!(
++        decompose_bivariate_curve(&irrational, &rectangle, Default::default()),
++        Err(BivariateTopologyError::VerticalComponent)
++    );
++    let boundary = BivariatePolynomial::new(vec![
++        vec![1_i32.into()],
++        vec![(-2_i32).into()],
++        vec![1_i32.into()],
++    ]);
++    assert_eq!(
++        decompose_bivariate_curve(&boundary, &domain(), Default::default()),
++        Err(BivariateTopologyError::VerticalComponent)
++    );
++}
++
++#[test]
++fn empty_axis_degree_and_work_refusals_allow_a_larger_retry() {
++    use hypersolve::bivariate_topology::BivariateTopologyConfig;
++    use hypersolve::work_budget::{self, WorkBudget};
++    let equation = BivariatePolynomial::new(vec![vec![1_i32.into()], vec![], vec![1_i32.into()]]);
++    for config in [
++        BivariateTopologyConfig {
++            max_axis_degree: 1,
++            ..Default::default()
++        },
++        BivariateTopologyConfig {
++            max_projection_degree: 2,
++            ..Default::default()
++        },
++    ] {
++        assert_eq!(
++            decompose_bivariate_curve(&equation, &domain(), config),
++            Err(BivariateTopologyError::DegreeLimit)
++        );
++    }
++    let denied = work_budget::with_budget(WorkBudget::ZERO, || {
++        let result = decompose_bivariate_curve(&equation, &domain(), Default::default());
++        assert_eq!(result, Err(BivariateTopologyError::BudgetExhausted));
++        result
++    });
++    assert!(denied.result.is_err());
++    // This rational census requires no additional algebraic promotion. A small
++    // budget that suffices must not be misreported as resource exhaustion.
++    let small = work_budget::with_budget(
++        WorkBudget {
++            refinements: 100_000,
++            promotions: 1,
++        },
++        || decompose_bivariate_curve(&equation, &domain(), Default::default()),
++    );
++    assert!(small.result.unwrap().unwrap().is_empty());
++    let recovered = work_budget::with_budget(
++        WorkBudget {
++            refinements: 100_000,
++            promotions: 100_000,
++        },
++        || decompose_bivariate_curve(&equation, &domain(), Default::default()),
++    );
++    assert!(recovered.result.unwrap().unwrap().is_empty());
++    assert_empty(equation);
++}
