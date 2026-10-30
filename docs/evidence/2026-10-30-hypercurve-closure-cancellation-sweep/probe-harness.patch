@@ -1,0 +1,218 @@
+diff --git a/crates/hypercurve/tests/hypercurve_composed_workloads.rs b/crates/hypercurve/tests/hypercurve_composed_workloads.rs
+index f9672613e0..1bcf7a5151 100644
+--- a/crates/hypercurve/tests/hypercurve_composed_workloads.rs
++++ b/crates/hypercurve/tests/hypercurve_composed_workloads.rs
+@@ -1693,3 +1693,99 @@ fn bevel_then_round_erosion_of_a_weight_six_conic_completes() {
+     )
+     .unwrap();
+ }
++
++// TEMPORARY cancellation-latency probes (not for commit).
++fn cancel_probe(name: &str, workload: fn()) {
++    use std::time::{Duration, Instant};
++    let wait: u64 = std::env::var("CANCEL_AFTER_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
++    let token = hypercurve::CancellationToken::new();
++    let (sender, receiver) = std::sync::mpsc::channel();
++    let started = Instant::now();
++    {
++        let token = token.clone();
++        std::thread::Builder::new().stack_size(512 << 20).spawn(move || {
++            let outcome = {
++                let outcome = hypercurve::evaluate_with_cancellable_budget(
++                    hypercurve::PredicatePolicy::STRICT,
++                    hypercurve::WorkBudget::UNLIMITED,
++                    &token,
++                    || std::panic::catch_unwind(workload),
++                );
++                match outcome.result {
++                    Err(exceeded) => format!("budget {:?} usage {:?}", exceeded.kind, outcome.usage),
++                    Ok(value) => match value.into_unverified() {
++                        Ok(()) => format!("completed usage {:?}", outcome.usage),
++                        Err(_) => format!("panicked usage {:?}", outcome.usage),
++                    },
++                }
++            };
++            let _ = sender.send((outcome, Instant::now()));
++        }).unwrap();
++    }
++    match receiver.recv_timeout(Duration::from_secs(wait)) {
++        Ok((outcome, finished)) => {
++            eprintln!("PROBE {name} finished-before-cancel after {:?}: {outcome}", finished - started);
++            return;
++        }
++        Err(_) => {}
++    }
++    let cancelled = Instant::now();
++    token.cancel();
++    let (outcome, finished) = receiver.recv().unwrap();
++    eprintln!("PROBE {name} latency {:?}: {outcome}", finished.saturating_duration_since(cancelled));
++}
++#[test]
++#[ignore]
++fn cancel_probe_repeated_inward_miter_offset_of_a_weighted_quadratic_completes() {
++    cancel_probe("repeated_inward_miter_offset_of_a_weighted_quadratic_completes", repeated_inward_miter_offset_of_a_weighted_quadratic_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_beveled_rational_seed_double_inward_offset_completes() {
++    cancel_probe("beveled_rational_seed_double_inward_offset_completes", beveled_rational_seed_double_inward_offset_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_chamfered_conic_round_then_miter_inward_offset_completes() {
++    cancel_probe("chamfered_conic_round_then_miter_inward_offset_completes", chamfered_conic_round_then_miter_inward_offset_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_weighted_conic_miter_bevel_bevel_offsets_complete() {
++    cancel_probe("weighted_conic_miter_bevel_bevel_offsets_complete", weighted_conic_miter_bevel_bevel_offsets_complete);
++}
++#[test]
++#[ignore]
++fn cancel_probe_wide_weighted_conic_miter_bevel_bevel_offsets_complete() {
++    cancel_probe("wide_weighted_conic_miter_bevel_bevel_offsets_complete", wide_weighted_conic_miter_bevel_bevel_offsets_complete);
++}
++#[test]
++#[ignore]
++fn cancel_probe_nested_xor_miter_dilation_completes() {
++    cancel_probe("nested_xor_miter_dilation_completes", nested_xor_miter_dilation_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_filleted_union_miter_dilation_completes() {
++    cancel_probe("filleted_union_miter_dilation_completes", filleted_union_miter_dilation_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_miter_eroded_ring_miter_erosion_completes() {
++    cancel_probe("miter_eroded_ring_miter_erosion_completes", miter_eroded_ring_miter_erosion_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_filleted_boolean_miter_erosion_completes() {
++    cancel_probe("filleted_boolean_miter_erosion_completes", filleted_boolean_miter_erosion_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_booleans_then_double_round_erosion_completes() {
++    cancel_probe("booleans_then_double_round_erosion_completes", booleans_then_double_round_erosion_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_bevel_then_round_erosion_of_a_weight_six_conic_completes() {
++    cancel_probe("bevel_then_round_erosion_of_a_weight_six_conic_completes", bevel_then_round_erosion_of_a_weight_six_conic_completes);
++}
+diff --git a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+index 8f374332f0..6ce553161d 100644
+--- a/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
++++ b/crates/hypercurve/tests/hypercurve_open_path_compositions.rs
+@@ -1409,3 +1409,109 @@ fn cancellation_stops_the_stalled_filleted_hyperbola_bevel_stroke() {
+     );
+     assert_eq!(result.unwrap_err().kind, hypercurve::WorkKind::Cancellation);
+ }
++
++// TEMPORARY cancellation-latency probes (not for commit).
++fn cancel_probe(name: &str, workload: fn()) {
++    use std::time::{Duration, Instant};
++    let wait: u64 = std::env::var("CANCEL_AFTER_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
++    let token = hypercurve::CancellationToken::new();
++    let (sender, receiver) = std::sync::mpsc::channel();
++    let started = Instant::now();
++    {
++        let token = token.clone();
++        std::thread::Builder::new().stack_size(512 << 20).spawn(move || {
++            let outcome = {
++                let outcome = hypercurve::evaluate_with_cancellable_budget(
++                    hypercurve::PredicatePolicy::STRICT,
++                    hypercurve::WorkBudget::UNLIMITED,
++                    &token,
++                    || std::panic::catch_unwind(workload),
++                );
++                match outcome.result {
++                    Err(exceeded) => format!("budget {:?} usage {:?}", exceeded.kind, outcome.usage),
++                    Ok(value) => match value.into_unverified() {
++                        Ok(()) => format!("completed usage {:?}", outcome.usage),
++                        Err(_) => format!("panicked usage {:?}", outcome.usage),
++                    },
++                }
++            };
++            let _ = sender.send((outcome, Instant::now()));
++        }).unwrap();
++    }
++    match receiver.recv_timeout(Duration::from_secs(wait)) {
++        Ok((outcome, finished)) => {
++            eprintln!("PROBE {name} finished-before-cancel after {:?}: {outcome}", finished - started);
++            return;
++        }
++        Err(_) => {}
++    }
++    let cancelled = Instant::now();
++    token.cancel();
++    let (outcome, finished) = receiver.recv().unwrap();
++    eprintln!("PROBE {name} latency {:?}: {outcome}", finished.saturating_duration_since(cancelled));
++}
++#[test]
++#[ignore]
++fn cancel_probe_refilleting_a_filleted_vertex_completes() {
++    cancel_probe("refilleting_a_filleted_vertex_completes", refilleting_a_filleted_vertex_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_mixed_family_miter_stroke_round_trips() {
++    cancel_probe("mixed_family_miter_stroke_round_trips", mixed_family_miter_stroke_round_trips);
++}
++#[test]
++#[ignore]
++fn cancel_probe_bevel_stroke_of_a_filleted_hyperbola_pair_completes() {
++    cancel_probe("bevel_stroke_of_a_filleted_hyperbola_pair_completes", bevel_stroke_of_a_filleted_hyperbola_pair_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_mixed_cubic_arc_miter_stroke_completes() {
++    cancel_probe("mixed_cubic_arc_miter_stroke_completes", mixed_cubic_arc_miter_stroke_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_chamfered_spline_bevel_stroke_round_trips() {
++    cancel_probe("chamfered_spline_bevel_stroke_round_trips", chamfered_spline_bevel_stroke_round_trips);
++}
++#[test]
++#[ignore]
++fn cancel_probe_miter_stroke_of_a_filleted_heavy_rational_cubic_completes() {
++    cancel_probe("miter_stroke_of_a_filleted_heavy_rational_cubic_completes", miter_stroke_of_a_filleted_heavy_rational_cubic_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_chamfered_cubic_line_bevel_stroke_round_trips() {
++    cancel_probe("chamfered_cubic_line_bevel_stroke_round_trips", chamfered_cubic_line_bevel_stroke_round_trips);
++}
++#[test]
++#[ignore]
++fn cancel_probe_round_stroke_of_a_filleted_heavy_nurbs_path_completes() {
++    cancel_probe("round_stroke_of_a_filleted_heavy_nurbs_path_completes", round_stroke_of_a_filleted_heavy_nurbs_path_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_chamfered_quadratic_bevel_stroke_round_trips() {
++    cancel_probe("chamfered_quadratic_bevel_stroke_round_trips", chamfered_quadratic_bevel_stroke_round_trips);
++}
++#[test]
++#[ignore]
++fn cancel_probe_chamfered_rational_nurbs_miter_stroke_completes() {
++    cancel_probe("chamfered_rational_nurbs_miter_stroke_completes", chamfered_rational_nurbs_miter_stroke_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_trimmed_chamfered_arc_cubic_bevel_stroke_completes() {
++    cancel_probe("trimmed_chamfered_arc_cubic_bevel_stroke_completes", trimmed_chamfered_arc_cubic_bevel_stroke_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_stroke_fillet_stroke_of_a_cubic_arc_path_completes() {
++    cancel_probe("stroke_fillet_stroke_of_a_cubic_arc_path_completes", stroke_fillet_stroke_of_a_cubic_arc_path_completes);
++}
++#[test]
++#[ignore]
++fn cancel_probe_round_stroke_of_a_filleted_nurbs_pair_completes() {
++    cancel_probe("round_stroke_of_a_filleted_nurbs_pair_completes", round_stroke_of_a_filleted_nurbs_pair_completes);
++}
