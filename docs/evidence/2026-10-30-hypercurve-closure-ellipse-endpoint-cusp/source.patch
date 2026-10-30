@@ -1,0 +1,398 @@
+From 18577f3f3684f4b78ca7104e3a317fcb04bb71f7 Mon Sep 17 00:00:00 2001
+From: Timothy Schmidt <timschmidt@gmail.com>
+Date: Fri, 30 Oct 2026 06:39:59 -0400
+Subject: [PATCH 1/2] Close elliptical holes at their minor semi-axis in the
+ corpus
+
+The elliptical hole witness covers nonrational parallels with swallowtails
+and records the open critical-curvature cusp case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/hypercurve/FUTURE_WORK.md              | 16 +++++++
+ .../qualification/capabilities.json           | 42 ++++++++++++++++++
+ .../hypercurve/tests/disappearance_chains.rs  | 44 +++++++++++++++++++
+ 3 files changed, 102 insertions(+)
+
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index b8b1e733cb..c5bb9996f9 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3475,6 +3475,22 @@ seven new capability rows. Evidence:
+ `docs/evidence/2026-10-30-hypercurve-closure-hole-dilation`, SHA-256
+ `83b0fba114b363ac0abe6d581361b400127e8c2613d509858ec6a7cab34e0ddb`.
+ 
++An elliptical hole (the unit disk scaled by 2 along x) also stayed open on the
++previous source when dilated by its minor semi-axis. Its witness checks closing
++at 1 and 3/2 against authored regions, and surviving holes at 1/4 and 3/4,
++where nonrational parallels form swallowtails, through exact Boolean identities
++with the separately eroded ellipse.
++
++At exactly the smallest radius of curvature, 1/2, the inner parallel's cusps
++fall on the half-arc endpoints at `(+-2, 0)`. Both the ellipse eroded by 1/2 and
++the framed hole dilated by 1/2 then fail with `Invalid(Offset, RationalBezier,
++Topology("parallel supporting-line root lies outside the unit domain"))`.
++`parallel_line_neighbor_sign` reaches a root equal to a retained range's end,
++where only one side exists; the caller's single-sided path covers only tangents
++certified parallel to the line, and a cusp has no tangent. The input is valid,
++so `Invalid` misreports a missing endpoint-contact rule. Defining contacts at
++retained endpoints for every consumer of that predicate remains open.
++
+ Open: holes that are neither circular nor convex polygonal, and curved
+ non-circular holes, take the slower band route even when they survive; their
+ cost on larger workloads is unmeasured. Disappearance chains through Bezier,
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index 15d571d4ba..bff5a04af4 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -16427,6 +16427,48 @@
+       ],
+       "oracle": "Independently authored exact regions (circles, rounded squares, polygons and algebraic lobe boundaries with sqrt 2 and sqrt(5)/2 endpoints) compared by an empty exact symmetric difference.",
+       "timeout_seconds": 180
++    },
++    {
++      "id": "elliptical_hole_closing",
++      "target": "disappearance_chains",
++      "test": "elliptical_hole_closes_at_its_minor_semi_axis",
++      "owner": "Hypercurve exact region offsets and the shared regularized arrangement",
++      "properties": [
++        "P12",
++        "P13",
++        "P14",
++        "P17",
++        "P18",
++        "P19"
++      ],
++      "domain": "A 16x16 square frame minus the unit disk scaled by 2 along x, dilated by 1/4, 3/4, 1 and 3/2; the ellipse eroded by 1/4 and 3/4.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "Line",
++        "RationalQuadraticBezier",
++        "AnalyticParallel"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "An elliptical hole closes at its minor semi-axis; a smaller dilation keeps a hole equal to the ellipse eroded by the same distance, including beyond the smallest radius of curvature.",
++      "claims": [
++        {
++          "stage": "offsets",
++          "outcome": "exact_success",
++          "assertion": "Dilations by 1 and 3/2 equal the rounded frame with no hole."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "At 1/4 and 3/4 the dilated region and the eroded ellipse are disjoint and their union equals the rounded frame; the dilation keeps two loops."
++        }
++      ],
++      "oracle": "Independently authored rounded squares for the closed cases; for surviving holes, exact Boolean identities between the dilated region and the separately eroded ellipse (disjoint, union equal to the dilated frame).",
++      "timeout_seconds": 180
+     }
+   ]
+ }
+diff --git a/crates/hypercurve/tests/disappearance_chains.rs b/crates/hypercurve/tests/disappearance_chains.rs
+index 8dcd7facef..162de235b3 100644
+--- a/crates/hypercurve/tests/disappearance_chains.rs
++++ b/crates/hypercurve/tests/disappearance_chains.rs
+@@ -336,3 +336,47 @@ fn convex_hole_edge_vanishes_before_the_hole_closes() {
+         ]),
+     );
+ }
++
++/// An elliptical hole, the disk of radius 1 scaled by 2 along x, in a
++/// square frame. Its inward parallels are nonrational. Dilating the region by
++/// at least the minor semi-axis closes the hole: at distance 1 the eroded
++/// ellipse is its center point. Smaller dilations keep a hole, which must be
++/// exactly the ellipse eroded by the same distance: the two are disjoint and
++/// together fill the dilated frame. Distance 3/4 exceeds the smallest radius
++/// of curvature, 1/2, so the eroded ellipse's raw parallels have swallowtails.
++#[test]
++fn elliptical_hole_closes_at_its_minor_semi_axis() {
++    let unit_disk = region(&[circle(0, 0, 1, false)]);
++    let ellipse = support::under(&STRICT, || {
++        unit_disk.transform_affine(
++            &Real::from(2),
++            &Real::zero(),
++            &Real::zero(),
++            &Real::one(),
++            &Real::zero(),
++            &Real::zero(),
++        )
++    })
++    .unwrap()
++    .into_value();
++    let framed = boolean(&region(&[square(8)]), &ellipse, BooleanOp::Difference);
++    for distance in [Real::one(), fraction(3, 2)] {
++        assert_same_set(
++            "closed ellipse",
++            &offset(&framed, distance.clone()),
++            &region(&[rounded_square(&Real::from(8), &distance)]),
++        );
++    }
++    for distance in [fraction(1, 4), fraction(3, 4)] {
++        let dilated = offset(&framed, distance.clone());
++        let hole = offset(&ellipse, -distance.clone());
++        assert!(!hole.is_empty());
++        assert_eq!(dilated.boundary_loops().len(), 2);
++        assert!(boolean(&dilated, &hole, BooleanOp::Intersection).is_empty());
++        assert_same_set(
++            "surviving ellipse",
++            &boolean(&dilated, &hole, BooleanOp::Union),
++            &region(&[rounded_square(&Real::from(8), &distance)]),
++        );
++    }
++}
+-- 
+2.56.0
+
+
+From 884790f27b339ec05ef19787ab9658c7283b0a27 Mon Sep 17 00:00:00 2001
+From: Timothy Schmidt <timschmidt@gmail.com>
+Date: Fri, 30 Oct 2026 08:46:03 -0400
+Subject: [PATCH 2/2] Classify supporting-line contacts at endpoint offset
+ cusps
+
+At the smallest radius of curvature of an ellipse, its inner parallel has
+cusps exactly at the half-arc ends. Eroding the ellipse, or dilating a
+frame around it, by that distance failed as Invalid: a band chord meets the
+parallel at the cusp, the pointwise derivative scale 1 - d k vanishes, and
+the two-sided neighbor fallback has no exterior side in the retained range.
+
+A root at a retained end with a vanishing pointwise scale now asks the
+range's singularity analysis whether every parallel cusp and source
+singularity lies at a range end. If so, the interior scale sign is the
+one-sided limit and the source tangent classifies the contact as at an
+ordinary endpoint; otherwise the previous outcome stands. Using the
+interior sign unconditionally emptied a region whose queried range holds
+interior cusps, so it is applied only after that certificate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/hypercurve/FUTURE_WORK.md              |  20 ++--
+ .../qualification/capabilities.json           |   4 +-
+ .../hypercurve/src/bezier_offset/parallel.rs  | 112 ++++++++++++++++--
+ .../hypercurve/tests/disappearance_chains.rs  |   7 +-
+ 4 files changed, 122 insertions(+), 21 deletions(-)
+
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index c5bb9996f9..24e38764e9 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3483,13 +3483,19 @@ with the separately eroded ellipse.
+ 
+ At exactly the smallest radius of curvature, 1/2, the inner parallel's cusps
+ fall on the half-arc endpoints at `(+-2, 0)`. Both the ellipse eroded by 1/2 and
+-the framed hole dilated by 1/2 then fail with `Invalid(Offset, RationalBezier,
+-Topology("parallel supporting-line root lies outside the unit domain"))`.
+-`parallel_line_neighbor_sign` reaches a root equal to a retained range's end,
+-where only one side exists; the caller's single-sided path covers only tangents
+-certified parallel to the line, and a cusp has no tangent. The input is valid,
+-so `Invalid` misreports a missing endpoint-contact rule. Defining contacts at
+-retained endpoints for every consumer of that predicate remains open.
++the framed hole dilated by 1/2 failed with `Invalid(Offset, RationalBezier,
++Topology("parallel supporting-line root lies outside the unit domain"))`: the
++band chord meets the parallel at that cusp, the pointwise derivative scale
++`1 - d k` vanishes there, the tangent sign was undecided, and the two-sided
++neighbor fallback has no exterior side within the retained range. Such a root
++now asks the range's singularity analysis whether every parallel cusp and
++source singularity lies at a range end. If so, the interior scale sign is the
++one-sided limit at the cusp, and the contact is classified from the source
++tangent exactly as at an ordinary endpoint; otherwise the previous outcome
++stands. A first version that always used the interior sign was wrong where
++the queried range contains interior cusps:
++`selected_parallel_arrangement_splits_interior_cusps` regularized to an empty
++region. It was replaced before commit. The witness adds distance 1/2.
+ 
+ Open: holes that are neither circular nor convex polygonal, and curved
+ non-circular holes, take the slower band route even when they survive; their
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index bff5a04af4..b0abc1b134 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -16441,7 +16441,7 @@
+         "P18",
+         "P19"
+       ],
+-      "domain": "A 16x16 square frame minus the unit disk scaled by 2 along x, dilated by 1/4, 3/4, 1 and 3/2; the ellipse eroded by 1/4 and 3/4.",
++      "domain": "A 16x16 square frame minus the unit disk scaled by 2 along x, dilated by 1/4, 1/2, 3/4, 1 and 3/2; the ellipse eroded by 1/4, 1/2 and 3/4. At 1/2, the smallest radius of curvature, the inner parallel has cusps at the half-arc ends.",
+       "origins": [
+         "authored",
+         "generated"
+@@ -16464,7 +16464,7 @@
+         {
+           "stage": "booleans",
+           "outcome": "exact_success",
+-          "assertion": "At 1/4 and 3/4 the dilated region and the eroded ellipse are disjoint and their union equals the rounded frame; the dilation keeps two loops."
++          "assertion": "At 1/4, 1/2 and 3/4 the dilated region and the eroded ellipse are disjoint and their union equals the rounded frame; the dilation keeps two loops."
+         }
+       ],
+       "oracle": "Independently authored rounded squares for the closed cases; for surviving holes, exact Boolean identities between the dilated region and the separately eroded ellipse (disjoint, union equal to the dilated frame).",
+diff --git a/crates/hypercurve/src/bezier_offset/parallel.rs b/crates/hypercurve/src/bezier_offset/parallel.rs
+index 260ee5d012..d247bd9fd5 100644
+--- a/crates/hypercurve/src/bezier_offset/parallel.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel.rs
+@@ -5504,6 +5504,7 @@ impl BezierParallel2 {
+             |(direction_x, direction_y)| (direction_x.clone(), direction_y.clone()),
+         );
+         let mut contacts = Vec::with_capacity(parameters.len());
++        let mut endpoint_scale_sign = None;
+         for (index, parameter) in parameters.iter().enumerate() {
+             if let Some((certified_parameter, direction)) = certified_crossing
+                 && parameter.scalar() == Some(certified_parameter)
+@@ -5528,15 +5529,61 @@ impl BezierParallel2 {
+             // exact oriented-line derivative is `direction x tangent`, so a
+             // nonzero sign proves both crossing kind and direction without
+             // consulting that exterior germ.
+-            let tangent_is_parallel = match self
+-                .vector_tangent_cross_and_dot_signs_with_tangent_field(
+-                    &parameter.clone().into(),
+-                    &tangent_direction_x,
+-                    &tangent_direction_y,
+-                    tangent_field,
+-                    derivative_scale_sign,
+-                    policy,
+-                )? {
++            let mut tangent_signs = self.vector_tangent_cross_and_dot_signs_with_tangent_field(
++                &parameter.clone().into(),
++                &tangent_direction_x,
++                &tangent_direction_y,
++                tangent_field,
++                derivative_scale_sign,
++                policy,
++            )?;
++            // A cusp at a retained end makes the pointwise scale `1 - d k`
++            // vanish. Without an interior cusp the range's interior sign is
++            // the one-sided limit there, and the source tangent decides.
++            if tangent_signs == Classification::Uncertain(UncertaintyReason::Boundary)
++                && derivative_scale_sign.is_none()
++                && let Some(range) = retained_range
++            {
++                let endpoint = CurveParameter2::from(parameter.clone());
++                let mut at_end = false;
++                for end in [range.start(), range.end()] {
++                    match endpoint.same_value(end, policy)? {
++                        Classification::Decided(equal) => at_end |= equal,
++                        Classification::Uncertain(reason) => {
++                            return Ok(Classification::Uncertain(reason));
++                        }
++                    }
++                }
++                if at_end {
++                    let sign = match endpoint_scale_sign {
++                        Some(sign) => sign,
++                        None => {
++                            let sign = match self
++                                .derivative_scale_sign_without_interior_cusps(range, policy)?
++                            {
++                                Classification::Decided(sign) => sign,
++                                Classification::Uncertain(reason) => {
++                                    return Ok(Classification::Uncertain(reason));
++                                }
++                            };
++                            endpoint_scale_sign = Some(sign);
++                            sign
++                        }
++                    };
++                    if let Some(sign) = sign {
++                        tangent_signs = self
++                            .vector_tangent_cross_and_dot_signs_with_tangent_field(
++                                &parameter.clone().into(),
++                                &tangent_direction_x,
++                                &tangent_direction_y,
++                                tangent_field,
++                                Some(sign),
++                                policy,
++                            )?;
++                    }
++                }
++            }
++            let tangent_is_parallel = match tangent_signs {
+                 Classification::Decided((cross, dot)) => {
+                     if cross != RealSign::Zero {
+                         if certified_tangent || inferred_tangent {
+@@ -7000,6 +7047,53 @@ impl BezierParallel2 {
+             })
+     }
+ 
++    /// The strict sign of the derivative scale `1 - d k` throughout `range`
++    /// when every parallel cusp and source singularity of the range lies at
++    /// one of its ends, and `None` otherwise. The sign is then also the
++    /// one-sided limit at each end, where a cusp makes the scale vanish.
++    fn derivative_scale_sign_without_interior_cusps(
++        &self,
++        range: &CurveParameterRange2,
++        policy: &CurveContext,
++    ) -> CurveResult<Classification<Option<RealSign>>> {
++        let analysis = match self.singularity_analysis_with_policy(range, policy)? {
++            Classification::Decided(analysis) => analysis,
++            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++        };
++        for event in analysis
++            .parallel_cusps()
++            .iter()
++            .chain(analysis.source_singularities())
++        {
++            let event = CurveParameter2::from(event.clone());
++            let mut at_end = false;
++            for end in [range.start(), range.end()] {
++                match event.same_value(end, policy)? {
++                    Classification::Decided(equal) => at_end |= equal,
++                    Classification::Uncertain(reason) => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                }
++            }
++            if !at_end {
++                return Ok(Classification::Decided(None));
++            }
++        }
++        let interior = match range.strict_interior_scalar(policy)? {
++            Classification::Decided(interior) => interior,
++            Classification::Uncertain(reason) => return Ok(Classification::Uncertain(reason)),
++        };
++        Ok(
++            match self.parallel_derivative_scale_sign_at_exact(&interior, policy)? {
++                Classification::Decided(sign @ (RealSign::Positive | RealSign::Negative)) => {
++                    Classification::Decided(Some(sign))
++                }
++                Classification::Decided(RealSign::Zero) => Classification::Decided(None),
++                Classification::Uncertain(reason) => Classification::Uncertain(reason),
++            },
++        )
++    }
++
+     /// [`Self::singularity_analysis`] under an explicit predicate policy.
+     pub(crate) fn singularity_analysis_with_policy(
+         &self,
+diff --git a/crates/hypercurve/tests/disappearance_chains.rs b/crates/hypercurve/tests/disappearance_chains.rs
+index 162de235b3..b5aa8ace7a 100644
+--- a/crates/hypercurve/tests/disappearance_chains.rs
++++ b/crates/hypercurve/tests/disappearance_chains.rs
+@@ -342,8 +342,9 @@ fn convex_hole_edge_vanishes_before_the_hole_closes() {
+ /// at least the minor semi-axis closes the hole: at distance 1 the eroded
+ /// ellipse is its center point. Smaller dilations keep a hole, which must be
+ /// exactly the ellipse eroded by the same distance: the two are disjoint and
+-/// together fill the dilated frame. Distance 3/4 exceeds the smallest radius
+-/// of curvature, 1/2, so the eroded ellipse's raw parallels have swallowtails.
++/// together fill the dilated frame. At distance 1/2, the smallest radius of
++/// curvature, the inner parallel has cusps exactly at the half-arc ends
++/// `(+-2, 0)`; distance 3/4 exceeds it, so the raw parallels have swallowtails.
+ #[test]
+ fn elliptical_hole_closes_at_its_minor_semi_axis() {
+     let unit_disk = region(&[circle(0, 0, 1, false)]);
+@@ -367,7 +368,7 @@ fn elliptical_hole_closes_at_its_minor_semi_axis() {
+             &region(&[rounded_square(&Real::from(8), &distance)]),
+         );
+     }
+-    for distance in [fraction(1, 4), fraction(3, 4)] {
++    for distance in [fraction(1, 4), fraction(1, 2), fraction(3, 4)] {
+         let dilated = offset(&framed, distance.clone());
+         let hole = offset(&ellipse, -distance.clone());
+         assert!(!hole.is_empty());
+-- 
+2.56.0
+
