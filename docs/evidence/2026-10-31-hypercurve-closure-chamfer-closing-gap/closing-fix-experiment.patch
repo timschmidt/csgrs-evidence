@@ -1,0 +1,45 @@
+diff --git a/crates/hypercurve/src/bezier_offset/algebraic_chord.rs b/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
+index e934623f89..36d2f7e392 100644
+--- a/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
++++ b/crates/hypercurve/src/bezier_offset/algebraic_chord.rs
+@@ -5191,6 +5191,17 @@ impl BezierAlgebraicChord2 {
+             }
+             _ => (self.clone(), distance, Real::zero(), Real::zero()),
+         };
++        // Composed displacements can cancel exactly, as when an erosion band
++        // offsets a dilated chord back. Both endpoints are then the source's
++        // own endpoints; rebuilding them as zero-distance parallel points would
++        // force later contacts to prove that coincidence from two unrelated
++        // representations.
++        if distance.zero_status() == ZeroKnowledge::Zero
++            && translation_x.zero_status() == ZeroKnowledge::Zero
++            && translation_y.zero_status() == ZeroKnowledge::Zero
++        {
++            return Ok(source);
++        }
+         let (start, end) = BezierAlgebraicChordParallelPoint2::new_pair(
+             source,
+             distance,
+diff --git a/crates/hypercurve/src/bezier_region/offset_joins.rs b/crates/hypercurve/src/bezier_region/offset_joins.rs
+index 275e1c9559..17c14f6e81 100644
+--- a/crates/hypercurve/src/bezier_region/offset_joins.rs
++++ b/crates/hypercurve/src/bezier_region/offset_joins.rs
+@@ -149,6 +149,7 @@ pub(super) fn share_exact_offset_band_endpoints(
+                 span.fragments.last()
+             };
+             let curve = match fragment {
++                Some(BezierSplitFragment2::AlgebraicCuspSemicircle(_)) => return true,
+                 Some(BezierSplitFragment2::Materialized { curve, .. }) => Some(curve),
+                 Some(BezierSplitFragment2::RetainedBezier { source_curve, .. }) => {
+                     Some(source_curve)
+@@ -170,9 +171,7 @@ pub(super) fn share_exact_offset_band_endpoints(
+         } else {
+             continue;
+         };
+-        if point.coordinates().is_none()
+-            || !offset_ends_meet_at_tangent_junction(&spans[index], &spans[next], distance, policy)
+-        {
++        if !offset_ends_meet_at_tangent_junction(&spans[index], &spans[next], distance, policy) {
+             continue;
+         }
+         let point = point.clone();
