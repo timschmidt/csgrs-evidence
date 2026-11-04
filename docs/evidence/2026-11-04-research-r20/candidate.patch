@@ -1,0 +1,1900 @@
+diff --git a/PERFORMANCE.md b/PERFORMANCE.md
+index 692181cf79..554966bef6 100644
+--- a/PERFORMANCE.md
++++ b/PERFORMANCE.md
+@@ -1322,3 +1322,39 @@ operation peak is 741,328 bytes above its starting live allocation. No speed
+ improvement or new work/memory/cancellation bound is claimed. Processes have
+ an external 120-second limit. The matched probe's `.text` changes from
+ 12,782,847 to 12,780,767 bytes; this is not application or WASM size attribution.
++## R20 regularized segmented revolution
++
++The [4 November R20 qualification](docs/research/regularized-revolution-2026-11-04.md)
++adds a material API without changing legacy successful rows. Five controls,
++three alternating baseline/candidate process pairs and 20 measured warm calls
++per fixture give the following medians with allocator instrumentation enabled:
++
++| Legacy fixture | Baseline µs | Candidate µs | Requested allocation B/call |
++| --- | ---: | ---: | ---: |
++| Positive partial, 270°, N=3 | 26.798 | 27.143 | 25,069 |
++| Negative partial, −270°, N=4 | 381.334 | 324.173 | 280,053 |
++| Positive full, N=5 | 337.932 | 339.187 | 341,949 |
++| Positive full, N=6 | 129.587 | 131.286 | 133,581 |
++| Opposite-side legacy boundary, 270°, N=4 | 619.638 | 629.767 | 570,870 |
++
++All exact rows, allocation counts, requested bytes, peak logical live bytes and
++retention agree between baseline `9a8bd78184` and candidate. Timing includes
++adverse movements and does not establish a statistical nonregression claim.
++Serialization is outside both timed regions; geometry and evidence are
++materialized inside them. Probe sources, locks and individual samples are in
++the evidence archive. These are shared-host, allocator-instrumented measurements.
++
++The new regularized opposite-side fixture takes 194.622 ms (20 warm samples),
++2,797,760 allocation calls, 208,222,247 requested allocation bytes, 819,378
++peak logical live bytes and 197,440 retained bytes. It performs exact union
++where the legacy result retains winding two, so their times compare different
++contracts. A crossing rectangle takes 986.318 µs, 3,437 calls, 558,992
++requested bytes, 88,392 peak logical live bytes and 5,816 retained bytes.
++Every measured result has zero post-drop logical allocation delta. Requested
++bytes include repeated allocation traffic and are not retained memory or RSS.
++
++All 576 declared matrix rows complete in the final release suite (674.46 s).
++The ASan stress campaign fails its 15-second per-input limit on an axis-touching
++hole at 359°, N=5; it is not a passing sanitizer envelope. Release matrix row
++325 completes in 6.61 s with independent membership and winding checks. No
++new internal work/memory/cancellation bound or general speedup is claimed.
+diff --git a/bindings/cpp/csgrs.hpp b/bindings/cpp/csgrs.hpp
+index 82bfa55650..17df62e641 100644
+--- a/bindings/cpp/csgrs.hpp
++++ b/bindings/cpp/csgrs.hpp
+@@ -135,6 +135,7 @@ struct RawReal;
+     static csgrs_status_t region_extrude(const csgrs_curve_region_t *region, scalar_type height, csgrs_triangle_mesh_t **out) { return csgrs_curve_region_##Name##_extrude(region, height, out); } \
+     static csgrs_status_t region_extrude_vector(const csgrs_curve_region_t *region, vec3_type direction, csgrs_triangle_mesh_t **out) { return csgrs_curve_region_##Name##_extrude_vector(region, direction, out); } \
+     static csgrs_status_t region_revolve(const csgrs_curve_region_t *region, scalar_type angle, std::size_t segments, csgrs_triangle_mesh_t **out) { return csgrs_curve_region_##Name##_revolve(region, angle, segments, out); } \
++    static csgrs_status_t region_revolve_solid(const csgrs_curve_region_t *region, scalar_type angle, std::size_t segments, csgrs_triangle_mesh_t **out) { return csgrs_curve_region_##Name##_revolve_solid(region, angle, segments, out); } \
+     static csgrs_status_t region_profiles(const csgrs_curve_region_t *region, region_profiles_type *out) { return csgrs_curve_region_##Name##_region_profiles(region, out); } \
+     static void mesh_buffers_free(mesh_buffers_type value) { csgrs_triangle_mesh_buffers_##Name##_free(value); } \
+     static void graphics_mesh_free(graphics_mesh_type value) { csgrs_graphics_mesh_##Name##_free(value); } \
+@@ -256,6 +257,7 @@ public:
+   TriangleMesh<Traits> extrude(scalar_type height) const { csgrs_triangle_mesh_t *out = nullptr; check(Traits::region_extrude(handle_, height, &out)); return TriangleMesh<Traits>(out); }
+   TriangleMesh<Traits> extrude_vector(vec3_type direction) const { csgrs_triangle_mesh_t *out = nullptr; check(Traits::region_extrude_vector(handle_, direction, &out)); return TriangleMesh<Traits>(out); }
+   TriangleMesh<Traits> revolve(scalar_type angle, std::size_t segments) const { csgrs_triangle_mesh_t *out = nullptr; check(Traits::region_revolve(handle_, angle, segments, &out)); return TriangleMesh<Traits>(out); }
++  TriangleMesh<Traits> revolve_solid(scalar_type angle, std::size_t segments) const { csgrs_triangle_mesh_t *out = nullptr; check(Traits::region_revolve_solid(handle_, angle, segments, &out)); return TriangleMesh<Traits>(out); }
+   region_profiles_type region_profiles() const { region_profiles_type out{}; check(Traits::region_profiles(handle_, &out)); return out; }
+   csgrs_curve_region_t *get() const { return handle_; }
+ 
+diff --git a/bindings/python/csgrs.py b/bindings/python/csgrs.py
+index 368eda2354..81c307f7f0 100644
+--- a/bindings/python/csgrs.py
++++ b/bindings/python/csgrs.py
+@@ -588,6 +588,11 @@ class CurveRegion:
+         _call(f"csgrs_curve_region_{self.family.prefix}_revolve", self.ptr, self.family.scalar(angle), ctypes.c_size_t(segments), ctypes.byref(out))
+         return mesh_class_for(self.family)(out)
+ 
++    def revolve_solid(self, angle, segments: int):
++        out = MeshPtr()
++        _call(f"csgrs_curve_region_{self.family.prefix}_revolve_solid", self.ptr, self.family.scalar(angle), ctypes.c_size_t(segments), ctypes.byref(out))
++        return mesh_class_for(self.family)(out)
++
+     def region_profiles(self):
+         out = self.family.region_profiles_type()
+         _call(f"csgrs_curve_region_{self.family.prefix}_region_profiles", self.ptr, ctypes.byref(out))
+diff --git a/crates/csgrs-ffi/include/csgrs.h b/crates/csgrs-ffi/include/csgrs.h
+index 08c1b7fd52..f4a44daed5 100644
+--- a/crates/csgrs-ffi/include/csgrs.h
++++ b/crates/csgrs-ffi/include/csgrs.h
+@@ -140,6 +140,10 @@ void csgrs_curve_region_free(csgrs_curve_region_t *value);
+ csgrs_status_t csgrs_triangle_mesh_family(const csgrs_triangle_mesh_t *value, csgrs_scalar_family_t *out);
+ csgrs_status_t csgrs_curve_region_family(const csgrs_curve_region_t *value, csgrs_scalar_family_t *out);
+ 
++/* revolve retains partial swept boundaries; revolve_solid returns regularized
++ * segmented material, admits axis crossings and permits closed PWN contacts.
++ * Both use strict decisions and the mesh construction-evidence queries. */
++
+ /*
+  * Array pointers may be NULL only when their corresponding length is zero.
+  * Polyhedron face_offsets must start at zero and end at face_index_len, so
+@@ -181,6 +185,7 @@ csgrs_status_t csgrs_curve_region_family(const csgrs_curve_region_t *value, csgr
+   csgrs_status_t csgrs_curve_region_##Name##_extrude(const csgrs_curve_region_t *region, Scalar height, csgrs_triangle_mesh_t **out); \
+   csgrs_status_t csgrs_curve_region_##Name##_extrude_vector(const csgrs_curve_region_t *region, Vec3 direction, csgrs_triangle_mesh_t **out); \
+   csgrs_status_t csgrs_curve_region_##Name##_revolve(const csgrs_curve_region_t *region, Scalar angle_degrees, size_t segments, csgrs_triangle_mesh_t **out); \
++  csgrs_status_t csgrs_curve_region_##Name##_revolve_solid(const csgrs_curve_region_t *region, Scalar angle_degrees, size_t segments, csgrs_triangle_mesh_t **out); \
+   csgrs_status_t csgrs_curve_region_##Name##_region_profiles(const csgrs_curve_region_t *region, RegionProfiles *out); \
+   void csgrs_triangle_mesh_buffers_##Name##_free(MeshBuffers value); \
+   void csgrs_graphics_mesh_##Name##_free(GraphicsMesh value); \
+diff --git a/crates/csgrs-ffi/src/lib.rs b/crates/csgrs-ffi/src/lib.rs
+index 4896b1d98b..e01985522d 100644
+--- a/crates/csgrs-ffi/src/lib.rs
++++ b/crates/csgrs-ffi/src/lib.rs
+@@ -1258,6 +1258,7 @@ macro_rules! export_family {
+             extrude: $region_extrude:ident,
+             extrude_vector: $region_extrude_vector:ident,
+             revolve: $region_revolve:ident,
++            revolve_solid: $region_revolve_solid:ident,
+             region_profiles: $region_region_profiles:ident
+         }
+     ) => {
+@@ -1814,6 +1815,27 @@ macro_rules! export_family {
+             })
+         }
+ 
++        #[unsafe(no_mangle)]
++        pub unsafe extern "C" fn $region_revolve_solid(
++            region: *const CsgrsCurveRegion,
++            angle_degrees: <$family as Family>::CScalar,
++            segments: usize,
++            out: *mut *mut CsgrsTriangleMesh,
++        ) -> CsgrsStatus {
++            ffi_status(|| {
++                let region =
++                    <$family as Family>::curve_region_ref(unsafe { ptr_ref(region) }?)?;
++                let mesh = region
++                    .revolve_solid(
++                        <$family as Family>::scalar_to_adapter(angle_degrees)?,
++                        segments,
++                        csgrs::GeometryContext::STRICT,
++                    )?
++                    .into_value();
++                unsafe { out_handle(out, triangle_mesh_handle::<$family>(mesh)) }
++            })
++        }
++
+         #[unsafe(no_mangle)]
+         pub unsafe extern "C" fn $region_region_profiles(
+             region: *const CsgrsCurveRegion,
+@@ -1869,6 +1891,7 @@ export_family!(
+         extrude: csgrs_curve_region_f32_extrude,
+         extrude_vector: csgrs_curve_region_f32_extrude_vector,
+         revolve: csgrs_curve_region_f32_revolve,
++        revolve_solid: csgrs_curve_region_f32_revolve_solid,
+         region_profiles: csgrs_curve_region_f32_region_profiles
+     }
+ );
+@@ -1913,6 +1936,7 @@ export_family!(
+         extrude: csgrs_curve_region_f64_extrude,
+         extrude_vector: csgrs_curve_region_f64_extrude_vector,
+         revolve: csgrs_curve_region_f64_revolve,
++        revolve_solid: csgrs_curve_region_f64_revolve_solid,
+         region_profiles: csgrs_curve_region_f64_region_profiles
+     }
+ );
+@@ -1957,6 +1981,7 @@ export_family!(
+         extrude: csgrs_curve_region_i128_extrude,
+         extrude_vector: csgrs_curve_region_i128_extrude_vector,
+         revolve: csgrs_curve_region_i128_revolve,
++        revolve_solid: csgrs_curve_region_i128_revolve_solid,
+         region_profiles: csgrs_curve_region_i128_region_profiles
+     }
+ );
+@@ -2001,6 +2026,7 @@ export_family!(
+         extrude: csgrs_curve_region_real_extrude,
+         extrude_vector: csgrs_curve_region_real_extrude_vector,
+         revolve: csgrs_curve_region_real_revolve,
++        revolve_solid: csgrs_curve_region_real_revolve_solid,
+         region_profiles: csgrs_curve_region_real_region_profiles
+     }
+ );
+@@ -2451,6 +2477,11 @@ mod tests {
+                     .unwrap()
+                     .contains("revolution angle sign is undecided")
+             );
++            assert_eq!(
++                csgrs_curve_region_real_revolve_solid(&square, &zero, 4, &mut output),
++                CsgrsStatus::PredicateUndecided
++            );
++            assert!(output.is_null());
+             let full = CsgrsReal { inner: 360.into() };
+             assert_eq!(
+                 csgrs_curve_region_real_revolve(&square, &full, 1, &mut output),
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 317d05a182..10e1828b3f 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -648,6 +648,18 @@ These changes alter represented sets, coordinates, file lengths or checksums.
+   Mesh coverage does not represent the traversal multiplicity of a
+   parameterized multi-turn surface. These are CSGRS semantics, without a
+   claim of matching every OpenSCAD version or call default.
++- **Regularized partial revolution.** The additive `curve::revolve_solid`
++  operation accepts axis-crossing profiles and returns the regularized union
++  of their signed segmented sweeps. Move callers requiring material with
++  winding zero or one to this API; legacy `revolve` and `revolve_from` keep
++  their partial swept-boundary semantics. The scalar adapters, C ABI, C++ and
++  Python expose `revolve_solid`; WASM exposes `revolveSolid`. These use the
++  existing failure and certainty channels. Contacts can be nonmanifold under
++  the native closed PWN contract. Nonlinear profiles retain their existing
++  sampling qualifications. Angular tables exceeding platform addressability
++  now fail with `CapacityOverflow` before allocation; this is not a total
++  work or memory budget. See the [R20 record](research/regularized-revolution-2026-11-04.md)
++  for measured completion and unresolved sanitizer stress limits.
+ - **Imported face triangulation.** OBJ, DXF and VRML import project each
+   planar polygon face onto two coordinates before triangulating it. The
+   dropped coordinate is still the largest normal component whenever strict
+diff --git a/docs/research-program.md b/docs/research-program.md
+index 6167e1678b..d399df216d 100644
+--- a/docs/research-program.md
++++ b/docs/research-program.md
+@@ -4,9 +4,11 @@ The October campaign paused at the maintainer's request on 26 October
+ 2026. Work resumed on 4 November under the simplification, branch consolidation
+ and remaining-research objective; see the
+ [current integration record](research/consolidation-2026-11-04.md).
+-R19 is the final admitted experiment in the October run; the remaining entries
+-keep their open scope. R20 received read-only preparation, with no candidate,
+-measurement campaign or admission. The exact curve and BRep closure plans and
++R19 is the final admitted experiment in the October run. R20 resumed on
++4 November with an additive segmented-mesh solid API; its
++[qualification record](research/regularized-revolution-2026-11-04.md) separates
++completed release fixtures from an unresolved sanitizer timeout. Its analytic
++and BRep extensions remain open. The exact curve and BRep closure plans and
+ agent instructions are retained as requirements, not completed implementations.
+ The milestone narratives below describe their original validation checkpoints;
+ publication status is maintained in the [evidence index](evidence-archive.md).
+@@ -138,7 +140,7 @@ part of this program's execution or coordination.
+ | R17 | Reduce retained scalar accelerators at their actual owner | ownership reproduced; private lazy-slot layout rejected. Complete trace replay and a separate census locate held storage, with no decline-only evaluation cells. The candidate lowers Nano report payload by 5.3% and release peak by 4.6%, but a protected warm query regresses and all 64 latency upper bounds exceed 1. Only three retention/source-drop/concurrency tests are retained; all eight final primary checks pass (1,776 tests). Internal resource bounds remain open. See the [owner's evidence](../crates/hyperreal/PERFORMANCE.md#retained-scalar-ownership-and-rejected-layout-r17-2026-10-25). |
+ | R18 | Prove hard compound rotation relations without a global limit increase | kept for scoped exact completion after all 20 final primary/downstream checks pass on 2,352 unchanged source inputs. Late common-factor recovery completes the original binary64 and decimal workflows plus 18 axis/family/policy cells without raising expanded degree or work limits. Thirty native pairs preserve 227,028,480 predicate results; eight workflow pairs preserve 32 exact artifact pairs. Every protected simultaneous latency upper bound exceeds 1; two scalar controls are marginally adverse, and the deliberate degree-14 decline requests 2,096 more bytes per query. General performance admission fails; no speedup is claimed. See the [owner record](../crates/hyperreal/PERFORMANCE.md#factored-compound-rotation-completion-r18-2026-10-25) and evidence record `2026-10-25-research-r18`. |
+ | R19 | Audit cold proof continuation and real resource bounds at import boundaries | kept for scoped exact completion after all 20 final primary/downstream checks pass on 2,354 unchanged source inputs: 303 new exact import/consumer cells and cold exact BRep archive replay. Thirty scalar pairs and eight workflow pairs preserve all declared results/artifacts, but fail general performance admission: 101 of 118 simultaneous upper bounds exceed one, with three adverse native-construction metrics. Costs, intentional expression changes and still-missing cumulative resource contracts are recorded in the [owner record](../crates/hyperreal/PERFORMANCE.md#cold-domain-continuation-and-resource-audit-r19-2026-10-25) and evidence record `2026-10-25-research-r19`. |
+-| R20 | Separate partial swept boundaries from regularized revolution solids | pending |
++| R20 | Separate partial swept boundaries from regularized revolution solids | mesh milestone retained; analytic/BRep and resource closure open; [qualification](research/regularized-revolution-2026-11-04.md) |
+ | R21 | Canonicalize straight sweep images with isolated stationary parameters | pending |
+ | R22 | Extend one affine-image BRep family through all required consumers | pending |
+ | R23 | Complete box containment with selected extrema on retained spans | exact rational/selected-span milestone kept after all seven final primary checks pass. The identical private source passes 2,610 Hypercurve tests, 24 CSGRS tests and all twenty Alumina envelope cases versus six completed / fourteen unresolved on baseline. Thirty cost pairs preserve 1,080 old artifacts and add 12,000 successful queries. Nineteen adverse timing cells, eight extra bytes on polynomial extrema and native size growth are disclosed; no speedup claim. Public witness locations and broader derivative domains remain open. |
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index f4fe16e941..ff6c10ed98 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -2,12 +2,6 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
+-[[package]]
+-name = "adler2"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+-
+ [[package]]
+ name = "aho-corasick"
+ version = "1.1.4"
+@@ -17,24 +11,6 @@ dependencies = [
+  "memchr",
+ ]
+ 
+-[[package]]
+-name = "aligned"
+-version = "0.4.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ee4508988c62edf04abd8d92897fca0c2995d907ce1dfeaf369dac3716a40685"
+-dependencies = [
+- "as-slice",
+-]
+-
+-[[package]]
+-name = "aligned-vec"
+-version = "0.6.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "dc890384c8602f339876ded803c97ad529f3842aba97f6392b3dba0dd171769b"
+-dependencies = [
+- "equator",
+-]
+-
+ [[package]]
+ name = "allocator-api2"
+ version = "0.2.21"
+@@ -62,114 +38,30 @@ version = "1.4.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+ 
+-[[package]]
+-name = "arg_enum_proc_macro"
+-version = "0.3.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0ae92a5119aa49cdbcf6b9f893fe4e1d98b04ccbf82ee0584ad948a44a734dea"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
+-]
+-
+ [[package]]
+ name = "arrayvec"
+ version = "0.7.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+ 
+-[[package]]
+-name = "as-slice"
+-version = "0.2.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "516b6b4f0e40d50dcda9365d53964ec74560ad4284da2e7fc97122cd83174516"
+-dependencies = [
+- "stable_deref_trait",
+-]
+-
+ [[package]]
+ name = "autocfg"
+ version = "1.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+ 
+-[[package]]
+-name = "av-scenechange"
+-version = "0.14.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0f321d77c20e19b92c39e7471cf986812cbb46659d2af674adc4331ef3f18394"
+-dependencies = [
+- "aligned",
+- "anyhow",
+- "arg_enum_proc_macro",
+- "arrayvec",
+- "log",
+- "num-rational",
+- "num-traits 0.2.19",
+- "pastey",
+- "rayon",
+- "thiserror",
+- "v_frame",
+- "y4m",
+-]
+-
+-[[package]]
+-name = "av1-grain"
+-version = "0.2.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8cfddb07216410377231960af4fcab838eaa12e013417781b78bd95ee22077f8"
+-dependencies = [
+- "anyhow",
+- "arrayvec",
+- "log",
+- "nom",
+- "num-rational",
+- "v_frame",
+-]
+-
+-[[package]]
+-name = "avif-serialize"
+-version = "0.8.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e7178fe5f7d460b13895ebb9dcb28a3a6216d2df2574a0806cb51b555d297f38"
+-dependencies = [
+- "arrayvec",
+-]
+-
+ [[package]]
+ name = "base64"
+ version = "0.22.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+ 
+-[[package]]
+-name = "bit_field"
+-version = "0.10.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
+-
+ [[package]]
+ name = "bitflags"
+ version = "2.11.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+ 
+-[[package]]
+-name = "bitstream-io"
+-version = "4.10.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7eff00be299a18769011411c9def0d827e8f2d7bf0c3dbf53633147a8867fd1f"
+-dependencies = [
+- "no_std_io2",
+-]
+-
+-[[package]]
+-name = "built"
+-version = "0.8.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5c0e531d93d39c34eef561e929e8a7f86d77a5af08aac4f6d6e39976c51858e9"
+-
+ [[package]]
+ name = "bumpalo"
+ version = "3.20.2"
+@@ -253,52 +145,12 @@ dependencies = [
+  "half",
+ ]
+ 
+-[[package]]
+-name = "color_quant"
+-version = "1.1.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+-
+ [[package]]
+ name = "core-foundation-sys"
+ version = "0.8.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+ 
+-[[package]]
+-name = "crc32fast"
+-version = "1.5.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+-dependencies = [
+- "cfg-if",
+-]
+-
+-[[package]]
+-name = "crossbeam-deque"
+-version = "0.8.6"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
+-dependencies = [
+- "crossbeam-epoch",
+- "crossbeam-utils",
+-]
+-
+-[[package]]
+-name = "crossbeam-epoch"
+-version = "0.9.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+-dependencies = [
+- "crossbeam-utils",
+-]
+-
+-[[package]]
+-name = "crossbeam-utils"
+-version = "0.8.21"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+-
+ [[package]]
+ name = "crunchy"
+ version = "0.2.4"
+@@ -399,26 +251,6 @@ dependencies = [
+  "num-traits 0.1.43",
+ ]
+ 
+-[[package]]
+-name = "equator"
+-version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4711b213838dfee0117e3be6ac926007d7f433d7bbe33595975d4190cb07e6fc"
+-dependencies = [
+- "equator-macro",
+-]
+-
+-[[package]]
+-name = "equator-macro"
+-version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "44f23cf4b44bfce11a86ace86f8a73ffdec849c9fd00a386a53d278bd9e81fb3"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
+-]
+-
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+@@ -434,21 +266,6 @@ dependencies = [
+  "num-traits 0.2.19",
+ ]
+ 
+-[[package]]
+-name = "exr"
+-version = "1.74.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4300e043a56aa2cb633c01af81ca8f699a321879a7854d3896a0ba89056363be"
+-dependencies = [
+- "bit_field",
+- "half",
+- "lebe",
+- "miniz_oxide",
+- "rayon-core",
+- "smallvec",
+- "zune-inflate",
+-]
+-
+ [[package]]
+ name = "fast-surface-nets"
+ version = "0.2.1"
+@@ -459,37 +276,12 @@ dependencies = [
+  "ndshape",
+ ]
+ 
+-[[package]]
+-name = "fax"
+-version = "0.2.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
+-
+-[[package]]
+-name = "fdeflate"
+-version = "0.3.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
+-dependencies = [
+- "simd-adler32",
+-]
+-
+ [[package]]
+ name = "find-msvc-tools"
+ version = "0.1.9"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+ 
+-[[package]]
+-name = "flate2"
+-version = "1.1.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+-dependencies = [
+- "crc32fast",
+- "miniz_oxide",
+-]
+-
+ [[package]]
+ name = "float-cmp"
+ version = "0.9.0"
+@@ -583,16 +375,6 @@ dependencies = [
+  "wasip3",
+ ]
+ 
+-[[package]]
+-name = "gif"
+-version = "0.14.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+-dependencies = [
+- "color_quant",
+- "weezl",
+-]
+-
+ [[package]]
+ name = "glam"
+ version = "0.29.3"
+@@ -794,38 +576,10 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+ dependencies = [
+  "bytemuck",
+  "byteorder-lite",
+- "color_quant",
+- "exr",
+- "gif",
+- "image-webp",
+  "moxcms",
+  "num-traits 0.2.19",
+- "png",
+- "qoi",
+- "ravif",
+- "rayon",
+- "rgb",
+- "tiff",
+- "zune-core",
+- "zune-jpeg",
+ ]
+ 
+-[[package]]
+-name = "image-webp"
+-version = "0.2.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
+-dependencies = [
+- "byteorder-lite",
+- "quick-error",
+-]
+-
+-[[package]]
+-name = "imgref"
+-version = "1.12.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "40fac9d56ed6437b198fddba683305e8e2d651aa42647f00f5ae542e7f5c94a2"
+-
+ [[package]]
+ name = "indexmap"
+ version = "2.14.0"
+@@ -844,17 +598,6 @@ version = "1.1.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a257582fdcde896fd96463bf2d40eefea0580021c0712a0e2b028b60b47a837a"
+ 
+-[[package]]
+-name = "interpolate_name"
+-version = "0.2.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c34819042dc3d3971c46c2190835914dfbe0c3c13f61449b2997f4e9722dfa60"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
+-]
+-
+ [[package]]
+ name = "itertools"
+ version = "0.14.0"
+@@ -939,12 +682,6 @@ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
+ 
+-[[package]]
+-name = "lebe"
+-version = "0.5.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
+-
+ [[package]]
+ name = "libc"
+ version = "0.2.186"
+@@ -967,41 +704,12 @@ version = "0.4.29"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+ 
+-[[package]]
+-name = "loop9"
+-version = "0.1.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
+-dependencies = [
+- "imgref",
+-]
+-
+-[[package]]
+-name = "maybe-rayon"
+-version = "0.1.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
+-dependencies = [
+- "cfg-if",
+- "rayon",
+-]
+-
+ [[package]]
+ name = "memchr"
+ version = "2.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+ 
+-[[package]]
+-name = "miniz_oxide"
+-version = "0.8.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+-dependencies = [
+- "adler2",
+- "simd-adler32",
+-]
+-
+ [[package]]
+ name = "moxcms"
+ version = "0.8.1"
+@@ -1021,36 +729,6 @@ dependencies = [
+  "static_assertions",
+ ]
+ 
+-[[package]]
+-name = "new_debug_unreachable"
+-version = "1.0.6"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+-
+-[[package]]
+-name = "no_std_io2"
+-version = "0.9.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
+-dependencies = [
+- "memchr",
+-]
+-
+-[[package]]
+-name = "nom"
+-version = "8.0.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+-dependencies = [
+- "memchr",
+-]
+-
+-[[package]]
+-name = "noop_proc_macro"
+-version = "0.3.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
+-
+ [[package]]
+ name = "num"
+ version = "0.4.3"
+@@ -1086,17 +764,6 @@ dependencies = [
+  "serde",
+ ]
+ 
+-[[package]]
+-name = "num-derive"
+-version = "0.4.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "syn",
+-]
+-
+ [[package]]
+ name = "num-integer"
+ version = "0.1.46"
+@@ -1153,37 +820,12 @@ version = "1.21.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+ 
+-[[package]]
+-name = "paste"
+-version = "1.0.15"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+-
+-[[package]]
+-name = "pastey"
+-version = "0.1.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+-
+ [[package]]
+ name = "pin-project-lite"
+ version = "0.2.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+ 
+-[[package]]
+-name = "png"
+-version = "0.18.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
+-dependencies = [
+- "bitflags",
+- "crc32fast",
+- "fdeflate",
+- "flate2",
+- "miniz_oxide",
+-]
+-
+ [[package]]
+ name = "polycool"
+ version = "0.4.0"
+@@ -1193,15 +835,6 @@ dependencies = [
+  "arrayvec",
+ ]
+ 
+-[[package]]
+-name = "ppv-lite86"
+-version = "0.2.21"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+-dependencies = [
+- "zerocopy",
+-]
+-
+ [[package]]
+ name = "prettyplease"
+ version = "0.2.37"
+@@ -1221,46 +854,12 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
+-[[package]]
+-name = "profiling"
+-version = "1.0.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+-dependencies = [
+- "profiling-procmacros",
+-]
+-
+-[[package]]
+-name = "profiling-procmacros"
+-version = "1.0.18"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
+-dependencies = [
+- "quote",
+- "syn",
+-]
+-
+ [[package]]
+ name = "pxfm"
+ version = "0.1.29"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
+ 
+-[[package]]
+-name = "qoi"
+-version = "0.4.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
+-dependencies = [
+- "bytemuck",
+-]
+-
+-[[package]]
+-name = "quick-error"
+-version = "2.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+-
+ [[package]]
+ name = "quote"
+ version = "1.0.45"
+@@ -1282,105 +881,6 @@ version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+ 
+-[[package]]
+-name = "rand"
+-version = "0.9.4"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
+-dependencies = [
+- "rand_chacha",
+- "rand_core",
+-]
+-
+-[[package]]
+-name = "rand_chacha"
+-version = "0.9.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+-dependencies = [
+- "ppv-lite86",
+- "rand_core",
+-]
+-
+-[[package]]
+-name = "rand_core"
+-version = "0.9.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
+-dependencies = [
+- "getrandom 0.3.4",
+-]
+-
+-[[package]]
+-name = "rav1e"
+-version = "0.8.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "43b6dd56e85d9483277cde964fd1bdb0428de4fec5ebba7540995639a21cb32b"
+-dependencies = [
+- "aligned-vec",
+- "arbitrary",
+- "arg_enum_proc_macro",
+- "arrayvec",
+- "av-scenechange",
+- "av1-grain",
+- "bitstream-io",
+- "built",
+- "cfg-if",
+- "interpolate_name",
+- "itertools",
+- "libc",
+- "libfuzzer-sys",
+- "log",
+- "maybe-rayon",
+- "new_debug_unreachable",
+- "noop_proc_macro",
+- "num-derive",
+- "num-traits 0.2.19",
+- "paste",
+- "profiling",
+- "rand",
+- "rand_chacha",
+- "simd_helpers",
+- "thiserror",
+- "v_frame",
+- "wasm-bindgen",
+-]
+-
+-[[package]]
+-name = "ravif"
+-version = "0.13.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e52310197d971b0f5be7fe6b57530dcd27beb35c1b013f29d66c1ad73fbbcc45"
+-dependencies = [
+- "avif-serialize",
+- "imgref",
+- "loop9",
+- "quick-error",
+- "rav1e",
+- "rayon",
+- "rgb",
+-]
+-
+-[[package]]
+-name = "rayon"
+-version = "1.12.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+-dependencies = [
+- "either",
+- "rayon-core",
+-]
+-
+-[[package]]
+-name = "rayon-core"
+-version = "1.13.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+-dependencies = [
+- "crossbeam-deque",
+- "crossbeam-utils",
+-]
+-
+ [[package]]
+ name = "regex"
+ version = "1.12.3"
+@@ -1410,12 +910,6 @@ version = "0.8.10"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+ 
+-[[package]]
+-name = "rgb"
+-version = "0.8.53"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+-
+ [[package]]
+ name = "rustversion"
+ version = "1.0.22"
+@@ -1477,21 +971,6 @@ version = "1.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
+ 
+-[[package]]
+-name = "simd-adler32"
+-version = "0.3.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+-
+-[[package]]
+-name = "simd_helpers"
+-version = "0.1.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
+-dependencies = [
+- "quote",
+-]
+-
+ [[package]]
+ name = "siphasher"
+ version = "1.0.3"
+@@ -1510,12 +989,6 @@ version = "1.15.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+ 
+-[[package]]
+-name = "stable_deref_trait"
+-version = "1.2.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+-
+ [[package]]
+ name = "static_assertions"
+ version = "1.1.0"
+@@ -1597,20 +1070,6 @@ dependencies = [
+  "syn",
+ ]
+ 
+-[[package]]
+-name = "tiff"
+-version = "0.11.3"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b63feaf3343d35b6ca4d50483f94843803b0f51634937cc2ec519fc32232bc52"
+-dependencies = [
+- "fax",
+- "flate2",
+- "half",
+- "quick-error",
+- "weezl",
+- "zune-jpeg",
+-]
+-
+ [[package]]
+ name = "ttf-parser"
+ version = "0.25.1"
+@@ -1641,17 +1100,6 @@ dependencies = [
+  "wasm-bindgen",
+ ]
+ 
+-[[package]]
+-name = "v_frame"
+-version = "0.3.9"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "666b7727c8875d6ab5db9533418d7c764233ac9c0cff1d469aec8fa127597be2"
+-dependencies = [
+- "aligned-vec",
+- "num-traits 0.2.19",
+- "wasm-bindgen",
+-]
+-
+ [[package]]
+ name = "wasip2"
+ version = "1.0.3+wasi-0.2.9"
+@@ -1749,12 +1197,6 @@ dependencies = [
+  "semver",
+ ]
+ 
+-[[package]]
+-name = "weezl"
+-version = "0.1.12"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+-
+ [[package]]
+ name = "windows-core"
+ version = "0.62.2"
+@@ -1923,12 +1365,6 @@ dependencies = [
+  "xml-rs",
+ ]
+ 
+-[[package]]
+-name = "y4m"
+-version = "0.8.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
+-
+ [[package]]
+ name = "zerocopy"
+ version = "0.8.48"
+@@ -1954,27 +1390,3 @@ name = "zmij"
+ version = "1.0.21"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+-
+-[[package]]
+-name = "zune-core"
+-version = "0.5.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "cb8a0807f7c01457d0379ba880ba6322660448ddebc890ce29bb64da71fb40f9"
+-
+-[[package]]
+-name = "zune-inflate"
+-version = "0.2.54"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02"
+-dependencies = [
+- "simd-adler32",
+-]
+-
+-[[package]]
+-name = "zune-jpeg"
+-version = "0.5.15"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+-dependencies = [
+- "zune-core",
+-]
+diff --git a/fuzz/Cargo.toml b/fuzz/Cargo.toml
+index 96b4724965..b303bbfbd3 100644
+--- a/fuzz/Cargo.toml
++++ b/fuzz/Cargo.toml
+@@ -141,3 +141,10 @@ path = "fuzz_targets/fuzz_part_blueprint.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "fuzz_curve_revolve_solid"
++path = "fuzz_targets/fuzz_curve_revolve_solid.rs"
++test = false
++doc = false
++bench = false
+diff --git a/readme.md b/readme.md
+index f6b295aa4f..064828e072 100644
+--- a/readme.md
++++ b/readme.md
+@@ -356,11 +356,14 @@ A zero extrusion height is invalid input (`ZeroParameter`), not an empty
+ solid, for `try_extrude`, `try_extrude_vector` and `extrude_twisted`. Both
+ `extrude_twisted` end scales zero taper the profile to the apex
+ `(0, 0, height)`; one zero or a negative scale is rejected. A full turn of
+-`revolve` revolves the fold of a profile with material on both sides of the
+-axis, the positive material united with the mirror image of the negative
+-material, so a profile may cross the axis. A partial turn requires each loop
+-to lie on one side of the axis, and opposite loops beyond a half turn are not
+-normalized against each other (see the `revolve` documentation).
++`revolve` splits material at the axis and unites the signed swept polyhedra,
++preserving their angular phase; even segment counts permit an equivalent
++planar fold. Its legacy partial turn requires each loop to lie on one side
++of the axis and can retain overlapping opposite-side boundaries with winding
++two. Use `curve::revolve_solid(region, angle, segments, context)` for regularized
++partial material: it accepts axis crossings and unites overlapping pieces
++exactly. Both APIs construct segmented polyhedra. Point and edge contacts in
++`revolve_solid` satisfy the closed PWN contract and can be nonmanifold.
+ 
+ ### Solid construction
+ 
+diff --git a/src/adapter/curve.rs b/src/adapter/curve.rs
+index 552da7df3a..b8cc9733be 100644
+--- a/src/adapter/curve.rs
++++ b/src/adapter/curve.rs
+@@ -256,6 +256,17 @@ where
+             .map_err(AdapterError::from)
+     }
+ 
++    pub fn revolve_solid(
++        &self,
++        angle_degrees: A::Scalar,
++        segments: usize,
++        context: GeometryContext,
++    ) -> AdapterResult<GeometryOutcome<ScalarMesh<A>>> {
++        curve::revolve_solid(&self.inner, A::into_real(angle_degrees)?, segments, context)
++            .map(|outcome| outcome.map(ScalarMesh::from_native))
++            .map_err(AdapterError::from)
++    }
++
+     pub fn region_profiles(
+         &self,
+         context: GeometryContext,
+diff --git a/src/curve/native.rs b/src/curve/native.rs
+index 7cc247e056..a7f2708920 100644
+--- a/src/curve/native.rs
++++ b/src/curve/native.rs
+@@ -2688,7 +2688,7 @@ fn emit_section_walls(
+     Ok(())
+ }
+ 
+-/// Segmented solid of revolution of a native filled region about the Y axis.
++/// Segmented swept boundary of a native filled region about the Y axis.
+ ///
+ /// The X coordinate of the profile is its radius. Each profile point `(x, y)`
+ /// is placed at `(x cos t, y, x sin t)` for `segments + 1` equally spaced
+@@ -2717,12 +2717,64 @@ fn emit_section_walls(
+ /// authored turn direction. Oversized noninteger sweeps (such as 450 degrees)
+ /// remain invalid: neither saturation nor modulo reduction is implicit. If
+ /// integrality cannot be proved, the result is a typed undecided predicate.
+-/// Use [`revolve_from`] to choose the authored starting angle explicitly.
++/// Use [`revolve_from`] to choose the authored starting angle explicitly, or
++/// [`revolve_solid`] for regularized partial material including axis crossings.
+ pub fn revolve(
+     region: &CurveRegion2,
+     angle_degrees: Real,
+     segments: usize,
+     context: GeometryContext,
++) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
++    revolve_with_output(
++        region,
++        angle_degrees,
++        segments,
++        context,
++        RevolutionOutput::SweptBoundary,
++    )
++}
++
++/// Regularized material of a segmented revolution about the Y axis.
++///
++/// Uses the same authored angular lattice, profile conversion, angle domain and
++/// direction as [`revolve`]. Signed material is split at the axis without folding
++/// partial sweeps; its one-sided swept polyhedra are united by the exact mesh
++/// arrangement. Axis-crossing profiles are admitted, and overlapping pieces
++/// contribute material once. The result is the regularized union of the sampled
++/// polyhedra, not an analytic surface of revolution. Nonlinear profile sampling
++/// retains the same construction qualifications as [`revolve`].
++///
++/// Regularization can retain point/edge contacts with a nonmanifold boundary;
++/// the output satisfies the native closed PWN contract rather than requiring a
++/// manifold boundary. Legacy [`revolve`] retains its swept-boundary semantics.
++/// This operation adds no total-work, retained-byte or cancellation bound.
++pub fn revolve_solid(
++    region: &CurveRegion2,
++    angle_degrees: Real,
++    segments: usize,
++    context: GeometryContext,
++) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
++    revolve_with_output(
++        region,
++        angle_degrees,
++        segments,
++        context,
++        RevolutionOutput::RegularizedSolid,
++    )
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum RevolutionOutput {
++    SweptBoundary,
++    RegularizedSolid,
++}
++
++fn revolve_with_output(
++    region: &CurveRegion2,
++    angle_degrees: Real,
++    segments: usize,
++    context: GeometryContext,
++    output: RevolutionOutput,
+ ) -> Result<GeometryOutcome<TriangleMesh>, ValidationError> {
+     let decisions = GeometryDecisions::new(context);
+     if segments < 2 {
+@@ -2774,6 +2826,9 @@ pub fn revolve(
+             .checked_add(1)
+             .ok_or(ValidationError::InvalidArguments)?
+     };
++    // The required angular table must fit the platform's addressable Vec size.
++    // This is a capacity preflight, not a total-work or retained-heap budget.
++    solid::capacity::<(Real, Real)>(Some(sample_count))?;
+     let angle_degrees = if magnitude_order == Ordering::Greater {
+         Real::from(if sign == hyperlimit::Sign::Positive {
+             360
+@@ -2797,18 +2852,18 @@ pub fn revolve(
+     let has_radial_sign = |radii: &[Vec<Vec<hyperreal::RealSign>>], sign| {
+         radii.iter().flatten().flatten().any(|radial| *radial == sign)
+     };
+-    if full
++    if (full || output == RevolutionOutput::RegularizedSolid)
+         && has_radial_sign(&radii, hyperreal::RealSign::Negative)
+         && has_radial_sign(&radii, hyperreal::RealSign::Positive)
+     {
+-        if !segments.is_multiple_of(2) {
++        if !(full && segments.is_multiple_of(2)) {
+             let halves = split_at_revolution_axis(profiles, &decisions)?;
+             let mut meshes = Vec::with_capacity(2);
+             for half in &halves {
+                 let profiles = try_modeling_profiles_with(half, &decisions)?;
+                 let radii = profile_radial_signs(&profiles, &decisions)?;
+                 meshes.push(revolve_profiles(
+-                    &profiles, &radii, &samples, full, sign, &decisions,
++                    &profiles, &radii, &samples, full, sign, output, &decisions,
+                 )?);
+             }
+             let united = decisions.consume_geometry(solid::boolean_with_context(
+@@ -2817,13 +2872,14 @@ pub fn revolve(
+                 hypermesh::BooleanOp::Union,
+                 context,
+             )?);
+-            let mesh = validate_closed_mesh(united, region.is_empty(), &decisions)?;
++            let mesh =
++                validate_revolution_mesh(united, region.is_empty(), output, &decisions)?;
+             return Ok(decisions.finish_mesh(mesh));
+         }
+         profiles = fold_across_revolution_axis(profiles, &decisions)?;
+         radii = profile_radial_signs(&profiles, &decisions)?;
+     }
+-    let mesh = revolve_profiles(&profiles, &radii, &samples, full, sign, &decisions)?;
++    let mesh = revolve_profiles(&profiles, &radii, &samples, full, sign, output, &decisions)?;
+     Ok(decisions.finish_mesh(mesh))
+ }
+ 
+@@ -2858,6 +2914,7 @@ fn revolve_profiles(
+     samples: &[(Real, Real)],
+     full: bool,
+     sign: hyperlimit::Sign,
++    output: RevolutionOutput,
+     decisions: &GeometryDecisions,
+ ) -> Result<TriangleMesh, ValidationError> {
+     let segments = if full {
+@@ -2978,13 +3035,35 @@ fn revolve_profiles(
+             )?;
+         }
+     }
+-    validate_closed_mesh(
++    validate_revolution_mesh(
+         TriangleMesh::new(positions, triangles),
+         profiles.is_empty(),
++        output,
+         decisions,
+     )
+ }
+ 
++fn validate_revolution_mesh(
++    mesh: TriangleMesh,
++    allow_empty: bool,
++    output: RevolutionOutput,
++    decisions: &GeometryDecisions,
++) -> Result<TriangleMesh, ValidationError> {
++    if output == RevolutionOutput::SweptBoundary {
++        return validate_closed_mesh(mesh, allow_empty, decisions);
++    }
++    if allow_empty && mesh.positions.is_empty() && mesh.triangles.is_empty() {
++        return Ok(decisions.qualify_mesh(mesh));
++    }
++    if mesh.triangles.is_empty() {
++        return Err(ValidationError::Geometry(
++            "nonempty revolution produced no material".into(),
++        ));
++    }
++    decisions.consume_mesh(mesh.validate_closed_pwn(decisions.mesh_context())?);
++    Ok(decisions.qualify_mesh(mesh))
++}
++
+ /// Radial sign of every ring vertex, by profile and by ring in the order of
+ /// [`oriented_profile_rings`]: material first, then holes.
+ fn profile_radial_signs(
+diff --git a/src/wasm/curve_js.rs b/src/wasm/curve_js.rs
+index 64530b3232..57357c7bcc 100644
+--- a/src/wasm/curve_js.rs
++++ b/src/wasm/curve_js.rs
+@@ -520,6 +520,23 @@ impl CurveRegionJs {
+         .map_err(crate::wasm::mesh_js::geometry_error)
+     }
+ 
++    #[wasm_bindgen(js_name = revolveSolid)]
++    pub fn revolve_solid(
++        &self,
++        angle_degrees: f64,
++        segments: usize,
++        approximate_512: bool,
++    ) -> Result<GeometryMeshResultJs, JsValue> {
++        curve::revolve_solid(
++            &self.inner,
++            real_from_js_named(angle_degrees, "angleDegrees")?,
++            segments,
++            geometry_context(approximate_512),
++        )
++        .map(Into::into)
++        .map_err(crate::wasm::mesh_js::geometry_error)
++    }
++
+     pub fn sweep(
+         &self,
+         path: Vec<Point3Js>,
+diff --git a/tests/adapter_curve_failures.rs b/tests/adapter_curve_failures.rs
+index 1ae29747ab..87ef3677b0 100644
+--- a/tests/adapter_curve_failures.rs
++++ b/tests/adapter_curve_failures.rs
+@@ -136,6 +136,12 @@ fn unresolved_revolve_angle_is_not_invalid_input_or_empty_geometry() {
+         .revolve(unresolved_zero(), 4, GeometryContext::STRICT)
+         .unwrap_err();
+     assert_cause(error, native, ValidationErrorKind::Undecided);
++    let native = curve::revolve_solid(&square, unresolved_zero(), 4, GeometryContext::STRICT)
++        .unwrap_err();
++    let error = raw
++        .revolve_solid(unresolved_zero(), 4, GeometryContext::STRICT)
++        .expect_err("undecided regularized angle");
++    assert_cause(error, native, ValidationErrorKind::Undecided);
+ }
+ 
+ // Axis-aligned integer rectangles partition the plane into unit cells. The
+@@ -199,3 +205,35 @@ fn successful_curve_booleans_and_empty_results_remain_composable() {
+     composition::<F64>();
+     composition::<I128>();
+ }
++
++fn regularized_revolution_adapter<A: ScalarAdapter>() {
++    let source = curve::translated(&curve::rectangle(5, 2).unwrap(), -2, 0).unwrap();
++    let wrapped = ScalarCurve::<A>::from_native(source.clone());
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let angle = A::from_real(&Real::from(270)).unwrap();
++        let result = wrapped.revolve_solid(angle, 3, context).unwrap();
++        assert_eq!(result.certainty, csgrs::GeometryCertainty::Certified);
++        let volume = csgrs::solid::exact_mass_properties(result.value.native(), Real::one())
++            .unwrap()
++            .volume;
++        assert_eq!(
++            volume.exact_rational_normal_form(),
++            Real::from(31).exact_rational_normal_form()
++        );
++        let angle = A::from_real(&Real::from(0)).unwrap();
++        let native = curve::revolve_solid(&source, Real::zero(), 3, context).unwrap_err();
++        let error = wrapped
++            .revolve_solid(angle, 3, context)
++            .err()
++            .expect("zero angle fails");
++        assert_cause(error, native, ValidationErrorKind::InvalidInput);
++    }
++}
++
++#[test]
++fn regularized_revolution_survives_every_scalar_adapter() {
++    regularized_revolution_adapter::<RawReal>();
++    regularized_revolution_adapter::<F32>();
++    regularized_revolution_adapter::<F64>();
++    regularized_revolution_adapter::<I128>();
++}
+diff --git a/tests/exact_profile_sweeps.rs b/tests/exact_profile_sweeps.rs
+index eea9d12231..581bddc6e5 100644
+--- a/tests/exact_profile_sweeps.rs
++++ b/tests/exact_profile_sweeps.rs
+@@ -1210,3 +1210,409 @@ fn sampled_nonlinear_profiles_remain_qualified() {
+         assert!(evidence.coordinates_projected());
+     }
+ }
++
++/// R20 requests a regularized material API distinct from the legacy swept
++/// boundary. This fixture's three 90-degree sectors give volume 27: the right
++/// annulus contributes 24, and the left contributes only 3 outside that set.
++#[test]
++fn regularized_revolution_removes_overlap_without_changing_legacy_semantics() {
++    let right = rectangle(&int(1), &int(0), &int(3), &int(2));
++    let left = rectangle(&int(-2), &int(0), &int(-1), &int(2));
++    let profile = region(&[right, left], &[], false);
++    let result = curve::revolve_solid(&profile, int(270), 3, GeometryContext::STRICT)
++        .expect("regularized solid must accept overlapping partial pieces");
++    assert_eq!(result.certainty, GeometryCertainty::Certified);
++    assert!(strictly_equal(&six_volume(&result.value), &int(162)));
++    let witness = Point3::new(int(1), int(1), q(1, 2));
++    assert!(
++        result
++            .value
++            .contains_point(&STRICT_MESH, &witness)
++            .unwrap()
++            .value
++    );
++    let off_diagonal = Point3::new(q(7, 5), int(1), q(2, 5));
++    assert_eq!(vertical_prism_winding(&result.value, &off_diagonal), Some(1));
++}
++
++#[test]
++fn regularized_revolution_splits_crossing_material_at_the_axis() {
++    let profile = region(&[rectangle(&int(-2), &int(0), &int(3), &int(2))], &[], false);
++    let result = curve::revolve_solid(&profile, int(270), 3, GeometryContext::STRICT)
++        .expect("regularized solid must accept an axis-crossing profile");
++    assert_eq!(result.certainty, GeometryCertainty::Certified);
++    assert!(strictly_equal(&six_volume(&result.value), &int(186)));
++    let witness = Point3::new(int(1), int(1), q(1, 2));
++    assert_eq!(vertical_prism_winding(&result.value, &witness), Some(1));
++    // Independently authored pieces exercise the public composition contract;
++    // the sector-membership matrix below supplies an independent set oracle.
++    let pieces = [(-2, 0), (0, 3)].map(|(low, high)| {
++        let source = region(
++            &[rectangle(&int(low), &int(0), &int(high), &int(2))],
++            &[],
++            false,
++        );
++        curve::revolve(&source, int(270), 3, GeometryContext::STRICT)
++            .unwrap()
++            .value
++    });
++    let united = solid::boolean_with_context(
++        &pieces[0],
++        &pieces[1],
++        BooleanOp::Union,
++        GeometryContext::STRICT,
++    )
++    .unwrap();
++    let difference = solid::boolean_with_context(
++        &united.value,
++        &result.value,
++        BooleanOp::SymmetricDifference,
++        GeometryContext::STRICT,
++    )
++    .unwrap();
++    assert!(difference.value.positions.is_empty() && difference.value.triangles.is_empty());
++}
++
++/// Membership in the independently constructed convex trapezoids between
++/// consecutive authored meridians. A point on any support is excluded from
++/// this interior oracle, even if that support is only an internal subdivision.
++fn rectangular_sector_membership(
++    rectangles: &[Vec<[Real; 2]>],
++    negative_radius: bool,
++    angle: i64,
++    segments: usize,
++    point: &Point3,
++) -> Option<bool> {
++    let classify = |value: &Real| {
++        hyperlimit::classify_real_sign(value, PredicatePolicy::STRICT)
++            .value()
++            .expect("exact sector sign")
++    };
++    let mut any = false;
++    for rectangle in rectangles {
++        let y0 = &rectangle[0][1];
++        let y1 = &rectangle[2][1];
++        if classify(&(&point.y - y0)) != hyperlimit::Sign::Positive
++            || classify(&(y1 - &point.y)) != hyperlimit::Sign::Positive
++        {
++            continue;
++        }
++        let (mut low, high) = if negative_radius {
++            (-rectangle[2][0].clone(), -rectangle[0][0].clone())
++        } else {
++            (rectangle[0][0].clone(), rectangle[2][0].clone())
++        };
++        if classify(&high) != hyperlimit::Sign::Positive {
++            continue;
++        }
++        if classify(&low) != hyperlimit::Sign::Positive {
++            low = Real::zero();
++        }
++        let direction = |i: usize, radius: &Real| {
++            let theta = (Real::pi() * int(angle) * Real::from(i as u64)
++                / Real::from(180 * segments as u64))
++            .unwrap();
++            let radius = if negative_radius {
++                -radius.clone()
++            } else {
++                radius.clone()
++            };
++            [radius.clone() * theta.clone().cos(), radius * theta.sin()]
++        };
++        for i in 0..segments {
++            let polygon = [
++                direction(i, &high),
++                direction(i + 1, &high),
++                direction(i + 1, &low),
++                direction(i, &low),
++            ];
++            let orientation = if angle > 0 {
++                hyperlimit::Sign::Positive
++            } else {
++                hyperlimit::Sign::Negative
++            };
++            let mut inside = true;
++            for j in 0..polygon.len() {
++                let a = &polygon[j];
++                let b = &polygon[(j + 1) % polygon.len()];
++                if a == b {
++                    continue;
++                }
++                let cross = (&b[0] - &a[0]) * (&point.z - &a[1])
++                    - (&b[1] - &a[1]) * (&point.x - &a[0]);
++                let sign = classify(&cross);
++                if sign == hyperlimit::Sign::Zero {
++                    return None;
++                }
++                inside &= sign == orientation;
++            }
++            any |= inside;
++        }
++    }
++    Some(any)
++}
++
++/// The complete R20 angle/lattice and ownership corpus. CSGRS_R20_CASE selects
++/// one row for fresh-process containment; the ordinary test runs every row.
++/// Each result is checked against source-sector membership and independent
++/// oriented cap winding, rather than only an area/volume or another wrapper.
++#[test]
++fn regularized_revolution_declared_matrix() {
++    let selected = std::env::var("CSGRS_R20_CASE")
++        .ok()
++        .map(|s| s.parse::<usize>().unwrap());
++    let rect = |a, b, c, d| rectangle(&int(a), &int(b), &int(c), &int(d));
++    let fixtures = [
++        (vec![rect(1, 0, 3, 2), rect(-2, 0, -1, 2)], vec![]),
++        (vec![rect(-2, 0, 3, 2)], vec![]),
++        (vec![rect(-3, 0, 3, 4)], vec![rect(-1, 1, 1, 3)]),
++        (vec![rect(-3, 0, 3, 4)], vec![rect(-1, 1, 0, 3)]),
++        (vec![rect(1, 0, 3, 1), rect(-2, 2, -1, 3)], vec![]),
++        (vec![rect(0, 0, 2, 1), rect(-2, 1, 0, 2)], vec![]),
++    ];
++    let mut row = 0;
++    let mut executed = 0;
++    for (fixture, (materials, holes)) in fixtures.iter().enumerate() {
++        for angle in [
++            179, 180, 181, 270, 359, 360, -179, -180, -181, -270, -359, -360,
++        ] {
++            for segments in [3, 4, 5, 6] {
++                for context in CONTEXTS {
++                    let this_row = row;
++                    row += 1;
++                    if selected.is_some_and(|selected| selected != this_row) {
++                        continue;
++                    }
++                    eprintln!(
++                        "R20 start\trow={this_row}\tfixture={fixture}\tangle={angle}\tsegments={segments}\tcontext={context:?}"
++                    );
++                    let source = region(materials, holes, this_row % 2 == 1);
++                    let outcome = curve::revolve_solid(&source, int(angle), segments, context)
++                        .unwrap_or_else(|error| panic!("row {this_row}: {error:?}"));
++                    assert_eq!(
++                        outcome.certainty,
++                        GeometryCertainty::Certified,
++                        "row {this_row}"
++                    );
++                    let mesh = outcome.value;
++                    mesh.validate_closed_pwn(&STRICT_MESH).unwrap();
++                    let mut checked = 0;
++                    let mut windings = 0;
++                    let mut interior = 0;
++                    for twice_y in [1, 3, 5] {
++                        for nx in [-17, -9, -2, 3, 11, 19] {
++                            for nz in [-17, -9, -2, 3, 11, 19] {
++                                let point = Point3::new(q(nx, 7), q(twice_y, 2), q(nz, 7));
++                                let mut expected = Some(false);
++                                for negative in [false, true] {
++                                    expected = expected.and_then(|inside| {
++                                        Some(
++                                            inside
++                                                || (rectangular_sector_membership(
++                                                    materials, negative, angle, segments,
++                                                    &point,
++                                                )? && !rectangular_sector_membership(
++                                                    holes, negative, angle, segments, &point,
++                                                )?),
++                                        )
++                                    });
++                                }
++                                let Some(expected) = expected else {
++                                    continue;
++                                };
++                                let actual =
++                                    mesh.contains_point(&STRICT_MESH, &point).unwrap();
++                                assert_eq!(actual.certainty, MeshCertainty::Certified);
++                                assert_eq!(
++                                    actual.value, expected,
++                                    "row={this_row}, query=({nx}/7,{twice_y}/2,{nz}/7)"
++                                );
++                                checked += 1;
++                                interior += usize::from(expected);
++                                if let Some(winding) = vertical_prism_winding(&mesh, &point) {
++                                    assert_eq!(winding, i32::from(expected), "row {this_row}");
++                                    windings += 1;
++                                }
++                            }
++                        }
++                    }
++                    assert!(
++                        checked >= 70 && windings >= 50 && interior > 0,
++                        "row {this_row}: insufficient independent coverage ({checked}, {windings}, {interior})"
++                    );
++                    eprintln!(
++                        "R20 complete\trow={this_row}\ttriangles={}\tqueries={checked}\twindings={windings}",
++                        mesh.triangles.len()
++                    );
++                    executed += 1;
++                }
++            }
++        }
++    }
++    assert_eq!(row, 576);
++    assert_eq!(executed, if selected.is_some() { 1 } else { 576 });
++}
++
++#[test]
++fn regularized_revolution_preserves_same_side_rows_and_input_validation() {
++    let positive = region(&[rectangle(&q(1, 3), &int(0), &q(5, 3), &int(2))], &[], false);
++    let negative = region(
++        &[rectangle(&q(-5, 3), &int(0), &q(-1, 3), &int(2))],
++        &[],
++        true,
++    );
++    for source in [&positive, &negative] {
++        for angle in [
++            179, 180, 181, 270, 359, 360, -179, -180, -181, -270, -359, -360,
++        ] {
++            for segments in [2, 3, 4, 5, 6] {
++                if segments == 2 && (angle == 360 || angle == -360) {
++                    for outcome in [
++                        curve::revolve(source, int(angle), segments, GeometryContext::STRICT),
++                        curve::revolve_solid(
++                            source,
++                            int(angle),
++                            segments,
++                            GeometryContext::STRICT,
++                        ),
++                    ] {
++                        assert!(matches!(
++                            outcome,
++                            Err(ValidationError::FieldLessThan {
++                                name: "segments",
++                                min: 3
++                            })
++                        ));
++                    }
++                    continue;
++                }
++                let legacy =
++                    curve::revolve(source, int(angle), segments, GeometryContext::STRICT)
++                        .unwrap();
++                let material = curve::revolve_solid(
++                    source,
++                    int(angle),
++                    segments,
++                    GeometryContext::STRICT,
++                )
++                .unwrap();
++                assert_eq!(material.certainty, legacy.certainty);
++                assert_eq!(material.value.positions, legacy.value.positions);
++                assert_eq!(material.value.triangles, legacy.value.triangles);
++                assert_eq!(
++                    material.value.construction_evidence(),
++                    legacy.value.construction_evidence()
++                );
++            }
++        }
++    }
++    for source in [&positive, &curve::empty()] {
++        for angle in [0, 450, -450] {
++            assert_eq!(
++                curve::revolve_solid(source, int(angle), 3, GeometryContext::STRICT)
++                    .unwrap_err()
++                    .kind(),
++                ValidationErrorKind::InvalidInput
++            );
++        }
++        assert!(matches!(
++            curve::revolve_solid(source, int(360), usize::MAX, GeometryContext::STRICT),
++            Err(ValidationError::CapacityOverflow)
++        ));
++    }
++    let empty =
++        curve::revolve_solid(&curve::empty(), int(270), 3, GeometryContext::STRICT).unwrap();
++    assert!(empty.value.positions.is_empty() && empty.value.triangles.is_empty());
++}
++
++#[test]
++fn regularized_revolution_retains_sub_binary64_axis_features() {
++    let tiny = power_of_two(-80);
++    let source = region(
++        &[rectangle(&-tiny.clone(), &int(0), &tiny, &int(1))],
++        &[],
++        false,
++    );
++    let result = curve::revolve_solid(&source, int(270), 3, GeometryContext::STRICT).unwrap();
++    assert_eq!(result.certainty, GeometryCertainty::Certified);
++    assert!(strictly_equal(
++        &six_volume(&result.value),
++        &(int(12) * tiny.clone() * tiny)
++    ));
++    assert!(!result.value.construction_evidence().coordinates_projected());
++}
++
++#[test]
++fn regularized_revolution_continues_through_export_and_subtraction() {
++    let result = {
++        let source = region(&[rectangle(&int(-2), &int(0), &int(3), &int(2))], &[], false);
++        curve::revolve_solid(&source, int(270), 3, GeometryContext::STRICT).unwrap()
++    };
++    let cutter = solid::cube(1).unwrap();
++    for context in [
++        GeometryContext::STRICT,
++        GeometryContext::APPROXIMATE_512,
++        GeometryContext::STRICT,
++    ] {
++        let cut = solid::boolean_with_context(
++            &result.value,
++            &cutter,
++            BooleanOp::Difference,
++            context,
++        )
++        .unwrap();
++        assert_eq!(cut.certainty, GeometryCertainty::Certified);
++        assert!(strictly_equal(&six_volume(&cut.value), &int(180)));
++        let restored =
++            solid::boolean_with_context(&cut.value, &cutter, BooleanOp::Union, context)
++                .unwrap();
++        let empty = solid::boolean_with_context(
++            &restored.value,
++            &result.value,
++            BooleanOp::SymmetricDifference,
++            context,
++        )
++        .unwrap();
++        assert!(empty.value.positions.is_empty() && empty.value.triangles.is_empty());
++    }
++    #[cfg(feature = "stl-io")]
++    {
++        let artifact =
++            csgrs::io::stl::to_stl_binary_artifact(&result.value, "regularized revolution")
++                .unwrap();
++        let replay = artifact.import().unwrap();
++        assert!(replay.construction_evidence().coordinates_projected());
++        replay.validate_closed_pwn(&STRICT_MESH).unwrap();
++        let cut = solid::boolean_with_context(
++            &replay,
++            &cutter,
++            BooleanOp::Difference,
++            GeometryContext::STRICT,
++        )
++        .unwrap();
++        assert!(cut.value.construction_evidence().coordinates_projected());
++        let overlap = solid::boolean_with_context(
++            &replay,
++            &cutter,
++            BooleanOp::Intersection,
++            GeometryContext::STRICT,
++        )
++        .unwrap();
++        let restored = solid::boolean_with_context(
++            &cut.value,
++            &overlap.value,
++            BooleanOp::Union,
++            GeometryContext::STRICT,
++        )
++        .unwrap();
++        let empty = solid::boolean_with_context(
++            &restored.value,
++            &replay,
++            BooleanOp::SymmetricDifference,
++            GeometryContext::STRICT,
++        )
++        .unwrap();
++        assert!(empty.value.positions.is_empty() && empty.value.triangles.is_empty());
++        assert!(empty.value.construction_evidence().coordinates_projected());
++    }
++}
+diff --git a/tests/ffi/curve_operation_failures.c b/tests/ffi/curve_operation_failures.c
+index be39a5c582..d0a0a0dc74 100644
+--- a/tests/ffi/curve_operation_failures.c
++++ b/tests/ffi/curve_operation_failures.c
+@@ -41,6 +41,21 @@ int main(void) {
+   assert(csgrs_curve_region_f64_revolve(square, 360, 1, &mesh) == CSGRS_STATUS_VALIDATION_FAILED);
+   assert(mesh == NULL && strcmp(csgrs_last_error_message(), "segments must not be less than 2") == 0);
+ 
++  csgrs_curve_region_t *wide = NULL, *crossing = NULL;
++  assert(csgrs_curve_region_f64_rectangle(5, 2, &wide) == CSGRS_STATUS_OK);
++  assert(csgrs_curve_region_f64_translate(wide, -2, 0, 0, &crossing) == CSGRS_STATUS_OK);
++  assert(csgrs_curve_region_f64_revolve(crossing, 270, 3, &mesh) == CSGRS_STATUS_VALIDATION_FAILED);
++  assert(mesh == NULL);
++  assert(csgrs_curve_region_f64_revolve_solid(crossing, 0, 3, &mesh) == CSGRS_STATUS_VALIDATION_FAILED);
++  assert(mesh == NULL);
++  assert(csgrs_curve_region_f64_revolve_solid(crossing, 270, 3, &mesh) == CSGRS_STATUS_OK);
++  assert(mesh != NULL);
++  assert(csgrs_curve_region_f64_revolve_solid(crossing, 270, 3, NULL) == CSGRS_STATUS_NULL_POINTER);
++  csgrs_triangle_mesh_free(mesh);
++  mesh = NULL;
++  csgrs_curve_region_free(crossing);
++  csgrs_curve_region_free(wide);
++
+   csgrs_curve_region_t *large = NULL, *scaled = NULL;
+   assert(csgrs_curve_region_f64_square(DBL_MAX, &large) == CSGRS_STATUS_OK);
+   assert(csgrs_curve_region_f64_scale(large, 2, 2, 1, &scaled) == CSGRS_STATUS_OK);
+diff --git a/tests/ffi/curve_operation_failures.cpp b/tests/ffi/curve_operation_failures.cpp
+index 7fe6f18d45..c9b22d2664 100644
+--- a/tests/ffi/curve_operation_failures.cpp
++++ b/tests/ffi/curve_operation_failures.cpp
+@@ -30,6 +30,13 @@ int main() {
+   fails([&] { square.intersection(opaque); }, CSGRS_STATUS_PREDICATE_UNDECIDED, "blocked by Predicate");
+   fails([&] { square.xor_with(opaque); }, CSGRS_STATUS_PREDICATE_UNDECIDED, "blocked by Predicate");
+   fails([&] { square.revolve(360, 1); }, CSGRS_STATUS_VALIDATION_FAILED, "segments must not be less than 2");
++  const auto crossing = Region::rectangle(5, 2).translate(-2, 0, 0);
++  fails([&] { crossing.revolve(270, 3); }, CSGRS_STATUS_VALIDATION_FAILED, "invalid arguments");
++  fails([&] { crossing.revolve_solid(0, 3); }, CSGRS_STATUS_VALIDATION_FAILED, "invalid arguments");
++  const auto revolved = crossing.revolve_solid(270, 3);
++  const auto revolved_bounds = revolved.bounding_box().value();
++  assert(revolved_bounds.mins.x == -3 && revolved_bounds.maxs.x == 3);
++  assert(revolved_bounds.mins.y == 0 && revolved_bounds.maxs.y == 2);
+   const auto large = Region::square(std::numeric_limits<double>::max()).scale(2, 2, 1);
+   fails([&] { large.region_profiles(); }, CSGRS_STATUS_VALIDATION_FAILED, "finite projection point is not finite");
+   const auto empty = square.difference(square);
+diff --git a/tests/ffi/curve_operation_failures.py b/tests/ffi/curve_operation_failures.py
+index 4f3d7086d5..e0d4f5f43a 100644
+--- a/tests/ffi/curve_operation_failures.py
++++ b/tests/ffi/curve_operation_failures.py
+@@ -51,3 +51,11 @@ bounds = recovered.bounding_box()
+ assert bounds.mins.x == 0 and bounds.mins.y == 0 and bounds.maxs.x == 2 and bounds.maxs.y == 2
+ del recovered, empty, large, opaque, restored, square
+ print('Python curve categories, diagnostics, empty composition and recovery passed')
++
++crossing = csgrs.CurveRegionF64.rectangle(5, 2).translate(-2, 0, 0)
++fails(lambda: crossing.revolve(270, 3), 4, 'invalid arguments')
++fails(lambda: crossing.revolve_solid(0, 3), 4, 'invalid arguments')
++regularized = crossing.revolve_solid(270, 3)
++regularized_bounds = regularized.bounding_box()
++assert regularized_bounds.mins.x == -3 and regularized_bounds.maxs.x == 3
++assert regularized_bounds.mins.y == 0 and regularized_bounds.maxs.y == 2
+diff --git a/tests/wasm/geometry_certainty.cjs b/tests/wasm/geometry_certainty.cjs
+index d336a4c273..1c087081b5 100644
+--- a/tests/wasm/geometry_certainty.cjs
++++ b/tests/wasm/geometry_certainty.cjs
+@@ -237,6 +237,21 @@ try {
+     assert.throws(() => signedProfiles.revolve(450, 3, approximate), (error) =>
+       error instanceof Error && error.name === "GeometryError" && error.code === "invalid_input");
+   }
++  // R20: keep the legacy swept boundary and request regularized material explicitly.
++  const crossingRectangle = keep(CurveRegionJs.rectangle(5, 2));
++  const crossingProfile = keep(crossingRectangle.translate(-2, 0));
++  const solidWitness = keep(new Point3Js(1, 1, 0.5));
++  for (const approximate of [false, true, false]) {
++    assert.throws(() => crossingProfile.revolve(270, 3, approximate));
++    const result = crossingProfile.revolveSolid(270, 3, approximate);
++    assert.equal(result.certainty, Certainty.Certified);
++    const mesh = keep(result.intoMesh());
++    const membership = keep(mesh.containsPointWithContext(solidWitness, false));
++    assert.equal(membership.certainty, Certainty.Certified);
++    assert.equal(membership.value, true);
++    assert.throws(() => crossingProfile.revolveSolid(0, 3, approximate), (error) =>
++      error instanceof Error && error.name === "GeometryError" && error.code === "invalid_input");
++  }
+   for (const approximate of [false, true]) {
+     for (const [operation, code] of [
+       [() => square.revolve(360, 1, approximate), "invalid_input"],
+diff --git a/tests/wasm/geometry_certainty.ts b/tests/wasm/geometry_certainty.ts
+index c92cfded1a..ef5967bb2c 100644
+--- a/tests/wasm/geometry_certainty.ts
++++ b/tests/wasm/geometry_certainty.ts
+@@ -84,3 +84,13 @@ const hullResult = cube.minkowskiHullWithContext(cube, false);
+ hullResult.intoMesh().free();
+ cube.minkowskiHull(cube).free();
+ cube.free();
++
++const solidRectangle = CurveRegionJs.rectangle(5, 2);
++const solidProfile = solidRectangle.translate(-2, 0);
++const solidResult = solidProfile.revolveSolid(270, 3, false);
++const solidReceipt: GeometryCertaintyJs = solidResult.certainty;
++if (solidReceipt !== GeometryCertaintyJs.Certified) throw new Error("Uncertified revolution");
++const revolvedSolid: MeshJs = solidResult.intoMesh();
++revolvedSolid.free();
++solidProfile.free();
++solidRectangle.free();

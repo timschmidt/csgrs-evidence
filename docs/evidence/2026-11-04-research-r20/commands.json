@@ -1,0 +1,38 @@
+{
+  "environment": {
+    "CCACHE_DISABLE": "1",
+    "CARGO_BUILD_JOBS": "8",
+    "CARGO_TARGET_DIR": "/tmp/csgrs-research-target",
+    "CARGO_NET_OFFLINE": "true"
+  },
+  "root": [
+    "cargo test --offline --locked --release -p csgrs",
+    "cargo test --offline --locked --release -p csgrs --test exact_profile_sweeps -- --skip regularized_revolution_declared_matrix",
+    "cargo test --offline --locked --release -p csgrs --test adapter_curve_failures",
+    "cargo test --offline --locked --release -p csgrs-ffi",
+    "cargo build --offline --locked --release -p csgrs-ffi",
+    "cargo clippy --offline --locked -p csgrs --all-targets --all-features -- -D warnings",
+    "cargo clippy --offline --locked -p csgrs-ffi --all-targets -- -D warnings",
+    "cargo +1.95.0 clippy --offline --locked -p csgrs --all-targets --features dispatch-trace -- -D warnings",
+    "cargo check --offline --locked --manifest-path fuzz/Cargo.toml --bins",
+    "cargo clippy --offline --locked --manifest-path fuzz/Cargo.toml --bin fuzz_curve_revolve_solid -- -D warnings",
+    "RUSTDOCFLAGS='-D warnings' cargo doc --offline --locked -p csgrs --no-deps --all-features",
+    "WASM_BINDGEN=/path/to/wasm-bindgen-0.2.126 bash scripts/test-wasm-bindings.sh",
+    "cargo fmt --all -- --check",
+    "git diff --check",
+    "bash scripts/check-repository-budget.sh"
+  ],
+  "C": "cc -std=c11 -Wall -Wextra -Werror -Icrates/csgrs-ffi/include tests/ffi/curve_operation_failures.c -L/tmp/csgrs-research-target/release -lcsgrs_ffi -Wl,-rpath,/tmp/csgrs-research-target/release -o /tmp/csgrs-r20-ffi-c",
+  "C++": "g++ -std=c++17 -Wall -Wextra -Werror -Icrates/csgrs-ffi/include -Ibindings/cpp tests/ffi/curve_operation_failures.cpp -L/tmp/csgrs-research-target/release -lcsgrs_ffi -Wl,-rpath,/tmp/csgrs-research-target/release -o /tmp/csgrs-r20-ffi-cpp",
+  "consumer_execution": [
+    "/tmp/csgrs-r20-ffi-c",
+    "/tmp/csgrs-r20-ffi-cpp",
+    "CSGRS_LIBRARY=/tmp/csgrs-research-target/release/libcsgrs_ffi.so python3 tests/ffi/curve_operation_failures.py"
+  ],
+  "SynapsCAD": "cargo clippy --offline --locked --all-targets --features dispatch-trace -- -D warnings",
+  "baseline_nightly": "CARGO_TARGET_DIR=/tmp/csgrs-r20-baseline-nightly cargo +nightly-2026-10-29 check --offline --locked --manifest-path /tmp/csgrs-r20-baseline/Cargo.toml -p hypercurve",
+  "asan_build": "cargo +nightly-2026-10-29 fuzz run --sanitizer address --target-dir /tmp/csgrs-r20-fuzz-target fuzz_curve_revolve_solid /tmp/csgrs-r20-fuzz-corpus -- -max_total_time=120 -timeout=15 -rss_limit_mb=2048 -max_len=32 -seed=20261104 -print_final_stats=1 -artifact_prefix=/tmp/csgrs-r20-fuzz-artifacts/",
+  "asan_host": "/tmp/csgrs-r20-fuzz-target/x86_64-unknown-linux-gnu/release/fuzz_curve_revolve_solid -max_total_time=120 -timeout=15 -rss_limit_mb=2048 -max_len=32 -seed=20261104 -print_final_stats=1 -artifact_prefix=/tmp/csgrs-r20-fuzz-artifacts/ /tmp/csgrs-r20-fuzz-corpus",
+  "asan_smoke": "/tmp/csgrs-r20-fuzz-target/x86_64-unknown-linux-gnu/release/fuzz_curve_revolve_solid -runs=3 -timeout=15 -rss_limit_mb=2048 -seed=20261104 -print_final_stats=1 -artifact_prefix=/tmp/csgrs-r20-fuzz-artifacts/ /tmp/csgrs-r20-fuzz-smoke",
+  "fixed_corpus_release": "/usr/bin/time -v /tmp/csgrs-r20-fuzz-stable/release/fuzz_curve_revolve_solid -runs=576 -timeout=15 -rss_limit_mb=2048 -max_len=32 -seed=20261104 -print_final_stats=1 -artifact_prefix=/tmp/csgrs-r20-fuzz-artifacts/ /tmp/csgrs-r20-fuzz-corpus"
+}
