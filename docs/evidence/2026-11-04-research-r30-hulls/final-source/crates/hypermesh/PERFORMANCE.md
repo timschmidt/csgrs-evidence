@@ -1,0 +1,1616 @@
+# Paper-driven performance audit
+
+This file records optimization hypotheses derived from the papers in the
+README, including rejected ideas and the evidence required to retain a change.
+All three papers in the README reference list are mapped to the relevant
+production paths below.
+
+The guiding safety boundary comes from EMBER's exact plane representation and
+adaptive spatial subdivision, together with Mesh Arrangements' separation of
+arrangement construction from winding-number extraction: approximate data may
+organize work, but it must never decide topology, classification, or output.
+
+## R30 cache-independent hull scheduling (2026-11-04)
+
+Status: kept for fixed-input representation correctness, with adverse costs.
+Owner: Hypermesh's hull eye selector, P27/P36; exact point deduplication,
+visibility, source coordinates, certainty and typed failures remain authoritative.
+The input is the existing finite 3D point-set domain, including retained facts.
+This is an intentional row/diagonal migration, not a performance-only refactor.
+
+### Reproduction and sufficient change
+
+On `d64c01aa69f31b37ddb14ea24f15c9f489f88aeb`, the original 32-by-16
+trigonometric sphere yields different vertex/triangle rows on consecutive
+strict hull calls. A direct equal-score test also chooses the last discovered
+point. An index tie-break alone fixes that test but still fails the sphere.
+A temporary trace retains identical seeds `[0,1,2,16]` and 482 points, but 40
+coordinate views change by one binary64 bit. The first different eye is number
+53: face `[377,406,422]` selects point 392 cold and 407 warm. The old account
+that unchanged coordinate projections left only discovery-order ties was
+incomplete. The original inputs and both failed variants remain in evidence.
+
+Stored rational coordinates retain distance scheduling through fresh rational
+views, independent of primitive approximation caches. Equal scores select the
+least retained input index. If any coordinate is symbolic, the selector uses
+input order; lossy coordinates still organize the BVH. No tolerance or sampled
+geometry replaces an exact coordinate. No new field, cache or geometry kernel
+is introduced.
+
+QuickHull requires an eye in the certified outside set, not a mathematically
+farthest point. Every selected eye still comes from that set; exact visibility
+and the existing horizon update preserve its convex-hull invariant for any
+such eye. Changing selection order can change diagonals and predicate order.
+The seed, scalar predicates, horizon rules and output qualification are not
+replaced. This qualifies the documented R30 scheduling workload, not every
+possible symbolic seed/predicate cache transition or a permutation-invariant
+triangulation. See [migration](../../docs/MIGRATIONS.md#cache-independent-convex-hull-scheduling-2026-11-04).
+
+### Exact acceptance and continuation
+
+The independent rational determinant checks every source point against every
+output halfspace. Eight known cube corners or 30 rational unit-sphere points
+prove the required extreme points; closed-PWN validation and original-point
+identity are separate checks. Both policies, three fixed input permutations,
+zero or `sqrt(2)` translations, interior/duplicate/coplanar points and all three
+public hull entry points are exercised. Tiny, rounded and overflowing
+scheduling views at powers -1100, -600, 60 and 1100 preserve distinct exact
+vertices. A convex intersection consumes the hull and feeds a further hull,
+with the same independent set oracle.
+
+The original 32-by-16 source is retained with exact trigonometric coordinates.
+Fresh, repeated, manually warmed, cloned and rebuilt hulls compare exact
+source-index/triangle rows and construction qualification. A fresh native child
+reconstructs the source before comparing the parent artifact. Neighboring
+24-by-12 and 17-by-9 sources exercise both policies. Existing sampled-sphere
+Boolean/hull and successive-operation tests remain unchanged. Finite checks do
+not establish all symbolic determinism or general operation/resource closure.
+
+### Matched completed-workload observations
+
+Nine controls use the same pinned inputs, features, allocator, validation and
+native row materialization in both revisions. Three alternating process pairs
+on one allowed CPU give 876 measured calls: 60 per revision for seven ordinary
+controls and nine per revision for each sphere. Sample zero is cold; later
+samples reuse the input. Hull construction and closed-PWN validation are timed;
+native JSON rows are generated afterward and compared separately. All calls
+complete with Certified local receipts. Geometry equality is not inferred from
+hashes. Five artifact rows agree with the baseline; curved-shell, symbolic-cube
+and both sphere artifacts intentionally change. Candidate rows agree across
+all repeated calls and fresh processes; baseline sphere32 rows do not.
+
+| Control | Candidate/base cold median | Candidate/base warm median |
+| --- | ---: | ---: |
+| Tetrahedron | 0.859 | 0.944 |
+| Coplanar-group API | 0.988 | 0.888 |
+| Retained-fact API | 1.045 | 0.855 |
+| 4,913-point grid | 0.930 | 0.924 |
+| 64-point moment curve | 0.988 | 0.999 |
+| 684-point curved shell | 1.027 | 0.965 |
+| Symbolically translated cube cloud | 3.387 | 3.538 |
+| 32-by-16 trigonometric sphere | 1.138 | 1.128 |
+| 17-by-9 trigonometric sphere | 1.169 | 1.195 |
+
+The symbolic cube's warm median is 12.569 ms versus 3.553 ms, with requested
+allocation traffic about 14.45 MB versus 4.23 MB. Sphere32 is 12.686 s versus
+11.245 s warm, about 10.27–10.30 GB versus 8.61–8.62 GB requested traffic.
+Sphere17 is 1.487 s versus 1.244 s warm, about 1.291 GB versus 1.025–1.028 GB.
+Rational tetrahedron, grid and moment-curve allocation sets and logical peaks
+agree; the curved-shell traffic grows slightly. Adverse observations remain.
+These shared-host medians are not a statistical speedup or nonregression claim.
+The correctness migration is retained despite its symbolic scheduling cost.
+
+Both matched native probe executables are 2,677,256 bytes; their hashes differ.
+Three mechanically shared exact geometry recipes execute in fresh zero-import
+WASM instances: 2,926,532-byte test artifact, runner maximum RSS 76,808 KiB.
+These are probe sizes, not library-only or installed-distribution measurements.
+Input-owned caches remain alive in allocation/drop observations. There is no
+new total-work, coefficient-growth, memory or cancellation-latency bound.
+
+### Validation and retained evidence
+
+The frozen three Rust source hashes bind these final checks:
+
+- `cargo test --offline --locked --release --all-features -p hypermesh`:
+  299 passing executions, seven existing ignores, 13 batches including docs.
+- Root release/dispatch-trace tests `hull_determinism`, `sampled_sphere_strict`,
+  `successive_operations`, `downstream_solids`, `construction_evidence` and
+  `receipt_composition`: 53 passes, six existing ignores. The original ignored
+  32-by-16 sphere hull is run separately and passes. Minimal-feature root
+  `hull_determinism`: three passes including its fresh child. Total: 356 native
+  executions; the three WASM recipes are additional.
+- Stable 1.98.1 and MSRV 1.95.0 warning-denied Clippy: all Hypermesh targets
+  and features, plus the six affected root test targets with dispatch traces.
+  Strict rustdoc for Hypermesh/root and the standalone Hypermesh fuzz-target
+  compile check pass. Workspace format, whitespace and retention checks pass.
+
+The first root witness used an equality assertion that dumped verbose scalar
+internals on failure; its unchanged geometry now uses a concise row assertion.
+The initial downstream command named a nonexistent `solid_regressions` target;
+the corrected command uses the actual six targets above. A first cost harness
+reimported `Ordering` from its allocator include; the corrected build is warning
+free. The initial owner-filtered command ran no new integration tests; the final
+full owner command runs all three unfiltered. These failures remain distinct
+from completed geometry and are retained in evidence.
+No runtime fuzz/sanitizer campaign, full pre-push CI, installed distribution,
+production binding qualification or push is claimed by this increment.
+
+## 2026-10-23: store crossing coordinates as their exact normal form
+
+Status: **kept**
+
+Research project M05 asked whether coordinates in a fixed algebraic field
+need a normalized representation behind `Real`. On `6d1f6e467c` the
+successive-operation chains no longer grow: the 30-, 45- and 10-degree cuts
+keep depth 15, 17 and 18 from step to step, and the radical coefficients of
+their normal forms stay near 20 bits. What remains is a constant cost.
+Every predicate expands the arithmetic history of the arrangement points it
+reads into Hyperreal's pi-Laurent normal form again, which took 42-67% of
+the step time of every symbolic chain, measured around each expansion.
+
+A point that a segment crosses a plane at now stores each derived coordinate
+as that normal form, `a + sum b_i sqrt(r_i)` possibly times powers of pi
+(`Real::compact_pi_laurent`), when it has fewer expression nodes than the
+construction. The form is exact; the value, the point's construction
+identities and every decision are unchanged. Exact rationals, a coordinate
+that an endpoint stores as the same expression, and values outside the form
+(sines of other rational turns) keep their construction. The existing
+compactor at this one construction site was enough; a separate number-field
+descriptor behind `Real` was not prototyped. Coordinates of the fields that
+would need one, such as the degree-six field of cos(pi/18), keep atoms that
+the compactor declines, and the near-coincident rotations that stayed
+undecided are rational turns of order 3,600,000, beyond any field of small
+degree (see `FUTURE_WORK.md`).
+
+User-space instructions for one process per chain (`perf stat`, release,
+`--untouched`, one run each; repetitions of this harness agree to 0.05%), and
+allocation over each chain in a validated run of
+`SUCCESSIVE_OPERATIONS_RAW=<file> cargo bench --locked --bench
+successive_operations`:
+
+| Chain | Instructions before | After | Allocated before | After |
+| --- | ---: | ---: | ---: | ---: |
+| 6-gon drills (sqrt 3) | 8.82 G | -42.1% | 1,150.8 MB | -46.2% |
+| 8-gon drills (sqrt 2) | 14.82 G | -44.0% | 1,968.6 MB | -46.7% |
+| 30-degree cube cuts | 4.82 G | -46.9% | 666.9 MB | -51.9% |
+| 45-degree cube cuts | 4.89 G | -51.8% | 702.4 MB | -56.6% |
+| 10-degree cube cuts | 2.73 G | -2.5% | 365.7 MB | -2.7% |
+| revolved ring cuts | 8.24 G | -2.4% | 987.0 MB | -2.7% |
+| 16-gon drills | 30.20 G | +0.2% | 3,350.1 MB | +0.1% |
+| sampled sphere cut | 16.18 G | +0.1% | 1,951.8 MB | +0.1% |
+| icosahedron unions | 20.42 G | +0.7% | 1,997.5 MB | +0.9% |
+
+Corpus allocation falls from 45,125 MB to 42,951 MB. The adverse rows are
+explained: in the icosahedron, 16-gon and sphere chains every compaction
+attempt declines (720, 784 and 192 attempts, counted with a temporary
+probe), because their coordinates contain square roots of irrational
+radicands or sines, and each declined attempt costs one bounded expansion.
+Every chain keeps its outcomes, closure, triangle and vertex counts and
+denominator bits. Coordinate graphs shrink: the 30-degree cuts keep depth 4
+over eight steps, the 45-degree cuts depth 4 from the third step, and their
+first two steps now publish only rational coordinates (the radicals of
+those crossings cancel). Rows change, a migration recorded under "Boolean
+output rows" in `docs/MIGRATIONS.md`.
+
+S01's cache of normal forms across predicates (Hyperreal `PERFORMANCE.md`)
+attacks the same cost. With this change in place, the part of it that a
+workspace in `DecisionContext` can reach saves only another 2-3%.
+
+## 2026-10-23: rank retained operands' vertices first as fan apexes
+
+Status: **kept**
+
+Output reduction fans each retriangulated polygon around its least arena
+vertex. The arena numbers source vertices by first use, operands in order,
+so that vertex is the first used, not the oldest. A probe of eight unions of
+translated icosahedra (research project M06; table and method in
+[`FUTURE_WORK.md`](FUTURE_WORK.md#kept-coplanar-strips-fan-from-their-oldest-end))
+found the corpus order `body.union(&tool)` bounded at 8 coplanar-overlap
+pairs and 392 MB per union, but `tool.union(&body)` growing by one or two
+pairs per union, to 26 pairs and 2,209 MB at the eighth. Reduction now ranks
+the vertices of operands that retain an earlier Boolean's facts first. The
+swapped chain's eighth union allocates 665 MB and the eight 4,926 MB instead
+of 9,714 MB (focused release probe, one run each, counting allocator).
+
+Preserved evidence: when such operands already come first the ranking is
+the arena order and reserves nothing. A full `SUCCESSIVE_OPERATIONS_RAW=<file>
+cargo bench --locked --bench successive_operations` run gives the same
+bytes and allocator calls on all 200 steps as without the ranking, and the
+row digests of the incidence change above are unchanged. Sets do not
+change: every variant of the probe published certified closed manifolds of
+44 + 24k triangles with exactly equal volumes. Rows change for Booleans
+whose retained operand follows one without retained facts, a migration
+recorded under "Boolean output rows" in `docs/MIGRATIONS.md`.
+`coplanar_union_strips_fan_from_their_oldest_end_with_the_new_operand_first`
+fails without the ranking (four triangles at a strip's newest end after the
+third union) and passes with it (three in one strip and two in the other
+after every union from the second).
+
+Deferred, not yet justified by measurement: a retained per-vertex age,
+which would remove the remaining 1.7-fold cost of the swapped order at four
+bytes a vertex; an operation-local plane-class region view; and retained
+collinear vertices, which trade output size for locality. Alternating growth at both ends of a
+strip (911 MB at the eighth union) has no fan-only fix.
+
+## 2026-10-22: take incidences from construction instead of zero proofs
+
+Status: **kept**
+
+A face arrangement proved again, by exact zeros, incidences that its points
+have by construction: each point's containment in its face's plane and on
+the edges it was built on, which points lie on each authored line, and the
+orientation of three collinear points in Hypertri's triangulation. The scalar
+layer refines a nonzero value quickly but must prove a zero, so these were
+the expensive predicates of symbolic arrangements, and for near-coincident
+rotations beyond the cyclotomic proof's domain they did not decide at all.
+Each point now keeps its construction identities, plane classes are built
+before corefinement, and the arrangement takes on-plane and on-line facts
+from them; Hypertri receives each line's points as
+`CollinearPointFacts`. The facts only decide that a point is on a plane or
+line. Rational arrangements keep no identities, since their zeros are cheap
+exact arithmetic. See [`FUTURE_WORK.md`](FUTURE_WORK.md#kept-incidences-from-construction-replace-zero-proofs)
+for the argument.
+
+Preserved evidence. One release run of `SUCCESSIVE_OPERATIONS_RAW=<file>
+cargo bench --locked --bench successive_operations` at `2aea178386` and one
+with this change, on a shared host (rustc 1.98.1, one thread): all 200 steps
+keep their outcome, manifold validation, triangle, vertex and coordinate
+counts, denominator bits and graph nodes and depth. A probe (not committed)
+digested every validated step's triangle indices, exact rational
+coordinates, and the binary64 value and graph size of each symbolic
+coordinate: the 200 digests are identical (SHA-256 of the digest list
+`f54208f9…80f5` both times). Allocation, in MB:
+
+| Chain | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 6-gon drills (sqrt 3) | 1,265.7 | 1,150.8 | -9.1% |
+| 8-gon drills (sqrt 2) | 2,153.5 | 1,968.6 | -8.6% |
+| 16-gon drills (sin pi/8) | 3,997.7 | 3,350.1 | -16.2% |
+| 32-gon drills (sin pi/16) | 11,859.5 | 11,294.1 | -4.8% |
+| 32-gon drills tilted 10 degrees | 34,337.4 | 20,464.8 | -40.4% |
+| 30-degree cube cuts (sqrt 3) | 732.8 | 666.9 | -9.0% |
+| 45-degree cube cuts (sqrt 2) | 767.3 | 702.4 | -8.5% |
+| 10-degree cube cuts (sin pi/18) | 505.9 | 365.7 | -27.7% |
+| icosahedron unions (sqrt 5) | 3,971.6 | 1,997.5 | -49.7% |
+| revolved ring, adjacent axis cuts | 1,391.2 | 987.0 | -29.1% |
+| sampled 32x16 sphere cut | 2,200.6 | 1,951.8 | -11.3% |
+| corpus | 63,408.2 | 45,124.8 | -28.8% |
+
+The eleven rational chains allocate within 0.1 MB of before. In the full run
+four of their steps (cross bars 19, feedback 2 and 3, extruded L 1) allocate
+168 to 296 bytes more; run alone, the cross-bar, feedback and L-profile
+chains allocate exactly the same bytes and allocator calls before and after,
+so the difference is state left by the symbolic chains that run earlier.
+Peak live-heap growth per step is unchanged within 0.2 MB. Step times fell
+with allocation (icosahedron unions 7.0 s to 2.6 s, tilted drills 35.8 s to
+20.3 s in total), but they are one shared-host run each. Raw rows: SHA-256
+`b3524268…7430` (before) and `ada971c3…361c` (after), not archived.
+
+Predicate counts, from a probe built with `--features dispatch-trace` (not
+committed) over six chains: Hyperlimit `orient2d` calls fall from 23,039 to
+17,879 on the icosahedron unions, 79,296 to 67,363 on the revolved ring,
+55,622 to 47,721 on the 30-degree cuts, 112,428 to 98,634 on the 8-gon drills
+and 472,748 to 437,790 on the tilted drills; radial `orient3d` calls fall
+from 491 to 346 and 508 to 359 on the first two. The rational square drills
+make the same calls.
+
+Completion: `solid::cylinder(8, 40, 8)` minus its rotation by 0.0001 degree
+about y or z ended `PredicateUndecided` before and is now certified, as are
+the other coordinate-axis rotations of the SynapsCAD fixture
+(`tests/downstream_solids.rs`) and the hypermesh regression
+`construction_incidences_decide_a_near_coincident_rotated_prism`, which
+fails before the change at `surface arrangement point on segment`. Rotations
+about a skew axis still stop in the pairwise tests, at zeros no construction
+implies.
+
+## 2026-10-22: bound the search for equal output coordinates
+
+Status: **kept**
+
+Coordinate sharing compared each new coordinate structurally with every
+expression of every group in its approximation window, then attempted a
+strict proof against every group. Distinct values crowded into one window
+made the pass quadratic: 4,096 dyadics `i / 2^60` beside a distant `sqrt(2)`
+took 8,386,560 structural comparisons and as many strict proofs (196 ms in
+release), and 256 distinct values `sqrt(1 + i / 2^50)` took 32,640 failed
+proofs (141 ms). Each coordinate now compares with the groups of at most the
+four nearest approximations, structurally with at most eight of their
+expressions, and attempts at most two proofs, so a pass over `n` vertices
+makes at most `24 n` comparisons and `6 n` proofs. Two exact rationals are not
+proved, since equal rationals already compare structurally. The scratch
+storage is flat (one record per coordinate, distinct expression and group,
+with groups' expressions linked by index) instead of two vectors per group,
+and it is reserved only when an axis holds a coordinate that is not an exact
+rational. The pass is optional: a coordinate that finds no equal expression
+within the bounds, or a pass whose scratch cannot be reserved, keeps every
+expression, so it no longer fails the operation with `CapacityOverflow`.
+Boolean operations have no cancellation or work budget, so the bounds are
+fixed counts.
+
+Preserved evidence: a probe over the whole successive-operation corpus
+before the change found at most one open group whenever a coordinate looked
+for candidates, and all 216 strict proofs succeeded against the nearest group,
+so the bounds discard nothing there. A full `cargo bench --bench
+successive_operations` run before and after gives identical outcomes,
+triangle and vertex counts, coordinate counts and graph sizes on all 200
+steps, and identical allocation at 0.1 MB resolution (63,408.4 MB and
+63,408.3 MB in total). Six icosahedron unions allocate 3,971.6 MB in the full
+run, the last three steps 654.2, 680.6 and 686.3 MB, and 3,963.8 MB when run
+alone (652.9, 679.3 and 685.0 MB), before and after. After the change,
+the dyadic fixture takes 16,374 comparisons, no proofs and 0.66 ms; the
+square roots take 509 proofs and 3.4 ms; 32 undecided multiples of one zero
+take 61 proofs and 2.0 ms instead of 496 and 12.1 ms (focused release probes,
+not committed). `shared_coordinate_search_is_bounded_in_a_crowded_window`,
+`undecided_coordinates_attempt_a_bounded_number_of_proofs` and
+`exact_rational_outputs_reserve_no_sharing_storage` check the counts, the
+unchanged values and an equal pair found inside a crowded window; the
+existing equal-coordinate tests pass unchanged.
+
+## 2026-10-22: store equal output coordinates as one expression
+
+Status: **kept**
+
+Exact bounds and orderings compare input coordinates. Two equal symbolic
+coordinates built by different operations compare equal only after
+refinement to the maximum precision and an exact zero proof, which every
+later Boolean repeated; on unions of translated icosahedra the number of such
+pairs grew with every union. Each output now stores the coordinates of one
+axis that strict policy proves equal as the smallest of their expressions,
+and hyperreal compares shared expressions by identity. Candidates come from a
+narrow approximate window; a coordinate matching an expression its group
+already holds needs no proof, so a new coordinate needs at most one equality
+proof. A segment crossing keeps a coordinate that both endpoints store as one
+expression. Values and certainty never change, and an undecided comparison
+keeps both expressions.
+
+Preserved evidence: every successive-operation chain keeps its triangle and
+vertex counts and outcomes. `equal_output_coordinates_share_one_expression`
+(`tests/output_reduction.rs`) fails without the pass, and
+`equal_output_coordinates_take_their_smallest_expression` covers the
+smallest choice, a nearby unequal value and an undecided zero. Six icosahedron
+unions allocate 3,972 MB instead of 4,225 MB, the last three steps 654, 681
+and 686 MB instead of 714, 755 and 893 MB. Over twelve unions a focused probe
+measured 712 MB and 849 ms at the fourth union and 812 MB and 928 ms at the
+twelfth, against 780 MB and 915 ms rising to 1,354 MB and 1,554 ms before.
+Rational chains allocate the same; the sampled sphere cut allocates 5.7 MB
+(0.3%) more. Measurements are in
+[`docs/successive-operations.md`](../../docs/successive-operations.md).
+
+## 2026-10-21: skip broad-phase pairs inside one certified embedded input
+
+Status: **kept**
+
+A Boolean output retains that its triangles meet only in shared vertices or
+edges, and the pairwise phase already discarded every pair of its triangles
+after recording radial separation for pairs that traverse a shared edge in
+opposite directions. The broad phase still enumerated those pairs, with exact
+bounds tests that are expensive on symbolic coordinates and grow with the
+operand. It now groups the triangles of each such input, skips every node
+pair inside one group before any bounds test, and records the radial
+separations from the triangles' source edge identities. The fact keys are
+sorted and deduplicated as before, so the arrangement receives the same
+facts and the same cross-operand pairs in the same order.
+
+Preserved evidence: `retained_arrangement_structure_does_not_change_later_outputs`
+(`tests/repeated_operations.rs`) still publishes identical rows for the
+retained path and the full self test, and every successive-operation chain
+keeps its triangle and vertex counts and outcomes. On six unions of
+translated icosahedra, after reduction fans strips from their oldest end, the
+pairwise phase took 0.25 s at the third union and 1.1 s at the seventh before
+and about 0.1 s at each after (focused timer probe), and the chain allocates
+4,225 MB in total. Two small rational chains allocate 0.2 MB (square drills,
+32 steps) and 0.1 MB (feedback) more with this and the same day's
+triangulation change together; reserving the group's edge array exactly
+removed 0.7 MB of the square drills' increase. Measurements are
+in [`docs/successive-operations.md`](../../docs/successive-operations.md).
+
+## 2026-07-28: canonical ordered-AABB predicates
+
+Status: **kept**
+
+Exact BVH overlap, subdivision-cache containment, and two copies of
+lower-dimensional cell relative-interior logic now forward to Hyperlimit's
+ordered-AABB predicates. The canonical cascade batches exact-rational
+coordinates before using the general Real comparison pipeline, while retaining
+Hypermesh's existing `UnknownClassification` boundary.
+
+Hyperlimit's general exact 3D box intersection and point rows improved by
+23.56% and 6.48%; the new full-axis ordered operations take roughly 24--30 ns.
+Hypermesh's 6,144-triangle polygon-soup row moved from 12.411 ms to 12.692 ms
+with no detected change (`p = 0.22`, 95% change interval -0.36% to +1.84%).
+The 192-cell subdivided-cube union moved from 80.506 ms to 79.993 ms, also with
+no detected change (`p = 0.69`, interval -1.86% to +1.33%). A transitive
+Hypervoxel gate improved exact box voxelization by 4.89% and triangle-solid
+voxelization by 3.89%.
+
+## 2026-07-28: canonical projected triangle degeneracy
+
+Status: **kept**
+
+Plane construction previously owned an 80-line cascade for proving that three
+3D points were non-collinear. Hyperlimit already exposed the corresponding
+exact predicate, but its implementation eagerly materialized and classified
+all three coordinate projections. The optimized stage-major cascade now lives
+in Hyperlimit, and `Plane::points_are_nondegenerate` consumes its explicit
+`NonDegenerate`, `Degenerate`, or `Unknown` result instead of maintaining a
+second determinant implementation.
+
+The direct 40-sample predicate gate improved from 436.90 ns to 33.72 ns
+(92.26%). Hypermesh's 6,144-triangle polygon-soup gate moved from 12.427 ms to
+12.275 ms (1.23% lower, within Criterion's configured noise threshold). The
+24-triangle cube-pair gate measured 43.531 us before and 43.688 us after; its
+intervals overlapped and Criterion classified the 1.34% estimate as within the
+noise threshold. Projection-order tests cover XY, XZ, YZ, and exactly
+collinear inputs, while Hypermesh's differential tests continue to compare the
+canonical result with materialized plane validation and the former rational
+path.
+
+A serialized CSGRS downstream gate kept medium-sphere construction at
+75.289 us warm (75.733 us in the preceding full-stack run), 5.33x faster than
+CGAL. Its five-sample fresh-process median increased from 1.338 ms to 1.695 ms,
+identifying a one-time cold-start tradeoff that is not present in the repeated
+construction path. Unit-box construction remained flat-to-better cold and
+improved from 1.362 us to 1.211 us warm in the paired focused run.
+
+## 2026-07-28: immediate construction and classification APIs
+
+Status: **kept**
+
+Three public free functions returned completed values despite carrying
+`build_` or `make_` lifecycle verbs. They are now named for their immediate
+results: `polygon_soup`, `convex_triangle`, and `convex_quad`.
+
+Boolean classification previously required `make_indicator` to allocate and
+return a boxed predicate, even though all supported behavior was already
+described by `BooleanOp`; its mesh-count argument was unused. The predicate
+carrier and constructor are removed. `BooleanOp::contains` now classifies a
+winding vector immediately, while `classify_polygon_output`, `process_leaf`,
+and subdivision accept `BooleanOp` directly. This removes an allocation,
+dynamic dispatch, and a prepared object from the public API.
+
+The triangle and quad constructors now spell their three and four edge planes
+directly instead of constructing them through an indexed modulo iterator. This
+keeps the geometry identical while making the fixed arity explicit and
+recovering a code-generation regression exposed by the performance gate.
+
+The affected release paths were measured serially with 100 Criterion samples
+before and after (20 samples for the end-to-end Boolean):
+
+| Benchmark | Before | After | Midpoint change |
+| --- | ---: | ---: | ---: |
+| `convex_polygon/triangle_construction` | 1.1794--1.1870 us | 1.1743--1.1784 us | -0.60% |
+| `convex_polygon/quad_construction` | 1.4708--1.4779 us | 1.4518--1.4596 us | -1.27% |
+| `build_polygon_soup/cube_pair` | 44.088--44.594 us | 44.199--44.849 us | +0.42% |
+| `boolean_immediate_output/cubes/boolean_mesh/Union` | 2.2691--2.2840 ms | 2.3030--2.3188 ms | +1.51% |
+
+The soup comparison reported no statistically significant change (`p = 0.09`).
+All unrelated sentinels drifted upward together during the final run, so the
+Boolean gate was also repeated against an archived clean `HEAD` in the same
+session. Clean `HEAD` measured 2.3007--2.3398 ms versus the final
+2.3030--2.3188 ms, a -0.33% midpoint change with overlapping intervals. The
+direct Boolean API therefore shows no same-session regression; the nominal
+cross-session increase reflects machine drift rather than the API change.
+
+The removed boxed-indicator constructor itself previously cost
+1.8543--1.8928 ns per allocation. It has no after measurement because the
+carrier and its benchmark no longer exist. The historical
+`build_polygon_soup` benchmark identifier remains stable for comparison
+continuity and is not a public API.
+
+## 2026-07-26: index split-edge incidence candidates
+
+Status: **kept**
+
+The certified construction-aware output path associated every split edge with
+all projective vertices incident to its two defining planes. It previously
+implemented that exact identity join by scanning every retained vertex once
+per split edge, making candidate construction O(split edges * vertices) and
+retaining an additional complete `(vertex, identity)` list.
+
+Candidate construction now indexes split groups by their unordered pair of
+canonical construction-plane identities. Each plane-triple vertex visits its
+three unordered plane pairs once, producing the same order-independent,
+incidence-consistent candidate sets in O(split edges + vertices). Final sorting
+and deduplication are unchanged. This is retained exact construction identity;
+no approximate value selects a candidate or commits topology, and coincidence
+classes still reach output resolution atomically.
+
+A two-second `perf` profile of the 4,512-triangle YeahRight union attributed
+2.25% self time to the old full-scan `Vec<usize>::extend` specialization. After
+indexing, that symbol was below the profile's 0.05% reporting threshold.
+Five deterministic single-execution counter runs measured:
+
+| Version | Instructions | Branches |
+| --- | ---: | ---: |
+| Full scan | 404,855,354 | 71,506,553 |
+| Plane-pair index | 403,118,176 | 70,848,636 |
+| Change | -0.43% | -0.92% |
+
+The corresponding 10-sample Criterion interval moved from
+14.920--15.315 ms to 15.021--17.104 ms with `p = 0.38`; wall-clock performance
+was therefore neutral at that sample size rather than a claimed improvement.
+The former full-scan hotspot, lower deterministic work, and lower asymptotic
+memory/time cost justify retaining the change.
+
+The competitive fixture support now also constructs closed 18,048- and
+72,192-triangle YeahRight variants by refining shared indexed edges. An ignored
+release stress test retains both raw fixture families and all Hypermesh,
+boolmesh, and manifold-rust carriers concurrently, then runs and closure-checks
+both exact Hypermesh unions. The measured run completed in 0.47 seconds with
+248,532 KiB peak RSS. Its first execution exposed that generic independently
+quantized barycentric refinement manufactured boundary edges at these scales;
+the stress generator now grows the pinned closed 4,512-triangle topology by
+shared-edge midpoint refinement instead.
+
+## 2026-07-20: direct interleaved GPU approximation
+
+Status: **kept**
+
+The public GPU boundary formerly produced separate position and normal vectors.
+Consumers with interleaved vertex layouts then allocated a third vector and
+moved both streams into it, increasing peak memory and repeating traversal.
+`approximate_interleaved_gpu_mesh_f32` and its binary64 counterpart now validate
+the exact input once and write each `(position, normal)` row directly into one
+pre-sized output vector. Exact source rows and topology remain unchanged; only
+the explicitly lossy renderer boundary is affected.
+
+On the 48,384-vertex `end_to_end` corpus, 100-sample Criterion intervals were
+4.749--4.761 ms interleaved versus 5.315--5.358 ms separate for `f32` (10.9%
+faster at the midpoint), and 0.713--0.721 ms versus 1.997--2.002 ms for `f64`
+(64.1% faster). The interleaved path also removes two temporary attribute-vector
+allocations from consumers that otherwise merge the streams. Unit tests prove
+row-for-row equality with the separate APIs and preserve invalid-index errors.
+
+## Public-path trace coverage
+
+Coverage is audited by executable public family. Constructors, enums, report
+accessors, and borrowed views are validated through the public operation that
+produces or consumes them; they do not receive misleading standalone timing
+rows. Every exact-computation family below has semantic assertions, a release
+timing, and a recording window that fails on an empty dispatch trace.
+
+| Public executable family | Semantic tests | Release benchmark | Exact path trace |
+| --- | --- | --- | --- |
+| Input meshes and polygon soups | `core`, `regression` | `end_to_end/build_polygon_soup` | `mesh_build_polygon_soup` plus the dispatch-trace integration test |
+| Primitives, clipping, intersections, BVHs, and local BSP | `core`, `regression` | exercised inside `end_to_end` Boolean and hull workloads | `polygon_clip_intersection_bvh_bsp` |
+| Immediate Boolean polygon and triangle output, including certified-convex dispatch and all operations | `core`, `regression` | `end_to_end/boolean_operation` and `end_to_end/boolean_immediate_output` | every operation over overlapping, nested, variadic, and subdivided inputs plus immediate certified-convex output views |
+| Subdivision, leaf processing, segment tracing, and winding propagation | `core`, `regression` | exercised inside `end_to_end` Boolean workloads | Boolean recordings plus `segment_and_winding` |
+| Certified output extraction, triangulation, and closure reports | `core`, `regression` | `end_to_end/output` | Boolean recordings include output-closure certification |
+| Convex hull, coplanar groups, and retained construction facts | `core`, `regression` | all `end_to_end/convex_hull` cases, including both retained variants | `convex_hull/grid_4913` and `convex_hull_public_variants` |
+
+`cargo bench --features dispatch-trace --bench dispatch_trace` records the
+exact-computation paths for every Boolean operation across overlapping,
+contained, variadic, and subdivided inputs, plus convex hull construction. It
+also contains direct public-module workloads for mesh preparation; polygon
+construction, clipping, and intersection; exact BVH queries; local BSP
+splitting; axis/general segment tracing; and winding propagation and output
+classification. Every recording window fails if it emits neither dispatch nor
+rational-reducer evidence.
+
+These trace workloads complement the Criterion timings in `end_to_end` and the
+unit/integration tests: the Criterion suite measures retained end-to-end costs,
+the dispatch benchmark identifies the selected exact paths, and the tests lock
+their semantic results and failure behavior.
+
+## 2026-07-15: cache approximate BVH partition keys
+
+Status: **kept**
+
+References considered:
+
+- Trettner, Nehring-Wirxel, and Kobbelt, *EMBER: Exact Mesh Booleans via
+  Efficient & Robust Local Arrangements*.
+- Zhou, Grinspun, Zorin, and Jacobson, *Mesh Arrangements for Solid Geometry*.
+
+Hypothesis: `BoundsBvh` repeatedly converted exact coordinates to `f64` inside
+median-partition comparators. The conversions only choose BVH partitions; exact
+AABB comparisons and exact point/plane predicates certify every rejection and
+reported candidate. Precomputing the three approximate keys per item should
+therefore remove repeated work without weakening the exact computation model.
+
+Implementation:
+
+- Precompute polygon-bound centers once before recursive BVH construction.
+- Precompute point coordinates once before recursive point-BVH construction.
+- Share the convex hull's existing approximate point table with its point BVH.
+- Keep exact bounds, exact longest-axis selection, and exact query predicates
+  unchanged.
+
+Benchmark evidence was collected with Criterion on an AMD Ryzen 7 5800X3D,
+Rust 1.97.0, using the `bench` profile:
+
+| Workload | Before | Cached BVH keys | Shared hull/BVH keys |
+| --- | ---: | ---: | ---: |
+| `convex_hull/grid_4913` | 13.383 ms | 7.747 ms | 7.399 ms |
+
+The final result is 44.7% faster than the same-turn baseline. Criterion also
+reported improvements against its stored baseline for
+`convex_hull/moment_curve_64` (53.8%) and `convex_hull/curved_shell_684`
+(26.9%). `boolean_operation/cubes/Union`, the Boolean workload with a current
+comparable baseline, was statistically unchanged.
+
+Trace evidence from `cargo bench --bench dispatch_trace --features
+dispatch-trace` for `convex_hull/grid_4913`:
+
+- 11 output vertices and 18 output triangles, matching the benchmark workload.
+- 327,498 exact-rational `compare-real` dispatches.
+- 385 certified predicate events.
+- zero unknown-fact events and zero fallback/abort events.
+
+Validation:
+
+- `cargo test --all-targets`: 950 unit, 52 core, and 48 regression tests passed;
+  one benchmark-style regression test remained intentionally ignored.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` passed.
+- `cargo check --examples --benches` passed.
+
+## 2026-07-15: bound leaf-cache lookup to completed passes
+
+Status: **kept**
+
+Reference considered:
+
+- Trettner, Nehring-Wirxel, and Kobbelt, *EMBER: Exact Mesh Booleans via
+  Efficient & Robust Local Arrangements*, especially its profile showing leaf
+  classification as the largest cost center and its emphasis on cheap local
+  fast paths.
+
+Hypothesis: the leaf classification caches preserve useful results across
+failed subdivision attempts and certified child reuse, but tracing showed no
+reuse among classifications appended during the same leaf-processing pass.
+Every new polygon therefore scanned an increasingly long suffix that could not
+produce a valid hit. Snapshotting the cache lengths at the beginning of a pass
+should preserve cross-pass reuse while avoiding the quadratic same-pass scan.
+
+Implementation:
+
+- Snapshot both leaf-cache lengths before processing a leaf.
+- Search only the completed-pass prefix while continuing to append current-pass
+  results for later retries or child reuse.
+- Trace hits, misses, and skipped same-pass scans separately.
+- Add focused tests proving that same-pass entries are skipped and completed-
+  pass entries remain reusable.
+
+Benchmark evidence was collected with Criterion on the same machine and
+profile as the BVH experiment:
+
+| Workload | Before | Bounded lookup | Result |
+| --- | ---: | ---: | ---: |
+| `boolean_operation/nested_tools_5/Difference` | 20.818 ms | 20.493 ms | 1.56% faster |
+| `boolean_operation/cubes/Union` | about 8.04 ms | 8.050 ms | statistically unchanged |
+| `boolean_operation/octahedra/Union` | 10.146 ms stored baseline | 10.060 ms | within noise threshold |
+
+The new variadic benchmark subtracts five disjoint nested cubes from one host
+cube, producing 72 classified polygons. Its trace recorded 72 misses and 71
+skipped same-pass scans in each of the polygon and interior-point caches, with
+zero hits. The existing cube, nested-cube, and octahedron traces showed the same
+all-miss pattern. The optimization does not remove the cache: entries from
+earlier passes are still searched and the focused tests cover that reuse.
+
+## 2026-07-15: EMBER subdivision experiments rejected or architecture-inapplicable
+
+Status: **no production changes retained**
+
+The following hypotheses were implemented and measured, then removed:
+
+- Moving the complete winding-reachability early-out ahead of root split-basis
+  preparation regressed `boolean_operation/nested_cubes/Difference` from
+  5.626 ms to 5.759 ms (2.37% slower). The more expensive reachability check is
+  correctly left after the cheaper preparation and contraction path.
+- A constant-time absent-transition-component early-out never fired in any
+  representative trace and added measurable overhead, so it was removed.
+- A dedicated upper-triangular BVH self-pair traversal changed the variadic
+  workload from 20.818 ms to 20.906 ms and cube union from about 8.04 ms to
+  about 8.15 ms. It was removed.
+- Returning unsorted internal BVH intersection candidates was statistically
+  neutral and was removed to retain deterministic ordering.
+
+Instrumentation retained from this audit records subdivision tasks, bound
+contractions, winding-reachability discards, completed leaves, and split
+searches. Every current Boolean trace performs two task entries, one bound
+contraction, and one completed leaf, with no split search or reachability
+discard. Consequently, EMBER's split heuristics and parallel work scheduling
+were additionally probed with exact-rational closed tetrahedra using certified
+face-, edge-, and vertex-reference normalization. Each again completed after a
+bound contraction and one leaf, with zero split searches. Closed-cube boundary
+references that lacked the required adjacent-cell winding certificate failed
+explicitly during reference propagation before subdivision, as required by the
+public correctness contract.
+
+This differs from EMBER's cost model: the paper subdivides until a local
+polygon threshold is reached, whereas this implementation first attempts its
+complete local BSP and exact segment-trace classifier even for the 384-polygon
+stress leaf. Recursive splitting is therefore a certification fallback, not a
+size-driven production hot path. Split ranking, branch work stealing, and
+parallel cache sharing have no correctness-certified workload under the
+current API on which they can be meaningfully timed. They are classified as
+architecture-inapplicable until the leaf policy or supported input contract
+changes, rather than left as an unbounded optimization task.
+
+Validation after the first two retained optimizations:
+
+- `cargo test --all-targets`: 952 unit and 52 core tests passed; 48 regression
+  tests passed and one benchmark-style regression remained intentionally
+  ignored; all benchmark smoke executions passed.
+- `cargo clippy --all-targets -- -D warnings` passed.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` passed.
+- `cargo check --examples --benches` passed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+- Dispatch traces remained certified with zero unknown-fact events. The
+  convex-hull trace had zero fallback/abort events; Boolean traces had only the
+  expected guarded division-by-zero probes and completed successfully.
+
+## 2026-07-15: reuse triangle support classifications during intersection
+
+Status: **kept**
+
+Reference considered:
+
+- Zhou, Grinspun, Zorin, and Jacobson, *Mesh Arrangements for Solid
+  Geometry*, especially its performance profile identifying exact
+  triangle-triangle intersection detection and construction as the dominant
+  cost of arrangement construction.
+
+The existing implementation already follows two central rules from the paper:
+it constructs each unordered candidate pair once and reverses that certified
+result for the other polygon, and it retains exact pairwise results in the
+subdivision runtime cache. The audit therefore focused inside the remaining
+exact construction.
+
+Hypothesis: each edge of a triangular polygon classified both endpoints
+against the opposing support plane, so each vertex was classified twice. A
+specialized triangle path can classify all three vertices once and reuse those
+results for the three edge tests without changing any predicate, construction,
+or topology decision. The generic convex-polygon path remains unchanged.
+
+Same-turn Criterion evidence:
+
+| Workload | Before | Triangle classification reuse | Result |
+| --- | ---: | ---: | ---: |
+| `boolean_operation/cubes/Union` | 8.1043 ms | 7.9284 ms | 2.17% faster |
+| `boolean_operation/octahedra/Union` | 10.101 ms | 9.8733 ms | 2.25% faster |
+| `boolean_operation/nested_tools_5/Difference` | 20.780 ms | 20.776 ms | unchanged |
+
+Dispatch traces explain the improvement while preserving certified behavior:
+
+- Each operation records one pairwise-cache miss followed by one exact-order
+  hit, confirming that root analysis and leaf processing share the constructed
+  arrangement intersections.
+- Cube union affine exact point/plane classifications fell from 14,170 to
+  12,838 across 132 BVH candidate pairs and 30 non-empty cuts.
+- Octahedron union classifications fell from 17,345 to 15,509 across 83
+  candidates and 36 non-empty cuts.
+- The variadic difference classifications fell from 31,742 to 29,150 across
+  324 candidates and 72 non-empty cuts, though the end-to-end time was
+  unchanged because intersection predicates are a smaller part of that case.
+- All traces retained zero unknown-fact events and the same output polygon
+  counts.
+
+Two broader variants were rejected before retaining the narrow triangle path:
+
+- Precomputing classifications into temporary vectors regressed the variadic
+  workload by 1.36%; allocation outweighed predicate reuse.
+- A rolling classification loop avoided allocation but regressed the variadic
+  workload from 20.780 ms to 21.398 ms in a repeat run. The generic loop was
+  restored, confining reuse to the common fixed-size triangle case where it is
+  measurably beneficial.
+
+## 2026-07-15: Generalized Winding Numbers applicability audit
+
+Status: **no production optimization applicable to the current contract**
+
+Reference considered:
+
+- Jacobson, Kavan, and Sorkine-Hornung, *Robust Inside-Outside Segmentation
+  Using Generalized Winding Numbers*.
+
+The paper evaluates a real-valued solid-angle field as an inside/outside
+confidence measure for open, self-intersecting, non-manifold, or otherwise
+imperfect oriented meshes. It accelerates repeated field evaluations with an
+AABB hierarchy whose nodes close local open patches; outside a node's convex
+hull, the winding contribution of the patch is the negative contribution of
+its usually smaller closure. Construction stops at about 100 facets or when a
+closure is no smaller than its source. The paper then uses graph-cut
+segmentation because a simple threshold is not reliable for imperfect input.
+
+`hypermesh` has a stricter and materially different contract:
+
+- Inputs must certify as PWN meshes; open or ambiguous inputs are rejected.
+- Classification propagates exact integer winding transitions along certified
+  paths. It never thresholds a floating solid-angle confidence value.
+- Boundary contacts produce an explicit unknown result and trigger alternate
+  probes or subdivision rather than being assigned by a numerical threshold.
+- Exact per-polygon bounds already cull segment-trace crossings, and the
+resulting front/back winding vectors are retained with output polygons.
+
+Replacing that path with generalized solid-angle evaluation or graph-cut
+labels would weaken exact Boolean topology guarantees, so it was not attempted.
+The paper's exact closure hierarchy also does not fit the measured workload:
+representative traces contain only 24–72 leaf polygons, below its approximate
+100-facet stopping threshold. Its applicability was tested separately on a
+much larger certified leaf below; any compatible design must accelerate the
+same exact transition semantics rather than introduce confidence thresholds.
+
+Final validation after the intersection change repeated the full matrix: 952
+unit tests and 52 core tests passed; 48 regression tests passed with the one
+benchmark-style regression intentionally ignored; benchmark smoke execution,
+Clippy with warnings denied, rustdoc with warnings denied, and example/bench
+compilation all passed.
+
+## 2026-07-15: large-leaf exact trace hierarchy rejected
+
+Status: **benchmark retained; production experiment removed**
+
+The earlier hierarchy audit lacked a representative leaf above the generalized
+winding-number paper's roughly 100-facet stopping scale. A new certified
+fixture recursively tessellates each face of two overlapping closed cubes,
+producing 192 triangles per mesh without changing their geometry. Its union
+completes as one exact leaf with 384 classification misses and 276 output
+polygons. The trace records 4,032 pairwise BVH candidates, 168 nonempty cuts,
+and 2,783,428 exact comparisons, so it is a genuine large-leaf stress case.
+
+An experiment built one shared `ExactBvh` in the leaf probe cache and queried
+each axis segment's exact AABB before running the unchanged exact tracer on the
+reported candidates. The hierarchy remained scheduling-only: exact node bounds
+certified every rejection and every candidate still entered the existing exact
+plane/edge predicates. Nevertheless, BVH construction, exact node traversal,
+candidate collection, and temporary polygon cloning outweighed the avoided
+linear checks:
+
+| workload | linear scan | exact trace BVH | result |
+| --- | ---: | ---: | ---: |
+| `boolean_operation/subdivided_cubes_192/Union` | 312.36 ms | 445.86 ms | 42.7% slower |
+
+All production hierarchy plumbing was removed. The benchmark and dispatch
+fixture remain so a future zero-copy query integration can prove a different
+cost model rather than extrapolating from the smaller cube cases.
+
+## 2026-07-23: operation-scoped immediate Boolean execution
+
+Status: **kept**
+
+The public build-once/extract-many Boolean surface was removed. Each call now
+names exactly one operation, performs only that operation's reachability and
+transition work, closure-certifies the result, and returns owned output without
+exposing or caching intermediate arrangement state.
+
+`boolean_operation` returns certified polygons. `boolean_mesh`
+continues directly through certified triangulation and output resolution.
+Both canonical APIs automatically consume immutable convexity and source-plane
+facts retained by native `TriangleMesh` inputs. The selected classified
+fragments are moved into the result instead of cloned.
+
+The former multi-result crossover measurements are intentionally retired:
+retaining classified arrangements is no longer an API or an optimization
+target. The immediate benchmark group measures polygon output, triangle-soup
+output, and certified-convex triangle-soup output separately so future work is
+judged on cold operation latency and allocation rather than cache reuse.
+
+A `--quick` Criterion smoke run on two overlapping cubes measured:
+
+| operation | polygon output | triangle-soup output | certified-convex triangle soup |
+| --- | ---: | ---: | ---: |
+| union | 3.30–3.36 ms | 3.31–3.47 ms | 166.7–167.4 us |
+| intersection | 3.18–3.36 ms | 3.08–3.10 ms | 108.6–110.6 us |
+| difference | 3.15–3.29 ms | 3.17–3.28 ms | 131.5–133.9 us |
+| symmetric difference | 3.38–3.39 ms | 3.36–3.40 ms | 190.1–190.3 us |
+
+These short runs are smoke evidence, not a replacement for the longer
+reference-guided sampling protocol.
+
+## 2026-07-18: retain rational point filter intervals
+
+Status: **kept**
+
+Sampled call stacks for the 192-triangle-per-mesh subdivided-cube union showed
+that exact point/plane classification was the largest named function and that
+rational magnitude detection plus conversion to conservative `f64` intervals
+accounted for another substantial share. Dispatch tracing recorded 211,430
+retained affine point queries feeding 265,416 exact-rational classifications: the
+same point was commonly tested against a support plane and several edge
+planes, but its three coordinates and homogeneous weight were converted again
+for every filter attempt.
+
+`hyperreal` exposes a hidden rational linear-form query carrying four
+approximate values and their certified error radii. `Point3PredicateEvidence`
+constructs the affine form once, uses an exact `1.0` homogeneous weight with
+zero error, and reuses it across every plane classification. Inconclusive
+filters still execute the same exact rational signed-product-sum ordering.
+
+Matched release A/B runs used identical code and settings except for retaining
+the query:
+
+| workload | repeated conversion | retained query | result |
+| --- | ---: | ---: | ---: |
+| `boolean_operation/subdivided_cubes_192/Union` | 168.49 ms | 163.39 ms | 3.03% faster |
+| `boolean_operation/cubes/Union` | 3.8631 ms | 3.7679 ms | 2.46% faster |
+| `convex_hull/grid_4913` | 7.6063 ms | 7.4052 ms | 2.64% faster |
+
+The subdivided case used 30 samples and a ten-second measurement window for
+each side of the A/B. Criterion reported a significant 3.12% regression when
+the retained query was disabled (`p < 0.01`), corroborating the direct
+point-estimate comparison. Cube union and the grid hull likewise regressed
+significantly when disabled (`p < 0.01`). The complete dispatch workload
+retained the same output polygon/triangle counts with zero unknown-fact and
+fallback/abort events.
+
+The full default and all-feature test matrices passed, as did the
+no-default-feature build, warning-denied Clippy, rustdoc, benchmark and fuzz
+target builds, the release WASM UI build, and a 15-second sanitizer campaign
+over `polygon_predicates` (35,735 executions with no failure).
+
+## 2026-07-19: consume single-operation orientation during triangulation
+
+Status: **kept for difference and intersection**
+
+The certified two-convex path already prunes fragments for one requested
+operation and carries their exact front/back winding evidence. Difference and
+intersection nevertheless cloned both winding vectors onto every generated
+triangle, then immediately classified those copies, allocated a second
+triangle/source list, and cloned the merged exact vertex pool. Their operation
+orientation is now classified once per output polygon and consumed directly
+while triangulating. Closure is still certified on the oriented soup, and
+failure still enters the existing precomputed-f64 exact fallback.
+
+Union and symmetric difference retain the prior construction-plus-winding
+selection path after the direct path did not improve both workloads. A
+31-fresh-process CSGRS/CGAL/OpenCascade sphere/box matrix compared the selective
+version with the clean implementation on the same host:
+
+| operation | clean cold | selective cold | cold result | clean warm | selective warm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| difference | 2.651918 ms | 2.582393 ms | 2.62% faster | 111.867 us | 88.964 us |
+| intersection | 2.005512 ms | 1.981404 ms | 1.20% faster | 33.222 us | 33.023 us |
+| union (control) | 4.010995 ms | 3.912562 ms | run-order variation | 129.991 us | 102.673 us |
+| symmetric difference (control) | 3.431765 ms | 3.439824 ms | 0.23% noise | 135.436 us | 132.836 us |
+
+Every operation retained the same output size and checksum. Difference and
+intersection remained much faster than OpenCascade; intersection also beat
+CGAL in the selective run, while the remaining cold competitor gaps stay open.
+
+## 2026-07-19: retain source-point filter queries across support planes
+
+Status: **kept**
+
+The two-convex classifier already caches the certified sign of each exact
+source point against each opposing support plane. It still rebuilt the same
+four-value floating filter query separately for every previously unseen
+point/plane pair. The cache now retains one normalized query per unique source
+point alongside its plane-indexed signs. Only conservative approximate values
+and their certified error radii are retained; uncertain filters continue to
+use the unchanged exact rational signed-product-sum ordering.
+
+A 500-operation alternating-input profile forced a fresh Boolean computation
+on every call. Rational-to-`f64` conversion fell from 10.97% to 8.20% of sampled cycles,
+a 25.3% reduction in the targeted hotspot's share. Total sampled cycles also
+fell from 4.775 billion to 4.713 billion.
+
+Because sequential release builds showed thermal drift, the end-to-end check
+preserved both binaries and alternated their execution for 101 fresh processes
+per side. Each process ran the same four CSGRS sphere/box operations; output
+sizes and checksums matched throughout.
+
+| operation | repeated query | retained query | cold result |
+| --- | ---: | ---: | ---: |
+| difference | 2.617380 ms | 2.558905 ms | 2.23% faster |
+| intersection | 1.978735 ms | 1.919859 ms | 2.98% faster |
+| union | 4.474474 ms | 4.355922 ms | 2.65% faster |
+| symmetric difference | 3.500130 ms | 3.393198 ms | 3.06% faster |
+
+Warm measurements used 31 similarly interleaved processes. Union and
+symmetric difference were unchanged; difference and intersection moved by
+about 1--2.5%, identifying that residual as binary-layout and measurement
+variation.
+
+Validation passed the default and all-feature matrices (954 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 371 `boolean_pipeline` executions without failure.
+
+## 2026-07-19: retain projective point evidence for plane recertification
+
+Status: **kept**
+
+The two-convex path first uses an inexact clip only to propose a smaller set of
+active opposing planes, then certifies the resulting homogeneous cycle against
+every exact candidate plane. That certification previously converted the same
+four exact projective coordinates into conservative floating intervals once
+per point/plane pair. `ProjectivePoint3PredicateEvidence` retains those intervals
+once per cycle point while visiting the candidate planes. The traversal remains
+fully certified: inconclusive filters evaluate the unchanged exact rational
+four-term signed product sum, and non-rational coordinates retain the general
+`Real` predicate fallback.
+
+Both release binaries were preserved and alternated for 101 fresh processes
+per side. Output sizes and checksums matched for every sample.
+
+| operation | repeated projective query | retained projective query | cold result |
+| --- | ---: | ---: | ---: |
+| difference | 2.540766 ms | 2.415564 ms | 4.93% faster |
+| intersection | 1.914299 ms | 1.786318 ms | 6.69% faster |
+| union | 4.300215 ms | 4.199283 ms | 2.35% faster |
+| symmetric difference | 3.384948 ms | 3.257197 ms | 3.77% faster |
+
+Thirty-one interleaved warm processes also improved every operation by
+1.2--1.8%. The focused predicate test checks repeated negative, on-plane, and
+positive results, including the non-rational coefficient fallback.
+
+Validation passed the default and all-feature matrices (955 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 371 `boolean_pipeline` executions without failure.
+
+## 2026-07-19: keep unselected union fragments recovery-only
+
+Status: **kept for union**
+
+Union needs vertices from unselected arrangement fragments to split selected
+boundaries at exact T-junctions, but it does not need to triangulate those
+fragments, clone their winding vectors onto every triangle, and then copy the
+selected triangle list. The single-union path now classifies each fragment
+once. Zero-classification fragments remain in the merged vertex pool and
+construction-candidate index but skip boundary triangulation; selected
+fragments emit triangles in their final exact orientation. Closure is still
+certified, and any failure retains the existing classified-triangle fallback.
+XOR remains on its prior path because the broader experiment did not improve
+it.
+
+A 301-pair fresh-process release A/B isolated the CSGRS sphere/box union and
+alternated the preserved binaries. Every output size and checksum matched:
+
+| operation | classified triangle selection | recovery-only fragments | result |
+| --- | ---: | ---: | ---: |
+| union | 4.272108 ms | 4.248489 ms | 0.55% faster |
+
+Validation passed the default and all-feature matrices (955 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 358 `boolean_pipeline` executions without failure.
+
+## 2026-07-19: defer certified-convex source-edge placeholders
+
+Status: **kept**
+
+Certified two-convex input preparation rebuilds exact edge planes only for
+selected output fragments. Its initial triangle carriers nevertheless cloned
+the four-coefficient support plane into all three edge slots before knowing
+whether a source triangle would reach projective clipping. The carrier now
+retains one placeholder support plane. `ProjectiveCycle` expands that value to
+the source vertex count only when the triangle actually needs clipping; direct
+inside/outside transitions avoid the two unused clones entirely. Exact support
+classification, crossing construction, final edge-plane rebuilding, and output
+closure certification are unchanged.
+
+Five interleaved release runs per side forced a fresh Boolean computation for each of
+500 alternating CSGRS sphere/box operations:
+
+| operation | eager placeholders | deferred placeholders | result |
+| --- | ---: | ---: | ---: |
+| union | 1,238.474 ms | 1,219.832 ms | 1.51% faster |
+| difference | 1,009.196 ms | 999.312 ms | 0.98% faster |
+
+An exact algebraic alternative expanded each `(p1 - p0) x (p2 - p0)` normal
+component into one six-term product sum. It was rejected: the additional
+products outweighed delayed rational normalization, regressing union by 6.05%
+and difference by 8.83% against the retained deferred-placeholder version.
+
+Validation passed the default and all-feature matrices (956 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 362 `boolean_pipeline` executions without failure, and the
+downstream CSGRS library suite passed all 304 tests.
+
+## 2026-07-19: borrow classified polygons during triangulation
+
+Status: **kept**
+
+The operation computation already owns every classified polygon through final
+triangle output. The construction-candidate triangulator nevertheless cloned the
+whole polygon set into a temporary vector, including exact support coefficients
+and winding vectors, before immediately borrowing those clones. Its internal
+polygon consumers now accept either owned or borrowed carriers and immediate
+triangle output passes references. Polygon output instead moves the selected
+fragments into the result. Vertex materialization,
+exact duplicate merging, construction-edge T-junction recovery, orientation,
+and closure certification are unchanged.
+
+Five interleaved release runs per side forced a fresh Boolean computation for each of
+500 alternating CSGRS sphere/box operations:
+
+| operation | cloned polygons | borrowed polygons | result |
+| --- | ---: | ---: | ---: |
+| union | 1,235.264 ms | 1,224.814 ms | 0.85% faster |
+| difference | 995.178 ms | 987.234 ms | 0.80% faster |
+
+A follow-up that also borrowed each polygon's retained vertex cycle was
+rejected. Avoiding its temporary `Vec<Point3>` changed union by -0.10% and
+difference by +0.06%, which is noise, while adding a second materialization
+branch.
+
+Validation passed the default and all-feature matrices (956 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 359 `boolean_pipeline` executions without failure, and the
+downstream CSGRS library suite passed all 304 tests.
+
+## 2026-07-19: borrow convex support planes during classification
+
+Status: **kept**
+
+Certified two-convex classification used a second owned support-plane table
+even though the input polygon soup remains alive for the whole preparation.
+For the sphere/box workload this cloned every exact normal and offset before
+performing read-only equality, classification, and clipping queries. The table
+now borrows each source polygon's support plane. Emitted fragments still own
+their source or derived polygon geometry, so immediate result ownership is
+unchanged.
+
+Five interleaved release runs per side forced a fresh Boolean computation for each of
+500 alternating CSGRS sphere/box operations:
+
+| operation | cloned support planes | borrowed support planes | result |
+| --- | ---: | ---: | ---: |
+| union | 1,234.734 ms | 1,216.364 ms | 1.49% faster |
+| difference | 1,004.544 ms | 995.970 ms | 0.85% faster |
+
+Validation passed the default and all-feature matrices (956 unit tests, 59/60
+core integration tests, and 48 regressions with one benchmark smoke test
+ignored), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 359 `boolean_pipeline` executions without failure, and the
+downstream CSGRS library suite passed all 304 tests.
+
+## 2026-07-19: stop source-plane classification at exact crossing
+
+Status: **kept**
+
+Once one source-triangle vertex is exactly positive and another is exactly
+negative against an opposing support plane, the triangle's `Crossing` relation
+cannot change. The classifier previously continued through the remaining
+vertex. It now returns immediately, avoiding an unnecessary prepared predicate
+query and allowing a decided crossing even when a later irrelevant query would
+be undecidable.
+
+Wall-clock movement was below scheduler noise, so five interleaved release runs
+per side measured retired instructions for 500 alternating immediate operations:
+
+| operation | visit every vertex | stop at crossing | result |
+| --- | ---: | ---: | ---: |
+| union | 11,289,466,082 | 11,277,251,607 | 0.108% fewer instructions |
+| difference | 9,012,280,707 | 8,999,990,649 | 0.136% fewer instructions |
+
+Every paired run retired fewer instructions. The focused test also verifies
+that only the two decisive source points enter the exact point/plane cache.
+
+Validation passed the default and all-feature matrices (957 unit tests, 59/60
+core tests, and 48 regressions plus one intentional ignore), the no-default-
+feature check, warning-denied Clippy and rustdoc, benchmark and fuzz-target
+builds, and the release WASM demo. A 20-second ASAN campaign completed 358
+`boolean_pipeline` executions without failure, and the downstream CSGRS library
+suite passed all 304 tests.
+
+## 2026-07-19: reduce exact output centroids once
+
+Status: **kept**
+
+Expanded polygon boundaries require a centroid fan to preserve the certified
+closed output. Each coordinate previously accumulated canonical `Real` sums
+and then performed another exact division. Exact-rational coordinates now use
+Hyperreal's borrowed mean reducer, which chooses one common-denominator
+schedule and canonicalizes only the final mean. Non-rational coordinates keep
+the original exact `Real` sum and division path, and triangulation topology is
+unchanged.
+
+Preserved release binaries each prepared 500 fresh sphere/box arrangements.
+Seven counter runs measured:
+
+| operation | repeated reduction | one final reduction | result |
+| --- | ---: | ---: | ---: |
+| union | 11,171,163,355 | 10,665,871,420 | 4.52% fewer instructions |
+| difference | 8,915,422,180 | 8,599,082,893 | 3.55% fewer instructions |
+
+Cycles fell 4.89% for union and 3.60% for difference. In the matched
+five-sample cross-kernel run, cold exact difference reached 1.966 ms versus
+CGAL EPECK's 1.882 ms, while cold union measured 3.097 ms versus 2.496 ms.
+Retained CSGRS remained 22.33x faster than CGAL for difference and 17.75x for
+union, and exceeded the tight OpenCascade rows at both temperatures.
+
+Validation passed the default and all-feature matrices (957 unit tests, all 60
+core tests, and 48 regressions plus one intentional ignore), the no-default-
+feature check, warning-denied Clippy and rustdoc, benchmark and fuzz-target
+builds, and the release WASM demo. A 20-second ASAN campaign completed 376
+`boolean_pipeline` executions without failure, and the downstream CSGRS library
+suite passed all 304 tests.
+
+## 2026-07-19: center expanded fans from source geometry
+
+Status: **kept**
+
+An exact T-junction expands a convex polygon's emitted boundary but does not
+change the polygon interior. The closure-preserving triangle fan therefore now
+chooses its center from the original polygon vertex cycle instead of averaging
+every inserted boundary point. The center remains a strict convex combination
+inside the same support plane, while the exact fan boundary, triangle count,
+source provenance, and represented surface remain unchanged. A focused
+regression inserts a midpoint into a source triangle edge and verifies that the
+fan retains the source triangle's exact `(2/3, 2/3, 0)` centroid.
+
+Preserved release binaries each prepared 500 fresh sphere/box arrangements.
+Seven counter runs measured:
+
+| operation | expanded-boundary mean | source-cycle mean | result |
+| --- | ---: | ---: | ---: |
+| union | 10,664,618,650 | 9,926,385,863 | 6.92% fewer instructions |
+| difference | 8,599,114,266 | 8,294,119,288 | 3.55% fewer instructions |
+
+Cycles fell 4.91% for union and 2.79% for difference. A two-midpoint dyadic
+interior point was rejected after increasing union instructions by 0.81%.
+
+Certified convex arrangements now also expose the already-constructed exact
+source support normal by global source triangle and output orientation. The
+lookup validates retained source identity and returns no value for general
+arrangements that consumed their source polygon carrier. This lets downstream
+adapters reuse exact support work without adding normals to `BooleanMesh` or
+changing its public storage contract.
+
+Validation passed the default and all-feature matrices (958 unit tests, 60/61
+core integration tests, and 48 regressions plus one intentional benchmark
+ignore), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 352 `boolean_pipeline` executions without failure. The
+downstream CSGRS default and all-feature suites passed all 305/369 library tests
+and their integration tests.
+
+## 2026-07-19: emit construction fans directly
+
+Status: **kept**
+
+Closed-arrangement triangulation formerly allocated one boundary vector and
+one triangle vector for every emitted polygon, then copied each temporary fan
+into the final triangle soup. It now reserves each boundary from the known
+polygon size, preallocates the final triangle/source rows, and appends
+construction-identity fans directly. A single pass skips consecutive segments
+with the same construction-edge identity while retaining the prior weakly
+convex fallback when fewer than three strict corners remain. Exact vertices,
+triangle order, source provenance, winding rows, and closure certification are
+unchanged.
+
+Preserved release binaries each performed 500 fresh sphere/box operations.
+Seven counter runs measured:
+
+| operation | temporary fans | direct fans | instruction result | cycle result |
+| --- | ---: | ---: | ---: | ---: |
+| union | 18,792,107,702 | 18,761,534,911 | 0.16% fewer | 0.98% fewer |
+| difference | 13,681,648,051 | 13,653,035,759 | 0.21% fewer | 0.73% fewer |
+
+Heap profiles of 25 unions fell from 1,045,599 to 1,038,724 allocations: 275
+allocations removed per operation, or 0.66% of the complete construction,
+Boolean, and materialization workload. Direct regressions cover an ordinary
+fan, a repeated collinear construction identity, and an uncertified fan that
+must leave output untouched for the exact fallback.
+
+Validation passed the default and all-feature matrices (961 unit tests, all 61
+core integration tests, and 48 regressions plus one intentional benchmark
+ignore), the no-default-feature check, warning-denied Clippy and rustdoc,
+benchmark and fuzz-target builds, and the release WASM demo. A 20-second ASAN
+campaign completed 370 `boolean_pipeline` executions without failure. The
+downstream CSGRS all-feature suite passed all 369 library tests and every
+integration test.
+
+## 2026-07-19: index certified source-point classifications
+
+Status: **kept**
+
+Certified-convex polygon edges retain the source mesh and their original endpoint
+indices. The vertex shared by the incoming and outgoing source edges therefore
+identifies the original source point without hashing its three arbitrary-precision
+coordinates. Source-plane classification now stores prepared point queries and
+per-plane results directly by that certified source index. Split, derived, or
+otherwise unlabeled points continue to use the exact coordinate-identity map, so
+the optimization changes neither the certified floating filter nor its exact
+fallback.
+
+Thirty deterministic counter runs over 500 alternating fresh sphere/box
+operations measured:
+
+| operation | coordinate-map instructions | source-index instructions | result | cycle result |
+| --- | ---: | ---: | ---: | ---: |
+| union | 9,936,194,568 | 9,861,417,347 | 0.75% fewer | 1.14% fewer |
+| difference | 7,860,766,245 | 7,787,262,464 | 0.94% fewer | 0.88% fewer |
+
+In the union profile, `prepare_two_convex_inputs_projectively` fell from 5.20%
+to 3.29% self time. Heap profiles of 50 unions fell only from 1,060,050 to
+1,059,904 allocations (2.92 allocations per operation), confirming that the
+measured CPU reduction comes primarily from avoiding arbitrary-precision
+coordinate hashing. A focused regression verifies that certified source
+vertices populate the indexed cache without touching the coordinate map, while
+the existing early-crossing regression continues to exercise the fallback map.
+
+Validation passed the default, all-feature, and all-target matrices (962 unit
+tests, all 61 core integration tests, and 48 regressions plus one intentional
+benchmark ignore), the no-default-feature check, warning-denied Clippy and
+rustdoc, benchmark and fuzz-target builds, and the release WASM demo. A
+20-second ASAN campaign completed 368 `boolean_pipeline` executions without
+failure. The downstream CSGRS all-feature suite passed all 370 library tests and
+every integration test.
+
+## 2026-07-19: borrow retained output vertex cycles
+
+Status: **kept**
+
+Output extraction and triangulation previously called `ConvexPolygon::vertices`
+even when the polygon already retained its exact affine vertex cycle. That call
+cloned the complete cycle into a temporary vector before the output path moved
+or cloned the same coordinates again. Public polygon extraction, fallback fan
+triangulation, and duplicate-vertex merging now borrow retained cycles directly;
+polygons without retained vertices preserve the computed affine fallback. The
+merge path also reserves its exact total input vertex count before collection.
+
+Eight alternating counter runs each performed 500 fresh, globally shifted
+sphere/box operations:
+
+| operation | temporary-cycle instructions | borrowed-cycle instructions | result | cycle result |
+| --- | ---: | ---: | ---: | ---: |
+| union | 9,988,951,430 | 9,955,446,701 | 0.34% fewer | 0.84% fewer |
+| difference | 8,520,274,492 | 8,489,569,986 | 0.36% fewer | 0.82% fewer |
+
+Heap profiles of 50 unions fell from 1,191,406 to 1,183,880 allocations: 7,526
+allocations removed in total, or 150.52 per operation and 0.63% of the complete
+construction, Boolean, and materialization workload. Exact `Real` coordinates,
+polygon order, source provenance, and the non-retained intersection fallback are
+unchanged.
+
+Validation passed the default, all-feature, and all-target matrices (962 unit
+tests, all 61 core integration tests, and 48 regressions plus one intentional
+benchmark ignore), the no-default-feature check, warning-denied Clippy and
+rustdoc, benchmark and fuzz-target builds, and the release WASM demo. A
+20-second ASAN campaign completed 371 `boolean_pipeline` executions without
+failure. The downstream CSGRS all-feature suite passed all 370 library tests and
+every integration test.
+
+## 2026-07-19: retain projected rational output vertices
+
+Status: **kept**
+
+Construction-aware T-junction filtering projected the same exact output vertex
+into many certified 2D line predicates, converting its arbitrary-precision
+coordinates and rebuilding conservative error radii each time. The output merge
+now retains each rational 3D query once when recovery filtering is enabled.
+Line endpoints and candidate queries select their two axes from those retained
+intervals; failed conversions, invalid projections, and uncertain filters still
+fall through to the unchanged exact point-on-segment predicate.
+
+Eight alternating counter runs each performed 500 fresh, globally shifted
+sphere/box operations:
+
+| operation | repeated-conversion instructions | retained-point instructions | result | cycle result |
+| --- | ---: | ---: | ---: | ---: |
+| union | 9,955,432,140 | 9,516,772,993 | 4.41% fewer | 4.04% fewer |
+| difference | 8,488,857,196 | 8,487,528,295 | 0.02% fewer | neutral |
+
+`Rational::to_f64_lossy` fell from 4.91% to 2.09% self time in the union
+profile. Heap profiles rose from 1,183,904 to 1,183,949 allocations over 50
+unions—only 0.9 allocation per operation for the retained-query vector. The
+Hyperreal regression suite locks positive, negative, uncertain, and invalid-axis
+filter behavior while Hypermesh's exact split-edge and output suites retain the
+same topology.
+
+Validation passed 962 unit tests, 60 default integration tests, 48 regression
+tests with the benchmark smoke test ignored, the complete all-target/all-feature
+suite, the no-default-feature build, Clippy with warnings denied, warning-clean
+documentation, benchmark compilation, every fuzz-target build, and the locked
+release WASM application build. A 20-second ASAN campaign completed 365
+`boolean_pipeline` executions without failure. The downstream CSGRS all-feature
+suite passed all 370 library tests and every integration test.
+
+## 2026-07-19: pack certified source classification rows
+
+Status: **kept**
+
+Certified source vertices previously stored one independently allocated plane-
+classification vector per vertex. The indexed source path now retains prepared
+queries in one vector and classifications in one contiguous vertex-by-plane
+matrix. Coordinate-keyed fallback points keep their existing independent cache,
+and a changed plane count fails closed instead of indexing an incompatible row.
+
+Eight alternating counter runs each performed 500 fresh, globally shifted 8x4
+sphere/box operations:
+
+| operation | per-vertex rows instructions | packed rows instructions | result | cycle result |
+| --- | ---: | ---: | ---: | ---: |
+| union | 8,048,764,677 | 8,037,695,540 | 0.14% fewer | 0.29% fewer |
+| difference | 6,796,668,533 | 6,787,164,684 | 0.14% fewer | 0.17% fewer |
+
+Heap profiles over 100 unions fell from 1,912,386 to 1,909,782 allocations,
+removing 2,604 allocations, or 26.04 per operation. The source-relation
+regression now verifies both packed query and classification occupancy.
+
+Validation passed the complete 962-test all-target/all-feature suite, the no-
+default-feature build, Clippy with warnings denied, warning-clean documentation,
+benchmark compilation, every fuzz-target build, and the locked release WASM
+application build. A 20-second ASAN campaign completed 373 `boolean_pipeline`
+executions without failure. The downstream CSGRS all-feature suite passed all
+370 library tests and every integration test.
+
+## 2026-07-20: store retained triangle facts in shared slices
+
+Status: **kept**
+
+Input triangles retained their three exact affine vertices and three source-edge
+identities as `Arc<Vec<_>>`. Each fixed-size cache therefore allocated both an
+`Arc` owner and a separate `Vec` buffer. These internal caches now use
+`Arc<[_]>`; triangle construction places each three-element array directly in
+one shared allocation, while variable-size derived cycles convert their owned
+vectors at the same boundary. Exact coordinates, edge identities, clone
+sharing, polygon order, and every public type remain unchanged.
+
+An isolated cold CSGRS sphere/box union under Callgrind fell from 55,517,396 to
+55,466,235 retired instructions, 51,161 fewer instructions (0.092%). A complete
+47-workload CSGRS/CGAL/OpenCascade sweep kept all warm CSGRS rows ahead of both
+comparison kernels. The cold sphere/box union measured 2.083 ms versus CGAL's
+2.024 ms (0.972x), while the related difference, intersection, and symmetric
+difference rows remained CSGRS wins.
+
+Two nearby ideas were rejected by deterministic measurement. Carrying selected
+fragment orientation through operation-scoped triangulation changed 55,517,396
+instructions to 55,518,574, and a per-arrangement prepared-plane filter cache
+increased the count to 55,531,805. The existing winding and global predicate
+filter paths are already cheaper for this workload.
+
+Validation passed all 962 unit tests, 60 core integration tests, and 48
+regressions plus one intentional benchmark ignore; all-target benchmark
+harnesses, warning-denied Clippy, rustdoc, and every fuzz-target build were
+clean. A 20-second ASAN `boolean_pipeline` campaign completed 369 executions
+without failure (LeakSanitizer was disabled because the runner uses ptrace).
+The downstream CSGRS all-feature suite passed all 373 library tests and the
+nine focused exact adapter/differential tests.
+
+## 2026-07-20: retain certified input vertices by source index
+
+Status: **kept**
+
+Certified two-convex preparation previously cloned the three exact source
+positions into every triangle even though `TriangleMeshRef` already supplied an indexed
+position pool. Deferred input polygons now retain one shared exact position
+slice per source mesh plus their three source indices. Owned vertex cycles
+remain available for ordinary input, clipping, inversion, and derived output,
+so this changes neither the public API nor exact fallback behavior. A regression
+verifies that adjacent triangles share the pool while preserving each indexed
+cycle and its affine materialization.
+
+The same projective candidate also built an approximate AABB for every deferred
+triangle. That candidate classifies directly against indexed support planes and
+does not query polygon bounds. Deferred polygons now omit those unused bounds;
+if candidate construction fails, preparation rebuilds ordinary bounded input
+before entering BVH or subdivision code.
+
+On the isolated cold CSGRS sphere/box union, shared indexed positions reduced
+Callgrind's count from 55,466,235 to 55,344,048 instructions. Omitting unused
+deferred AABBs reduced it again to 54,906,147: 560,088 fewer instructions
+(1.01%) than the preceding checkpoint and 611,249 fewer (1.10%) than the
+original 55,517,396 baseline. In the final 47-workload cross-kernel sweep, cold
+sphere/box union measured 1.973 ms versus CGAL's 2.095 ms, a 1.062x CSGRS win;
+the related difference, intersection, and symmetric-difference rows also won,
+and every warm CSGRS row remained ahead of both CGAL and OpenCascade.
+
+Validation passed all 963 unit tests, 60 core integration tests, and 48
+regressions plus one intentional benchmark ignore, including every benchmark
+harness. Warning-denied Clippy, rustdoc, and every fuzz-target build were clean.
+A 20-second ASAN `boolean_pipeline` campaign completed 373 executions without
+failure (LeakSanitizer remained disabled because the runner uses ptrace). The
+downstream CSGRS all-feature suite passed all 373 library tests.
+
+## 2026-07-21: bound one-shot root leaf caches
+
+Status: **kept**
+
+Large certified root leaves populated the host-BSP and BSP-leaf-certification
+caches even though a completed root attempt returns immediately and can never
+query those entries. Each entry retained a clone of the complete polygon
+family. On the 1,140-facet YeahRight convex-hull/box arrangement, the dispatch
+trace reported one subdivision task and Heaptrack attributed 480 full-family
+clones (323.94 MiB) to BSP certification plus 160 clones (107.98 MiB) to host
+BSP leaves. The root path now computes those values once without retaining
+them; recursive tasks keep the existing caches because split retries can reuse
+their results. Probe-query caches are likewise scoped to one classification so
+unrelated exact probes do not retain one another's search state.
+
+Five fresh-process runs produced a 944.8 ms median with 81.6--82.5 MiB peak
+RSS, versus the 1.341 s and 569,956 KiB baseline: 29.5% lower latency and 85.5%
+lower peak RSS. Heaptrack fell from 6,589,299 to 5,020,891 allocations and from
+534.04 MiB to 67.74 MiB peak heap. Output remained 5,152 polygons with checksum
+675,298,388. The refreshed native comparison measured 930.7 ms cold and 941.9
+ms warm for CSGRS, 1.66x faster than OpenCascade; CGAL EPECK remains the target
+to close at 9.0 ms cold.
+
+Validation passed the complete 970-test all-target/all-feature unit suite and
+all integration, regression, and benchmark targets, the no-default-feature
+build, warning-denied Clippy, rustdoc, and every fuzz-target build. A 20-second
+ASAN `boolean_pipeline` campaign completed 380 executions without failure. All
+nine downstream CSGRS exact Hypermesh adapter and differential tests passed.
+The concurrent CSGRS curve conversion edit left the broader downstream run at
+389/390; its sole curved-region failure is outside this subdivision change.
+
+## 2026-07-27: direct rational predicate evidence APIs
+
+Status: **kept**
+
+The exact-rational plane filter and homogeneous query retain only the compact
+values needed for repeated classification, but callers now construct those
+values directly instead of entering a prepared-object lifecycle. Internal
+point and plane wrappers are named for the predicate evidence they carry.
+One-shot callers use the immediate certified-sign API, while the existing
+bounded caches continue to reuse filters and queries where measurement
+previously established a benefit.
+
+The serialized subdivided-cube union gate measured 80.350 ms versus the
+80.657 ms baseline. An accepted repeat of the four cube operations reported
+no Criterion regression: union 2.284 ms, intersection 2.191 ms, difference
+2.239 ms, and symmetric difference 2.373 ms. The first repeat drifted upward
+across all four operations; the already-built binary returned to the baseline
+range on the next serialized run.
+
+## 2026-07-27: direct rational output line APIs
+
+Status: **kept**
+
+Projected rational output predicates now construct point queries and line
+filters directly rather than entering a prepared-object lifecycle. One-shot
+callers can use Hyperreal's immediate certified line-sign API. Construction-
+aware T-junction recovery retains the same compact coordinate intervals and
+line filters because the earlier counter gate established their benefit;
+uncertain filters still reach the exact point-on-segment predicate.
+
+The serialized cube triangle-output gate reported no Criterion regression.
+Baseline/candidate medians were 2.302/2.307 ms for union, 2.285/2.300 ms for
+intersection, 2.274/2.291 ms for difference, and 2.413/2.434 ms for symmetric
+difference. The larger YeahRight immediate triangle-soup union measured
+10.302/10.356 ms, a change within Criterion's noise threshold.
+
+## 2026-07-28: original full-resolution mesh measurements
+
+This historical run used the original YeahRight control mesh as an always-on
+competitive input. The corpus has since moved to the opt-in benchmark download
+described in `README.md`; the measurements below are retained for comparison.
+
+Fresh serialized Criterion import measurements were:
+
+| engine | full control mesh import |
+| --- | ---: |
+| Hypermesh | 2.90--3.00 ms |
+| boolmesh | 7.98--8.23 ms |
+| manifold-rust | 5.70--5.75 ms |
+| tri-mesh | 1.89--1.90 ms |
+
+The original rotated-copy Boolean remains an ignored explicit hard test at the
+same 11,894-by-11,894-triangle resolution. It is intentionally outside routine
+gates because the corresponding CSGRS workload previously reached about
+116 GiB RSS.
+
+## Completed reference disposition
+
+All reference-derived ideas are mapped as follows:
+
+- **EMBER:** exact plane predicates, local BSP construction, segment tracing,
+  early-outs, caches, split ranking, and reference propagation were audited.
+  Measured workloads—including a 384-polygon exact leaf—complete in the local
+  classifier. Recursive split and work-stealing ideas are architecture-
+  inapplicable until that execution policy changes.
+- **Mesh Arrangements:** intersection reuse, arrangement cell construction,
+  exact winding-vector propagation, output extraction, and repair avoidance.
+  Pair symmetry, BVH culling, operation-local exact-result caching, and
+  triangle predicate reuse are implemented and benchmarked. Public retained
+  arrangement reuse was evaluated and subsequently removed in favor of cold
+  immediate-operation performance.
+- **Generalized Winding Numbers:** the hierarchy, retained winding evidence,
+  boundary behavior, and repeated-query model have been audited. A 384-polygon
+  certified leaf now covers the paper's size scale, but a shared exact segment
+  hierarchy was 42.7% slower. Its approximate solid-angle threshold and graph
+  cut are incompatible with the exact closed-PWN contract; a different result
+  would require a zero-copy hierarchy design or an intentional contract change.

@@ -1,0 +1,318 @@
+diff --git a/crates/hypermesh/CHANGELOG.md b/crates/hypermesh/CHANGELOG.md
+index 978c2a25f1..7cf848b349 100644
+--- a/crates/hypermesh/CHANGELOG.md
++++ b/crates/hypermesh/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [0.1.0] - Unreleased
+ 
++- Make convex-hull eye scheduling independent of symbolic approximation caches.
++  Equal rational scheduling scores use the least retained input index; symbolic
++  inputs use input order. Exact visibility, source coordinates and typed failures
++  stay authoritative. Hull rows/diagonals may change; see the
++  [migration](../../docs/MIGRATIONS.md#cache-independent-convex-hull-scheduling-2026-11-04)
++  and [qualification](PERFORMANCE.md#r30-cache-independent-hull-scheduling-2026-11-04).
++
+ Initial release.
+ 
+ Hypermesh provides exact Boolean operations on 3D triangle meshes for the
+diff --git a/crates/hypermesh/FUTURE_WORK.md b/crates/hypermesh/FUTURE_WORK.md
+index 184fae5b3e..febf205888 100644
+--- a/crates/hypermesh/FUTURE_WORK.md
++++ b/crates/hypermesh/FUTURE_WORK.md
+@@ -14,7 +14,7 @@ Strict hulls and Booleans of csgrs `solid::sphere` meshes used to stop on exact
+ 
+ **What remains.**
+ - **Cost.** These workloads complete, but slowly. Release builds take about 9 s for the four Booleans of `boolean_operations` and about 7 s for `convex_hull`; debug builds take about 70 s and 55 s. A strict hull of the 32 × 16 sphere alone takes 17 s in release. The proof itself is a small part of that: 5.5% of retired instructions in `boolean_operations`. Structural sign facts (`exact_quadratic_surd_parts` through the Laurent normal form) take about 38%, and bounded refinement about 29%. A generator-side certificate could still save work, but it is no longer needed for completion.
+-- **Hull row stability.** A second strict hull of the same 32 × 16 sphere mesh in one process can return different rows and a different triangulation of its coplanar faces, though the hull is the same set. This happens when the first hull starts from coordinates with no cached approximation. With the coordinates' binary64 projections computed first, which leaves those projections unchanged, three successive hulls agreed. Fresh processes agree. The 24 × 12 and 17 × 9 hulls and the Booleans gave identical rows. The earlier sampled-sphere trial traced this to eye selection: farthest-point ties between cospherical points are broken by the order in which points are found. P27 asks for deterministic rows. Breaking ties by point index would fix this, but it changes the certified rows of existing degenerate hulls, so it needs a recorded migration.
++- **Hull row stability.** The [R30 qualification](PERFORMANCE.md#r30-cache-independent-hull-scheduling-2026-11-04) supersedes the earlier diagnosis. The original 32 × 16 sphere reproduces different cold/repeated rows; a tie-only fix still fails because 40 coordinate views change by one binary64 bit. Symbolic eye scheduling now uses input order, with deterministic ties for stored rational distances. Fresh/repeated/warmed/cloned/rebuilt and cold-process witnesses retain exact trigonometric coordinates and construction qualification. Changed diagonals and artifact rows are an explicit migration. General cache/resource and broader determinism qualification remain open; this is not permutation-invariant triangulation.
+ - **Domain limits.** The proof only shows that a value is zero. A nonzero value below the refinement limit stays undecided. Other square roots, field orders above 16384 or degrees above 1024, graphs above 4096 distinct nodes, and more than 2^25 work charges also stay undecided. These limits are typed declines, not answers.
+ - **Rational stereographic sampling** would make every predicate rational. It changes the sampled geometry, so it would need an explicit migration.
+ 
+diff --git a/crates/hypermesh/PERFORMANCE.md b/crates/hypermesh/PERFORMANCE.md
+index 2701aab1e9..52602b46cd 100644
+--- a/crates/hypermesh/PERFORMANCE.md
++++ b/crates/hypermesh/PERFORMANCE.md
+@@ -10,6 +10,131 @@ adaptive spatial subdivision, together with Mesh Arrangements' separation of
+ arrangement construction from winding-number extraction: approximate data may
+ organize work, but it must never decide topology, classification, or output.
+ 
++## R30 cache-independent hull scheduling (2026-11-04)
++
++Status: kept for fixed-input representation correctness, with adverse costs.
++Owner: Hypermesh's hull eye selector, P27/P36; exact point deduplication,
++visibility, source coordinates, certainty and typed failures remain authoritative.
++The input is the existing finite 3D point-set domain, including retained facts.
++This is an intentional row/diagonal migration, not a performance-only refactor.
++
++### Reproduction and sufficient change
++
++On `d64c01aa69f31b37ddb14ea24f15c9f489f88aeb`, the original 32-by-16
++trigonometric sphere yields different vertex/triangle rows on consecutive
++strict hull calls. A direct equal-score test also chooses the last discovered
++point. An index tie-break alone fixes that test but still fails the sphere.
++A temporary trace retains identical seeds `[0,1,2,16]` and 482 points, but 40
++coordinate views change by one binary64 bit. The first different eye is number
++53: face `[377,406,422]` selects point 392 cold and 407 warm. The old account
++that unchanged coordinate projections left only discovery-order ties was
++incomplete. The original inputs and both failed variants remain in evidence.
++
++Stored rational coordinates retain distance scheduling through fresh rational
++views, independent of primitive approximation caches. Equal scores select the
++least retained input index. If any coordinate is symbolic, the selector uses
++input order; lossy coordinates still organize the BVH. No tolerance or sampled
++geometry replaces an exact coordinate. No new field, cache or geometry kernel
++is introduced.
++
++QuickHull requires an eye in the certified outside set, not a mathematically
++farthest point. Every selected eye still comes from that set; exact visibility
++and the existing horizon update preserve its convex-hull invariant for any
++such eye. Changing selection order can change diagonals and predicate order.
++The seed, scalar predicates, horizon rules and output qualification are not
++replaced. This qualifies the documented R30 scheduling workload, not every
++possible symbolic seed/predicate cache transition or a permutation-invariant
++triangulation. See [migration](../../docs/MIGRATIONS.md#cache-independent-convex-hull-scheduling-2026-11-04).
++
++### Exact acceptance and continuation
++
++The independent rational determinant checks every source point against every
++output halfspace. Eight known cube corners or 30 rational unit-sphere points
++prove the required extreme points; closed-PWN validation and original-point
++identity are separate checks. Both policies, three fixed input permutations,
++zero or `sqrt(2)` translations, interior/duplicate/coplanar points and all three
++public hull entry points are exercised. Tiny, rounded and overflowing
++scheduling views at powers -1100, -600, 60 and 1100 preserve distinct exact
++vertices. A convex intersection consumes the hull and feeds a further hull,
++with the same independent set oracle.
++
++The original 32-by-16 source is retained with exact trigonometric coordinates.
++Fresh, repeated, manually warmed, cloned and rebuilt hulls compare exact
++source-index/triangle rows and construction qualification. A fresh native child
++reconstructs the source before comparing the parent artifact. Neighboring
++24-by-12 and 17-by-9 sources exercise both policies. Existing sampled-sphere
++Boolean/hull and successive-operation tests remain unchanged. Finite checks do
++not establish all symbolic determinism or general operation/resource closure.
++
++### Matched completed-workload observations
++
++Nine controls use the same pinned inputs, features, allocator, validation and
++native row materialization in both revisions. Three alternating process pairs
++on one allowed CPU give 876 measured calls: 60 per revision for seven ordinary
++controls and nine per revision for each sphere. Sample zero is cold; later
++samples reuse the input. Hull construction and closed-PWN validation are timed;
++native JSON rows are generated afterward and compared separately. All calls
++complete with Certified local receipts. Geometry equality is not inferred from
++hashes. Five artifact rows agree with the baseline; curved-shell, symbolic-cube
++and both sphere artifacts intentionally change. Candidate rows agree across
++all repeated calls and fresh processes; baseline sphere32 rows do not.
++
++| Control | Candidate/base cold median | Candidate/base warm median |
++| --- | ---: | ---: |
++| Tetrahedron | 0.859 | 0.944 |
++| Coplanar-group API | 0.988 | 0.888 |
++| Retained-fact API | 1.045 | 0.855 |
++| 4,913-point grid | 0.930 | 0.924 |
++| 64-point moment curve | 0.988 | 0.999 |
++| 684-point curved shell | 1.027 | 0.965 |
++| Symbolically translated cube cloud | 3.387 | 3.538 |
++| 32-by-16 trigonometric sphere | 1.138 | 1.128 |
++| 17-by-9 trigonometric sphere | 1.169 | 1.195 |
++
++The symbolic cube's warm median is 12.569 ms versus 3.553 ms, with requested
++allocation traffic about 14.45 MB versus 4.23 MB. Sphere32 is 12.686 s versus
++11.245 s warm, about 10.27–10.30 GB versus 8.61–8.62 GB requested traffic.
++Sphere17 is 1.487 s versus 1.244 s warm, about 1.291 GB versus 1.025–1.028 GB.
++Rational tetrahedron, grid and moment-curve allocation sets and logical peaks
++agree; the curved-shell traffic grows slightly. Adverse observations remain.
++These shared-host medians are not a statistical speedup or nonregression claim.
++The correctness migration is retained despite its symbolic scheduling cost.
++
++Both matched native probe executables are 2,677,256 bytes; their hashes differ.
++Three mechanically shared exact geometry recipes execute in fresh zero-import
++WASM instances: 2,926,532-byte test artifact, runner maximum RSS 76,808 KiB.
++These are probe sizes, not library-only or installed-distribution measurements.
++Input-owned caches remain alive in allocation/drop observations. There is no
++new total-work, coefficient-growth, memory or cancellation-latency bound.
++
++### Validation and retained evidence
++
++The frozen three Rust source hashes bind these final checks:
++
++- `cargo test --offline --locked --release --all-features -p hypermesh`:
++  299 passing executions, seven existing ignores, 13 batches including docs.
++- Root release/dispatch-trace tests `hull_determinism`, `sampled_sphere_strict`,
++  `successive_operations`, `downstream_solids`, `construction_evidence` and
++  `receipt_composition`: 53 passes, six existing ignores. The original ignored
++  32-by-16 sphere hull is run separately and passes. Minimal-feature root
++  `hull_determinism`: three passes including its fresh child. Total: 356 native
++  executions; the three WASM recipes are additional.
++- Stable 1.98.1 and MSRV 1.95.0 warning-denied Clippy: all Hypermesh targets
++  and features, plus the six affected root test targets with dispatch traces.
++  Strict rustdoc for Hypermesh/root and the standalone Hypermesh fuzz-target
++  compile check pass. Workspace format, whitespace and retention checks pass.
++
++The first root witness used an equality assertion that dumped verbose scalar
++internals on failure; its unchanged geometry now uses a concise row assertion.
++The initial downstream command named a nonexistent `solid_regressions` target;
++the corrected command uses the actual six targets above. A first cost harness
++reimported `Ordering` from its allocator include; the corrected build is warning
++free. The initial owner-filtered command ran no new integration tests; the final
++full owner command runs all three unfiltered. These failures remain distinct
++from completed geometry and are retained in evidence.
++No runtime fuzz/sanitizer campaign, full pre-push CI, installed distribution,
++production binding qualification or push is claimed by this increment.
++
+ ## 2026-10-23: store crossing coordinates as their exact normal form
+ 
+ Status: **kept**
+diff --git a/crates/hypermesh/src/convex_hull.rs b/crates/hypermesh/src/convex_hull.rs
+index 689c26391d..f6fedd614b 100644
+--- a/crates/hypermesh/src/convex_hull.rs
++++ b/crates/hypermesh/src/convex_hull.rs
+@@ -89,13 +89,27 @@ pub(crate) fn convex_hull_impl(
+     let approximate_points = points
+         .iter()
+         .map(|point| {
+-            [
+-                point.x.to_f64_lossy().unwrap_or(0.0),
+-                point.y.to_f64_lossy().unwrap_or(0.0),
+-                point.z.to_f64_lossy().unwrap_or(0.0),
+-            ]
++            point.coordinates().map(|coordinate| {
++                // A fresh exact-rational view cannot inherit a symbolic
++                // primitive approximation cached before a rational proof.
++                coordinate
++                    .exact_rational_ref()
++                    .map_or_else(
++                        || coordinate.to_f64_lossy(),
++                        |value| Real::new(value.clone()).to_f64_lossy(),
++                    )
++                    .unwrap_or(0.0)
++            })
+         })
+         .collect::<Vec<_>>();
++    // Primitive approximations of symbolic values may change as their shared
++    // computation caches refine. They may schedule the BVH, but must not choose
++    // a different hull representation. Stored rational coordinates have fixed
++    // projections; otherwise use the first unprocessed input point as the eye.
++    let eye_points = points
++        .iter()
++        .all(PointCoordinates::has_exact_rational_coordinates)
++        .then_some(approximate_points.as_slice());
+     let point_bvh =
+         match ExactPointBvh::build_with_approximate(decisions, &points, &approximate_points) {
+             Ok(point_bvh) => Some(point_bvh),
+@@ -132,7 +146,7 @@ pub(crate) fn convex_hull_impl(
+         if !face.active {
+             return None;
+         }
+-        pop_farthest_outside(face, &approximate_points, &processed).map(|point| (index, point))
++        pop_farthest_outside(face, eye_points, &processed).map(|point| (index, point))
+     }) {
+         processed[eye] = true;
+         let mut visible = Vec::new();
+@@ -192,7 +206,7 @@ pub(crate) fn convex_hull_impl(
+ 
+ fn pop_farthest_outside(
+     face: &mut HullFace,
+-    points: &[[f64; 3]],
++    points: Option<&[[f64; 3]]>,
+     processed: &[bool],
+ ) -> Option<usize> {
+     face.outside.retain(|&point| !processed[point]);
+@@ -203,8 +217,15 @@ fn pop_farthest_outside(
+         .max_by(|left, right| {
+             let left = *left.1;
+             let right = *right.1;
+-            approximate_face_distance(points, face.vertices, left)
+-                .total_cmp(&approximate_face_distance(points, face.vertices, right))
++            points
++                .map_or(std::cmp::Ordering::Equal, |points| {
++                    approximate_face_distance(points, face.vertices, left)
++                        .total_cmp(&approximate_face_distance(points, face.vertices, right))
++                })
++                // Outside discovery may follow different certified BVH paths
++                // after caches warm. Equal scheduling scores must not inherit
++                // that order. Deduplication retains the first input index.
++                .then_with(|| right.cmp(&left))
+         })?
+         .0;
+     Some(face.outside.swap_remove(farthest))
+@@ -610,6 +631,37 @@ mod tests {
+         Point3::new(Real::from(x), Real::from(y), Real::from(z))
+     }
+ 
++    #[test]
++    fn equal_eye_scores_choose_the_least_input_index_in_any_discovery_order() {
++        let points = [
++            [0.0, 0.0, 0.0],
++            [1.0, 0.0, 0.0],
++            [0.0, 1.0, 0.0],
++            [0.0, 0.0, 1.0],
++            [1.0, 1.0, 1.0],
++            [2.0, 0.0, 1.0],
++        ];
++        for outside in [vec![3, 4, 5], vec![5, 3, 4], vec![4, 5, 3]] {
++            let mut face = HullFace {
++                vertices: [0, 1, 2],
++                outside,
++                active: true,
++            };
++            let mut processed = [false; 6];
++            for expected in 3..6 {
++                assert_eq!(
++                    pop_farthest_outside(&mut face, Some(&points), &processed),
++                    Some(expected)
++                );
++                processed[expected] = true;
++            }
++            assert_eq!(
++                pop_farthest_outside(&mut face, Some(&points), &processed),
++                None
++            );
++        }
++    }
++
+     #[test]
+     fn tetrahedron_hull_is_closed_and_outward() {
+         let input = vec![p(0, 0, 0), p(2, 0, 0), p(0, 2, 0), p(0, 0, 2)];
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 1057295084..0b0aeb956d 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -1,5 +1,22 @@
+ # Migrations
+ 
++## Cache-independent convex-hull scheduling (2026-11-04)
++
++Hypermesh's three convex-hull entry points now break equal scheduling scores
++by the first retained input index. If any coordinate is symbolic, eyes are
++chosen by input index instead of lossy distance. Stored rational coordinates
++retain distance scheduling through fresh exact-rational views. Certified
++visibility predicates, source coordinates, set semantics and failure types
++are unchanged.
++
++Triangle diagonals, row order and checksums may change, including for existing
++degenerate/coplanar hulls. Update artifact baselines intentionally; matching
++sets and matching serialized rows are separate checks. Fixed-input repeatability
++does not promise identical rows after input permutation. The original 32-by-16
++sampled sphere retains its trigonometric coordinates; it is not resampled.
++See the [R30 qualification](../crates/hypermesh/PERFORMANCE.md#r30-cache-independent-hull-scheduling-2026-11-04)
++for the reproduced failures, independent set checks and measured costs.
++
+ ## Polynomial pair chart admission (2026-11-04)
+ 
+ Native polynomial graph pairs with proved rational relative similarities now
+diff --git a/docs/research-program.md b/docs/research-program.md
+index a6edd30915..b139920567 100644
+--- a/docs/research-program.md
++++ b/docs/research-program.md
+@@ -150,7 +150,7 @@ part of this program's execution or coordination.
+ | R27 | Place each exact section vertex once while streaming wall rows | pending |
+ | R28 | Use certified nonconstant circular images to reject line fitting | shortcut rejected: thirty native pairs preserve 5,760 outcome-row pairs and improve circle queries, but five simultaneous protected intervals regress. Only seven independent fit/degeneracy/receipt tests and a correction to the misleading `NotLine` description are retained. All eight final checks pass, including 63 Hypercurve and 24 downstream tests. |
+ | R29 | Factor only measured duplicated SDF setup and finalization | pending |
+-| R30 | Make degenerate hull tie selection independent of cache warmth | pending |
++| R30 | Make degenerate hull tie selection independent of cache warmth | scheduling fix retained for the documented cold/repeated sphere and exact hull corpus; a tie-only fix fails because symbolic coordinate views change. Input-order symbolic scheduling restores rows, with explicit artifact migration and adverse symbolic costs. See the [owner qualification](../crates/hypermesh/PERFORMANCE.md#r30-cache-independent-hull-scheduling-2026-11-04). Broader symbolic seed/cache determinism and resource closure remain open. |
+ 
+ The bounded alternatives are tracked separately so an old rejected variant
+ cannot silently close a different research hypothesis:
