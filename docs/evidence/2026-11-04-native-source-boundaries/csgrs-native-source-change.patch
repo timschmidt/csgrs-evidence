@@ -1,0 +1,885 @@
+diff --git a/docs/SIMPLIFICATION-API-ADMISSION.md b/docs/SIMPLIFICATION-API-ADMISSION.md
+index a4a2f28..af02c42 100644
+--- a/docs/SIMPLIFICATION-API-ADMISSION.md
++++ b/docs/SIMPLIFICATION-API-ADMISSION.md
+@@ -4,6 +4,8 @@ This is the D01/D02 checkpoint of CSGRS's November 2026 simplification/API
+ program. Source parent: `a63c4c9`; required CSGRS API: `d9b06483a3`.
+ The sibling monorepo layout is intentional. This is source-path qualification,
+ not installed-package delivery or a release-ready claim.
++The native-source follow-up below supersedes the original two-failure snapshot:
++the near-coincident case now passes; B-text extrusion remains a CI failure.
+ 
+ ## Implemented contract
+ 
+@@ -127,3 +129,76 @@ projection/welding. Authoritative native-carrier export, finite-boundary
+ validation and the normal fallbacks still require review. The two full-library
+ CI failures above remain open; that expensive suite was not rerun for this
+ private export-helper correction.
++
++## Native source, display and export follow-up
++
++Each compiled/rendered part now retains its authoritative `TriangleMesh` in
++OpenSCAD Z-up coordinates. The same native source reaches the application and
++export path; derived Bevy buffers remain Y-up display projections. Shared native
++geometry is cloned through its Arc storage, extending its lifetime without
++duplicating coordinate/expression buffers. This increases retained memory; the
++48-byte increase in the part value is not a total retained-heap measurement.
++
++The unchanged near-coincident cylinder fixture reproduces distinct exact
++vertices rounding to equal binary32 display positions. Hypermesh's native GPU
++API constructs finite normals from exact triangles and permits this display
++collapse. SynapsCAD now reuses that API, keeps GPU errors and their typed causes,
++and retains the exact source. The original fifteen-case rotation test passes.
++No display position, normal or index is consumed as source geometry by export.
++
++STL uses the native serializer and rejects binary32 triangle collapse before
++replacing a file. OBJ uses native geometry serialization with application-only
++material/group records. 3MF projects the native source to binary64 and validates
++encoded triangles through the native predicates. Original exact triangles are
++also validated first: the collinear points `(0,0)`, `(1/2,1/5)`, `(3/2,3/5)`
++can appear nondegenerate after rounding. Removing this preflight reproduced
++false export success. Orphan native positions also fail explicitly. Numerical
++conversion/validation errors are returned before file creation; this is not a
++promise of transactional recovery from later filesystem errors.
++
++All three formats ignore edits to display buffers. Tests retain the thin-box
++write/read regressions, native axes and winding, global OBJ indices, source-order
++material ownership, and an exported/reimported two-part model used as a further
++exact Boolean operand (independent volumes 25 then 24).
++
++This is an explicit API/artifact migration: external `MeshData` struct literals
++now need a native `source`; exports use authored Z-up coordinates and native
++winding instead of the previous renderer-buffer convention. OBJ/3MF no longer
++weld renderer copies, OBJ omits derived normal records and requests flat shading,
++and native GPU projection may change display coordinates/normals at float
++rounding boundaries. Cross-revision byte identity is not claimed. Plain format
++files remain lossy, omit native source receipts, and do not certify source
++fidelity or general preservation of topology after projection.
++
++Final focused checks: 43 binary/UI tests and four conversion tests pass;
++warning-denied all-target Clippy, native release build, WASM binary and fuzz-target
++compilation, rustdoc, formatting and whitespace checks pass. The unchanged
++configured CI command terminated with exit 101: 64 passed, one failed, two
++ignored and 53 filtered, in 935.18 seconds. B-text extrusion still times out;
++no fixture, assertion or workflow exclusion was weakened. A separately labelled
++run excluding B for diagnosis passed 64 tests, with two ignored and 54 filtered;
++it is not a passing replacement for the CI command. The configured library
++run predates final test-only/documentation edits; current conversion witnesses
++were rerun, and final export changes have their complete binary test run.
++
++The ordinary through-hole preview matches installed OpenSCAD 2021.01 visually.
++At both tiny rotation angles, OpenSCAD reports a non-manifold result and differs
++visually; images and warnings are retained. General visual conformance, especially
++those degenerate reference cases, is not established.
++
++Cost is adverse: a warm source-carrying shim of the prior normal calculation
++versus the native GPU route measures about 0.006/0.022 ms for a cube, 11.2/83.2 ms
++for a 528-triangle sphere, 0.010/0.051 ms for a drilled body, and 0.248/1.335 ms
++for a rotated cylinder (20 alternating pairs each, one shared-host process).
++These paths have different display outputs and this is a capability migration,
++not a performance-only optimization or a matched end-to-end speedup claim.
++The candidate default scene completes three times in 288–320 ms with 20 parts,
++2,632 native triangles, five views and no failures or warnings. The unchanged
++benchmark driver also completes `default:all` at its default `$fn=16` in a
++single 480 ms smoke run; no paired speedup is inferred. Native normal
++construction/reuse cost remains a research target.
++
++Source retention for models that cannot produce any finite f32 display buffer,
++full projected-topology guarantees, exact native file replay and installed
++distribution remain open. No push is qualified while configured CI fails. The
++CSGRS evidence index retains this follow-up separately from earlier checkpoints.
+diff --git a/src/compiler/evaluator/tests.rs b/src/compiler/evaluator/tests.rs
+index 88991cf..d02258d 100644
+--- a/src/compiler/evaluator/tests.rs
++++ b/src/compiler/evaluator/tests.rs
+@@ -624,16 +624,19 @@ fn compile_to_merged_mesh(code: &str) -> MeshData {
+                 !parts.is_empty(),
+                 "No mesh parts produced; warnings={warnings:?}"
+             );
++            let mut sources = Vec::new();
+             let mut positions = Vec::new();
+             let mut normals = Vec::new();
+             let mut indices = Vec::new();
+             for part in parts {
++                sources.push(part.source);
+                 let offset = u32::try_from(positions.len()).expect("mesh exceeds u32 indexing");
+                 positions.extend(part.positions);
+                 normals.extend(part.normals);
+                 indices.extend(part.indices.iter().map(|i| i + offset));
+             }
+             MeshData {
++                source: solid::merge(&sources).expect("merge native test sources"),
+                 positions,
+                 normals,
+                 indices,
+diff --git a/src/compiler/geometry/conversions.rs b/src/compiler/geometry/conversions.rs
+index 1a97a25..65413b0 100644
+--- a/src/compiler/geometry/conversions.rs
++++ b/src/compiler/geometry/conversions.rs
+@@ -11,8 +11,11 @@ fn render_failure(message: impl Into<String>) -> ShapeFailure {
+ ///
+ /// # Errors
+ ///
+-/// Returns an error when the mesh is empty or an exact coordinate or normal
+-/// cannot be represented as a finite `f32`.
++/// Returns an error when exact triangles are invalid, the mesh is empty, or
++/// native GPU construction cannot produce finite coordinates and normals.
++/// A display projection may collapse distinct exact vertices. Normals are
++/// constructed from the authoritative source, which remains attached to the part;
++/// projected buffers establish no topology or source-fidelity claim.
+ pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, ShapeFailure> {
+     let valid = mesh
+         .has_unique_nondegenerate_triangles(&crate::compiler::MESH_CONTEXT)
+@@ -22,60 +25,12 @@ pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, Shape
+             "mesh contains duplicate or degenerate exact triangles",
+         ));
+     }
+-    let vertex_capacity = mesh
+-        .triangles
+-        .len()
+-        .checked_mul(3)
+-        .ok_or_else(|| render_failure("finite mesh projection exceeds addressable memory"))?;
+-    let mut positions = Vec::with_capacity(vertex_capacity);
+-    let mut normals = Vec::with_capacity(vertex_capacity);
+-    let mut indices = Vec::with_capacity(vertex_capacity);
+-    for (triangle_index, triangle) in mesh.triangles.iter().enumerate() {
+-        let finite_position = |index: usize| -> Result<[f32; 3], ShapeFailure> {
+-            mesh.positions
+-                .get(index)
+-                .ok_or_else(|| {
+-                    render_failure(format!(
+-                        "triangle {triangle_index} references missing position {index}"
+-                    ))
+-                })?
+-                .to_f32_array_lossy()
+-                .ok_or_else(|| {
+-                    render_failure(format!(
+-                        "triangle {triangle_index} has an unrepresentable finite position"
+-                    ))
+-                })
+-        };
+-        let [a, b, c] = triangle.indices().map(finite_position);
+-        let [a, b, c] = [a?, b?, c?];
+-        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+-        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+-        let cross = [
+-            ab[1].mul_add(ac[2], -(ab[2] * ac[1])),
+-            ab[2].mul_add(ac[0], -(ab[0] * ac[2])),
+-            ab[0].mul_add(ac[1], -(ab[1] * ac[0])),
+-        ];
+-        let squared_norm =
+-            cross[0].mul_add(cross[0], cross[1].mul_add(cross[1], cross[2] * cross[2]));
+-        if !squared_norm.is_finite() || squared_norm <= 0.0 {
+-            return Err(render_failure(format!(
+-                "triangle {triangle_index} collapses at the finite rendering boundary"
+-            )));
+-        }
+-        let inverse_norm = squared_norm.sqrt().recip();
+-        let normal = cross.map(|component| component * inverse_norm);
+-        let base = u32::try_from(positions.len())
+-            .map_err(|_| render_failure("finite mesh projection exceeds u32 indexing"))?;
+-        let second = base
+-            .checked_add(1)
+-            .ok_or_else(|| render_failure("finite mesh projection exceeds u32 indexing"))?;
+-        let third = base
+-            .checked_add(2)
+-            .ok_or_else(|| render_failure("finite mesh projection exceeds u32 indexing"))?;
+-        positions.extend([a, b, c]);
+-        normals.extend([normal; 3]);
+-        indices.extend([base, second, third]);
+-    }
++    let gpu = mesh
++        .try_to_gpu_mesh_f32()
++        .map_err(|error| ShapeFailure::kernel("native GPU projection failed", error))?;
++    let positions = gpu.positions;
++    let normals = gpu.normals;
++    let indices = gpu.indices;
+     if positions.is_empty() {
+         return Err(render_failure("mesh has no vertices"));
+     }
+@@ -85,6 +40,7 @@ pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, Shape
+     let normals = normals.into_iter().map(|[x, y, z]| [x, z, -y]).collect();
+ 
+     Ok(MeshData {
++        source: mesh.clone(),
+         positions,
+         normals,
+         indices,
+@@ -121,6 +77,51 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn display_collapse_retains_native_source_and_finite_normals() {
++        use csgrs::solid::SolidExt;
++        use std::sync::Arc;
++        let exact = solid::cube(1)
++            .unwrap()
++            .translated(10_000_000_000_u64, 0, 0)
++            .unwrap();
++        let projected = triangle_mesh_to_mesh_data(&exact).unwrap();
++        assert!(Arc::ptr_eq(&exact.positions, &projected.source.positions));
++        assert!(Arc::ptr_eq(&exact.triangles, &projected.source.triangles));
++        assert_eq!(
++            exact.construction_evidence(),
++            projected.source.construction_evidence()
++        );
++        assert!(projected.positions.as_chunks::<3>().0.iter().any(|t| {
++            let [a, b, c] = t.map(|p| p.map(f32::to_bits));
++            a == b || a == c || b == c
++        }));
++        assert!(projected.normals.iter().flatten().all(|n| n.is_finite()));
++        assert_eq!(projected.indices.len(), exact.triangles.len() * 3);
++        let validation = projected
++            .source
++            .has_unique_nondegenerate_triangles(&crate::compiler::MESH_CONTEXT)
++            .unwrap();
++        assert!(validation.value);
++    }
++
++    #[test]
++    fn native_gpu_projection_error_keeps_its_typed_cause() {
++        use csgrs::solid::SolidExt;
++        let exact = solid::cube(1)
++            .unwrap()
++            .translated(csgrs::decimal("1e40").unwrap(), 0, 0)
++            .unwrap();
++        let error = triangle_mesh_to_mesh_data(&exact).unwrap_err();
++        assert!(matches!(
++            error.kernel_error(),
++            Some(csgrs::Error::Gpu(
++                hypermesh::GpuMeshError::AttributeApproximationFailed { .. }
++            ))
++        ));
++        assert!(std::error::Error::source(&error).is_some());
++    }
++
+     #[test]
+     fn renderer_boundary_rejects_duplicate_exact_triangle_geometry() {
+         let cube = solid::cube(Real::one()).unwrap();
+diff --git a/src/compiler/types.rs b/src/compiler/types.rs
+index f846eda..42993b7 100644
+--- a/src/compiler/types.rs
++++ b/src/compiler/types.rs
+@@ -3,6 +3,9 @@ use super::failure::{FailedPart, PartEvidence};
+ /// Triangle mesh data ready for Bevy rendering.
+ #[derive(Debug)]
+ pub struct MeshData {
++    /// Authoritative native geometry in `OpenSCAD`'s Z-up coordinates.
++    /// Display buffers are derived projections and must never replace this source.
++    pub source: csgrs::TriangleMesh,
+     /// Vertex positions in Bevy's Y-up coordinate system.
+     pub positions: Vec<[f32; 3]>,
+     /// Per-vertex normals parallel to [`Self::positions`].
+diff --git a/src/export.rs b/src/export.rs
+index 24f804f..41682c2 100644
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -1,37 +1,7 @@
+ use crate::plugins::compilation::StlMeshData;
+-use std::collections::HashMap;
+-use std::io::Write;
++use std::fmt::Write;
+ use std::path::Path;
+ 
+-/// Deduplicate equal finite renderer positions, retaining the first occurrence.
+-/// Flat shading duplicates positions; export must not merge distinct positions
+-/// or infer manifoldness from equality alone. Signed zeros denote one position.
+-#[allow(clippy::cast_possible_truncation)]
+-fn weld_vertices(positions: &[[f32; 3]], indices: &[u32]) -> (Vec<[f32; 3]>, Vec<u32>) {
+-    let mut vmap: HashMap<[u32; 3], u32> = HashMap::new();
+-    let mut new_positions: Vec<[f32; 3]> = Vec::new();
+-    let mut new_indices: Vec<u32> = Vec::with_capacity(indices.len());
+-
+-    for &idx in indices {
+-        let pos = positions[idx as usize];
+-        let key = pos.map(|coordinate| {
+-            if coordinate == 0.0 {
+-                0
+-            } else {
+-                coordinate.to_bits()
+-            }
+-        });
+-        let new_idx = *vmap.entry(key).or_insert_with(|| {
+-            let i = new_positions.len() as u32;
+-            new_positions.push(pos);
+-            i
+-        });
+-        new_indices.push(new_idx);
+-    }
+-
+-    (new_positions, new_indices)
+-}
+-
+ /// Supported export formats.
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ pub enum ExportFormat {
+@@ -67,6 +37,32 @@ pub fn export_parts(
+     path: &Path,
+     format: ExportFormat,
+ ) -> Result<(), String> {
++    for part in parts {
++        if part.source.positions.is_empty() && part.source.triangles.is_empty() {
++            continue;
++        }
++        if part.source.triangles.is_empty() {
++            return Err(format!(
++                "Part @{} has orphan native positions without triangles",
++                part.part
++            ));
++        }
++        let valid = part
++            .source
++            .has_unique_nondegenerate_triangles(&csgrs::GeometryContext::STRICT.mesh_context())
++            .map_err(|error| {
++                format!(
++                    "Part @{} native export validation failed: {error}",
++                    part.part
++                )
++            })?;
++        if !valid.value {
++            return Err(format!(
++                "Part @{} has duplicate or degenerate native triangles",
++                part.part
++            ));
++        }
++    }
+     match format {
+         ExportFormat::Stl => export_stl(parts, path),
+         ExportFormat::Obj => export_obj(parts, path),
+@@ -74,150 +70,105 @@ pub fn export_parts(
+     }
+ }
+ 
+-/// Binary STL export (no colors).
+-#[allow(clippy::cast_possible_truncation, clippy::tuple_array_conversions)]
+-fn export_stl(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
+-    let mut file =
+-        std::fs::File::create(path).map_err(|e| format!("Failed to create file: {e}"))?;
+-
+-    let total_triangles: u32 = parts.iter().map(|p| (p.indices.len() / 3) as u32).sum();
+-
+-    // Binary STL begins with an arbitrary 80-byte header and triangle count.
+-    let mut header = [0u8; 80];
+-    let label = b"SynapsCAD STL Export";
+-    header[..label.len()].copy_from_slice(label);
+-    file.write_all(&header).map_err(|e| e.to_string())?;
+-    file.write_all(&total_triangles.to_le_bytes())
+-        .map_err(|e| e.to_string())?;
+-
+-    for part in parts {
+-        for tri in part.indices.chunks(3) {
+-            // Swap v1/v2 to produce CCW winding (outward normals);
+-            // internal mesh uses CW order.
+-            let (v0, v1, v2) = (
+-                part.positions[tri[0] as usize],
+-                part.positions[tri[2] as usize],
+-                part.positions[tri[1] as usize],
+-            );
+-            let u = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+-            let v = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+-            let n = [
+-                u[1].mul_add(v[2], -(u[2] * v[1])),
+-                u[2].mul_add(v[0], -(u[0] * v[2])),
+-                u[0].mul_add(v[1], -(u[1] * v[0])),
+-            ];
+-            let len = n[2].mul_add(n[2], n[0].mul_add(n[0], n[1] * n[1])).sqrt();
+-            let normal = if len > 0.0 {
+-                [n[0] / len, n[1] / len, n[2] / len]
+-            } else {
+-                [0.0, 0.0, 1.0]
+-            };
+-
+-            for &c in &normal {
+-                file.write_all(&c.to_le_bytes())
+-                    .map_err(|e| e.to_string())?;
+-            }
+-            for vtx in [v0, v1, v2] {
+-                for c in vtx {
+-                    file.write_all(&c.to_le_bytes())
+-                        .map_err(|e| e.to_string())?;
+-                }
+-            }
+-            file.write_all(&0u16.to_le_bytes())
+-                .map_err(|e| e.to_string())?;
+-        }
++/// Project native source positions to binary64 and check every encoded triangle.
++/// This is a format-boundary check, not a proof of original-source fidelity or
++/// general preservation of intersections/topology under coordinate projection.
++fn native_positions_f64(part: &StlMeshData) -> Result<Vec<[f64; 3]>, String> {
++    use hyperlattice::Point3;
++    let positions = part
++        .source
++        .positions
++        .iter()
++        .map(|point| {
++            point.to_f64_array_lossy().ok_or_else(|| {
++                format!(
++                    "Part @{} has an unrepresentable binary64 export position",
++                    part.part
++                )
++            })
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    let projected = csgrs::TriangleMesh::new(
++        positions
++            .iter()
++            .map(|p| {
++                Point3::new(
++                    csgrs::Real::try_from(p[0]).expect("finite projection"),
++                    csgrs::Real::try_from(p[1]).expect("finite projection"),
++                    csgrs::Real::try_from(p[2]).expect("finite projection"),
++                )
++            })
++            .collect(),
++        part.source.triangles.to_vec(),
++    );
++    let valid = projected
++        .has_unique_nondegenerate_triangles(&csgrs::GeometryContext::STRICT.mesh_context())
++        .map_err(|error| format!("Part @{} export validation failed: {error}", part.part))?;
++    if !valid.value {
++        return Err(format!(
++            "Part @{} has duplicate or degenerate triangles after binary64 export projection",
++            part.part
++        ));
+     }
++    Ok(positions)
++}
+ 
+-    Ok(())
++/// Binary STL owns its binary32 projection and rejects collapsed triangles.
++fn export_stl(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
++    let source = csgrs::solid::merge(&parts.iter().map(|p| p.source.clone()).collect::<Vec<_>>())
++        .map_err(|error| error.to_string())?;
++    let bytes =
++        csgrs::io::stl::to_stl_binary(&source, "SynapsCAD").map_err(|error| error.to_string())?;
++    std::fs::write(path, bytes).map_err(|error| error.to_string())
+ }
+ 
+-/// OBJ + MTL export (with per-part colors).
++/// OBJ geometry is serialized by the native format implementation. Application
++/// records add only per-part groups and materials; vertex/face records are kept.
+ fn export_obj(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
+     let mtl_path = path.with_extension("mtl");
+     let mtl_filename = mtl_path.file_name().unwrap_or_default().to_string_lossy();
+-
+-    let mut obj =
+-        std::fs::File::create(path).map_err(|e| format!("Failed to create OBJ file: {e}"))?;
+-    let mut mtl =
+-        std::fs::File::create(&mtl_path).map_err(|e| format!("Failed to create MTL file: {e}"))?;
+-
+-    writeln!(obj, "# SynapsCAD OBJ Export").map_err(|e| e.to_string())?;
+-    writeln!(obj, "mtllib {mtl_filename}").map_err(|e| e.to_string())?;
+-    writeln!(mtl, "# SynapsCAD MTL Export").map_err(|e| e.to_string())?;
+-
+-    let mut vertex_offset = 1usize;
+-    let mut normal_global_offset = 0usize;
+-
+-    for (i, part) in parts.iter().enumerate() {
+-        let mat_name = format!("part_{}", i + 1);
+-        let color = part.color.unwrap_or([0.7, 0.7, 0.7]);
+-
+-        writeln!(mtl, "newmtl {mat_name}").map_err(|e| e.to_string())?;
+-        writeln!(mtl, "Kd {} {} {}", color[0], color[1], color[2]).map_err(|e| e.to_string())?;
+-        writeln!(mtl, "Ka 0.1 0.1 0.1").map_err(|e| e.to_string())?;
+-        writeln!(mtl, "Ks 0.3 0.3 0.3").map_err(|e| e.to_string())?;
+-        writeln!(mtl, "Ns 100.0").map_err(|e| e.to_string())?;
+-        writeln!(mtl, "d 1.0").map_err(|e| e.to_string())?;
+-
+-        writeln!(obj, "o part_{}", i + 1).map_err(|e| e.to_string())?;
+-        writeln!(obj, "usemtl {mat_name}").map_err(|e| e.to_string())?;
+-
+-        let (welded_pos, welded_idx) = weld_vertices(&part.positions, &part.indices);
+-
+-        for pos in &welded_pos {
+-            writeln!(obj, "v {} {} {}", pos[0], pos[1], pos[2]).map_err(|e| e.to_string())?;
+-        }
+-
+-        for tri in welded_idx.chunks(3) {
+-            let verts = [
+-                welded_pos[tri[0] as usize],
+-                welded_pos[tri[2] as usize],
+-                welded_pos[tri[1] as usize],
+-            ];
+-            let edge1 = [
+-                verts[1][0] - verts[0][0],
+-                verts[1][1] - verts[0][1],
+-                verts[1][2] - verts[0][2],
+-            ];
+-            let edge2 = [
+-                verts[2][0] - verts[0][0],
+-                verts[2][1] - verts[0][1],
+-                verts[2][2] - verts[0][2],
+-            ];
+-            let cross = [
+-                edge1[1].mul_add(edge2[2], -(edge1[2] * edge2[1])),
+-                edge1[2].mul_add(edge2[0], -(edge1[0] * edge2[2])),
+-                edge1[0].mul_add(edge2[1], -(edge1[1] * edge2[0])),
+-            ];
+-            let len = cross[2]
+-                .mul_add(cross[2], cross[0].mul_add(cross[0], cross[1] * cross[1]))
+-                .sqrt();
+-            let normal = if len > 0.0 {
+-                [cross[0] / len, cross[1] / len, cross[2] / len]
+-            } else {
+-                [0.0, 0.0, 1.0]
+-            };
+-            writeln!(obj, "vn {} {} {}", normal[0], normal[1], normal[2])
+-                .map_err(|e| e.to_string())?;
+-        }
+-
+-        // OBJ indices are one-based; swap the last two vertices for CCW winding.
+-        let normal_offset = normal_global_offset;
+-        for (fi, tri) in welded_idx.chunks(3).enumerate() {
+-            let (a, b, c) = (
+-                tri[0] as usize + vertex_offset,
+-                tri[2] as usize + vertex_offset,
+-                tri[1] as usize + vertex_offset,
+-            );
+-            let ni = normal_offset + fi + 1;
+-            writeln!(obj, "f {a}//{ni} {b}//{ni} {c}//{ni}").map_err(|e| e.to_string())?;
++    let sources = parts
++        .iter()
++        .map(|part| {
++            native_positions_f64(part)?;
++            Ok(part.source.clone())
++        })
++        .collect::<Result<Vec<_>, String>>()?;
++    let source = csgrs::solid::merge(&sources).map_err(|error| error.to_string())?;
++    let native = csgrs::io::obj::to_obj(&source, "SynapsCAD").map_err(|error| error.to_string())?;
++    let mut obj = format!("# SynapsCAD OBJ Export\nmtllib {mtl_filename}\ns off\n");
++    let mut mtl = String::from("# SynapsCAD MTL Export\n");
++    for part in parts {
++        let n = part.part;
++        let c = part.color.unwrap_or([0.7, 0.7, 0.7]);
++        writeln!(
++            mtl,
++            "newmtl part_{n}\nKd {} {} {}\nKa 0.1 0.1 0.1\nKs 0.3 0.3 0.3\nNs 100\nd 1.0",
++            c[0], c[1], c[2]
++        )
++        .expect("writing to String");
++    }
++    let mut part_index = 0;
++    let mut faces_in_part = 0;
++    for line in native.lines() {
++        if line.starts_with("f ") {
++            while part_index < parts.len()
++                && faces_in_part == parts[part_index].source.triangles.len()
++            {
++                part_index += 1;
++                faces_in_part = 0;
++            }
++            if faces_in_part == 0 {
++                let n = parts[part_index].part;
++                writeln!(obj, "o part_{n}\nusemtl part_{n}").expect("writing to String");
++            }
++            faces_in_part += 1;
+         }
+-
+-        vertex_offset += welded_pos.len();
+-        normal_global_offset += welded_idx.len() / 3;
++        obj.push_str(line);
++        obj.push('\n');
+     }
+-
+-    Ok(())
++    std::fs::write(path, obj).map_err(|error| format!("Failed to write OBJ: {error}"))?;
++    std::fs::write(mtl_path, mtl).map_err(|error| format!("Failed to write MTL: {error}"))
+ }
+ 
+ /// 3MF export (with per-part colors via `ColorGroup`).
+@@ -271,23 +222,13 @@ fn export_3mf(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
+         let object_id = first_part_id + i;
+         let mut mesh = Mesh::new();
+ 
+-        let (welded_pos, welded_idx) = weld_vertices(&part.positions, &part.indices);
+-
+-        for pos in &welded_pos {
+-            mesh.vertices.push(Vertex::new(
+-                f64::from(pos[0]),
+-                f64::from(pos[1]),
+-                f64::from(pos[2]),
+-            ));
++        for pos in native_positions_f64(part)? {
++            mesh.vertices.push(Vertex::new(pos[0], pos[1], pos[2]));
+         }
+ 
+-        for tri_indices in welded_idx.chunks(3) {
+-            // The 3MF specification requires CCW winding; internal meshes use CW.
+-            let mut tri = Triangle::new(
+-                tri_indices[0] as usize,
+-                tri_indices[2] as usize,
+-                tri_indices[1] as usize,
+-            );
++        for triangle in part.source.triangles.iter() {
++            let [a, b, c] = triangle.indices();
++            let mut tri = Triangle::new(a, b, c);
+             if let Some(Some(color_idx)) = part_color_indices.get(i) {
+                 tri.pid = Some(color_group_id);
+                 tri.pindex = Some(*color_idx);
+@@ -296,7 +237,7 @@ fn export_3mf(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
+         }
+ 
+         let mut object = Object::new(object_id);
+-        object.name = Some(format!("Part {}", i + 1));
++        object.name = Some(format!("Part {}", part.part));
+         object.mesh = Some(mesh);
+         model.resources.objects.push(object);
+     }
+@@ -336,13 +277,11 @@ mod tests {
+     use hyperlattice::Point3;
+     use hypermesh::Triangle;
+ 
+-    /// A closed box whose two x planes are distinct even in binary32.
+-    fn thin_box() -> StlMeshData {
+-        let width = csgrs::ratio(1, 16_777_216).unwrap();
+-        let exact = solid::cuboid(width, 1, 1).unwrap();
++    fn source_part(exact: TriangleMesh) -> StlMeshData {
+         let projected =
+             crate::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&exact).unwrap();
+         StlMeshData {
++            source: projected.source,
+             positions: projected.positions,
+             normals: projected.normals,
+             indices: projected.indices,
+@@ -352,6 +291,11 @@ mod tests {
+         }
+     }
+ 
++    /// A closed box whose two x planes are distinct even in binary32.
++    fn thin_box() -> StlMeshData {
++        source_part(solid::cuboid(csgrs::ratio(1, 16_777_216).unwrap(), 1, 1).unwrap())
++    }
++
+     fn assert_thin_closed_box(positions: Vec<[f32; 3]>, triangles: Vec<[usize; 3]>) {
+         assert_eq!(
+             positions.len(),
+@@ -436,10 +380,202 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn duplicate_signed_zero_positions_still_weld() {
+-        let positions = [[0.0, 1.0, 2.0], [-0.0, 1.0, 2.0], [0.0, 1.0, 2.0]];
+-        let (positions, indices) = weld_vertices(&positions, &[0, 1, 2]);
+-        assert_eq!(positions.len(), 1);
+-        assert_eq!(indices, vec![0, 0, 0]);
++    fn obj_export_ignores_display_buffer_edits() {
++        let path = std::env::temp_dir().join(format!("synaps-native-{}.obj", std::process::id()));
++        let mut part = thin_box();
++        export_parts(&[part.clone()], &path, ExportFormat::Obj).unwrap();
++        let original = std::fs::read_to_string(&path).unwrap();
++        for position in &mut part.positions {
++            position[0] += 64.0;
++        }
++        export_parts(&[part], &path, ExportFormat::Obj).unwrap();
++        let after_display_edit = std::fs::read_to_string(&path).unwrap();
++        std::fs::remove_file(&path).unwrap();
++        std::fs::remove_file(path.with_extension("mtl")).unwrap();
++        assert_eq!(
++            after_display_edit, original,
++            "display edits must not alter exported source geometry"
++        );
++    }
++
++    #[test]
++    fn stl_export_ignores_display_buffer_edits() {
++        let path = std::env::temp_dir().join(format!("synaps-native-{}.stl", std::process::id()));
++        let mut part = thin_box();
++        export_parts(&[part.clone()], &path, ExportFormat::Stl).unwrap();
++        let original = std::fs::read(&path).unwrap();
++        part.positions.clear();
++        part.normals.clear();
++        part.indices.clear();
++        export_parts(&[part], &path, ExportFormat::Stl).unwrap();
++        let after_display_edit = std::fs::read(&path).unwrap();
++        std::fs::remove_file(path).unwrap();
++        assert_eq!(after_display_edit, original);
++    }
++
++    #[test]
++    #[cfg(not(target_arch = "wasm32"))]
++    fn three_mf_export_ignores_display_buffer_edits() {
++        let path = std::env::temp_dir().join(format!("synaps-native-{}.3mf", std::process::id()));
++        let mut part = thin_box();
++        part.positions.clear();
++        part.normals.clear();
++        part.indices.clear();
++        part.part = 3;
++        let expected = native_positions_f64(&part).unwrap();
++        let triangles = part.source.triangles.clone();
++        export_parts(&[part], &path, ExportFormat::ThreeMf).unwrap();
++        let model = lib3mf::Model::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
++        std::fs::remove_file(path).unwrap();
++        assert_eq!(model.resources.objects[0].name.as_deref(), Some("Part 3"));
++        let mesh = model.resources.objects[0].mesh.as_ref().unwrap();
++        let positions: Vec<_> = mesh.vertices.iter().map(|p| [p.x, p.y, p.z]).collect();
++        assert_eq!(positions, expected);
++        assert_eq!(mesh.triangles.len(), triangles.len());
++        assert!(
++            mesh.triangles
++                .iter()
++                .zip(triangles.iter())
++                .all(|(a, b)| [a.v1, a.v2, a.v3] == b.indices())
++        );
++    }
++
++    #[test]
++    fn obj_parts_keep_native_axes_indices_and_material_ownership() {
++        use csgrs::solid::SolidExt;
++        let mut first = source_part(solid::cuboid(2, 3, 4).unwrap());
++        let mut second = source_part(solid::cube(1).unwrap().translated(10, 0, 0).unwrap());
++        first.part = 1;
++        second.part = 3;
++        second.color = Some([0.8, 0.4, 0.2]);
++        let source = solid::merge(&[first.source.clone(), second.source.clone()]).unwrap();
++        let path = std::env::temp_dir().join(format!("synaps-parts-{}.obj", std::process::id()));
++        export_parts(&[first, second], &path, ExportFormat::Obj).unwrap();
++        let text = std::fs::read_to_string(&path).unwrap();
++        let mtl = std::fs::read_to_string(path.with_extension("mtl")).unwrap();
++        std::fs::remove_file(&path).unwrap();
++        std::fs::remove_file(path.with_extension("mtl")).unwrap();
++        let restored = csgrs::io::obj::from_obj(text.as_bytes()).unwrap();
++        assert_eq!(restored.positions, source.positions);
++        assert_eq!(restored.triangles, source.triangles);
++        assert!(text.contains("o part_1\nusemtl part_1\nf "));
++        assert!(text.contains("o part_3\nusemtl part_3\nf "));
++        assert!(mtl.contains("newmtl part_1\nKd 0.2 0.4 0.8"));
++        assert!(mtl.contains("newmtl part_3\nKd 0.8 0.4 0.2"));
++        assert_eq!(
++            solid::exact_mass_properties(&restored, Real::one())
++                .unwrap()
++                .volume
++                .exact_rational_normal_form(),
++            Real::from(25).exact_rational_normal_form()
++        );
++        let next = restored.try_difference(&solid::cube(1).unwrap()).unwrap();
++        assert_eq!(
++            solid::exact_mass_properties(&next, Real::one())
++                .unwrap()
++                .volume
++                .exact_rational_normal_form(),
++            Real::from(24).exact_rational_normal_form()
++        );
++    }
++
++    #[test]
++    #[cfg(not(target_arch = "wasm32"))]
++    fn every_export_rejects_invalid_native_geometry_before_writing() {
++        let mut part = thin_box();
++        part.source = TriangleMesh::new(
++            vec![
++                Point3::origin(),
++                Point3::new(
++                    csgrs::ratio(1, 2).unwrap(),
++                    csgrs::ratio(1, 5).unwrap(),
++                    Real::zero(),
++                ),
++                Point3::new(
++                    csgrs::ratio(3, 2).unwrap(),
++                    csgrs::ratio(3, 5).unwrap(),
++                    Real::zero(),
++                ),
++            ],
++            vec![Triangle::new(0, 1, 2)],
++        );
++        for format in ALL_FORMATS {
++            let path = std::env::temp_dir().join(format!(
++                "synaps-invalid-native-{}.{}",
++                std::process::id(),
++                format.extension()
++            ));
++            std::fs::write(&path, b"previous complete artifact").unwrap();
++            let error = export_parts(&[part.clone()], &path, *format).unwrap_err();
++            assert!(error.contains("degenerate native triangles"), "{error}");
++            assert_eq!(std::fs::read(&path).unwrap(), b"previous complete artifact");
++            std::fs::remove_file(path).unwrap();
++        }
++    }
++
++    #[test]
++    #[cfg(not(target_arch = "wasm32"))]
++    fn every_export_rejects_orphan_native_positions() {
++        let mut part = thin_box();
++        part.source = TriangleMesh::new(vec![Point3::origin()], vec![]);
++        for format in ALL_FORMATS {
++            let path = std::env::temp_dir().join(format!(
++                "synaps-orphan-native-{}.{}",
++                std::process::id(),
++                format.extension()
++            ));
++            std::fs::write(&path, b"previous complete artifact").unwrap();
++            let error = export_parts(&[part.clone()], &path, *format).unwrap_err();
++            assert!(error.contains("orphan native positions"), "{error}");
++            assert_eq!(std::fs::read(&path).unwrap(), b"previous complete artifact");
++            std::fs::remove_file(path).unwrap();
++        }
++    }
++
++    #[test]
++    fn stl_projection_failure_preserves_existing_file() {
++        use csgrs::solid::SolidExt;
++        let part = source_part(
++            solid::cube(1)
++                .unwrap()
++                .translated(10_000_000_000_u64, 0, 0)
++                .unwrap(),
++        );
++        let path = std::env::temp_dir().join(format!("synaps-collapse-{}.stl", std::process::id()));
++        std::fs::write(&path, b"previous complete artifact").unwrap();
++        let error = export_parts(&[part], &path, ExportFormat::Stl).unwrap_err();
++        assert!(error.contains("degenerate triangle"), "{error}");
++        assert_eq!(std::fs::read(&path).unwrap(), b"previous complete artifact");
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn binary64_projection_failure_preserves_existing_obj() {
++        use csgrs::solid::SolidExt;
++        let part = source_part(
++            solid::cube(1)
++                .unwrap()
++                .translated(csgrs::decimal("1e20").unwrap(), 0, 0)
++                .unwrap(),
++        );
++        let path = std::env::temp_dir().join(format!("synaps-collapse-{}.obj", std::process::id()));
++        std::fs::write(&path, b"previous complete artifact").unwrap();
++        let error = export_parts(&[part], &path, ExportFormat::Obj).unwrap_err();
++        assert!(
++            error.contains("degenerate triangles after binary64"),
++            "{error}"
++        );
++        assert_eq!(std::fs::read(&path).unwrap(), b"previous complete artifact");
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn display_signed_zero_edits_keep_native_vertices() {
++        let mut part = thin_box();
++        let before = native_positions_f64(&part).unwrap();
++        for position in &mut part.positions {
++            *position = [-0.0; 3];
++        }
++        assert_eq!(native_positions_f64(&part).unwrap(), before);
+     }
+ }
+diff --git a/src/plugins/compilation.rs b/src/plugins/compilation.rs
+index 44f35b2..bb03830 100644
+--- a/src/plugins/compilation.rs
++++ b/src/plugins/compilation.rs
+@@ -105,6 +105,8 @@ impl Default for PartLabelVisibility {
+ 
+ #[derive(Clone)]
+ pub struct StlMeshData {
++    /// Authoritative native geometry; the finite buffers are for display only.
++    pub source: csgrs::TriangleMesh,
+     pub positions: Vec<[f32; 3]>,
+     pub normals: Vec<[f32; 3]>,
+     pub indices: Vec<u32>,
+@@ -443,6 +445,7 @@ fn compile_openscad(
+                 parts: parts
+                     .into_iter()
+                     .map(|m| StlMeshData {
++                        source: m.source,
+                         positions: m.positions,
+                         normals: m.normals,
+                         indices: m.indices,
