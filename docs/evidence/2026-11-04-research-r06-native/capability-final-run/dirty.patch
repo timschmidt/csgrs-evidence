@@ -1,0 +1,1334 @@
+diff --git a/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json b/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
+index d7bc64312d..ae056f861c 100644
+--- a/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
++++ b/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
+@@ -3252,6 +3252,30 @@
+       "validation": "Final production source passes the combined library/integration BRep and BRep IO corpus, the original vertical-section fixture with both solver-success and exact typed curve-blocker assertions, 41 root downstream tests and twelve owner/consumer doctests. Full Hypercurve coverage is completed across the initial native prefix and all 19 resumed targets after a recorded disk-quota interruption; the unchanged six-test chord replay target also passes separately. Stable/MSRV all-target Clippy, strict docs, standalone fuzz checks and focused native/WASM/ASan owner evidence pass. See the owner record for exact counts, source attribution and limits.",
+       "cost_evidence": "Owner qualification records matched finite-graph topology/native SVG costs and separately measures newly successful solver components with blocked native admission. No vertical BRep operation or BRep performance improvement is claimed.",
+       "limits": "Native selected vertical charts, complete pcurve/spatial transport, BRep replay and further section/solid operations remain open. Algebraic coefficient/bound and total-resource contracts remain open. All prior work-package statuses remain unchanged."
++    },
++    {
++      "id": "native-vertical-charts-2026-11-04",
++      "work_packages": [
++        "WP05a",
++        "WP05b",
++        "WP13",
++        "WP21"
++      ],
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "change": "Consume Hypercurve exchanged selected graph charts for whole vertical plane/tensor sections. Hypercurve owns the whole-image polynomial pullback/divisibility certificate; BRep retains spatial/pcurve parameterization validation. Native references select original graph-chart indices explicitly. Record grammar is unchanged.",
++      "source": "../tests/support/plane_tensor_sections.rs",
++      "evidence": "../../hypercurve/PERFORMANCE.md#r06-native-vertical-charts-2026-11-04",
++      "validation": "The original vertical section fixture now completes source relation checks, exact pcurves, image validation, native replay, general affine transport/revalidation and further plane contact. A squared vertical section also replays in a fresh process and retains defining exponent two. The single owner record reports final source qualification and storage failures separately.",
++      "cost_evidence": "Matched legacy native-curve workload allocation/outcome rows are unchanged; timing varies in both directions on a shared host. Newly completed native chart workloads are measured separately. BRep performance was not rebenchmarked.",
++      "limits": "General mixed-chart polynomial incidence remains intersection/Unsupported on the direct xy half-axis probe. Algebraic coefficient/bound admission, complete trimmed solids, implicit offset/corner closure and total-resource guarantees remain open. This increment does not complete R06/R07 or any broader work package."
+     }
+   ],
+   "work_packages": [
+diff --git a/crates/hyperbrep/docs/SUPPORT_MATRIX.md b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+index ce0661e816..36e8770825 100644
+--- a/crates/hyperbrep/docs/SUPPORT_MATRIX.md
++++ b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+@@ -410,11 +410,16 @@ prove an exact similarity reuse Hypercurve line sections while retaining their
+ original guards, so the replayed section remains intersectable. The
+ [implementation record](IMPLEMENTATION_STATUS.json) links the shared solver
+ qualification. Repeated finite-fiber sources retain defining exponents.
+-R06 additionally certifies whole vertical intervals at the solver, but native
+-vertical curve charts still return construction/Unsupported before section
+-publication. The original vertical tensor-section fixture tests both stages;
+-see the [owner qualification](../../hypersolve/PERFORMANCE.md#r06-vertical-topology-components-2026-11-04).
+-Native vertical charts and general trimmed arrangements remain open.
++R06 additionally admits rational vertical sections as selected exchanged native
++charts. The original vertical tensor-section fixture now completes both
++pcurves, whole-image validation, restriction/reversal, native save/reload,
++affine transport/revalidation and a further transverse plane cut. A squared
++vertical section also reconstructs its defining power in a fresh process.
++Hypercurve owns chart pullback and the sufficient polynomial identity proof;
++BRep retains its spatial/pcurve correspondence check. See the
++[owner qualification](../../hypercurve/PERFORMANCE.md#r06-native-vertical-charts-2026-11-04).
++General coefficient fields, complete mixed-chart intersections and trimmed
++arrangements remain open.
+ 
+ `CurveSurfacePoint` exposes `Parameter`, `GeometricPoint3` and
+ `CurveSurfaceContactKind::{Simple, Repeated, Boundary}`. The first two kinds
+diff --git a/crates/hyperbrep/src/geometry/plane_tensor.rs b/crates/hyperbrep/src/geometry/plane_tensor.rs
+index b9fdfbba60..1f41c250e7 100644
+--- a/crates/hyperbrep/src/geometry/plane_tensor.rs
++++ b/crates/hyperbrep/src/geometry/plane_tensor.rs
+@@ -189,21 +189,13 @@ impl Surface {
+         let Some(branch) = pcurve.polynomial_branch() else {
+             return Ok(false);
+         };
+-        if branch.image_transform().is_some() || !branch.rational_maps().is_empty() {
+-            return Ok(false);
+-        }
+         let plane = PlaneSurface {
+             origin: image.origin.clone(),
+             u: image.u.clone(),
+             v: image.v.clone(),
+         };
+         let (equation, map) = pullback(&plane, surface)?;
+-        if hypersolve::divide_bivariate_polynomial_exact(
+-            &equation,
+-            branch.topology().geometric_equation(),
+-        )
+-        .is_none()
+-        {
++        if !branch.certifies_polynomial_identity(&equation) {
+             return Ok(false);
+         }
+         let source = pcurve.rational_image(&map)?;
+diff --git a/crates/hyperbrep/src/persistence/polynomial.rs b/crates/hyperbrep/src/persistence/polynomial.rs
+index 67e26001f2..bbc1cb8919 100644
+--- a/crates/hyperbrep/src/persistence/polynomial.rs
++++ b/crates/hyperbrep/src/persistence/polynomial.rs
+@@ -181,13 +181,12 @@ impl RawPolynomialBranch {
+                 index: self.root,
+             });
+         }
+-        // Native curves use projection-slab and root order. Both indices have
+-        // been checked against the independently reconstructed complete graph.
+-        let offset: usize = source.topology().slabs()[..self.slab]
+-            .iter()
+-            .map(|slab| slab.arcs().len())
+-            .sum();
+-        let curve = &source.curves()[offset + self.root];
++        let curve = source.graph_branch(self.slab, self.root).ok_or(
++            PersistenceError::InvalidReference {
++                kind: "polynomial branch",
++                index: self.root,
++            },
++        )?;
+         let [start, end] = self.range;
+         let mut curve = curve
+             .subcurve(graph.curve_parameter(start)?, graph.curve_parameter(end)?)
+diff --git a/crates/hyperbrep/tests/plane_tensor_sections.rs b/crates/hyperbrep/tests/plane_tensor_sections.rs
+index ffcf075cc7..98a40d8fa0 100644
+--- a/crates/hyperbrep/tests/plane_tensor_sections.rs
++++ b/crates/hyperbrep/tests/plane_tensor_sections.rs
+@@ -36,3 +36,8 @@ fn empty_contained_boundary_and_solver_frontier() {
+ fn repeated_section_native_replay_is_cold() {
+     support::repeated_section_native_replay_is_cold();
+ }
++
++#[test]
++fn vertical_section_native_replay_is_cold() {
++    support::vertical_section_native_replay_is_cold();
++}
+diff --git a/crates/hyperbrep/tests/support/plane_tensor_sections.rs b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+index 461ed9d2c3..361481d67b 100644
+--- a/crates/hyperbrep/tests/support/plane_tensor_sections.rs
++++ b/crates/hyperbrep/tests/support/plane_tensor_sections.rs
+@@ -850,7 +850,7 @@ pub fn empty_contained_boundary_and_solver_frontier() {
+     }
+     let equation = polynomial(vec![vec![q(-1, 2)], vec![1.into()]]);
+     // Keep the original vertical-section input. R06 now certifies its whole
+-    // interval at the solver; native graph-chart admission remains a typed gap.
++    // interval at the solver and retains its exchanged native chart downstream.
+     let topology = decompose_bivariate_curve(
+         &equation,
+         &BivariateCurveDomain {
+@@ -865,12 +865,31 @@ pub fn empty_contained_boundary_and_solver_frontier() {
+     assert_eq!(topology.vertical_components().len(), 1);
+     assert_eq!(topology.vertical_components()[0].defining_exponent(), 1);
+     let surface = tensor([x(), y(), equation], one());
+-    let error = plane().intersect_surface(&surface).unwrap_err();
+-    assert!(
+-        matches!(error, GeometryError::PlanarCurve(hypercurve::ExactCurveError::Blocked(blocker))
+-        if blocker.operation() == hypercurve::CurveOperation2::Construction
+-            && blocker.reason() == hypercurve::UncertaintyReason::Unsupported)
+-    );
++    let sections = branches(plane().intersect_surface(&surface).unwrap());
++    assert_eq!(sections.len(), 1);
++    assert_eq!(sections[0].polynomial_contact_exponent(), Some(1));
++    check_correspondence(&sections[0], &plane(), &surface);
++    let model = model_and_replay(&sections, &surface, "vertical-section");
++    let cutting = Surface::plane(
++        Point3::new(0.into(), q(1, 2), 0.into()),
++        Vector3::x(),
++        Vector3::z(),
++    )
++    .unwrap();
++    for curve in model.curves() {
++        let CurveSurfaceIntersection::Points(contacts) =
++            cutting.intersect_curve(curve.geometry()).unwrap()
++        else {
++            panic!("one transverse recut after vertical replay")
++        };
++        assert_eq!(contacts.len(), 1);
++        assert!(
++            contacts[0]
++                .point
++                .coincides_with(&Point3::new(q(1, 2), q(1, 2), 0.into()).into())
++                .unwrap()
++        );
++    }
+ }
+ 
+ pub fn repeated_section_native_replay_is_cold() {
+@@ -957,3 +976,87 @@ pub fn repeated_section_native_replay_is_cold() {
+         String::from_utf8_lossy(&result.stderr)
+     );
+ }
++
++pub fn vertical_section_native_replay_is_cold() {
++    const INPUT: &str = "HYPERBREP_VERTICAL_REPLAY_INPUT";
++    fn consume(text: &str) {
++        let model = RawModel::from_json(text, &ArchiveLimits::default())
++            .unwrap()
++            .validate()
++            .unwrap();
++        assert_eq!(model.to_json().unwrap(), text);
++        assert_eq!(model.pcurves().count(), 2);
++        for pcurve in model.pcurves() {
++            assert_eq!(
++                pcurve
++                    .geometry()
++                    .curve()
++                    .polynomial_branch()
++                    .unwrap()
++                    .defining_exponent(),
++                2
++            );
++        }
++        revalidate_recorded_images(
++            &model,
++            &[(1.into(), 0.into()), (1.into(), 0.into())],
++            "cold-vertical-section",
++        );
++        let cutting = Surface::plane(
++            Point3::new(0.into(), q(1, 2), 0.into()),
++            Vector3::x(),
++            Vector3::z(),
++        )
++        .unwrap();
++        for curve in model.curves() {
++            let CurveSurfaceIntersection::Points(contacts) =
++                cutting.intersect_curve(curve.geometry()).unwrap()
++            else {
++                panic!("one vertical-section recut")
++            };
++            assert_eq!(contacts.len(), 1);
++            assert!(
++                contacts[0]
++                    .point
++                    .coincides_with(&Point3::new(q(1, 2), q(1, 2), 0.into()).into())
++                    .unwrap()
++            );
++        }
++    }
++    if let Some(path) = std::env::var_os(INPUT) {
++        consume(&std::fs::read_to_string(path).unwrap());
++        return;
++    }
++    let surface = tensor(
++        [
++            x(),
++            y(),
++            polynomial(vec![vec![q(1, 4)], vec![(-1).into()], vec![1.into()]]),
++        ],
++        one(),
++    );
++    let sections = branches(plane().intersect_surface(&surface).unwrap());
++    assert_eq!(sections.len(), 1);
++    assert_eq!(sections[0].polynomial_contact_exponent(), Some(2));
++    let model = model_and_replay(&sections, &surface, "vertical-section-cold-source");
++    let text = model.to_json().unwrap();
++    consume(&text);
++    let path = std::env::temp_dir().join(format!("hyperbrep-vertical-{}.json", std::process::id()));
++    std::fs::write(&path, text).unwrap();
++    let result = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "vertical_section_native_replay_is_cold",
++            "--nocapture",
++        ])
++        .env(INPUT, &path)
++        .output()
++        .unwrap();
++    std::fs::remove_file(path).unwrap();
++    assert!(
++        result.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&result.stdout),
++        String::from_utf8_lossy(&result.stderr)
++    );
++}
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index 67b1c147d4..1d4c0ac15a 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -2,6 +2,14 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Admit rational vertical polynomial components in selected exchanged charts.
++  Preserve full equations, factor powers and exact selected points through
++  restrictions, similarities, line sections, named filled operations and
++  native SVG/BRep replay. `graph_branch` checks source-chart references;
++  `certifies_polynomial_identity` supplies a sufficient whole-image proof.
++  General mixed-chart incidence and algebraic coefficient/bound admission
++  remain open. See the [R06 qualification](PERFORMANCE.md#r06-native-vertical-charts-2026-11-04).
++
+ - Replay retained Bezier ranges through exact SVG graph metadata. An arc cut
+   at an algebraic parameter, as a chamfer on an ellipse leaves it, now writes
+   graph definition tag 32 with its native source and exact boundaries; import
+diff --git a/crates/hypercurve/FUTURE_WORK.md b/crates/hypercurve/FUTURE_WORK.md
+index 4af1734af2..f0c81d869b 100644
+--- a/crates/hypercurve/FUTURE_WORK.md
++++ b/crates/hypercurve/FUTURE_WORK.md
+@@ -3941,22 +3941,24 @@ walk. The likely cost is the band arrangement over the glyph's many Bezier
+ spans. Profile it and treat it as M2 cost work. It is also a completed-workload
+ envelope regression for text offsets.
+ 
+-## Vertical topology consumer boundary (R06, 2026-11-04)
+-
+-Hypersolve now retains complete rational vertical components, their defining
+-powers and residual graph incidence. Its
+-[qualification](../hypersolve/PERFORMANCE.md#r06-vertical-topology-components-2026-11-04)
+-separates this solver success from native curve construction.
+-`PolynomialCurveSet2::from_topology` currently reports
+-construction/Unsupported for whole vertical intervals before publishing any
+-curve set. The shared importer also protects native SVG and BRep source replay.
+-The maintained `vertical_topology_consumer_boundary` capability witness tests
+-the original equations, solver replay and this exact blocker.
+-
+-The next R06/R07 work is a selected vertical chart in the existing curve
+-carrier, retaining original source/factor identity through point queries,
+-incidence, restriction, transforms, filled arrangements and native SVG/BRep
+-replay. Keep the rational vertical topology corpus and all existing horizontal,
+-repeated and selected-branch successes. General coefficient fields, selected
+-rectangle bounds, offsets/corner operations and total resource contracts remain
+-open. This owner increment does not complete native vertical curve geometry.
++## Vertical native charts (R06, 2026-11-04)
++
++Whole rational vertical components now enter the existing selected graph carrier
++through an exchanged chart and exact reflection. Original nonvertical graphs
++use the solver's residual fiber equation and reduced graph support; neither
++vertical columns nor residual isolated points on those columns disappear.
++Full equations, selected fibers, source rectangles and defining powers remain
++available after restriction, reversal, similarities and native SVG/BRep replay.
++The [qualification](PERFORMANCE.md#r06-native-vertical-charts-2026-11-04)
++records the demonstrated workflows and their limits. The original
++`vertical_topology_consumer_boundary` witness is now a positive native census;
++separate fixtures cover selected quintics, singular/boundary columns, filled
++reconstruction, cold replay and actual resource-denial/retry receipts.
++
++R06/R07 remain in progress. General algebraic coefficient fields and selected
++rectangle bounds, complete incidence across distinct polynomial charts,
++singular differential germs, implicit offset/corner operations and total
++resource contracts remain open. The second complete decomposition can add
++avoidable projection events and work; this is not the minimum-cost chart atlas
++or a general closure claim. Keep native specializations and original hard
++cases while completing these consumers.
+diff --git a/crates/hypercurve/PERFORMANCE.md b/crates/hypercurve/PERFORMANCE.md
+index e77b728e73..9e24e60c51 100644
+--- a/crates/hypercurve/PERFORMANCE.md
++++ b/crates/hypercurve/PERFORMANCE.md
+@@ -10,6 +10,123 @@ optimization experiments were retained or rejected. The governing constraint is
+ that a speedup may not weaken exact topology, erase retained evidence, or move a
+ finite approximation across a predicate boundary.
+ 
++## R06 native vertical charts (2026-11-04)
++
++The original `x=0` topology on `[-1,1] × [-2,2]` is certified by
++Hypersolve at `ff9926b76e0da47f4a886dcef4db53f4621bfd9a`, but
++`PolynomialCurveSet2::from_topology` reports construction/Unsupported. The
++missing witness reproduces that exact failure before this change. Hypercurve
++owns chart admission, selected fibers, differential and incidence support
++(P15, P17–P20); BRep owns spatial/pcurve validation and native references.
++This increment extends rational-coefficient, rational-rectangle topology,
++including algebraic selected coordinates. It does not admit arbitrary
++algebraic coefficients or selected rectangle bounds.
++
++### Representation and proof
++
++For the solver's checked identity `F(x,y)=p(x)R(x,y)`, the original chart
++retains all nonvertical graphs of R. A second complete decomposition of
++`F(v,u)` in the exchanged rectangle supplies precisely the graphs selected
++by `p(v)=0`; exact reflection maps them back to the original plane. An open
++slab cannot change selected factor before its certified event boundary.
++Together these cover the complete zero set without replacing a selected
++curve with a fitted line or materializing its algebraic abscissa. Full
++equations (up to exact coordinate exchange), defining powers, rectangles,
++ordered fibers and chart maps remain authoritative and reconstruct on replay.
++Residual isolated points on a whole column are incident to that column,
++not isolated components of the union. Other isolated points remain retained.
++
++Point fibers use the unreduced residual R when vertical content is present;
++geometric graph queries use the solver's reduced `graph_equation()`. The
++full supporting equation is not a graph differential at a removed vertical
++factor. The original full equation remains available as provenance.
++
++`graph_branch(slab,root)` selects only a collection's original chart;
++`curves()` appends exchanged components after those branches. SVG and BRep
++replay use this distinction when checking references. Native record grammar
++is unchanged. `certifies_polynomial_identity` pulls an equation through the
++retained coordinate forms and checks exact divisibility by graph support.
++It is a sufficient whole-image certificate; false does not prove
++nonincidence. Unmapped branches reuse the prior direct divisibility path.
++BRep consumes the certificate and still validates spatial/pcurve parameter
++agreement. No independent geometry kernel or trusted serialized proof flag
++is added.
++
++### Demonstrated scope and limits
++
++The maintained witnesses include the original x, xy and x(x²+y²) inputs;
++x²y³; node, cusp, crossing and tangential parabola products; squared boundary
++columns; columns separated by 2^-80; and a repeated selected quintic column
++with `max_axis_degree=16`. Independent equations, component counts, defining
++powers, exact point forms and jets supplement the topology authority.
++Selected output is consumed by line incidence, splitting, reversal,
++similarities, filled square reconstruction and Boolean empty-set identities.
++Cold SVG replay checks the transported quintic relation and further
++restriction. The original BRep vertical section now completes whole-image
++validation, native replay, affine transport and recut; a squared vertical
++section also reconstructs its defining power in a fresh process.
++
++Configured degree, fiber and refinement limits apply to the exchanged
++construction as well. A zero-budget admission actually declines one
++promotion (used 0, limit 0, requested 1); a pre-cancelled attempt reports
++cancellation and a later retry succeeds. Failure publishes no partial set.
++These controls do not bound total coefficient arithmetic, expression size,
++heap, elapsed time or cancellation latency. The second complete projection
++can add avoidable events and retained work; this is not a minimal-cost atlas.
++
++A direct current-source probe of two half axes from xy in distinct retained
++charts still reports intersection/Unsupported. General mixed-chart
++polynomial incidence, singular differential germs, algebraic coefficient and
++bound admission, implicit offset/corner closure and complete trimmed solids
++remain open. Passing these named workflows does not complete R06/R07 or prove
++the universal algebraic closure target. The native square witness does not
++qualify every hole or disconnected vertical-boundary configuration.
++
++### Completed-workload cost observations
++
++A frozen archive of the committed base and the candidate use the same
++external source, warmups, allocator and nine legacy topology/point-query/
++reversal/native-SVG outcome recipes. Three alternating process pairs pinned
++to one allowed CPU supply 1,080 measured calls (20 per case per process).
++All six complete outcome/artifact row files have identical SHA-256
++`bd4f2c207f537b93711fc7aa64aa62025b9d59a4e472d6bbbbe03f986b490580`.
++The full implicit-circle SVG attempt already reports BudgetExhausted on the
++base; it is preserved as an exhausted outcome, not an exact-success control.
++That receipt alone does not prove a reached resource limit. Eight other SVG
++controls complete. Semantic identities and deterministic bytes are separate
++checks.
++
++Legacy allocation-call and requested-byte observations are unchanged in all
++nine rows. Median time ratios range from 0.7445 to 1.1903; the slower boundary
++row is 215.8 → 256.9 µs, and the cusp is 42.11 → 47.36 ms. Other validation
++jobs were active on this shared host. These observations establish neither a
++speedup nor statistical performance nonregression; the adverse observations
++are retained with the rest.
++
++Four newly successful native construction/query/incidence-location/split/
++reversal workflows have 20 samples each. Their medians are 279 µs (one
++column), 1.385 ms (crossing powers), 1.502 ms (node and column) and 25.038 ms
++(circle and algebraic columns). Requested allocation traffic is respectively
++150,730; 729,845; 1,209,800; and 10,147,724–10,151,084 bytes. Peak logical live
++bytes are 32,765; 68,030; 79,332; and 701,602–707,186. These are different
++completed contracts from the former unsupported admissions, so there is no
++successful baseline speedup comparison. They do not include native SVG or
++BRep completion. The circle/columns row retains post-drop deltas of
++0–5,584 bytes; legacy cusp/circle observations retain up to 384 bytes. No
++leak-free or universal ownership bound is claimed. BRep performance was not
++rebenchmarked in this increment.
++
++The follow-up retention probe performs 100 calls per case in three cycles of
++fresh source inputs. Both builds retain startup allocations of 166,128 bytes
++for the legacy circle and 303,192 for the cusp; the candidate additionally
++retains 263,192 for the new circle/columns workflow. The measured totals stop
++growing between calls 20 and 100, and later cycles return to their starting
++logical live-byte level after source/result drop. This is bounded warm-cache
++stability, not identification of every owner or a universal ownership bound.
++Measured topology/branch sizes stay 416/544 bytes. The main probe grows
++20,760,296 → 20,788,552 bytes (+28,256), including candidate-only workflow
++and certificate code; this does not isolate library code-size growth.
++
+ ## K06: selected polynomial field route versus cusp semicircle kernels (2026-11-03)
+ 
+ **Verdict: rejected.** On the only partner family the two routes share,
+diff --git a/crates/hypercurve/qualification/capabilities.json b/crates/hypercurve/qualification/capabilities.json
+index 6a94d9d15a..e9ac0b858c 100644
+--- a/crates/hypercurve/qualification/capabilities.json
++++ b/crates/hypercurve/qualification/capabilities.json
+@@ -16938,7 +16938,7 @@
+     {
+       "id": "vertical_topology_consumer_boundary",
+       "target": "polynomial_empty_axis",
+-      "test": "whole_vertical_topology_never_publishes_a_partial_curve_collection",
++      "test": "whole_vertical_topology_enters_a_complete_native_curve_collection",
+       "owner": "Hypersolve component topology and Hypercurve curve-set admission",
+       "properties": [
+         "P15",
+@@ -16958,7 +16958,7 @@
+       "policies": [
+         "STRICT"
+       ],
+-      "semantics": "Solver vertical intervals retain selected first coordinates and full closed second bounds; the native graph-branch importer currently refuses them before publishing a curve collection.",
++      "semantics": "Solver vertical intervals retain selected first coordinates and full closed second bounds. Native admission assembles original nonvertical graphs and selected exchanged-chart components with exact reflection, preserving full equations and factor powers.",
+       "claims": [
+         {
+           "stage": "restriction_reconstruction",
+@@ -16967,11 +16967,246 @@
+         },
+         {
+           "stage": "representation",
+-          "outcome": "unsupported",
+-          "assertion": "PolynomialCurveSet2 returns a construction/Unsupported blocker for every whole-vertical input; no empty or incomplete curve set is published."
++          "outcome": "exact_success",
++          "assertion": "The original x, xy and x(x^2+y^2) inputs publish complete native collections with respectively 1, 4 and 2 branches and no spurious isolated point."
++        }
++      ],
++      "oracle": "Exact retained source, one whole vertical solver component, identical topology replay, independent native component counts and no spurious isolated point. Broader native operation claims have separate fixtures.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "vertical_selected_quintic",
++      "target": "polynomial_vertical_components",
++      "test": "selected_quintic_columns_keep_points_jets_and_sections_exact",
++      "owner": "Hypercurve polynomial chart admission and existing selected-branch consumers",
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "domain": "The cube of x^5+5x+5 in [-2,2]^2, max_axis_degree=16 and otherwise default solver/evaluation controls.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Exact coordinate exchange retains the complete defining polynomial, source domains, selected fibers and defining powers. No fitted curve, materialized algebraic coordinate or trusted replay flag. This fixture is a bounded increment, not general algebraic operation closure.",
++      "claims": [
++        {
++          "stage": "evaluation",
++          "outcome": "exact_success",
++          "assertion": "Point queries satisfy the independently specified quintic relation and exact ordinate."
++        },
++        {
++          "stage": "differentials",
++          "outcome": "exact_success",
++          "assertion": "First and second jets equal (0,1) and (0,0)."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "A horizontal authored line has exactly one certified transverse contact; split output is consumed by another complete line section."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Split branches retain defining exponent three."
++        }
++      ],
++      "oracle": "Strict monotonicity proves one real column; defining relation, ordinate identities, exact jets and independent one-contact census.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "vertical_singular_and_boundary",
++      "target": "polynomial_vertical_components",
++      "test": "singular_contacts_boundary_columns_and_close_roots_keep_complete_native_sets",
++      "owner": "Hypercurve polynomial chart admission and existing selected-branch consumers",
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "domain": "Column times node, cusp, crossing or tangential parabola in [-2,2]^2; squared columns on either rectangle boundary; two columns separated by 2^-80.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Exact coordinate exchange retains the complete defining polynomial, source domains, selected fibers and defining powers. No fitted curve, materialized algebraic coordinate or trusted replay flag. This fixture is a bounded increment, not general algebraic operation closure.",
++      "claims": [
++        {
++          "stage": "representation",
++          "outcome": "exact_success",
++          "assertion": "Independent component counts are 6,4,4,6 for the singular cases; boundary columns retain exponent two and close columns remain distinct."
++        },
++        {
++          "stage": "incidence_order",
++          "outcome": "exact_success",
++          "assertion": "Known column points remain incident on both sides of each singular event."
++        },
++        {
++          "stage": "evaluation",
++          "outcome": "exact_success",
++          "assertion": "Every retained endpoint satisfies the original equation; whole-image divisibility certificates retain the defining relation."
++        }
++      ],
++      "oracle": "Independent product equations, graph-piece census, exact column coordinates and distinctness. Does not classify every singular tangent germ.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "vertical_region_reconstruction",
++      "target": "polynomial_vertical_components",
++      "test": "vertical_charts_reenter_region_arrangement_and_reconstruction",
++      "owner": "Hypercurve polynomial chart admission and existing selected-branch consumers",
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "domain": "Square bounded by two native selected vertical sides and two authored horizontal lines.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Exact coordinate exchange retains the complete defining polynomial, source domains, selected fibers and defining powers. No fitted curve, materialized algebraic coordinate or trusted replay flag. This fixture is a bounded increment, not general algebraic operation closure.",
++      "claims": [
++        {
++          "stage": "region_admission",
++          "outcome": "exact_success",
++          "assertion": "The mixed exact boundary enters CurveRegion2."
++        },
++        {
++          "stage": "classification",
++          "outcome": "exact_success",
++          "assertion": "Interior, boundary and exterior witnesses agree with the independently specified square."
++        },
++        {
++          "stage": "booleans",
++          "outcome": "exact_success",
++          "assertion": "Reconstruction under EvenOdd has empty symmetric difference; self-difference is empty and union from empty restores the region."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Vertical sides retain exact selected restrictions and reversed traversal."
++        }
++      ],
++      "oracle": "Independent square boundaries, closed path incidence, exact set identities and empty-operand composition; sampled membership is supplementary.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "vertical_cold_replay",
++      "target": "polynomial_vertical_components",
++      "test": "exchanged_charts_replay_cold_and_compose",
++      "owner": "Hypercurve polynomial chart admission and existing selected-branch consumers",
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "domain": "The native square plus a reversed, restricted, reflected/scaled/translated repeated quintic column; native SVG source graph.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Exact coordinate exchange retains the complete defining polynomial, source domains, selected fibers and defining powers. No fitted curve, materialized algebraic coordinate or trusted replay flag. This fixture is a bounded increment, not general algebraic operation closure.",
++      "claims": [
++        {
++          "stage": "exact_replay",
++          "outcome": "exact_success",
++          "assertion": "Fresh-process replay reconstructs the selected source and factor power; re-encoding is deterministic."
++        },
++        {
++          "stage": "transforms",
++          "outcome": "exact_success",
++          "assertion": "World points satisfy the transported quintic relation (y+1)^5+80(y+1)+160=0 and x=2t+3."
++        },
++        {
++          "stage": "restriction_reconstruction",
++          "outcome": "exact_success",
++          "assertion": "Replayed curves split with shared endpoint and exponent three; the replayed filled square re-enters classification and Boolean identities."
++        }
++      ],
++      "oracle": "Independent transformed polynomial identity, source multiplicity, exact point forms and region set identities; bytes checked separately.",
++      "timeout_seconds": 300
++    },
++    {
++      "id": "vertical_resource_retry",
++      "target": "polynomial_vertical_components",
++      "test": "admission_exhaustion_and_cancellation_do_not_poison_retry",
++      "owner": "Hypercurve polynomial chart admission and existing selected-branch consumers",
++      "properties": [
++        "P15",
++        "P17",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P39"
++      ],
++      "domain": "A pre-certified x=0 topology, zero promotion/refinement budget, pre-cancelled token, and subsequent unrestricted retry.",
++      "origins": [
++        "authored",
++        "generated"
++      ],
++      "families": [
++        "ImplicitPolynomial",
++        "Line"
++      ],
++      "policies": [
++        "STRICT"
++      ],
++      "semantics": "Exact coordinate exchange retains the complete defining polynomial, source domains, selected fibers and defining powers. No fitted curve, materialized algebraic coordinate or trusted replay flag. This fixture is a bounded increment, not general algebraic operation closure.",
++      "claims": [
++        {
++          "stage": "resource_recovery",
++          "outcome": "exact_success",
++          "assertion": "The new exchanged-chart decomposition declines exactly one promotion against limit zero, propagates cancellation and allows a later successful native admission."
+         }
+       ],
+-      "oracle": "Exact retained source, one whole vertical component, nonempty topology, identical replay and the typed downstream blocker; no claim of native vertical curve operation completion.",
++      "oracle": "Actual BudgetExceeded receipts (kind, requested, used and limit) and successful larger-budget retry; no total-work, heap or cancellation-latency bound.",
+       "timeout_seconds": 300
+     }
+   ]
+diff --git a/crates/hypercurve/src/polynomial_curve.rs b/crates/hypercurve/src/polynomial_curve.rs
+index 19234aadc4..e8c6898766 100644
+--- a/crates/hypercurve/src/polynomial_curve.rs
++++ b/crates/hypercurve/src/polynomial_curve.rs
+@@ -6,7 +6,9 @@ use crate::bezier_algebraic_image::parameter_representation;
+ use crate::bezier_offset::BezierSimilarityPoint2;
+ use crate::polynomial_point::PolynomialPoint2;
+ use hyperlimit::Certainty;
+-use hypersolve::bivariate_topology::BivariateCurveTopology;
++use hypersolve::bivariate_topology::{
++    BivariateCurveDomain, BivariateCurveTopology, BivariateTopologyError, decompose_bivariate_curve,
++};
+ use hypersolve::{
+     AlgebraicFiberRootIsolationConfig, AlgebraicFiberRootIsolationStatus,
+     AlgebraicRootRepresentation, CurveResultantParameter,
+@@ -34,7 +36,11 @@ mod selected_chord;
+ /// This is a curve collection, not a filled region. Every solver graph arc is
+ /// retained as a native [`Curve2`]; event roots without an incident arc are
+ /// retained separately. Singular contacts can join several branch endpoints.
+-/// The solver's finite-fiber restrictions and resource limits still apply.
++/// Whole vertical components use an exchanged graph chart and an exact
++/// reflection. The original chart's branches precede exchanged components;
++/// their parameters and slab/root indices belong to their own source charts.
++/// Solver degree/refinement limits apply to both decompositions. Their counters
++/// do not bound total work, coefficient size, memory or cancellation latency.
+ #[derive(Clone, Debug)]
+ pub struct PolynomialCurveSet2 {
+     source: Arc<PolynomialCurveSource2>,
+@@ -48,6 +54,17 @@ struct PolynomialCurveSource2 {
+     fiber_config: AlgebraicFiberRootIsolationConfig,
+ }
+ 
++impl PolynomialCurveSource2 {
++    // The original equation can vanish identically at a vertical event. The
++    // solver's exact residual retains all defining powers of the point fibers.
++    fn fiber_equation(&self) -> &hypersolve::BivariatePolynomial {
++        self.topology.vertical_content().map_or_else(
++            || self.topology.equation(),
++            |content| content.residual_equation(),
++        )
++    }
++}
++
+ /// One selected graph branch, its source chart, and its composed image map.
+ ///
+ /// The parameter is the first coordinate of the source polynomial, including
+@@ -215,6 +232,11 @@ fn parameter(root: &AlgebraicRootRepresentation) -> ExactCurveResult<BezierParam
+ impl PolynomialCurveSet2 {
+     /// Consumes a solver-certified complete graph, replaying its point selectors.
+     ///
++    /// Vertical content is assembled from the original nonvertical graph and
++    /// selected components in the exchanged chart. Each chart retains the full
++    /// defining equation (up to the exact coordinate exchange), source domain,
++    /// selected fibers and factor powers. Replay reconstructs that authority.
++    ///
+     /// `fiber_config` controls subsequent point evaluation. Its subdivision and
+     /// refinement limits do not bound total work, coefficient size, heap bytes,
+     /// or cancellation latency. Failure publishes no partial curve collection.
+@@ -230,11 +252,67 @@ impl PolynomialCurveSet2 {
+         topology: BivariateCurveTopology,
+         fiber_config: AlgebraicFiberRootIsolationConfig,
+     ) -> ExactCurveResult<Self> {
+-        // Graph branches do not yet carry whole vertical intervals. Refuse
+-        // before publication rather than silently omitting those components.
+-        if !topology.vertical_components().is_empty() {
+-            return Err(blocked(UncertaintyReason::Unsupported));
++        if topology.vertical_components().is_empty() {
++            return Self::import_graphs(topology, fiber_config);
+         }
++        // F(x,y) = p(x) R(x,y). The ordinary chart covers R; the
++        // exchanged chart F(v,u) covers the missing p(v) components. Both
++        // charts retain their full defining equation and checked multiplicity
++        // evidence. The exact reflection transports points and traversal.
++        let exchanged =
++            hypersolve::bivariate_arithmetic::bivariate_swap_parameters(topology.equation());
++        let domain = BivariateCurveDomain {
++            first: topology.domain().second.clone(),
++            second: topology.domain().first.clone(),
++        };
++        let exchanged =
++            decompose_bivariate_curve(&exchanged, &domain, topology.config()).map_err(|error| {
++                blocked(match error {
++                    BivariateTopologyError::DegreeLimit
++                    | BivariateTopologyError::RefinementLimit
++                    | BivariateTopologyError::BudgetExhausted => UncertaintyReason::BudgetExhausted,
++                    BivariateTopologyError::UnsupportedCoefficient
++                    | BivariateTopologyError::VerticalComponent
++                    | BivariateTopologyError::RepeatedComponent
++                    | BivariateTopologyError::BoundaryComponent => UncertaintyReason::Unsupported,
++                    _ => UncertaintyReason::Predicate,
++                })
++            })?;
++        let component = hypersolve::BivariatePolynomial::new(vec![
++            topology
++                .vertical_content()
++                .expect("vertical components retain their content")
++                .factor()
++                .to_vec(),
++        ]);
++        let mut set = Self::import_graphs(topology, fiber_config)?;
++        let exchanged = Self::import_graphs(exchanged, fiber_config)?;
++        let reflection = Similarity2::try_from_real_affine(
++            Real::zero(),
++            Real::one(),
++            Real::one(),
++            Real::zero(),
++            Real::zero(),
++            Real::zero(),
++        )
++        .map_err(invalid)?;
++        for curve in exchanged.curves {
++            let branch = curve
++                .polynomial_branch()
++                .expect("graph imports retain native branches");
++            if branch.selects_component(&component, &CurveContext::STRICT)? {
++                set.curves.push(curve.transform_similarity(&reflection)?);
++            }
++        }
++        Ok(set)
++    }
++
++    // Private partial chart import. Only import_topology publishes a complete
++    // collection: callers must assemble the vertical components before return.
++    fn import_graphs(
++        topology: BivariateCurveTopology,
++        fiber_config: AlgebraicFiberRootIsolationConfig,
++    ) -> ExactCurveResult<Self> {
+         let source = Arc::new(PolynomialCurveSource2 {
+             topology,
+             fiber_config,
+@@ -243,7 +321,7 @@ impl PolynomialCurveSet2 {
+         for event in source.topology.events() {
+             let base = parameter(event.parameter())?;
+             let points = PolynomialPoint2::from_fiber(
+-                source.topology.equation().clone(),
++                source.fiber_equation().clone(),
+                 base.clone(),
+                 event.roots(),
+             )?;
+@@ -253,6 +331,11 @@ impl PolynomialCurveSet2 {
+             .iter()
+             .map(|(_, points)| vec![false; points.len()])
+             .collect();
++        // Residual event points on whole columns are incident to those columns,
++        // even when R alone has an isolated point there.
++        for component in source.topology.vertical_components() {
++            incident[component.event_index()].fill(true);
++        }
+         let mut curves = Vec::new();
+         for (slab, cell) in source.topology.slabs().iter().enumerate() {
+             for (root, arc) in cell.arcs().iter().enumerate() {
+@@ -297,7 +380,21 @@ impl PolynomialCurveSet2 {
+     pub fn topology(&self) -> &BivariateCurveTopology {
+         &self.source.topology
+     }
+-    /// Borrows all native branches in projection-slab and root order.
++    /// Borrows a branch in the source's original projection chart.
++    ///
++    /// Slab/root indices from a retained branch refer to its own source chart,
++    /// not to the complete collection, which can also contain exchanged charts.
++    pub fn graph_branch(&self, slab: usize, root: usize) -> Option<&Curve2> {
++        let cell = self.topology().slabs().get(slab)?;
++        cell.arcs().get(root)?;
++        let offset: usize = self.topology().slabs()[..slab]
++            .iter()
++            .map(|cell| cell.arcs().len())
++            .sum();
++        self.curves.get(offset + root)
++    }
++
++    /// Borrows original graph branches followed by exchanged-chart components.
+     pub fn curves(&self) -> &[Curve2] {
+         &self.curves
+     }
+@@ -312,6 +409,10 @@ impl PolynomialCurveSet2 {
+ }
+ 
+ impl PolynomialCurveBranch2 {
++    pub(crate) fn fiber_equation(&self) -> &hypersolve::BivariatePolynomial {
++        self.source.fiber_equation()
++    }
++
+     /// Controls for subsequent selected-fiber evaluation, retained on replay.
+     pub fn evaluation_config(&self) -> AlgebraicFiberRootIsolationConfig {
+         self.source.fiber_config
+@@ -397,7 +498,7 @@ impl PolynomialCurveBranch2 {
+             // the domain, including removable factors retained by each map.
+             if hypersolve::divide_bivariate_polynomial_exact(
+                 &residual,
+-                self.topology().geometric_equation(),
++                self.topology().graph_equation(),
+             )
+             .is_none()
+             {
+@@ -407,6 +508,46 @@ impl PolynomialCurveBranch2 {
+         true
+     }
+ 
++    /// Sufficient exact proof that this branch's entire image satisfies an equation.
++    ///
++    /// Pulls the equation through the retained maps and similarity, then checks
++    /// divisibility by the graph support. Original denominator guards remain
++    /// authoritative. `false` means no certificate was obtained; it does not
++    /// prove nonincidence. This does not add a total-work or coefficient bound.
++    pub fn certifies_polynomial_identity(
++        &self,
++        equation: &hypersolve::BivariatePolynomial,
++    ) -> bool {
++        if self.transform.is_none() && self.maps.is_empty() {
++            return hypersolve::divide_bivariate_polynomial_exact(
++                equation,
++                self.topology().graph_equation(),
++            )
++            .is_some();
++        }
++        use hypersolve::bivariate_arithmetic::{
++            bivariate_active_total_degree, bivariate_homogeneous_compose, bivariate_multiply,
++        };
++        let (Some((nx, wx)), Some((ny, wy)), Some(degree)) = (
++            self.coordinate_form(0),
++            self.coordinate_form(1),
++            bivariate_active_total_degree(equation),
++        ) else {
++            return false;
++        };
++        let Some(pulled) = bivariate_homogeneous_compose(
++            equation,
++            &bivariate_multiply(&nx, &wy),
++            &bivariate_multiply(&ny, &wx),
++            &bivariate_multiply(&wx, &wy),
++            degree,
++        ) else {
++            return false;
++        };
++        hypersolve::divide_bivariate_polynomial_exact(&pulled, self.topology().graph_equation())
++            .is_some()
++    }
++
+     fn coordinate_form(
+         &self,
+         axis: usize,
+@@ -624,7 +765,7 @@ impl PolynomialCurveBranch2 {
+             let slope = (&dy / &dx).map_err(|cause| invalid(cause.into()))?;
+             let offset = y0 - &slope * x0;
+             let mut substituted = bivariate_substitute_second_equal_affine_first(
+-                self.topology().geometric_equation(),
++                self.topology().graph_equation(),
+                 &slope,
+                 &offset,
+             );
+@@ -643,7 +784,7 @@ impl PolynomialCurveBranch2 {
+                     vec![-slope.clone()],
+                 ]);
+                 let residual = hypersolve::divide_bivariate_polynomial_exact(
+-                    self.topology().geometric_equation(),
++                    self.topology().graph_equation(),
+                     &component,
+                 )
+                 .ok_or_else(|| blocked(UncertaintyReason::Predicate))?;
+@@ -667,7 +808,7 @@ impl PolynomialCurveBranch2 {
+             forms.get_or_init(|| {
+                 let equation = residual_equation
+                     .as_ref()
+-                    .unwrap_or_else(|| self.topology().geometric_equation());
++                    .unwrap_or_else(|| self.topology().graph_equation());
+                 let fy = derivative(equation, CurveResultantParameter::Second);
+                 // Where F_y != 0, t x d has the sign of (dy F_y + dx F_x) F_y;
+                 // for a vertical line, that of dy.
+@@ -811,13 +952,7 @@ impl PolynomialCurveBranch2 {
+         &self,
+         policy: &CurveContext,
+     ) -> ExactCurveResult<bool> {
+-        for row in self
+-            .topology()
+-            .geometric_equation()
+-            .coefficients
+-            .iter()
+-            .skip(1)
+-        {
++        for row in self.topology().graph_equation().coefficients.iter().skip(1) {
+             if !polynomial_is_zero(row, policy)? {
+                 return Ok(false);
+             }
+@@ -848,7 +983,7 @@ impl PolynomialCurveBranch2 {
+         let slab = &self.topology().slabs()[self.slab];
+         let root = &slab.roots()[self.root];
+         Ok(PolynomialPoint2::from_fiber(
+-            self.topology().equation().clone(),
++            self.fiber_equation().clone(),
+             BezierParameter2::Exact(slab.sample().clone()),
+             std::slice::from_ref(root),
+         )?
+@@ -983,7 +1118,7 @@ impl PolynomialCurveBranch2 {
+                 hypersolve::BivariatePolynomial::new(vec![vec![Real::one()]]),
+             );
+             let Some((rank, count)) = PolynomialPoint2::query_fiber_rank(
+-                self.topology().equation(),
++                self.fiber_equation(),
+                 &parameter,
+                 &ordinate,
+                 &self.topology().domain().second,
+@@ -1032,10 +1167,9 @@ impl PolynomialCurveBranch2 {
+             return self.query_fiber_point(value, policy);
+         }
+         let (base, equation, map) = if let Some(base) = value.as_bezier_parameter() {
+-            (base.clone(), self.topology().equation().clone(), None)
++            (base.clone(), self.fiber_equation().clone(), None)
+         } else {
+-            let (base, equation, map) =
+-                abscissa::pullback(self.topology().equation(), value, policy)?;
++            let (base, equation, map) = abscissa::pullback(self.fiber_equation(), value, policy)?;
+             (base, equation, Some(map))
+         };
+         let root = match &base {
+@@ -1138,7 +1272,7 @@ impl PolynomialCurveBranch2 {
+                 }
+             }
+         }
+-        let equation = self.topology().equation();
++        let equation = self.fiber_equation();
+         let report = PolynomialPoint2::query_fiber_roots(
+             equation,
+             value,
+diff --git a/crates/hypercurve/src/polynomial_curve_differential.rs b/crates/hypercurve/src/polynomial_curve_differential.rs
+index 39664836d0..9deb802f9c 100644
+--- a/crates/hypercurve/src/polynomial_curve_differential.rs
++++ b/crates/hypercurve/src/polynomial_curve_differential.rs
+@@ -134,7 +134,7 @@ impl PolynomialCurveBranch2 {
+             let base = parameter(event.parameter())?;
+             if compare(&base.clone().into())?.is_eq() {
+                 return PolynomialPoint2::from_fiber(
+-                    self.topology().equation().clone(),
++                    self.fiber_equation().clone(),
+                     base,
+                     &event.roots()[root_index..=root_index],
+                 )?
+@@ -159,7 +159,7 @@ impl PolynomialCurveBranch2 {
+         if max_order == 0 {
+             return Ok(result);
+         }
+-        let d = GraphDifferential::new(self.topology().geometric_equation());
++        let d = GraphDifferential::new(self.topology().graph_equation());
+         if point
+             .rational_form(d.fy.clone(), one())?
+             .compare_to_real(&Real::zero())?
+@@ -203,7 +203,7 @@ impl PolynomialCurveBranch2 {
+     pub fn tangent_direction_at(&self, value: &CurveParameter2) -> ExactCurveResult<CurveVector2> {
+         let policy = crate::policy::principal_context();
+         let point = self.differential_source_point(value, &policy)?;
+-        let d = GraphDifferential::new(self.topology().geometric_equation());
++        let d = GraphDifferential::new(self.topology().graph_equation());
+         let zero = Real::zero();
+         let fy_order = point
+             .rational_form(d.fy.clone(), one())?
+@@ -219,7 +219,7 @@ impl PolynomialCurveBranch2 {
+         let orientation = if fy_order.is_eq() {
+             let slab = &self.topology().slabs()[self.slab];
+             let sample = PolynomialPoint2::from_fiber(
+-                self.topology().equation().clone(),
++                self.fiber_equation().clone(),
+                 BezierParameter2::Exact(slab.sample().clone()),
+                 &slab.roots()[self.root..=self.root],
+             )?
+diff --git a/crates/hypercurve/src/polynomial_curve_pair.rs b/crates/hypercurve/src/polynomial_curve_pair.rs
+index 0942717e64..4e24385742 100644
+--- a/crates/hypercurve/src/polynomial_curve_pair.rs
++++ b/crates/hypercurve/src/polynomial_curve_pair.rs
+@@ -288,8 +288,8 @@ pub(super) fn intersect(
+     }
+ 
+     let original = [
+-        a.topology().geometric_equation().clone(),
+-        b.topology().geometric_equation().clone(),
++        a.topology().graph_equation().clone(),
++        b.topology().graph_equation().clone(),
+     ];
+     // Distinct roots of one checked slab can meet only at its retained event
+     // incidences. Do not rebuild the opposite branch at an algebraic trim that
+diff --git a/crates/hypercurve/src/polynomial_curve_projection.rs b/crates/hypercurve/src/polynomial_curve_projection.rs
+index 0ac3c8e27a..719ae6a2f4 100644
+--- a/crates/hypercurve/src/polynomial_curve_projection.rs
++++ b/crates/hypercurve/src/polynomial_curve_projection.rs
+@@ -77,7 +77,7 @@ impl PolynomialCurveBranch2 {
+             lower: anchor.clone(),
+             upper: anchor.clone(),
+         };
+-        let equation = self.topology().geometric_equation();
++        let equation = self.topology().graph_equation();
+         // At most twice the ordinate degree can make an edge pass through
+         // another root of the anchor fiber. The admitted finite fiber is not
+         // identically zero. Try distinct positive margins inside the requested
+diff --git a/crates/hypercurve/src/polynomial_curve_rational.rs b/crates/hypercurve/src/polynomial_curve_rational.rs
+index 5e055a89d4..86dcdcee0f 100644
+--- a/crates/hypercurve/src/polynomial_curve_rational.rs
++++ b/crates/hypercurve/src/polynomial_curve_rational.rs
+@@ -257,7 +257,7 @@ pub(super) fn intersect(
+             Some(inverse) => rational.transform_similarity(inverse),
+             None => rational,
+         };
+-        let section = Section::new(branch.topology().geometric_equation(), &rational)?;
++        let section = Section::new(branch.topology().graph_equation(), &rational)?;
+         let range = if matches!(span.fragment, BezierSplitFragment2::Materialized { .. }) {
+             CurveParameterRange2::unit()
+         } else {
+diff --git a/crates/hypercurve/src/polynomial_curve_selected_chord.rs b/crates/hypercurve/src/polynomial_curve_selected_chord.rs
+index 5848b94847..bcfecabaa9 100644
+--- a/crates/hypercurve/src/polynomial_curve_selected_chord.rs
++++ b/crates/hypercurve/src/polynomial_curve_selected_chord.rs
+@@ -149,7 +149,7 @@ impl PolynomialCurveBranch2 {
+         }
+         let section = self
+             .topology()
+-            .geometric_equation()
++            .graph_equation()
+             .coefficients
+             .iter()
+             .map(|row| row.first().cloned().unwrap_or_else(Real::zero))
+@@ -222,11 +222,11 @@ impl PolynomialCurveBranch2 {
+         let dx = bx.subtract(&ax)?;
+         let dy = by.subtract(&ay)?;
+         let fx = bivariate_parameter_derivative(
+-            self.topology().geometric_equation(),
++            self.topology().graph_equation(),
+             CurveResultantParameter::First,
+         );
+         let fy = bivariate_parameter_derivative(
+-            self.topology().geometric_equation(),
++            self.topology().graph_equation(),
+             CurveResultantParameter::Second,
+         );
+         let tangent = |point: &CurvePoint2| -> ExactCurveResult<Option<RealSign>> {
+@@ -283,7 +283,7 @@ impl PolynomialCurveBranch2 {
+             }
+         }
+         let coefficients = substitute(
+-            self.topology().geometric_equation(),
++            self.topology().graph_equation(),
+             &start,
+             &[ax.clone(), dx.clone()],
+             &[ay.clone(), dy.clone()],
+diff --git a/crates/hypercurve/src/polynomial_curve_selected_circle.rs b/crates/hypercurve/src/polynomial_curve_selected_circle.rs
+index e16895ef91..e291d941b1 100644
+--- a/crates/hypercurve/src/polynomial_curve_selected_circle.rs
++++ b/crates/hypercurve/src/polynomial_curve_selected_circle.rs
+@@ -161,7 +161,7 @@ impl PolynomialCurveBranch2 {
+         let mut contacts = Vec::new();
+         for left in [false, true] {
+             let coefficients = coefficients(
+-                self.topology().geometric_equation(),
++                self.topology().graph_equation(),
+                 &local_center,
+                 &local_radius,
+                 left,
+diff --git a/crates/hypercurve/src/svg/exact/graph/polynomial.rs b/crates/hypercurve/src/svg/exact/graph/polynomial.rs
+index 66179b6f9c..b979d55ddd 100644
+--- a/crates/hypercurve/src/svg/exact/graph/polynomial.rs
++++ b/crates/hypercurve/src/svg/exact/graph/polynomial.rs
+@@ -120,13 +120,7 @@ pub(super) fn read_definition(
+     let slab = reader.read_len()?;
+     let root = reader.read_len()?;
+     let curve = source
+-        .curves()
+-        .iter()
+-        .find(|curve| {
+-            curve
+-                .polynomial_branch()
+-                .is_some_and(|branch| branch.slab_index() == slab && branch.root_index() == root)
+-        })
++        .graph_branch(slab, root)
+         .ok_or_else(|| malformed("exact polynomial branch has an invalid slab or root index"))?;
+     let start_index = reader.read_len()?;
+     let end_index = reader.read_len()?;
+diff --git a/crates/hypercurve/src/svg/exact/graph/polynomial/tests.rs b/crates/hypercurve/src/svg/exact/graph/polynomial/tests.rs
+index 37728d2a17..6e146980bb 100644
+--- a/crates/hypercurve/src/svg/exact/graph/polynomial/tests.rs
++++ b/crates/hypercurve/src/svg/exact/graph/polynomial/tests.rs
+@@ -107,3 +107,36 @@ fn unused_polynomial_sources_are_validated() {
+         ))
+     ));
+ }
++
++#[test]
++fn exchanged_components_cannot_supply_invalid_original_graph_indices() {
++    // This source has a complete vertical interval but no ordinary graph arc.
++    // Its exchanged branch's (0,0) must not validate a source-chart reference.
++    let mut writer = GraphWriter::new(1_048_576, 256);
++    let source = writer.begin(POLYNOMIAL_SOURCE).unwrap();
++    writer
++        .polynomial(&hypersolve::BivariatePolynomial::new(vec![
++            vec![],
++            vec![Real::one()],
++        ]))
++        .unwrap();
++    for value in [-1, 1, -1, 1] {
++        writer.writer.write_real(&Real::from(value)).unwrap();
++    }
++    for limit in [8, 128, 128, 128, 64, 128, 64] {
++        writer.writer.write_len(limit).unwrap();
++    }
++    let start = writer.scalar_parameter(&Real::from(-1).into()).unwrap();
++    let end = writer.scalar_parameter(&Real::one().into()).unwrap();
++    writer.begin(POLYNOMIAL_BRANCH).unwrap();
++    for index in [source, 0, 0, start, end] {
++        writer.writer.write_u32(index).unwrap();
++    }
++    writer.writer.write_bool(false).unwrap();
++    writer.writer.write_len(0).unwrap();
++    writer.writer.write_bool(false).unwrap();
++    assert!(matches!(
++        read(&writer.writer.bytes, writer.count),
++        Err(SvgError::MalformedInput(_))
++    ));
++}
+diff --git a/crates/hypercurve/tests/polynomial_empty_axis.rs b/crates/hypercurve/tests/polynomial_empty_axis.rs
+index eeb4e71e84..ce1bd0e865 100644
+--- a/crates/hypercurve/tests/polynomial_empty_axis.rs
++++ b/crates/hypercurve/tests/polynomial_empty_axis.rs
+@@ -41,12 +41,12 @@ fn empty_axis_topology_enters_the_native_curve_set() {
+ }
+ 
+ #[test]
+-fn whole_vertical_topology_never_publishes_a_partial_curve_collection() {
++fn whole_vertical_topology_enters_a_complete_native_curve_collection() {
+     let domain = BivariateCurveDomain {
+         first: [(-2_i32).into(), 2_i32.into()],
+         second: [(-2_i32).into(), 2_i32.into()],
+     };
+-    for equation in [
++    for (equation, expected_branches) in [
+         BivariatePolynomial::new(vec![vec![], vec![1_i32.into()]]), // x
+         BivariatePolynomial::new(vec![vec![], vec![0_i32.into(), 1_i32.into()]]), // xy
+         BivariatePolynomial::new(vec![
+@@ -55,7 +55,10 @@ fn whole_vertical_topology_never_publishes_a_partial_curve_collection() {
+             vec![],
+             vec![1_i32.into()],
+         ]), // x(x²+y²)
+-    ] {
++    ]
++    .into_iter()
++    .zip([1, 4, 2])
++    {
+         let topology = decompose_bivariate_curve(&equation, &domain, Default::default()).unwrap();
+         assert!(!topology.is_empty());
+         assert_eq!(topology.vertical_components().len(), 1);
+@@ -63,10 +66,9 @@ fn whole_vertical_topology_never_publishes_a_partial_curve_collection() {
+             decompose_bivariate_curve(topology.equation(), topology.domain(), topology.config())
+                 .unwrap();
+         assert_eq!(topology, replay);
+-        let error = PolynomialCurveSet2::from_topology(topology, Default::default()).unwrap_err();
+-        assert_eq!(error.operation(), hypercurve::CurveOperation2::Construction);
+-        assert!(
+-            matches!(error, hypercurve::ExactCurveError::Blocked(blocker) if blocker.reason() == hypercurve::UncertaintyReason::Unsupported)
+-        );
++        let set = PolynomialCurveSet2::from_topology(topology, Default::default()).unwrap();
++        assert!(!set.is_empty());
++        assert!(set.isolated_points().is_empty());
++        assert_eq!(set.curves().len(), expected_branches);
+     }
+ }
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index d8317142b4..ea846129a8 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -668,13 +668,19 @@ These changes alter represented sets, coordinates, file lengths or checksums.
+   vertical components. Repeated-factor evidence refers to the residual when
+   vertical content is present; `vertical_content()` retains the exact original
+   factor/quotient identity. The finite `rational_fiber()` query retains its
+-  `VerticalComponent` error on a whole interval. Native curve/BRep consumers
+-  still lack vertical charts and now report construction/Unsupported at curve
+-  admission; the original BRep section failure is
+-  `GeometryError::PlanarCurve(ExactCurveError::Blocked(...))` rather than the
+-  earlier solver `PolynomialTopology(VerticalComponent)`. No native archive
+-  grammar or supported finite-graph source changes. See the
+-  [R06 qualification](../crates/hypersolve/PERFORMANCE.md#r06-vertical-topology-components-2026-11-04).
++  `VerticalComponent` error on a whole interval. Native admission now assembles
++  vertical components in exchanged source charts, with exact reflections.
++  `curves()` returns the original graph branches followed by exchanged-chart
++  components. Each branch's parameter, slab/root indices and topology belong
++  to its own chart. Use `graph_branch(slab, root)` to select a branch of a
++  collection's original chart; indexing the complete collection by a source
++  slab/root pair is insufficient. Native replay validates this distinction.
++  `certifies_polynomial_identity` supplies a sufficient whole-image proof
++  through retained maps, including these charts; false is not nonincidence.
++  The original vertical BRep section now succeeds through native replay and
++  recut. Archive/SVG record grammar is unchanged. General mixed-chart incidence
++  and implicit operation closure remain open. See the
++  [native R06 qualification](../crates/hypercurve/PERFORMANCE.md#r06-native-vertical-charts-2026-11-04).
+ - **Stationary straight BRep sweeps.** `hyperbrep::builder::sweep_curve`, its
+   region form and fixed-axis moving-frame inputs admit strictly increasing
+   straight images with isolated stationary parameters. Their surfaces and
+diff --git a/docs/research-program.md b/docs/research-program.md
+index bb4ddeccaf..a6edd30915 100644
+--- a/docs/research-program.md
++++ b/docs/research-program.md
+@@ -126,7 +126,7 @@ part of this program's execution or coordination.
+ | R03 | Author selected fillet centers without global eliminant flattening | gate reproduced: the unchanged NURBS fillet/round-stroke test exceeds an external 300 s budget. Local center authoring remains pending; no solver replacement accepted. |
+ | R04 | Preserve exact members of mixed nonlinear modeling profiles | repair kept after all 39 final checks pass on unchanged retained source, including the six original downstream profiles, symbolic-hole gate, full owner/modeling/BRep/PCB suites and real binding consumers. The isolated 38,400-result triangulation comparison preserves exact rows and allocation fields; adverse cold timings remain disclosed. No speedup or release claim. |
+ | R05 | Extend polynomial queries by selected and mapped source families | admission withdrawn for the shared cut-point experiment: exact definitions and split/topology costs improve, but the unchanged section control regresses. It does not satisfy the literal latency gate in the Hypercurve handoff. The production change has been removed. Selected/algebraic lines, mapped queries, branch pairs and common components remain open. |
+-| R06 | Publish component and multiplicity authority for polynomial topology | in progress; rational vertical interval topology, defining powers and residual half-branch incidence retained at the solver owner. Native vertical curve charts, planar/BRep consumers, algebraic coefficients/bounds and total resources remain open. [Qualification](../crates/hypersolve/PERFORMANCE.md#r06-vertical-topology-components-2026-11-04). |
++| R06 | Publish component and multiplicity authority for polynomial topology | in progress; rational vertical topology now enters native exchanged curve charts, selected queries/jets, line sections, named filled reconstruction and cold SVG/BRep replay/recut. Full mixed-chart incidence, algebraic coefficients/bounds, offset/corner closure and total resources remain open. [Qualification](../crates/hypercurve/PERFORMANCE.md#r06-native-vertical-charts-2026-11-04). |
+ | R07 | Carry polynomial boundaries through filled arrangements and BRep trims | pending |
+ | R08 | Finish terminal-qualified consumers and explicit-policy receipts | in progress; typed replay, qualified affine continuation and five PCB query outcomes kept. Full Hypercurve and affected downstream checks pass. Native contour/extrusion qualification and cold archive/rebuild remain open. See admission below. |
+ | R09 | Overlay coplanar class boundaries before repeated triangulation | pending |
