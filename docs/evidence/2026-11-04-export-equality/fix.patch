@@ -1,0 +1,159 @@
+diff --git a/src/export.rs b/src/export.rs
+index dac1981..24f804f 100644
+--- a/src/export.rs
++++ b/src/export.rs
+@@ -3,23 +3,24 @@ use std::collections::HashMap;
+ use std::io::Write;
+ use std::path::Path;
+ 
+-/// Weld vertices that share the same position, producing a properly indexed
+-/// mesh with shared vertices (manifold-compatible). The rendering pipeline
+-/// duplicates vertices for flat shading; this reverses that for export.
+-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
++/// Deduplicate equal finite renderer positions, retaining the first occurrence.
++/// Flat shading duplicates positions; export must not merge distinct positions
++/// or infer manifoldness from equality alone. Signed zeros denote one position.
++#[allow(clippy::cast_possible_truncation)]
+ fn weld_vertices(positions: &[[f32; 3]], indices: &[u32]) -> (Vec<[f32; 3]>, Vec<u32>) {
+-    const QUANT: f64 = 1e6;
+-    let mut vmap: HashMap<[i64; 3], u32> = HashMap::new();
++    let mut vmap: HashMap<[u32; 3], u32> = HashMap::new();
+     let mut new_positions: Vec<[f32; 3]> = Vec::new();
+     let mut new_indices: Vec<u32> = Vec::with_capacity(indices.len());
+ 
+     for &idx in indices {
+         let pos = positions[idx as usize];
+-        let key = [
+-            (f64::from(pos[0]) * QUANT).round() as i64,
+-            (f64::from(pos[1]) * QUANT).round() as i64,
+-            (f64::from(pos[2]) * QUANT).round() as i64,
+-        ];
++        let key = pos.map(|coordinate| {
++            if coordinate == 0.0 {
++                0
++            } else {
++                coordinate.to_bits()
++            }
++        });
+         let new_idx = *vmap.entry(key).or_insert_with(|| {
+             let i = new_positions.len() as u32;
+             new_positions.push(pos);
+@@ -327,3 +328,118 @@ fn export_3mf(parts: &[StlMeshData], path: &Path) -> Result<(), String> {
+ fn export_3mf(_parts: &[StlMeshData], _path: &Path) -> Result<(), String> {
+     Err("3MF export is not available in the web build.".into())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use csgrs::{GeometryContext, Real, TriangleMesh, solid};
++    use hyperlattice::Point3;
++    use hypermesh::Triangle;
++
++    /// A closed box whose two x planes are distinct even in binary32.
++    fn thin_box() -> StlMeshData {
++        let width = csgrs::ratio(1, 16_777_216).unwrap();
++        let exact = solid::cuboid(width, 1, 1).unwrap();
++        let projected =
++            crate::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&exact).unwrap();
++        StlMeshData {
++            positions: projected.positions,
++            normals: projected.normals,
++            indices: projected.indices,
++            color: Some([0.2, 0.4, 0.8]),
++            part: 1,
++            evidence: projected.evidence,
++        }
++    }
++
++    fn assert_thin_closed_box(positions: Vec<[f32; 3]>, triangles: Vec<[usize; 3]>) {
++        assert_eq!(
++            positions.len(),
++            8,
++            "both distinct x planes must survive export"
++        );
++        assert_eq!(triangles.len(), 12);
++        let width = 1.0_f32 / 16_777_216.0;
++        assert!(positions.iter().any(|p| p[0].to_bits() == width.to_bits()));
++        let mesh = TriangleMesh::new(
++            positions
++                .into_iter()
++                .map(|p| {
++                    Point3::new(
++                        Real::try_from(p[0]).unwrap(),
++                        Real::try_from(p[1]).unwrap(),
++                        Real::try_from(p[2]).unwrap(),
++                    )
++                })
++                .collect(),
++            triangles
++                .into_iter()
++                .map(|[a, b, c]| Triangle::new(a, b, c))
++                .collect(),
++        );
++        assert!(mesh.is_closed_manifold());
++        assert!(
++            mesh.has_unique_nondegenerate_triangles(&GeometryContext::STRICT.mesh_context())
++                .unwrap()
++                .value
++        );
++    }
++
++    #[test]
++    fn obj_export_preserves_distinct_binary32_planes() {
++        let path = std::env::temp_dir().join(format!("synaps-thin-{}.obj", std::process::id()));
++        export_parts(&[thin_box()], &path, ExportFormat::Obj).unwrap();
++        let text = std::fs::read_to_string(&path).unwrap();
++        std::fs::remove_file(&path).unwrap();
++        std::fs::remove_file(path.with_extension("mtl")).unwrap();
++        let positions = text
++            .lines()
++            .filter_map(|line| line.strip_prefix("v "))
++            .map(|line| {
++                let p: Vec<f32> = line
++                    .split_whitespace()
++                    .map(|x| x.parse().unwrap())
++                    .collect();
++                [p[0], p[1], p[2]]
++            })
++            .collect();
++        let triangles = text
++            .lines()
++            .filter_map(|line| line.strip_prefix("f "))
++            .map(|line| {
++                let f: Vec<usize> = line
++                    .split_whitespace()
++                    .map(|x| x.split('/').next().unwrap().parse::<usize>().unwrap() - 1)
++                    .collect();
++                [f[0], f[1], f[2]]
++            })
++            .collect();
++        assert_thin_closed_box(positions, triangles);
++    }
++
++    #[test]
++    #[cfg(not(target_arch = "wasm32"))]
++    #[allow(clippy::cast_possible_truncation)]
++    fn three_mf_export_preserves_distinct_binary32_planes() {
++        let path = std::env::temp_dir().join(format!("synaps-thin-{}.3mf", std::process::id()));
++        export_parts(&[thin_box()], &path, ExportFormat::ThreeMf).unwrap();
++        let model = lib3mf::Model::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
++        std::fs::remove_file(&path).unwrap();
++        let mesh = model.resources.objects[0].mesh.as_ref().unwrap();
++        let positions = mesh
++            .vertices
++            .iter()
++            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
++            .collect();
++        let triangles = mesh.triangles.iter().map(|t| [t.v1, t.v2, t.v3]).collect();
++        assert_thin_closed_box(positions, triangles);
++    }
++
++    #[test]
++    fn duplicate_signed_zero_positions_still_weld() {
++        let positions = [[0.0, 1.0, 2.0], [-0.0, 1.0, 2.0], [0.0, 1.0, 2.0]];
++        let (positions, indices) = weld_vertices(&positions, &[0, 1, 2]);
++        assert_eq!(positions.len(), 1);
++        assert_eq!(indices, vec![0, 0, 0]);
++    }
++}
