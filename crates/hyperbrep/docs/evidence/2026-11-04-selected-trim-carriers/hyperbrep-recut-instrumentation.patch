@@ -1,0 +1,722 @@
+--- a/crates/hyperbrep/src/boolean_kernel.rs
++++ b/crates/hyperbrep/src/boolean_kernel.rs
+@@ -1792,7 +1792,7 @@
+             .pcurve(first_use.pcurve())
+             .expect("validated spherical pcurve")
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let latitude = if let [upper_wire] = face_record.inner() {
+             let upper_use = model
+                 .edge_use(
+@@ -1806,7 +1806,7 @@
+                 .pcurve(upper_use.pcurve())
+                 .expect("validated spherical band pcurve")
+                 .line_segment()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .start()
+                 .y()
+                 .clone();
+@@ -1959,20 +1959,20 @@
+         let midpoint = midpoint
+             .coordinates()
+             .cloned()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         outer_boundary_probes.push(midpoint.clone());
+         candidates.push(
+             average_planar_points(&[
+                 (curve.start().clone())
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .clone(),
+                 midpoint.clone(),
+                 curve
+                     .end()
+                     .coordinates()
+                     .cloned()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+             ])?
+             .expect("three curve points are nonempty"),
+         );
+@@ -2017,7 +2017,7 @@
+                         outer_probe.clone(),
+                         (inner_probe.clone())
+                             .coordinates()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                             .clone(),
+                     ])?
+                     .expect("two boundary probes are nonempty"),
+@@ -4527,7 +4527,7 @@
+         let domain = carrier.curve().parameter_domain();
+         let (start, end) = domain
+             .scalar_endpoints()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         // Keep the two parameter identities at the seam. Interior contacts on
+         // the same complete native parameterization already carry their exact
+         // spatial preimage; recovering it from independently expanded curve
+@@ -5897,12 +5897,12 @@
+                         || !crossing.parameter_components().is_empty()
+                         || !crossing.overlaps().is_empty()
+                     {
+-                        return Err(GeometryError::UnsupportedPcurveContour);
++                        return Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour });
+                     }
+                     for contact in crossing.contacts() {
+                         let parameter = contact.first().parameter()?;
+                         let Some(value) = parameter.scalar().cloned() else {
+-                            return Err(GeometryError::UnsupportedPcurveContour);
++                            return Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour });
+                         };
+                         insert_sorted_parameter(&mut cuts, value)?;
+                     }
+@@ -6046,13 +6046,13 @@
+                 contour
+             }
+         }
+-        .ok_or(GeometryError::UnsupportedPcurveContour)?;
++        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         contours_by_loop.push(contour);
+     }
+     if material_index != native.material_contours().len()
+         || hole_index != native.hole_contours().len()
+     {
+-        return Err(GeometryError::UnsupportedPcurveContour);
++        return Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour });
+     }
+     let profiles =
+         match crate::error::classified(region.boundary_profiles()).map_err(GeometryError::from)? {
+@@ -6066,7 +6066,7 @@
+         .map(|profile| {
+             let material = contours_by_loop
+                 .get(profile.material_loop_index())
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+             let holes = profile
+                 .hole_loop_indices()
+                 .iter()
+@@ -6074,7 +6074,7 @@
+                     contours_by_loop
+                         .get(*index)
+                         .map(|contour| (*contour).clone())
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })
+                 })
+                 .collect::<Result<Vec<_>, _>>()?;
+             Ok(NativeContourProfile {
+--- a/crates/hyperbrep/src/construction.rs
++++ b/crates/hyperbrep/src/construction.rs
+@@ -4030,12 +4030,12 @@
+                 .parameter_domain()
+                 .start()
+                 .scalar()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 + curve
+                     .parameter_domain()
+                     .end()
+                     .scalar()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+         )?,
+     })
+ }
+@@ -4492,17 +4492,17 @@
+             points.push(Point3::new(
+                 (curve.start())
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .x()
+                     * angle.clone().cos(),
+                 (curve.start())
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .x()
+                     * angle.clone().sin(),
+                 (curve.start())
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .y()
+                     .clone(),
+             ));
+@@ -4528,7 +4528,7 @@
+                     Real::zero(),
+                     (curve.start())
+                         .coordinates()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                         .y()
+                         .clone(),
+                 ),
+@@ -4536,7 +4536,7 @@
+                 Vector3::y(),
+                 (curve.start())
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .x()
+                     .clone(),
+                 start.clone(),
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -251,7 +251,7 @@
+                 .parameter_endpoints()
+                 .0
+                 .scalar()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })
+         })
+     }
+ 
+@@ -261,7 +261,7 @@
+                 .parameter_endpoints()
+                 .1
+                 .scalar()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })
+         })
+     }
+ 
+@@ -301,7 +301,7 @@
+         match self.curve.geometry() {
+             Some(CurveGeometry2::Line(line)) => Ok(Segment2::Line(line.clone())),
+             Some(CurveGeometry2::CircularArc(arc)) => Ok(Segment2::Arc(arc.clone())),
+-            _ => Err(GeometryError::UnsupportedPcurveContour),
++            _ => Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour }),
+         }
+     }
+ 
+@@ -2756,10 +2756,10 @@
+     let (first, last) = curve.parameter_endpoints();
+     let curve_domain_start = first
+         .scalar()
+-        .ok_or(GeometryError::UnsupportedPcurveContour)?;
++        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+     let curve_domain_end = last
+         .scalar()
+-        .ok_or(GeometryError::UnsupportedPcurveContour)?;
++        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+     let curve_start = curve_domain_start.clone();
+     let curve_span = curve_domain_end - &curve_start;
+     let target_span = target_domain.end() - target_domain.start();
+--- a/crates/hyperbrep/src/geometry/pcurve.rs
++++ b/crates/hyperbrep/src/geometry/pcurve.rs
+@@ -221,7 +221,7 @@
+                         let (scale, offset) = carrier
+                             .correspondence
+                             .affine_coefficients()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                         let inverse = (Real::one() / scale).map_err(GeometryError::Numeric)?;
+                         let local = source
+                             .affine_image(&inverse, &(-offset * &inverse))?
+@@ -357,14 +357,14 @@
+                         ordered_source_start,
+                         (domain.start())
+                             .scalar()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+                         crate::STRICT_PREDICATES,
+                     ))? == Ordering::Equal
+                         && decided_order(compare_reals(
+                             ordered_source_end,
+                             (domain.end())
+                                 .scalar()
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+                             crate::STRICT_PREDICATES,
+                         ))? == Ordering::Equal
+                     {
+@@ -420,7 +420,7 @@
+                         let domain = carrier.curve.parameter_domain();
+                         let (start, end) = domain
+                             .scalar_endpoints()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                         if boundaries.is_empty() {
+                             boundaries.push(
+                                 carrier
+@@ -628,11 +628,11 @@
+             let (scale, offset) = carrier
+                 .correspondence
+                 .affine_coefficients()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+             let domain = carrier.curve.parameter_domain();
+             let (local_start, local_end) = domain
+                 .scalar_endpoints()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+             let carrier_start = scale * local_start + offset;
+             let carrier_end = scale * local_end + offset;
+             let overlap_start = if decided_order(compare_reals(
+@@ -741,12 +741,12 @@
+                         return Ok(spatial_end.clone().into());
+                     }
+                     let Some(CurveGeometry2::CircularArc(arc)) = self.curve.geometry() else {
+-                        return Err(GeometryError::UnsupportedPcurveContour);
++                        return Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour });
+                     };
+                     let point = self.curve.point_at(parameter)?;
+                     let point = point
+                         .coordinates()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                     let fraction = match crate::error::classified(arc.sweep_fraction(point))? {
+                         Classification::Decided(fraction) => fraction,
+                         Classification::Uncertain(reason) => {
+--- a/crates/hyperbrep/src/geometry/tensor_image.rs
++++ b/crates/hyperbrep/src/geometry/tensor_image.rs
+@@ -187,7 +187,7 @@
+             Ok(uv) => uv,
+             Err(GeometryError::UnsupportedPcurveContour) => self
+                 .certified_rational_uv(&self.parameter(s))?
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+             Err(error) => return Err(error),
+         };
+         self.surface
+--- a/crates/hyperbrep/src/persistence/selection.rs
++++ b/crates/hyperbrep/src/persistence/selection.rs
+@@ -121,7 +121,7 @@
+         }
+         match parameter
+             .as_bezier_parameter()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+         {
+             BezierParameter2::Exact(value) => Ok(RawParameter::Scalar(value.clone())),
+             BezierParameter2::Algebraic(root) => {
+--- a/crates/hyperbrep/src/topology/correspondence.rs
++++ b/crates/hyperbrep/src/topology/correspondence.rs
+@@ -129,7 +129,7 @@
+         }
+         let arc = pcurve
+             .circular_arc()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let value = pcurve_parameter
+             .try_real()
+             .ok_or(GeometryError::UnrepresentableParameter)?;
+@@ -178,7 +178,7 @@
+                 || constant.compare(&last.affine_form(a, b, Real::zero()).parameter()?)?
+                     != std::cmp::Ordering::Equal
+             {
+-                return Err(GeometryError::UnsupportedPcurveContour);
++                return Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour });
+             }
+             let point = match (axis, value.try_real(), constant.scalar()) {
+                 (hypercurve::Axis2::X, _, Some(v)) => value.curve_parameter().affine_point(
+@@ -229,7 +229,7 @@
+         }
+         let arc = pcurve
+             .circular_arc()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let value = edge_parameter
+             .try_real()
+             .ok_or(GeometryError::UnrepresentableParameter)?;
+--- a/crates/hyperbrep/src/topology/measure.rs
++++ b/crates/hyperbrep/src/topology/measure.rs
+@@ -31,7 +31,7 @@
+                         )
+                         .expect("validated pcurve")
+                         .line_segment()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                         .start()
+                         .y()
+                         .clone();
+@@ -45,7 +45,7 @@
+                         )
+                         .expect("validated pcurve")
+                         .line_segment()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                         .start()
+                         .y()
+                         .clone();
+@@ -59,7 +59,7 @@
+                         .pcurve(edge_use.pcurve)
+                         .expect("validated spherical pcurve")
+                         .line_segment()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                     if !real_values_equal(line.start().y(), line.end().y())
+                         .map_err(build_error_geometry)?
+                     {
+--- a/crates/hyperbrep/src/topology/query.rs
++++ b/crates/hyperbrep/src/topology/query.rs
+@@ -1695,7 +1695,7 @@
+                         Ok(segment) => segments.push(segment),
+                         Err(GeometryError::UnsupportedPcurveContour) => {
+                             let region = certified_region()?
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                             return Ok(Some(CertifiedZPrismProfile {
+                                 region,
+                                 z_min,
+@@ -1866,7 +1866,7 @@
+                     clockwise,
+                 )?))
+             }
+-            _ => Err(GeometryError::UnsupportedPcurveContour),
++            _ => Err({ eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour }),
+         }
+     }
+ }
+--- a/crates/hyperbrep/src/topology/edit/edge.rs
++++ b/crates/hyperbrep/src/topology/edit/edge.rs
+@@ -95,7 +95,7 @@
+                     {
+                         let arc = pcurve
+                             .circular_arc()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                         let (start, end) = match edge_use.direction {
+                             Direction::Forward => (
+                                 edge.domain.represented_start()?,
+@@ -130,7 +130,7 @@
+                     } else {
+                         let arc = pcurve
+                             .circular_arc()
+-                            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                         let (start, end) = match edge_use.direction {
+                             Direction::Forward => (
+                                 edge.domain.represented_start()?,
+--- a/crates/hyperbrep/src/topology/edit/face.rs
++++ b/crates/hyperbrep/src/topology/edit/face.rs
+@@ -458,7 +458,7 @@
+                         .expect("validated edge-use pcurve ID");
+                     Ok((pcurve.curve().start().clone())
+                         .coordinates()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                         .clone())
+                 };
+                 let start_uv = pcurve_start(outer_uses[start_index])?;
+--- a/crates/hyperbrep/src/topology/edit/surface.rs
++++ b/crates/hyperbrep/src/topology/edit/surface.rs
+@@ -407,7 +407,7 @@
+             )
+             .expect("validated spherical pcurve")
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let old_latitude = old_line.start().y().clone();
+         let increasing = decided_model_order(compare_reals(
+             old_line.end().x(),
+@@ -427,18 +427,18 @@
+         if !real_values_equal(
+             (new_start)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+             (new_end)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+         )? {
+             return Err(TopologyEditError::UnsupportedFaceSplitCurve(curve.kind()));
+         }
+         let new_latitude = (new_start)
+             .coordinates()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+             .y()
+             .clone();
+         let relation = decided_model_order(compare_reals(
+@@ -688,7 +688,7 @@
+         )
+         .map_err(GeometryError::from)?;
+         let loop_area = resolve_planar_classification(loop_area)?
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let area_order = decided_model_order(compare_reals(
+             &loop_area,
+             &Real::zero(),
+--- a/crates/hyperbrep/src/topology/validation/analytic_image.rs
++++ b/crates/hyperbrep/src/topology/validation/analytic_image.rs
+@@ -288,7 +288,7 @@
+         debug_assert!(data.circle);
+         let arc = pcurve
+             .circular_arc()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let center_parameter = Point2::new(arc.center().x().clone(), arc.center().y().clone());
+         let mapped_center = surface.evaluate_real(&center_parameter)?;
+         require_point_equal(
+@@ -362,7 +362,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+@@ -430,7 +430,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+@@ -470,7 +470,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         let v_constant = real_values_equal(line.start().y(), line.end().y())?;
+         if u_constant == v_constant {
+@@ -531,7 +531,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let Curve3ExactData::EllipseArc(curve_data) = curve.exact_data() else {
+             unreachable!("circle kind carries ellipse-arc exact data");
+         };
+@@ -629,7 +629,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+@@ -647,7 +647,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+@@ -688,7 +688,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         if u_constant {
+             return Ok(());
+@@ -714,7 +714,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+@@ -801,7 +801,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+@@ -876,7 +876,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+--- a/crates/hyperbrep/src/topology/validation/image.rs
++++ b/crates/hyperbrep/src/topology/validation/image.rs
+@@ -377,7 +377,7 @@
+             ) => {
+                 let line = pcurve
+                     .line_segment()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?;
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+                 if real_values_equal(line.start().x(), line.end().x())? {
+                     self.validate_revolution_meridian_image(
+                         curve, edge, edge_use, pcurve, surface,
+--- a/crates/hyperbrep/src/topology/validation/revolution.rs
++++ b/crates/hyperbrep/src/topology/validation/revolution.rs
+@@ -409,10 +409,10 @@
+                 if curve_points_equal(
+                     (curve.start())
+                         .coordinates()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+                     (end)
+                         .coordinates()
+-                        .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                        .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+                 )? && matching.replace(index).is_some()
+                 {
+                     return Ok(None);
+@@ -426,10 +426,10 @@
+         if !curve_points_equal(
+             (ordered.last().expect("nonempty profile").end())
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+             (ordered[0].start())
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?,
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?,
+         )? {
+             return Ok(None);
+         }
+--- a/crates/hyperbrep/src/topology/validation/tensor.rs
++++ b/crates/hyperbrep/src/topology/validation/tensor.rs
+@@ -330,21 +330,21 @@
+             SurfaceIsoAxis::U => (
+                 (start)
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .x(),
+                 (end)
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .x(),
+             ),
+             SurfaceIsoAxis::V => (
+                 (start)
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .y(),
+                 (end)
+                     .coordinates()
+-                    .ok_or(GeometryError::UnsupportedPcurveContour)?
++                    .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                     .y(),
+             ),
+         };
+@@ -593,7 +593,7 @@
+     ) -> Result<(), BuildError> {
+         let line = pcurve
+             .line_segment()
+-            .ok_or(GeometryError::UnsupportedPcurveContour)?;
++            .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         let v_constant = real_values_equal(line.start().y(), line.end().y())?;
+         if u_constant == v_constant {
+--- a/crates/hyperbrep/src/topology/validation/wire.rs
++++ b/crates/hyperbrep/src/topology/validation/wire.rs
+@@ -101,22 +101,22 @@
+                         decided_model_order(compare_reals(
+                             (end)
+                                 .coordinates()
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                                 .x(),
+                             (start)
+                                 .coordinates()
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                                 .x(),
+                             crate::STRICT_PREDICATES,
+                         ))?,
+                         decided_model_order(compare_reals(
+                             (end)
+                                 .coordinates()
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                                 .y(),
+                             (start)
+                                 .coordinates()
+-                                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                                 .y(),
+                             crate::STRICT_PREDICATES,
+                         ))?,
+@@ -145,31 +145,31 @@
+             }
+         }
+         let (graph_start, graph_end, graph_u_direction, graph_v_direction) =
+-            graph_endpoints.ok_or(GeometryError::UnsupportedPcurveContour)?;
++            graph_endpoints.ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?;
+         let mut candidates = Vec::with_capacity(2);
+         let graph_on_left = real_values_equal(
+             (graph_start)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .x(),
+             u_domain.represented_start()?,
+         )? && real_values_equal(
+             (graph_end)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .x(),
+             u_domain.represented_start()?,
+         )?;
+         let graph_on_right = real_values_equal(
+             (graph_start)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .x(),
+             u_domain.represented_end()?,
+         )? && real_values_equal(
+             (graph_end)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .x(),
+             u_domain.represented_end()?,
+         )?;
+@@ -200,26 +200,26 @@
+         let graph_on_bottom = real_values_equal(
+             (graph_start)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+             v_domain.represented_start()?,
+         )? && real_values_equal(
+             (graph_end)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+             v_domain.represented_start()?,
+         )?;
+         let graph_on_top = real_values_equal(
+             (graph_start)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+             v_domain.represented_end()?,
+         )? && real_values_equal(
+             (graph_end)
+                 .coordinates()
+-                .ok_or(GeometryError::UnsupportedPcurveContour)?
++                .ok_or_else(|| { eprintln!("PCURVE BLOCK {}:{}", file!(), line!()); GeometryError::UnsupportedPcurveContour })?
+                 .y(),
+             v_domain.represented_end()?,
+         )?;
