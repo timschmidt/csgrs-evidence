@@ -1,0 +1,1178 @@
+diff --git a/crates/hyperbrep/src/boolean_kernel.rs b/crates/hyperbrep/src/boolean_kernel.rs
+index c97ad297a8..cddecb1f66 100644
+--- a/crates/hyperbrep/src/boolean_kernel.rs
++++ b/crates/hyperbrep/src/boolean_kernel.rs
+@@ -1002,7 +1002,7 @@ fn retain_planar_surface_trace_boundary_contacts(
+         .map(
+             |interval| -> Result<SurfaceIntersectionCurve, BooleanError> {
+                 Ok(trace
+-                    .subcurve(&interval.start, &interval.end)?
++                    .trimmed_interval(&interval.start, &interval.end)?
+                     .with_boundary_contacts(
+                         operand,
+                         interval.start_contacts,
+@@ -3318,7 +3318,7 @@ fn trim_face_pair_intersection(
+             SurfaceSurfaceIntersection::Point(point) => Ok(FacePairTrim::PointContact(
+                 point
+                     .try_coordinates()
+-                    .ok_or(GeometryError::UnsupportedSelectedEvaluation)?
++                    .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?
+                     .clone(),
+             )),
+             SurfaceSurfaceIntersection::Points(points) => Ok(point_contacts_trim(
+@@ -3328,7 +3328,7 @@ fn trim_face_pair_intersection(
+                         point
+                             .try_coordinates()
+                             .cloned()
+-                            .ok_or(GeometryError::UnsupportedSelectedEvaluation)
++                            .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })
+                     })
+                     .collect::<Result<Vec<_>, _>>()?,
+             )),
+@@ -3416,7 +3416,7 @@ fn trim_face_pair_intersection(
+             second_face,
+             point
+                 .try_coordinates()
+-                .ok_or(GeometryError::UnsupportedSelectedEvaluation)?,
++                .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
+         );
+     }
+     if let SurfaceSurfaceIntersection::Points(points) = intersection {
+@@ -3429,7 +3429,7 @@ fn trim_face_pair_intersection(
+                 second_face,
+                 point
+                     .try_coordinates()
+-                    .ok_or(GeometryError::UnsupportedSelectedEvaluation)?,
++                    .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
+             )? {
+                 FacePairTrim::PointContact(point) => retained.push(point),
+                 FacePairTrim::NoContact => {}
+@@ -3567,28 +3567,68 @@ fn trim_face_pair_intersection(
+         Classification::Decided(None) => return Ok(FacePairTrim::NoCurveInterior),
+         Classification::Uncertain(reason) => return Ok(FacePairTrim::Unresolved(reason)),
+     };
+-    let first_fragments =
+-        match trim_segment_to_planar_face(first_model, first_face, &span_start, &span_end)? {
+-            Classification::Decided(fragments) => fragments,
+-            Classification::Uncertain(reason) => return Ok(FacePairTrim::Unresolved(reason)),
+-        };
+-    if first_fragments.is_empty() {
+-        return Ok(FacePairTrim::NoCurveInterior);
+-    }
+-    let mut common_fragments = Vec::new();
+-    for fragment in first_fragments {
+-        let start = fragment.evaluate_real(fragment.domain().represented_start()?)?;
+-        let end = fragment.evaluate_real(fragment.domain().represented_end()?)?;
+-        match trim_segment_to_planar_face(second_model, second_face, &start, &end)? {
+-            Classification::Decided(fragments) => common_fragments.extend(fragments),
+-            Classification::Uncertain(reason) => return Ok(FacePairTrim::Unresolved(reason)),
++    let native = (|| -> Result<FacePairTrim, GeometryError> {
++        let first_fragments =
++            match trim_segment_to_planar_face(first_model, first_face, &span_start, &span_end)? {
++                Classification::Decided(fragments) => fragments,
++                Classification::Uncertain(reason) => return Ok(FacePairTrim::Unresolved(reason)),
++            };
++        if first_fragments.is_empty() {
++            return Ok(FacePairTrim::NoCurveInterior);
++        }
++        let mut common_fragments = Vec::new();
++        for fragment in first_fragments {
++            let start = fragment.evaluate_real(fragment.domain().represented_start()?)?;
++            let end = fragment.evaluate_real(fragment.domain().represented_end()?)?;
++            match trim_segment_to_planar_face(second_model, second_face, &start, &end)? {
++                Classification::Decided(fragments) => common_fragments.extend(fragments),
++                Classification::Uncertain(reason) => return Ok(FacePairTrim::Unresolved(reason)),
++            }
+         }
++        Ok(if common_fragments.is_empty() {
++            FacePairTrim::NoCurveInterior
++        } else {
++            FacePairTrim::CurveFragments(common_fragments)
++        })
++    })();
++    match native {
++        Err(GeometryError::UnsupportedPcurveContour | GeometryError::UnrepresentableParameter) => {
++            let first_source = Curve2::from(LineSeg2::try_new(
++                project_to_plane(first_surface, &span_start)?,
++                project_to_plane(first_surface, &span_end)?,
++            )?);
++            let second_source = Curve2::from(LineSeg2::try_new(
++                project_to_plane(second_surface, &span_start)?,
++                project_to_plane(second_surface, &span_end)?,
++            )?);
++            let (u, v) = first_surface.plane_directions().expect("planar line pair");
++            let curve = Curve3::planar_image(
++                first_source.clone(),
++                first_surface
++                    .plane_origin()
++                    .expect("planar line pair")
++                    .clone(),
++                u.clone(),
++                v.clone(),
++            )?;
++            // The exact plane-plane intersection supplies the common line.
++            // Both plane charts and this line are affine in the same unit
++            // parameter, so their endpoint projections prove the whole image.
++            let retained = SurfaceIntersectionCurve::from_certified_exact_pcurves(
++                curve,
++                first_source,
++                second_source,
++            )?;
++            trim_retained_surface_curve(
++                first_model,
++                first_face,
++                second_model,
++                second_face,
++                &retained,
++            )
++        }
++        other => other,
+     }
+-    Ok(if common_fragments.is_empty() {
+-        FacePairTrim::NoCurveInterior
+-    } else {
+-        FacePairTrim::CurveFragments(common_fragments)
+-    })
+ }
+ 
+ fn trim_contained_surface_region(
+@@ -4084,7 +4124,7 @@ fn push_contained_face_curve_fragments(
+     };
+     for interval in intervals {
+         let fragment = candidate
+-            .subcurve(&interval.start, &interval.end)?
++            .trimmed_interval(&interval.start, &interval.end)?
+             .with_boundary_contacts(
+                 SurfaceIntersectionOperand::First,
+                 interval.start_contacts,
+@@ -4196,7 +4236,7 @@ fn trim_intersection_components(
+             second_face,
+             point
+                 .try_coordinates()
+-                .ok_or(GeometryError::UnsupportedSelectedEvaluation)?,
++                .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
+         )? {
+             FacePairTrim::PointContact(point) => point_contacts.push(point),
+             FacePairTrim::NoContact => {}
+@@ -4320,9 +4360,17 @@ fn trim_surface_curve_in_authored_charts(
+     let mut common = Vec::new();
+     for first_interval in &first {
+         for second_interval in &second {
+-            let start = exact_max(&first_interval.start, &second_interval.start)?;
+-            let end = exact_min(&first_interval.end, &second_interval.end)?;
+-            if exact_order(&start, &end)? == Ordering::Less {
++            let start = if first_interval.start.compare(&second_interval.start)? == Ordering::Less {
++                second_interval.start.clone()
++            } else {
++                first_interval.start.clone()
++            };
++            let end = if first_interval.end.compare(&second_interval.end)? == Ordering::Greater {
++                second_interval.end.clone()
++            } else {
++                first_interval.end.clone()
++            };
++            if start.compare(&end)? == Ordering::Less {
+                 common.push(CommonRetainedParameterInterval {
+                     first_start_contacts: contacts_at_interval_start(first_interval, &start)?,
+                     first_end_contacts: contacts_at_interval_end(first_interval, &end)?,
+@@ -4339,7 +4387,7 @@ fn trim_surface_curve_in_authored_charts(
+         .map(
+             |interval| -> Result<SurfaceIntersectionCurve, GeometryError> {
+                 Ok(intersection
+-                    .subcurve(&interval.start, &interval.end)?
++                    .trimmed_interval(&interval.start, &interval.end)?
+                     .with_boundary_contacts(
+                         SurfaceIntersectionOperand::First,
+                         interval.first_start_contacts,
+@@ -4362,16 +4410,16 @@ fn trim_surface_curve_in_authored_charts(
+ 
+ #[derive(Clone, Debug)]
+ struct FaceRetainedParameterInterval {
+-    start: Real,
+-    end: Real,
++    start: crate::Parameter,
++    end: crate::Parameter,
+     start_contacts: Vec<SurfaceIntersectionBoundaryContact>,
+     end_contacts: Vec<SurfaceIntersectionBoundaryContact>,
+ }
+ 
+ #[derive(Clone, Debug)]
+ struct CommonRetainedParameterInterval {
+-    start: Real,
+-    end: Real,
++    start: crate::Parameter,
++    end: crate::Parameter,
+     first_start_contacts: Vec<SurfaceIntersectionBoundaryContact>,
+     first_end_contacts: Vec<SurfaceIntersectionBoundaryContact>,
+     second_start_contacts: Vec<SurfaceIntersectionBoundaryContact>,
+@@ -4391,8 +4439,8 @@ fn retained_curve_face_intervals(
+     if face_is_boundaryless(model, face) {
+         return Ok(Classification::Decided(Some(vec![
+             FaceRetainedParameterInterval {
+-                start: spatial_domain.represented_start()?.clone(),
+-                end: spatial_domain.represented_end()?.clone(),
++                start: spatial_domain.start().clone(),
++                end: spatial_domain.end().clone(),
+                 start_contacts: Vec::new(),
+                 end_contacts: Vec::new(),
+             },
+@@ -4420,7 +4468,7 @@ fn retained_curve_face_intervals(
+             Err(error) => return Err(GeometryError::from(error)),
+         };
+         for fragment in trimmed {
+-            let Some((pcurve_start, pcurve_end)) = (match fragment.represented_parameter_range() {
++            let represented = match fragment.represented_parameter_range() {
+                 Some(range) => Some(range),
+                 // A native polynomial branch's parameter is its abscissa: a
+                 // selected end is certified from the branch's defining
+@@ -4455,8 +4503,18 @@ fn retained_curve_face_intervals(
+                     }
+                     None => None,
+                 },
+-            }) else {
+-                return Ok(Classification::Uncertain(UncertaintyReason::Unsupported));
++            };
++            let (pcurve_start, pcurve_end) = if let Some((start, end)) = represented {
++                (
++                    crate::Parameter::from_real(start),
++                    crate::Parameter::from_real(end),
++                )
++            } else {
++                let range = fragment.parameter_range()?;
++                (
++                    crate::Parameter::from_curve(range.start())?,
++                    crate::Parameter::from_curve(range.end())?,
++                )
+             };
+             // Hypercurve's closed-set trim proves the complete retained
+             // interval, including positive-length boundary overlaps. A trace
+@@ -4492,11 +4550,11 @@ fn retained_curve_face_intervals(
+             )?;
+             let mut end =
+                 retained_spatial_parameter(&carrier, &pcurve_end, &end_contacts, spatial_curve)?;
+-            if exact_order(&start, &end)? == Ordering::Greater {
++            if start.compare(&end)? == Ordering::Greater {
+                 std::mem::swap(&mut start, &mut end);
+                 std::mem::swap(&mut start_contacts, &mut end_contacts);
+             }
+-            if exact_order(&start, &end)? == Ordering::Less {
++            if start.compare(&end)? == Ordering::Less {
+                 intervals.push(FaceRetainedParameterInterval {
+                     start,
+                     end,
+@@ -4513,10 +4571,10 @@ fn retained_curve_face_intervals(
+ 
+ fn retained_spatial_parameter(
+     carrier: &crate::MaterializedSurfacePcurve,
+-    parameter: &Real,
++    parameter: &crate::Parameter,
+     contacts: &[SurfaceIntersectionBoundaryContact],
+     spatial_curve: &Curve3,
+-) -> Result<Real, GeometryError> {
++) -> Result<crate::Parameter, GeometryError> {
+     if matches!(
+         carrier.correspondence(),
+         crate::SurfacePcurveCorrespondence::AngularSweep { .. }
+@@ -4532,8 +4590,8 @@ fn retained_spatial_parameter(
+         // the same complete native parameterization already carry their exact
+         // spatial preimage; recovering it from independently expanded curve
+         // coordinates discards that evidence and can needlessly fail.
+-        if exact_order(parameter, start)? != Ordering::Equal
+-            && exact_order(parameter, end)? != Ordering::Equal
++        if parameter.compare(&start.clone().into())? != Ordering::Equal
++            && parameter.compare(&end.clone().into())? != Ordering::Equal
+         {
+             for contact in contacts {
+                 if contact
+@@ -4541,21 +4599,20 @@ fn retained_spatial_parameter(
+                     .has_certified_same_parameterization(spatial_curve)
+                 {
+                     let lifts = crate::geometry::angular_parameter_lifts(
+-                        contact.parameter(),
++                        contact
++                            .parameter()
++                            .try_real()
++                            .ok_or(GeometryError::UnrepresentableParameter)?,
+                         &spatial_curve.domain().represented_domain()?,
+                     )?;
+                     if let [lift] = lifts.as_slice() {
+-                        return Ok(lift.clone());
++                        return Ok(lift.clone().into());
+                     }
+                 }
+             }
+         }
+     }
+-    carrier
+-        .spatial_parameter_at(&parameter.clone().into())?
+-        .try_real()
+-        .cloned()
+-        .ok_or(GeometryError::UnrepresentableParameter)
++    carrier.spatial_parameter_at(&parameter.curve_parameter())
+ }
+ 
+ fn model_boundary_contacts(
+@@ -4569,32 +4626,8 @@ fn model_boundary_contacts(
+     let face = model.face(face_id).expect("validated trim face");
+     let mut translated = Vec::with_capacity(contacts.len());
+     for contact in contacts {
+-        // A selected contact on a polynomial carrier is certified as an exact
+-        // scalar point from the carrier's defining polynomial.
+-        let certified;
+-        let pcurve_point = match contact.point().and_then(|point| point.coordinates()) {
+-            Some(point) => point,
+-            None => {
+-                let Some(selected) = contact.point() else {
+-                    return Ok(None);
+-                };
+-                // A mapped branch's selected contact is certified in its
+-                // source chart and carried through its exact view.
+-                let point = match (defining, mapped) {
+-                    (Some(defining), _) => {
+-                        crate::geometry::certified_scalar_point(selected, defining)?
+-                    }
+-                    (None, Some(branch)) => {
+-                        crate::geometry::certified_branch_point(selected, branch)?
+-                    }
+-                    (None, None) => None,
+-                };
+-                let Some(point) = point else {
+-                    return Ok(None);
+-                };
+-                certified = point;
+-                &certified
+-            }
++        let Some(selected) = contact.point() else {
++            return Ok(None);
+         };
+         let canonical_coordinate = |coordinate: &Real| {
+             coordinate
+@@ -4602,23 +4635,38 @@ fn model_boundary_contacts(
+                 .map(Real::new)
+                 .unwrap_or_else(|| coordinate.clone())
+         };
+-        let pcurve_point = hypercurve::Point2::new(
+-            canonical_coordinate(pcurve_point.x()),
+-            canonical_coordinate(pcurve_point.y()),
+-        );
+-        let point = crate::Point2::new(pcurve_point.x().clone(), pcurve_point.y().clone());
++        // A useful native view is retained when it can be proved. Otherwise
++        // carry the complete selected UV point; materialization is optional.
++        let represented = if let Some(point) = selected.coordinates() {
++            Some(point.clone())
++        } else {
++            match (defining, mapped) {
++                (Some(defining), _) => crate::geometry::certified_scalar_point(selected, defining)?,
++                (None, Some(branch)) => crate::geometry::certified_branch_point(selected, branch)?,
++                (None, None) => None,
++            }
++        };
++        let pcurve_point: hypercurve::CurvePoint2 = match represented {
++            Some(point) => hypercurve::Point2::new(
++                canonical_coordinate(point.x()),
++                canonical_coordinate(point.y()),
++            )
++            .into(),
++            None => selected.clone(),
++        };
+         let surface = model
+             .surface(face.surface())
+             .expect("validated trim face surface");
+-        let spatial_point = surface.evaluate_real(&crate::Point2::new(
+-            pcurve_point.x().clone(),
+-            pcurve_point.y().clone(),
+-        ))?;
+-        let spatial_point = Point3::new(
+-            canonical_coordinate(&spatial_point.x),
+-            canonical_coordinate(&spatial_point.y),
+-            canonical_coordinate(&spatial_point.z),
+-        );
++        let spatial_point = surface.point_at(&pcurve_point)?;
++        let spatial_point = match spatial_point.try_coordinates() {
++            Some(point) => Point3::new(
++                canonical_coordinate(&point.x),
++                canonical_coordinate(&point.y),
++                canonical_coordinate(&point.z),
++            )
++            .into(),
++            None => spatial_point,
++        };
+         // Native region preparation may reverse, subdivide, coalesce or
+         // reorder authored boundaries. Its fragment/contour indices identify
+         // that prepared region, never the original BREP edge-use arena.
+@@ -4637,7 +4685,7 @@ fn model_boundary_contacts(
+                 let pcurve = model
+                     .pcurve(edge_use.pcurve())
+                     .expect("validated boundary pcurve");
+-                for parameter in pcurve.parameters_at_point(&point)? {
++                for parameter in pcurve.parameters_at_point(&pcurve_point)? {
+                     let observed_parameter = model
+                         .edge_parameter_at(edge_use_id, &parameter)
+                         .map_err(|error| match error {
+@@ -4653,10 +4701,6 @@ fn model_boundary_contacts(
+                         .curve(edge.curve())
+                         .expect("validated boundary curve")
+                         .clone();
+-                    let observed_parameter = observed_parameter
+-                        .try_real()
+-                        .ok_or(GeometryError::UnrepresentableParameter)?
+-                        .clone();
+                     let affine_parameter = edge_use
+                         .parameter_correspondence()
+                         .affine_coefficients()
+@@ -4668,12 +4712,16 @@ fn model_boundary_contacts(
+                                 .is_some_and(|surface| surface.kind() == crate::SurfaceKind::Plane)
+                         })
+                         .map(|_| observed_parameter.clone());
+-                    let edge_parameter = match canonical_surface {
+-                        Some(surface) => {
+-                            canonical_surface_edge_parameter(surface, &curve, &observed_parameter)?
++                    let edge_parameter = match (canonical_surface, observed_parameter.try_real()) {
++                        (Some(surface), Some(value)) => {
++                            canonical_surface_edge_parameter(surface, &curve, value)?
++                                .map(crate::Parameter::from_real)
+                                 .unwrap_or(observed_parameter)
+                         }
+-                        None => observed_parameter,
++                        // The original boundary inverse and edge correspondence
++                        // already identify this contact. Both pcurve images of
++                        // the intersection carry the canonical-surface proof.
++                        _ => observed_parameter,
+                     };
+                     translated.push(SurfaceIntersectionBoundaryContact::new(
+                         curve,
+@@ -4801,28 +4849,24 @@ mod retained_plane_contact_tests {
+ 
+ fn contacts_at_interval_start(
+     interval: &FaceRetainedParameterInterval,
+-    parameter: &Real,
++    parameter: &crate::Parameter,
+ ) -> Result<Vec<SurfaceIntersectionBoundaryContact>, GeometryError> {
+-    Ok(
+-        if exact_order(parameter, &interval.start)? == Ordering::Equal {
+-            interval.start_contacts.clone()
+-        } else {
+-            Vec::new()
+-        },
+-    )
++    Ok(if parameter.compare(&interval.start)? == Ordering::Equal {
++        interval.start_contacts.clone()
++    } else {
++        Vec::new()
++    })
+ }
+ 
+ fn contacts_at_interval_end(
+     interval: &FaceRetainedParameterInterval,
+-    parameter: &Real,
++    parameter: &crate::Parameter,
+ ) -> Result<Vec<SurfaceIntersectionBoundaryContact>, GeometryError> {
+-    Ok(
+-        if exact_order(parameter, &interval.end)? == Ordering::Equal {
+-            interval.end_contacts.clone()
+-        } else {
+-            Vec::new()
+-        },
+-    )
++    Ok(if parameter.compare(&interval.end)? == Ordering::Equal {
++        interval.end_contacts.clone()
++    } else {
++        Vec::new()
++    })
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -5261,7 +5305,7 @@ fn coalesce_face_parameter_intervals(
+     for interval in intervals {
+         let mut insertion = ordered.len();
+         while insertion > 0
+-            && exact_order(&interval.start, &ordered[insertion - 1].start)? == Ordering::Less
++            && interval.start.compare(&ordered[insertion - 1].start)? == Ordering::Less
+         {
+             insertion -= 1;
+         }
+@@ -5273,17 +5317,17 @@ fn coalesce_face_parameter_intervals(
+             coalesced.push(interval);
+             continue;
+         };
+-        let start_order = exact_order(&interval.start, &previous.end)?;
++        let start_order = interval.start.compare(&previous.end)?;
+         if start_order == Ordering::Greater {
+             coalesced.push(interval);
+             continue;
+         }
+-        if exact_order(&interval.start, &previous.start)? == Ordering::Equal {
++        if interval.start.compare(&previous.start)? == Ordering::Equal {
+             previous
+                 .start_contacts
+                 .extend(interval.start_contacts.clone());
+         }
+-        match exact_order(&interval.end, &previous.end)? {
++        match interval.end.compare(&previous.end)? {
+             Ordering::Greater => {
+                 previous.end = interval.end;
+                 previous.end_contacts = interval.end_contacts;
+@@ -5302,7 +5346,7 @@ fn coalesce_common_parameter_intervals(
+     for interval in intervals {
+         let mut insertion = ordered.len();
+         while insertion > 0
+-            && exact_order(&interval.start, &ordered[insertion - 1].start)? == Ordering::Less
++            && interval.start.compare(&ordered[insertion - 1].start)? == Ordering::Less
+         {
+             insertion -= 1;
+         }
+@@ -5314,11 +5358,11 @@ fn coalesce_common_parameter_intervals(
+             coalesced.push(interval);
+             continue;
+         };
+-        if exact_order(&interval.start, &previous.end)? == Ordering::Greater {
++        if interval.start.compare(&previous.end)? == Ordering::Greater {
+             coalesced.push(interval);
+             continue;
+         }
+-        if exact_order(&interval.start, &previous.start)? == Ordering::Equal {
++        if interval.start.compare(&previous.start)? == Ordering::Equal {
+             previous
+                 .first_start_contacts
+                 .extend(interval.first_start_contacts.clone());
+@@ -5326,7 +5370,7 @@ fn coalesce_common_parameter_intervals(
+                 .second_start_contacts
+                 .extend(interval.second_start_contacts.clone());
+         }
+-        match exact_order(&interval.end, &previous.end)? {
++        match interval.end.compare(&previous.end)? {
+             Ordering::Greater => {
+                 previous.end = interval.end;
+                 previous.first_end_contacts = interval.first_end_contacts;
+@@ -5451,7 +5495,7 @@ fn coplanar_boundary_split_traces(
+                         for interval in intervals {
+                             traces.push(
+                                 retained
+-                                    .subcurve(&interval.start, &interval.end)?
++                                    .trimmed_interval(&interval.start, &interval.end)?
+                                     .with_boundary_contacts(
+                                         target_operand,
+                                         interval.start_contacts,
+@@ -7884,12 +7928,14 @@ mod tests {
+                                 .unwrap();
+                         assert!(!retained.is_empty());
+                         for contact in retained {
+-                            let replay =
+-                                contact.curve().evaluate_real(contact.parameter()).unwrap();
++                            let replay = contact
++                                .curve()
++                                .evaluate_real(contact.parameter().try_real().unwrap())
++                                .unwrap();
+                             assert_eq!(
+                                 hyperlimit::point3_equal(
+                                     &replay,
+-                                    contact.spatial_point(),
++                                    contact.spatial_point().try_coordinates().unwrap(),
+                                     crate::STRICT_PREDICATES
+                                 )
+                                 .value(),
+diff --git a/crates/hyperbrep/src/geometry.rs b/crates/hyperbrep/src/geometry.rs
+index b043c8e5e9..63b0427152 100644
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -321,15 +321,19 @@ impl Pcurve {
+ 
+     /// Recovers every incident public parameter without replacing the native
+     /// chart or discarding selected-root authority.
+-    pub(crate) fn parameters_at_point(&self, point: &Point2) -> GeometryResult<Vec<Parameter>> {
++    pub(crate) fn parameters_at_point(
++        &self,
++        point: &hypercurve::CurvePoint2,
++    ) -> GeometryResult<Vec<Parameter>> {
+         crate::context::strict(|| {
+-            let point = CurvePoint2::new(point.x.clone(), point.y.clone());
+-            if let Some(line) = self.line_segment() {
++            if let Some(line) = self.line_segment()
++                && let Some(point) = point.coordinates()
++            {
+                 // A native strict side proof can exclude unrelated source
+                 // uses before constructing their rational incidence equations.
+                 // On-line and blocked classifications still use the complete
+                 // native inverse, including finite domains and root identity.
+-                match line.classify_point(&point) {
++                match line.classify_point(point) {
+                     Ok(hypercurve::LineSide::Left | hypercurve::LineSide::Right) => {
+                         return Ok(Vec::new());
+                     }
+@@ -338,7 +342,7 @@ impl Pcurve {
+                     Err(error) => return Err(error.into()),
+                 }
+             }
+-            match self.curve.point_locations(&point.into())? {
++            match self.curve.point_locations(point)? {
+                 hypercurve::CurvePointLocations2::Locations(locations) => locations
+                     .iter()
+                     .map(|location| Parameter::from_curve(&location.parameter()?))
+@@ -1204,7 +1208,7 @@ impl Curve3 {
+                 self.derivative_at(parameter, 1)?
+             };
+             if result.is_zero()? {
+-                return Err(GeometryError::UnsupportedSelectedEvaluation);
++                return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+             }
+             Ok(result)
+         })
+@@ -2195,19 +2199,19 @@ pub struct SurfaceIntersectionCurve {
+ #[derive(Clone, Debug)]
+ pub(crate) struct SurfaceIntersectionBoundaryContact {
+     curve: Curve3,
+-    parameter: Real,
+-    affine_parameter: Option<Real>,
+-    pcurve_point: CurvePoint2,
+-    spatial_point: Point3,
++    parameter: Parameter,
++    affine_parameter: Option<Parameter>,
++    pcurve_point: hypercurve::CurvePoint2,
++    spatial_point: GeometricPoint3,
+ }
+ 
+ impl SurfaceIntersectionBoundaryContact {
+     pub(crate) fn new(
+         curve: Curve3,
+-        parameter: Real,
+-        affine_parameter: Option<Real>,
+-        pcurve_point: CurvePoint2,
+-        spatial_point: Point3,
++        parameter: Parameter,
++        affine_parameter: Option<Parameter>,
++        pcurve_point: hypercurve::CurvePoint2,
++        spatial_point: GeometricPoint3,
+     ) -> Self {
+         Self {
+             curve,
+@@ -2222,22 +2226,22 @@ impl SurfaceIntersectionBoundaryContact {
+         &self.curve
+     }
+ 
+-    pub(crate) const fn parameter(&self) -> &Real {
++    pub(crate) const fn parameter(&self) -> &Parameter {
+         &self.parameter
+     }
+ 
+     /// The same spatial preimage before canonicalization, retained from a
+     /// certified affine pcurve contact. All incident affine uses can consume
+     /// this representative without reconstructing the contact's coordinates.
+-    pub(crate) const fn affine_parameter(&self) -> Option<&Real> {
++    pub(crate) const fn affine_parameter(&self) -> Option<&Parameter> {
+         self.affine_parameter.as_ref()
+     }
+ 
+-    pub(crate) const fn pcurve_point(&self) -> &CurvePoint2 {
++    pub(crate) const fn pcurve_point(&self) -> &hypercurve::CurvePoint2 {
+         &self.pcurve_point
+     }
+ 
+-    pub(crate) const fn spatial_point(&self) -> &Point3 {
++    pub(crate) const fn spatial_point(&self) -> &GeometricPoint3 {
+         &self.spatial_point
+     }
+ }
+@@ -2629,6 +2633,17 @@ impl SurfaceIntersectionCurve {
+         })
+     }
+ 
++    pub(crate) fn trimmed_interval(
++        &self,
++        start: &Parameter,
++        end: &Parameter,
++    ) -> GeometryResult<Self> {
++        if let (Some(start), Some(end)) = (start.try_real(), end.try_real()) {
++            return self.subcurve(start, end);
++        }
++        self.restrict_source(ParameterRange::new(start.clone(), end.clone())?)
++    }
++
+     /// Restricts the spatial curve and both exact pcurve mappings to one
+     /// increasing represented parameter interval.
+     pub fn subcurve(&self, start: &Real, end: &Real) -> GeometryResult<Self> {
+@@ -11148,6 +11163,10 @@ pub(crate) fn represented_test_surface_parameter(point: hypercurve::CurvePoint2)
+ 
+ #[cfg(test)]
+ mod tests {
++    fn retained_uv(point: &super::Point2) -> hypercurve::CurvePoint2 {
++        hypercurve::Point2::new(point.x.clone(), point.y.clone()).into()
++    }
++
+     use super::*;
+     use hyperlimit::point3_equal;
+     use hyperreal::Rational;
+@@ -11278,7 +11297,7 @@ mod tests {
+                 .unwrap();
+             assert_eq!(carrier.curve.family(), CurveFamily2::CircularArc);
+             let local = Pcurve::new(carrier.curve.clone())
+-                .parameters_at_point(&uv)
++                .parameters_at_point(&retained_uv(&uv))
+                 .unwrap();
+             assert_eq!(local.len(), 1);
+             let spatial_parameter = carrier
+@@ -11469,7 +11488,7 @@ mod tests {
+             .unwrap(),
+         ));
+         for curve in [curve.clone(), curve.reversed().unwrap()] {
+-            let parameters = curve.parameters_at_point(&point).unwrap();
++            let parameters = curve.parameters_at_point(&retained_uv(&point)).unwrap();
+             assert_eq!(parameters.len(), 1);
+             let replay = curve
+                 .evaluate_real(parameters[0].try_real().unwrap())
+@@ -11479,7 +11498,12 @@ mod tests {
+                 Some(true)
+             );
+             let near = Point2::new(r(3), r(4) + q(1, 1_000_000_000_000));
+-            assert!(curve.parameters_at_point(&near).unwrap().is_empty());
++            assert!(
++                curve
++                    .parameters_at_point(&retained_uv(&near))
++                    .unwrap()
++                    .is_empty()
++            );
+         }
+         let full = Pcurve::new(Curve2::from(
+             CircularArc2::try_from_center(
+@@ -11490,7 +11514,9 @@ mod tests {
+             )
+             .unwrap(),
+         ));
+-        let parameters = full.parameters_at_point(&Point2::new(r(5), r(0))).unwrap();
++        let parameters = full
++            .parameters_at_point(&retained_uv(&Point2::new(r(5), r(0))))
++            .unwrap();
+         assert_eq!(parameters.len(), 2);
+         assert_eq!(parameters[0].try_real(), Some(&Real::zero()));
+         assert_eq!(parameters[1].try_real(), Some(&Real::one()));
+@@ -11512,7 +11538,7 @@ mod tests {
+             for (curve, reversed) in [(pcurve.clone(), false), (pcurve.reversed().unwrap(), true)] {
+                 for t in [Real::zero(), q(1, 4), q(1, 2), Real::one()] {
+                     let expected = point(t.clone());
+-                    let parameters = curve.parameters_at_point(&expected).unwrap();
++                    let parameters = curve.parameters_at_point(&retained_uv(&expected)).unwrap();
+                     assert_eq!(parameters.len(), 1);
+                     let actual = parameters[0].try_real().unwrap();
+                     assert_eq!(
+@@ -11535,10 +11561,20 @@ mod tests {
+                     );
+                     let tiny = q(1, 1_000_000_000_000);
+                     let near = Point2::new(expected.x - r(dy) * &tiny, expected.y + r(dx) * tiny);
+-                    assert!(curve.parameters_at_point(&near).unwrap().is_empty());
++                    assert!(
++                        curve
++                            .parameters_at_point(&retained_uv(&near))
++                            .unwrap()
++                            .is_empty()
++                    );
+                 }
+                 for t in [q(-1, 2), q(3, 2)] {
+-                    assert!(curve.parameters_at_point(&point(t)).unwrap().is_empty());
++                    assert!(
++                        curve
++                            .parameters_at_point(&retained_uv(&point(t)))
++                            .unwrap()
++                            .is_empty()
++                    );
+                 }
+             }
+         }
+diff --git a/crates/hyperbrep/src/geometry/pcurve.rs b/crates/hyperbrep/src/geometry/pcurve.rs
+index 6097163cda..98af6bfc21 100644
+--- a/crates/hyperbrep/src/geometry/pcurve.rs
++++ b/crates/hyperbrep/src/geometry/pcurve.rs
+@@ -182,7 +182,7 @@ impl SurfaceIntersectionPcurve {
+                         return Ok(projected.curve.point_at(&local.curve_parameter())?);
+                     }
+                     let projected = project_curve_to_plane_frame(spatial, origin, u, v)?
+-                        .ok_or(GeometryError::UnsupportedSelectedEvaluation)?;
++                        .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?;
+                     Ok(projected.point_at(&source.curve_parameter())?)
+                 }
+                 SurfaceIntersectionPcurveMapping::LinearPlaneSection {
+@@ -216,7 +216,7 @@ impl SurfaceIntersectionPcurve {
+                         coefficient_scale,
+                         coefficient_offset,
+                     )?
+-                    .ok_or(GeometryError::UnsupportedSelectedEvaluation)?;
++                    .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?;
+                     for carrier in carriers {
+                         let (scale, offset) = carrier
+                             .correspondence
+diff --git a/crates/hyperbrep/src/geometry/point.rs b/crates/hyperbrep/src/geometry/point.rs
+index 05f1b754e9..52ade34fe4 100644
+--- a/crates/hyperbrep/src/geometry/point.rs
++++ b/crates/hyperbrep/src/geometry/point.rs
+@@ -451,7 +451,7 @@ impl GeometricPoint3 {
+             .into()),
+             PointData3::CurveImage(image) => {
+                 let PointProjections3::Native { xy, xz } = &image.projections else {
+-                    return Err(GeometryError::UnsupportedSelectedEvaluation);
++                    return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+                 };
+                 let cache = if axis == Axis::Z { xz } else { xy };
+                 crate::cache::get_or_try_init(cache, || {
+@@ -512,7 +512,7 @@ impl Curve3 {
+                 rotation.point_at(
+                     parameter
+                         .try_real()
+-                        .ok_or(GeometryError::UnsupportedSelectedEvaluation)?,
++                        .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
+                 )
+             });
+         }
+@@ -524,7 +524,7 @@ impl Curve3 {
+                 line.point_at(
+                     parameter
+                         .try_real()
+-                        .ok_or(GeometryError::UnsupportedSelectedEvaluation)?,
++                        .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
+                 )
+             });
+         }
+@@ -551,7 +551,7 @@ impl Curve3 {
+                 self.data.geometry,
+                 CurveGeometry3::CircleArc(_) | CurveGeometry3::EllipseArc(_)
+             ) {
+-                return Err(GeometryError::UnsupportedSelectedEvaluation);
++                return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+             }
+             let projections = if let CurveGeometry3::PlanarImage(image) = &self.data.geometry {
+                 let mapped = parameter.affine_image(&image.source_scale, &image.source_offset)?;
+@@ -628,7 +628,7 @@ impl Curve3 {
+             | CurveGeometry3::Translation(_)
+             | CurveGeometry3::PlanarImage(_)
+             | CurveGeometry3::TensorImage(_) => {
+-                return Err(GeometryError::UnsupportedSelectedEvaluation);
++                return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+             }
+         })
+     }
+diff --git a/crates/hyperbrep/src/geometry/surface_point/rational.rs b/crates/hyperbrep/src/geometry/surface_point/rational.rs
+index 7364f2a6eb..6bd35a872c 100644
+--- a/crates/hyperbrep/src/geometry/surface_point/rational.rs
++++ b/crates/hyperbrep/src/geometry/surface_point/rational.rs
+@@ -104,7 +104,7 @@ impl RationalSurfacePoint {
+                 }
+                 coefficients
+             }
+-            _ => return Err(GeometryError::UnsupportedSelectedEvaluation),
++            _ => return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation }),
+         };
+         let [x, y, z, weight] = coefficients;
+         // Check the original weight at this joint UV before retaining a finite image.
+diff --git a/crates/hyperbrep/src/geometry/tensor_image.rs b/crates/hyperbrep/src/geometry/tensor_image.rs
+index 1e0428cb9b..e2f9861058 100644
+--- a/crates/hyperbrep/src/geometry/tensor_image.rs
++++ b/crates/hyperbrep/src/geometry/tensor_image.rs
+@@ -339,21 +339,21 @@ impl TensorCurve3 {
+         order: usize,
+     ) -> GeometryResult<GeometricVector3> {
+         if order != 1 {
+-            return Err(GeometryError::UnsupportedSelectedEvaluation);
++            return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+         }
+         let mapped = s.affine_image(&self.source_scale, &self.source_offset)?;
+         let value = mapped
+             .try_real()
+-            .ok_or(GeometryError::UnsupportedSelectedEvaluation)?;
++            .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?;
+         let uv = represented_curve_point(&self.source, value)?;
+         let tangent = self.source.derivatives_at(&mapped.curve_parameter(), 1)?;
+         let (du, dv) = tangent[0]
+             .represented_coordinates()
+-            .ok_or(GeometryError::UnsupportedSelectedEvaluation)?;
++            .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?;
+         let partials = self.surface.partials_at(&uv.into())?;
+         let (Some(su), Some(sv)) = (partials.u.try_coordinates(), partials.v.try_coordinates())
+         else {
+-            return Err(GeometryError::UnsupportedSelectedEvaluation);
++            return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+         };
+         Ok(GeometricVector3::from_coordinates(
+             (su.clone() * du + sv.clone() * dv) * &self.source_scale,
+diff --git a/crates/hyperbrep/src/geometry/vector.rs b/crates/hyperbrep/src/geometry/vector.rs
+index c4477bd37b..1acf2bcb96 100644
+--- a/crates/hyperbrep/src/geometry/vector.rs
++++ b/crates/hyperbrep/src/geometry/vector.rs
+@@ -75,7 +75,7 @@ impl GeometricVector3 {
+ 
+     pub(crate) fn require_coordinates(&self) -> GeometryResult<&Vector3> {
+         self.try_coordinates()
+-            .ok_or(GeometryError::UnsupportedSelectedEvaluation)
++            .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })
+     }
+ 
+     /// Compares `direction dot self` with an authored exact value.
+diff --git a/crates/hyperbrep/src/geometry/vector/algebra.rs b/crates/hyperbrep/src/geometry/vector/algebra.rs
+index ade100d317..38940ac18a 100644
+--- a/crates/hyperbrep/src/geometry/vector/algebra.rs
++++ b/crates/hyperbrep/src/geometry/vector/algebra.rs
+@@ -367,7 +367,7 @@ impl GeometricVector3 {
+         let u = u.parts()?;
+         let v = v.parts()?;
+         if u.divisor_squared.is_some() || v.divisor_squared.is_some() {
+-            return Err(GeometryError::UnsupportedSelectedEvaluation);
++            return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation });
+         }
+         Ok(Self::from_forms(forms3(|i| {
+             Ok(u.coordinates[i]
+diff --git a/crates/hyperbrep/src/topology/correspondence.rs b/crates/hyperbrep/src/topology/correspondence.rs
+index afd3208617..c8eebb5819 100644
+--- a/crates/hyperbrep/src/topology/correspondence.rs
++++ b/crates/hyperbrep/src/topology/correspondence.rs
+@@ -199,7 +199,7 @@ impl ParameterCorrespondence {
+                 (hypercurve::Axis2::X, Some(u), _) => {
+                     constant.affine_point(Real::zero(), u.clone(), Real::one(), Real::zero())?
+                 }
+-                _ => return Err(GeometryError::UnsupportedSelectedEvaluation),
++                _ => return Err({ eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation }),
+             };
+             return match pcurve.curve().point_locations(&point)? {
+                 hypercurve::CurvePointLocations2::Locations(locations) if locations.len() == 1 => {
+diff --git a/crates/hyperbrep/src/topology/edit/attachment.rs b/crates/hyperbrep/src/topology/edit/attachment.rs
+index ba274ecc2a..17bcd7fbf2 100644
+--- a/crates/hyperbrep/src/topology/edit/attachment.rs
++++ b/crates/hyperbrep/src/topology/edit/attachment.rs
+@@ -7,7 +7,7 @@ impl ArenaModel {
+         &self,
+         face_id: FaceId,
+         endpoint: Endpoint,
+-        point: &Point3,
++        point: &GeometricPoint3,
+         contacts: &[SurfaceIntersectionBoundaryContact],
+     ) -> Result<(Self, VertexId, Option<ArenaEdgeSplit>), TopologyEditError> {
+         match self.locate_surface_curve_split_endpoint(face_id, endpoint, point, contacts)? {
+@@ -19,7 +19,7 @@ impl ArenaModel {
+             } => {
+                 let (staged, split) = self.split_edge_with_pcurve_parameter(
+                     edge,
+-                    (parameter).into(),
++                    parameter,
+                     pcurve_split.map(|witness| *witness),
+                 )?;
+                 Ok((staged, split.vertex, Some(split)))
+@@ -32,8 +32,8 @@ impl ArenaModel {
+         face_id: FaceId,
+         intersection: &SurfaceIntersectionCurve,
+         operand: SurfaceIntersectionOperand,
+-        start: &Point3,
+-        end: &Point3,
++        start: &GeometricPoint3,
++        end: &GeometricPoint3,
+     ) -> Result<bool, TopologyEditError> {
+         let start_contacts = intersection.start_boundary_contacts(operand);
+         let end_contacts = intersection.end_boundary_contacts(operand);
+@@ -67,23 +67,19 @@ impl ArenaModel {
+                         ..
+                     },
+                 ) if start_edge == end_edge => {
+-                    decided_model_order(compare_reals(
+-                        &start_parameter,
+-                        &end_parameter,
+-                        crate::STRICT_PREDICATES,
+-                    ))? == std::cmp::Ordering::Equal
++                    start_parameter.compare(&end_parameter)? == std::cmp::Ordering::Equal
+                 }
+                 _ => false,
+             });
+         }
+-        Ok(exact_point_order(start, end)? == std::cmp::Ordering::Equal)
++        Ok(start.coincides_with(end)?)
+     }
+ 
+     pub(in crate::topology) fn locate_surface_curve_split_endpoint(
+         &self,
+         face_id: FaceId,
+         endpoint: Endpoint,
+-        point: &Point3,
++        point: &GeometricPoint3,
+         contacts: &[SurfaceIntersectionBoundaryContact],
+     ) -> Result<FaceSplitEndpointLocation, TopologyEditError> {
+         let face = self
+@@ -93,62 +89,119 @@ impl ArenaModel {
+             return Err(TopologyEditError::WholeSurfaceFace(face_id));
+         };
+         if contacts.is_empty() {
+-            return self.locate_face_split_endpoint(face_id, endpoint, point);
++            return self.locate_face_split_endpoint(
++                face_id,
++                endpoint,
++                point
++                    .try_coordinates()
++                    .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
++            );
++        }
++        self.locate_retained_contact_endpoint(face_id, endpoint, &[outer], contacts)
++            .map(|(_, location)| location)
++    }
++
++    /// Locates a retained contact on material or hole boundaries, preserving
++    /// the owning wire and the original canonical curve parameter.
++    pub(in crate::topology) fn locate_surface_curve_boundary_endpoint(
++        &self,
++        face_id: FaceId,
++        endpoint: Endpoint,
++        point: &GeometricPoint3,
++        contacts: &[SurfaceIntersectionBoundaryContact],
++    ) -> Result<(WireId, FaceSplitEndpointLocation), TopologyEditError> {
++        if contacts.is_empty() {
++            return self.locate_face_boundary_split_endpoint(
++                face_id,
++                endpoint,
++                point
++                    .try_coordinates()
++                    .ok_or_else(|| { eprintln!("SELECTED STOP {}:{}\n{}", file!(), line!(), std::backtrace::Backtrace::force_capture()); GeometryError::UnsupportedSelectedEvaluation })?,
++            );
+         }
+-        let wire = self.wire(outer).expect("validated face outer wire");
++        let face = self.face(face_id).expect("surface split prevalidates face");
++        let wires = face.boundary_wires().copied().collect::<Vec<_>>();
++        self.locate_retained_contact_endpoint(face_id, endpoint, &wires, contacts)
++    }
++
++    pub(in crate::topology) fn attach_surface_curve_boundary_endpoint(
++        &self,
++        face_id: FaceId,
++        endpoint: Endpoint,
++        point: &GeometricPoint3,
++        contacts: &[SurfaceIntersectionBoundaryContact],
++    ) -> Result<(Self, WireId, VertexId, Option<ArenaEdgeSplit>), TopologyEditError> {
++        let (wire, location) =
++            self.locate_surface_curve_boundary_endpoint(face_id, endpoint, point, contacts)?;
++        match location {
++            FaceSplitEndpointLocation::Vertex(vertex) => Ok((self.clone(), wire, vertex, None)),
++            FaceSplitEndpointLocation::Edge {
++                edge,
++                parameter,
++                pcurve_split,
++            } => {
++                let (model, split) = self.split_edge_with_pcurve_parameter(
++                    edge,
++                    parameter,
++                    pcurve_split.map(|contact| *contact),
++                )?;
++                Ok((model, wire, split.vertex, Some(split)))
++            }
++        }
++    }
++
++    fn locate_retained_contact_endpoint(
++        &self,
++        face_id: FaceId,
++        endpoint: Endpoint,
++        wires: &[WireId],
++        contacts: &[SurfaceIntersectionBoundaryContact],
++    ) -> Result<(WireId, FaceSplitEndpointLocation), TopologyEditError> {
+         let mut matching_vertices = Vec::new();
+         let mut matching_edges = Vec::new();
+-        for use_id in wire.edge_uses() {
+-            let edge_use = self.edge_use(*use_id).expect("validated edge use");
+-            let edge = self.edge(edge_use.edge).expect("validated canonical edge");
+-            let curve = self.curve(edge.curve).expect("validated edge curve");
+-            for contact in contacts {
+-                if !curve.shares_identity(contact.curve()) {
+-                    continue;
+-                }
+-                let start_order = decided_model_order(compare_reals(
+-                    contact.parameter(),
+-                    (edge.domain.start())
+-                        .try_real()
+-                        .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+-                    crate::STRICT_PREDICATES,
+-                ))?;
+-                if start_order == std::cmp::Ordering::Equal {
+-                    if !matching_vertices.contains(&edge.start) {
+-                        matching_vertices.push(edge.start);
++        for &wire_id in wires {
++            let wire = self.wire(wire_id).expect("validated face boundary wire");
++            for use_id in wire.edge_uses() {
++                let edge_use = self.edge_use(*use_id).expect("validated edge use");
++                let edge = self.edge(edge_use.edge).expect("validated canonical edge");
++                let curve = self.curve(edge.curve).expect("validated edge curve");
++                for contact in contacts {
++                    if !curve.shares_identity(contact.curve()) {
++                        continue;
+                     }
+-                    continue;
+-                }
+-                let end_order = decided_model_order(compare_reals(
+-                    contact.parameter(),
+-                    (edge.domain.end())
+-                        .try_real()
+-                        .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+-                    crate::STRICT_PREDICATES,
+-                ))?;
+-                if end_order == std::cmp::Ordering::Equal {
+-                    if !matching_vertices.contains(&edge.end) {
+-                        matching_vertices.push(edge.end);
++                    let start_order = contact.parameter().compare(edge.domain.start())?;
++                    if start_order == std::cmp::Ordering::Equal {
++                        if !matching_vertices.contains(&(wire_id, edge.start)) {
++                            matching_vertices.push((wire_id, edge.start));
++                        }
++                        continue;
++                    }
++                    let end_order = contact.parameter().compare(edge.domain.end())?;
++                    if end_order == std::cmp::Ordering::Equal {
++                        if !matching_vertices.contains(&(wire_id, edge.end)) {
++                            matching_vertices.push((wire_id, edge.end));
++                        }
++                        continue;
++                    }
++                    if start_order == std::cmp::Ordering::Greater
++                        && end_order == std::cmp::Ordering::Less
++                        && !matching_edges.iter().any(|(wire, candidate, _, _, _)| {
++                            *wire == wire_id && *candidate == edge_use.edge
++                        })
++                    {
++                        matching_edges.push((
++                            wire_id,
++                            edge_use.edge,
++                            contact.parameter().clone(),
++                            *use_id,
++                            contact.clone(),
++                        ));
+                     }
+-                    continue;
+-                }
+-                if start_order == std::cmp::Ordering::Greater
+-                    && end_order == std::cmp::Ordering::Less
+-                    && !matching_edges
+-                        .iter()
+-                        .any(|(candidate, _, _, _)| *candidate == edge_use.edge)
+-                {
+-                    matching_edges.push((
+-                        edge_use.edge,
+-                        contact.parameter().clone(),
+-                        *use_id,
+-                        contact.clone(),
+-                    ));
+                 }
+             }
+         }
+         match matching_vertices.as_slice() {
+-            [vertex] => return Ok(FaceSplitEndpointLocation::Vertex(*vertex)),
++            [(wire, vertex)] => return Ok((*wire, FaceSplitEndpointLocation::Vertex(*vertex))),
+             [] => {}
+             _ => {
+                 return Err(TopologyEditError::FaceSplitEndpointAmbiguous {
+@@ -158,11 +211,14 @@ impl ArenaModel {
+             }
+         }
+         match matching_edges.as_slice() {
+-            [(edge, parameter, edge_use, contact)] => Ok(FaceSplitEndpointLocation::Edge {
+-                edge: *edge,
+-                parameter: parameter.clone(),
+-                pcurve_split: Some(Box::new((*edge_use, contact.clone()))),
+-            }),
++            [(wire, edge, parameter, edge_use, contact)] => Ok((
++                *wire,
++                FaceSplitEndpointLocation::Edge {
++                    edge: *edge,
++                    parameter: parameter.clone(),
++                    pcurve_split: Some(Box::new((*edge_use, contact.clone()))),
++                },
++            )),
+             [] => Err(TopologyEditError::FaceSplitEndpointNotOnOuterBoundary {
+                 face: face_id,
+                 endpoint,
