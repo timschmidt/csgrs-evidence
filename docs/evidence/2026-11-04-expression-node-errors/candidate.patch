@@ -1,0 +1,543 @@
+diff --git a/src/errors.rs b/src/errors.rs
+index bee6fa0fea..f0701610c7 100644
+--- a/src/errors.rs
++++ b/src/errors.rs
+@@ -17,6 +17,15 @@ pub enum CurveBooleanError {
+ #[derive(Debug, Clone, thiserror::Error, PartialEq)]
+ #[non_exhaustive]
+ pub enum ValidationError {
++    /// Lazy expression evaluation failed at the specified path from its root.
++    /// An empty path identifies the root evaluation, including arrangement
++    /// failures that cannot be attributed to an individual operand.
++    #[error("CSG expression node {node_path:?}: {source}")]
++    Expression {
++        node_path: Vec<crate::solid_expr::SolidExprChild>,
++        #[source]
++        source: Box<ValidationError>,
++    },
+     /// A length or radius that must be nonnegative was proved negative.
+     #[error("{name} must be nonnegative")]
+     NegativeParameter { name: &'static str },
+@@ -187,6 +196,7 @@ const fn curve_error_kind(source: &CurveError) -> ValidationErrorKind {
+ impl ValidationError {
+     pub const fn kind(&self) -> ValidationErrorKind {
+         match self {
++            Self::Expression { source, .. } => source.kind(),
+             Self::Gpu(error) => match error {
+                 hypermesh::GpuMeshError::TriangleNormalUndecided { .. }
+                 | hypermesh::GpuMeshError::TriangleNormalFailed {
+diff --git a/src/lib.rs b/src/lib.rs
+index b81c3c6a93..6450c43398 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -82,7 +82,7 @@ pub use context::{GeometryCertainty, GeometryContext, GeometryOutcome};
+ pub use hypermesh::{ConstructionEvidence, TriangleMesh};
+ pub use hyperreal::Real;
+ pub use session::{Csg, Error, IntoReal, Result, decimal, ratio};
+-pub use solid_expr::SolidExpr;
++pub use solid_expr::{SolidExpr, SolidExprChild};
+ 
+ pub(crate) const PREDICATE_POLICY: hyperlimit::PredicatePolicy =
+     hyperlimit::PredicatePolicy::STRICT;
+diff --git a/src/solid_expr.rs b/src/solid_expr.rs
+index 7eec4331e0..ba801f114c 100644
+--- a/src/solid_expr.rs
++++ b/src/solid_expr.rs
+@@ -38,6 +38,32 @@
+ //! An empty leaf contributes the empty set, because the kernel does not accept
+ //! empty operands. An expression with no nonempty leaf evaluates to the
+ //! canonical empty mesh.
++//!
++//! # Locating failures
++//!
++//! Evaluation failures preserve their typed cause and category, adding a path
++//! relative to the expression that was evaluated. Paths select occurrences,
++//! including when a subtree is shared; they are not persistent identifiers
++//! across edits to the expression. Shared-arrangement failures without an
++//! operand location report the root evaluation (an empty path).
++//!
++//! ```
++//! use csgrs::{Csg, Error, SolidExpr, SolidExprChild};
++//!
++//! # fn main() -> csgrs::Result<()> {
++//! let m = Csg::strict();
++//! let body = SolidExpr::from(m.cube(2)?);
++//! let collapsed = body.scaled(0, 1, 1)?;
++//! let model = &body | &collapsed;
++//! let Error::Expression { node_path, source } = m.evaluate(&model).unwrap_err() else {
++//!     panic!("expected expression context");
++//! };
++//! assert_eq!(node_path, [SolidExprChild::Right]);
++//! assert_eq!(*source, Error::InvalidArguments);
++//! assert!(model.node_at(&node_path).is_some());
++//! # Ok(())
++//! # }
++//! ```
+ 
+ use std::collections::HashMap;
+ use std::ops::{BitAnd, BitOr, BitXor, Sub};
+@@ -47,6 +73,7 @@ use hyperlattice::Matrix4;
+ use hypermesh::{BooleanExpression, BooleanOp, BooleanProgram, Plane};
+ 
+ use crate::context::{GeometryContext, GeometryDecisions, GeometryOutcome};
++use crate::errors::ValidationError;
+ use crate::session::{IntoReal, Result};
+ use crate::{Real, TriangleMesh, solid};
+ 
+@@ -66,6 +93,18 @@ enum Node {
+     Boolean(BooleanOp, SolidExpr, SolidExpr),
+ }
+ 
++/// One step from a lazy expression's root to a node reported by an error.
++/// Paths describe occurrences: a shared subtree can have several paths.
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub enum SolidExprChild {
++    /// The operand of a transform.
++    Input,
++    /// The left operand of a Boolean operation.
++    Left,
++    /// The right operand of a Boolean operation.
++    Right,
++}
++
+ /// A lazily evaluated CSG expression over meshes.
+ ///
+ /// Cloning is cheap and shares the subtree, and a shared subtree is lowered
+@@ -84,6 +123,21 @@ impl From<TriangleMesh> for SolidExpr {
+ }
+ 
+ impl SolidExpr {
++    /// Resolves an error's node path relative to this expression. An empty
++    /// path selects the root; an incompatible child step returns `None`.
++    pub fn node_at(&self, path: &[SolidExprChild]) -> Option<&Self> {
++        let mut node = self;
++        for child in path {
++            node = match (child, &*node.0) {
++                (SolidExprChild::Input, Node::Transform(_, input)) => input,
++                (SolidExprChild::Left, Node::Boolean(_, left, _)) => left,
++                (SolidExprChild::Right, Node::Boolean(_, _, right)) => right,
++                _ => return None,
++            };
++        }
++        Some(node)
++    }
++
+     fn boolean(&self, operation: BooleanOp, other: &Self) -> Self {
+         Self(Arc::new(Node::Boolean(
+             operation,
+@@ -180,13 +234,19 @@ impl SolidExpr {
+     /// The receipt is the weakest certainty of every decision made: the
+     /// leaf transforms and the shared arrangement. The output mesh also
+     /// inherits the construction evidence of every leaf.
++    ///
++    /// Failures retain their category and source in [`ValidationError::Expression`].
++    /// Its path resolves with [`Self::node_at`]. Transform failures identify
++    /// that transform; indexed input errors identify the leaf's first lowered
++    /// occurrence. Shared-arrangement and unlocalized kernel failures identify
++    /// the root evaluation (an empty path), without assigning blame to a leaf.
+     pub fn evaluate_with_context(
+         &self,
+         context: GeometryContext,
+     ) -> Result<GeometryOutcome<TriangleMesh>> {
+         let decisions = GeometryDecisions::new(context);
+         let mut program = Program::default();
+-        let root = program.lower(self, &[], context, &decisions)?;
++        let root = program.lower(self, &[], None, context, &decisions)?;
+         if program.meshes.is_empty() {
+             // Only empty leaves: every node is a constant, and the operators
+             // available here map an all-false input to false.
+@@ -194,19 +254,30 @@ impl SolidExpr {
+             return Ok(decisions.finish_mesh(solid::empty()));
+         }
+         let meshes: Vec<_> = program.meshes.iter().map(TriangleMesh::as_ref).collect();
+-        let batch = decisions.consume_mesh(hypermesh::boolean(
+-            decisions.mesh_context(),
+-            &meshes,
+-            BooleanProgram::Expressions {
+-                nodes: &program.nodes,
+-                roots: &[root],
+-            },
+-        )?);
+-        let mesh = batch.into_triangle_meshes()?.pop().ok_or(
+-            hypermesh::HypermeshError::InvalidBooleanProgram {
+-                reason: "a CSG expression produced no result row",
+-            },
+-        )?;
++        let batch = decisions.consume_mesh(
++            hypermesh::boolean(
++                decisions.mesh_context(),
++                &meshes,
++                BooleanProgram::Expressions {
++                    nodes: &program.nodes,
++                    roots: &[root],
++                },
++            )
++            .map_err(|error| program.mesh_failure(error))?,
++        );
++        let mesh = batch
++            .into_triangle_meshes()
++            .map_err(|error| program.failure(None, error.into()))?
++            .pop()
++            .ok_or_else(|| {
++                program.failure(
++                    None,
++                    hypermesh::HypermeshError::InvalidBooleanProgram {
++                        reason: "a CSG expression produced no result row",
++                    }
++                    .into(),
++                )
++            })?;
+         Ok(decisions.finish_mesh(mesh))
+     }
+ }
+@@ -216,12 +287,61 @@ impl SolidExpr {
+ struct Program {
+     nodes: Vec<BooleanExpression>,
+     meshes: Vec<TriangleMesh>,
++    /// Parent-linked occurrence paths; root is `None`. Materialize a full
++    /// path only on failure, rather than copying every ancestor per leaf.
++    locations: Vec<Location>,
++    mesh_locations: Vec<Option<usize>>,
+     /// Lowered nodes by subtree identity and the transforms above it.
+     memo: HashMap<(*const Node, Vec<*const Node>), u32>,
+     false_node: Option<u32>,
+ }
+ 
++struct Location {
++    parent: Option<usize>,
++    child: SolidExprChild,
++}
++
+ impl Program {
++    fn child_location(
++        &mut self,
++        parent: Option<usize>,
++        child: SolidExprChild,
++    ) -> Option<usize> {
++        self.locations.push(Location { parent, child });
++        Some(self.locations.len() - 1)
++    }
++
++    fn failure(
++        &self,
++        mut location: Option<usize>,
++        source: ValidationError,
++    ) -> ValidationError {
++        let mut node_path = Vec::new();
++        while let Some(index) = location {
++            let entry = &self.locations[index];
++            node_path.push(entry.child);
++            location = entry.parent;
++        }
++        node_path.reverse();
++        ValidationError::Expression {
++            node_path,
++            source: Box::new(source),
++        }
++    }
++
++    fn mesh_failure(&self, source: hypermesh::HypermeshError) -> ValidationError {
++        let location = match &source {
++            hypermesh::HypermeshError::EmptyMesh { mesh_index }
++            | hypermesh::HypermeshError::DegenerateTriangle { mesh_index, .. }
++            | hypermesh::HypermeshError::OpenInput { mesh_index, .. }
++            | hypermesh::HypermeshError::NonPwnInput { mesh_index, .. } => {
++                self.mesh_locations.get(*mesh_index).copied().flatten()
++            },
++            _ => None,
++        };
++        self.failure(location, source.into())
++    }
++
+     fn push(&mut self, node: BooleanExpression) -> u32 {
+         self.nodes.push(node);
+         u32::try_from(self.nodes.len() - 1).expect("a CSG expression exceeds u32 nodes")
+@@ -243,7 +363,8 @@ impl Program {
+     fn lower(
+         &mut self,
+         expr: &SolidExpr,
+-        above: &[&SolidExpr],
++        above: &[(&SolidExpr, Option<usize>)],
++        location: Option<usize>,
+         context: GeometryContext,
+         decisions: &GeometryDecisions,
+     ) -> Result<u32> {
+@@ -251,7 +372,7 @@ impl Program {
+             Arc::as_ptr(&expr.0),
+             above
+                 .iter()
+-                .map(|node| Arc::as_ptr(&node.0))
++                .map(|(node, _)| Arc::as_ptr(&node.0))
+                 .collect::<Vec<_>>(),
+         );
+         if let Some(node) = self.memo.get(&key) {
+@@ -261,11 +382,14 @@ impl Program {
+             Node::Leaf(mesh) => {
+                 let mut mesh = mesh.clone();
+                 // Innermost transform first: the order they were applied.
+-                for transform in above.iter().rev() {
++                for (transform, transform_location) in above.iter().rev() {
+                     let Node::Transform(transform, _) = &*transform.0 else {
+                         unreachable!("only transform nodes are recorded above a leaf");
+                     };
+-                    mesh = decisions.record(apply(&mesh, transform, context)?);
++                    mesh = decisions.record(
++                        apply(&mesh, transform, context)
++                            .map_err(|error| self.failure(*transform_location, error))?,
++                    );
+                 }
+                 // Empty geometry still carries construction ancestry. Keep it
+                 // before replacing its geometry with the constant false node.
+@@ -274,6 +398,7 @@ impl Program {
+                     self.false_node()
+                 } else {
+                     self.meshes.push(mesh);
++                    self.mesh_locations.push(location);
+                     let operand = u32::try_from(self.meshes.len() - 1)
+                         .expect("a CSG expression exceeds u32 operands");
+                     self.push(BooleanExpression::Operand(operand))
+@@ -281,12 +406,15 @@ impl Program {
+             },
+             Node::Transform(_, child) => {
+                 let mut above = above.to_vec();
+-                above.push(expr);
+-                self.lower(child, &above, context, decisions)?
++                above.push((expr, location));
++                let child_location = self.child_location(location, SolidExprChild::Input);
++                self.lower(child, &above, child_location, context, decisions)?
+             },
+             Node::Boolean(operation, left, right) => {
+-                let left = self.lower(left, above, context, decisions)?;
+-                let right = self.lower(right, above, context, decisions)?;
++                let left_location = self.child_location(location, SolidExprChild::Left);
++                let left = self.lower(left, above, left_location, context, decisions)?;
++                let right_location = self.child_location(location, SolidExprChild::Right);
++                let right = self.lower(right, above, right_location, context, decisions)?;
+                 match operation {
+                     BooleanOp::Union => self.push(BooleanExpression::Or([left, right])),
+                     BooleanOp::Intersection => {
+diff --git a/tests/solid_expr.rs b/tests/solid_expr.rs
+index 004342a75b..4e4f5c4a2c 100644
+--- a/tests/solid_expr.rs
++++ b/tests/solid_expr.rs
+@@ -7,7 +7,10 @@
+ #[path = "support/uncertainty.rs"]
+ mod uncertainty;
+ 
+-use csgrs::{Csg, GeometryCertainty, GeometryContext, Real, SolidExpr, TriangleMesh, solid};
++use csgrs::{
++    Csg, Error, GeometryCertainty, GeometryContext, Real, SolidExpr, SolidExprChild,
++    TriangleMesh, errors::ValidationErrorKind, solid,
++};
+ use hypermesh::BooleanOp;
+ 
+ fn volume(mesh: &TriangleMesh) -> Real {
+@@ -137,6 +140,187 @@ fn empty_leaves_are_the_empty_set() {
+     assert!(evaluate(&(&empty | &empty)).triangles.is_empty());
+ }
+ 
++#[test]
++fn expression_failures_identify_the_failing_node() {
++    use SolidExprChild::{Left, Right};
++    let cube = SolidExpr::from(solid::cube(2).unwrap());
++    let singular = cube.scaled(0, 1, 1).unwrap();
++    let expression = &cube | &(&singular - &cube);
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let session = Csg::new(context);
++        let error = session.evaluate(&expression).unwrap_err();
++        assert_eq!(session.certainty(), GeometryCertainty::Certified);
++        assert_eq!(error.kind(), ValidationErrorKind::InvalidInput);
++        assert!(
++            error
++                .to_string()
++                .contains("CSG expression node [Right, Left]")
++        );
++        let Error::Expression { node_path, source } = &error else {
++            panic!("missing expression context: {error}");
++        };
++        assert_eq!(node_path, &[Right, Left]);
++        assert_eq!(**source, Error::InvalidArguments);
++        assert_eq!(
++            std::error::Error::source(&error)
++                .unwrap()
++                .downcast_ref::<Box<Error>>(),
++            Some(source)
++        );
++        // Resolving the path selects the singular transform itself.
++        let selected = expression.node_at(node_path).unwrap();
++        assert_eq!(
++            selected.evaluate_with_context(context).unwrap_err().kind(),
++            ValidationErrorKind::InvalidInput
++        );
++    }
++
++    let mesh = solid::cube(2).unwrap();
++    let open = TriangleMesh::from_construction(
++        mesh.positions.to_vec(),
++        mesh.triangles[1..].to_vec(),
++        csgrs::ConstructionEvidence::DECLARED_COORDINATES,
++    );
++    let expression = &cube | &(&cube - &SolidExpr::from(open));
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let error = expression.evaluate_with_context(context).unwrap_err();
++        assert_eq!(error.kind(), ValidationErrorKind::InvalidInput);
++        assert!(
++            error
++                .to_string()
++                .contains("CSG expression node [Right, Right]")
++        );
++        let Error::Expression { node_path, source } = &error else {
++            panic!("missing expression context: {error}");
++        };
++        assert_eq!(node_path, &[Right, Right]);
++        let cause = std::error::Error::source(source.as_ref()).unwrap();
++        assert!(matches!(
++            cause.downcast_ref::<hypermesh::HypermeshError>(),
++            Some(
++                hypermesh::HypermeshError::OpenInput { .. }
++                    | hypermesh::HypermeshError::NonPwnInput { .. }
++            )
++        ));
++        assert!(expression.node_at(node_path).is_some());
++        assert!(expression.node_at(&[SolidExprChild::Input]).is_none());
++        assert!(expression.node_at(&[Left, Left]).is_none());
++    }
++}
++
++#[test]
++fn expression_paths_follow_transforms_and_shared_occurrences() {
++    use SolidExprChild::{Input, Left, Right};
++    let mesh = solid::cube(2).unwrap();
++    let invalid = SolidExpr::from(TriangleMesh::from_construction(
++        mesh.positions.to_vec(),
++        Vec::new(),
++        csgrs::ConstructionEvidence::DECLARED_COORDINATES,
++    ));
++    let shared = &invalid | &invalid;
++    let expression = shared.translated(3, 0, 0).unwrap();
++    for _ in 0..2 {
++        let error = expression
++            .evaluate_with_context(GeometryContext::STRICT)
++            .unwrap_err();
++        let Error::Expression { node_path, source } = error else {
++            panic!("missing expression context");
++        };
++        // The shared operand is lowered once at its first occurrence.
++        assert_eq!(node_path, &[Input, Left]);
++        assert!(matches!(
++            *source,
++            Error::Mesh(hypermesh::HypermeshError::EmptyMesh { mesh_index: 0 })
++        ));
++    }
++
++    let cube = SolidExpr::from(mesh);
++    let singular = shared.scaled(0, 1, 1).unwrap();
++    let expression = &cube | &singular;
++    let error = expression
++        .evaluate_with_context(GeometryContext::STRICT)
++        .unwrap_err();
++    let Error::Expression { node_path, source } = error else {
++        panic!("missing expression context");
++    };
++    // Pushing an outer transform to leaves still blames that transform.
++    assert_eq!(node_path, &[Right]);
++    assert_eq!(*source, Error::InvalidArguments);
++}
++
++#[test]
++fn empty_expression_operands_do_not_hide_located_input_failures() {
++    use SolidExprChild::{Left, Right};
++    let mesh = solid::cube(2).unwrap();
++    let invalid = SolidExpr::from(TriangleMesh::from_construction(
++        mesh.positions.to_vec(),
++        Vec::new(),
++        csgrs::ConstructionEvidence::DECLARED_COORDINATES,
++    ));
++    let empty = SolidExpr::from(solid::empty());
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        for (left, right, path) in [(&empty, &invalid, Right), (&invalid, &empty, Left)] {
++            for expression in [left | right, left & right, left - right, left ^ right] {
++                let error = expression.evaluate_with_context(context).unwrap_err();
++                assert_eq!(error.kind(), ValidationErrorKind::InvalidInput);
++                let Error::Expression { node_path, source } = error else {
++                    panic!("missing expression context");
++                };
++                assert_eq!(node_path, &[path]);
++                assert!(matches!(
++                    *source,
++                    Error::Mesh(hypermesh::HypermeshError::EmptyMesh { mesh_index: 0 })
++                ));
++            }
++        }
++    }
++}
++
++#[test]
++fn unbounded_expression_transforms_keep_their_typed_cause() {
++    let mesh = solid::cube(2).unwrap();
++    // An invertible projective map undefined on x = 0.
++    let reciprocal_x = hyperlattice::Matrix4::from_row_major(
++        [0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0].map(Real::from),
++    );
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let expected =
++            solid::transform_with_context(&mesh, &reciprocal_x, context).unwrap_err();
++        let leaf = SolidExpr::from(mesh.clone());
++        let expression = &leaf | &leaf.transformed(reciprocal_x.clone());
++        let error = expression.evaluate_with_context(context).unwrap_err();
++        assert_eq!(error.kind(), ValidationErrorKind::Unbounded);
++        let Error::Expression { node_path, source } = error else {
++            panic!("missing expression context");
++        };
++        assert_eq!(node_path, &[SolidExprChild::Right]);
++        assert_eq!(*source, expected);
++    }
++}
++
++#[test]
++fn unlocalized_mesh_failures_identify_root_evaluation() {
++    let malformed = TriangleMesh::new(
++        vec![hyperlattice::Point3::origin()],
++        vec![hypermesh::Triangle::new(0, 1, 0)],
++    );
++    let leaf = SolidExpr::from(malformed);
++    let expression = &SolidExpr::from(solid::empty()) | &leaf;
++    let error = expression
++        .evaluate_with_context(GeometryContext::STRICT)
++        .unwrap_err();
++    let Error::Expression { node_path, source } = error else {
++        panic!("missing expression context");
++    };
++    // This kernel diagnostic carries no operand index. Do not infer a leaf.
++    assert!(node_path.is_empty());
++    assert!(expression.node_at(&node_path).is_some());
++    assert!(matches!(
++        *source,
++        Error::Mesh(hypermesh::HypermeshError::VertexIndexOutOfBounds { .. })
++    ));
++}
++
+ /// Regularization can produce an empty mesh while retaining approximate
+ /// construction ancestry. Lowering that leaf to `false` must keep its receipt.
+ #[test]
+@@ -198,7 +382,19 @@ fn shared_subtrees_and_an_approximate_step_keep_their_meaning() {
+     let expression = &pair | &(&pair & &cube);
+ 
+     let strict = Csg::strict();
+-    assert!(strict.evaluate(&expression).is_err());
++    let error = strict.evaluate(&expression).unwrap_err();
++    assert_eq!(error.kind(), ValidationErrorKind::Undecided);
++    let Error::Expression { node_path, source } = error else {
++        panic!("missing expression context");
++    };
++    assert!(node_path.is_empty());
++    assert!(matches!(
++        *source,
++        Error::Mesh(
++            hypermesh::HypermeshError::PredicateUndecided { .. }
++                | hypermesh::HypermeshError::UnknownClassification
++        )
++    ));
+     assert_eq!(strict.certainty(), GeometryCertainty::Certified);
+ 
+     let approximate = Csg::approximate_512();

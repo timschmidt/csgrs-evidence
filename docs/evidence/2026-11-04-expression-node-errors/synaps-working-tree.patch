@@ -1,0 +1,3679 @@
+diff --git a/.github/actions/hyper-workspace/action.yml b/.github/actions/hyper-workspace/action.yml
+index 5a842f6..95a1675 100644
+--- a/.github/actions/hyper-workspace/action.yml
++++ b/.github/actions/hyper-workspace/action.yml
+@@ -1,5 +1,5 @@
+ name: Checkout Hyper workspace
+-description: Fetch the exact sibling repositories required by local path dependencies
++description: Fetch the csgrs monorepo and openscad-rs siblings required by local path dependencies
+ 
+ runs:
+   using: composite
+@@ -21,14 +21,6 @@ runs:
+           git -C "${destination}" checkout --detach FETCH_HEAD
+         }
+ 
+-        checkout_repo csgrs https://github.com/timschmidt/csgrs.git d0634cead65ccd2f870fcfcf8b46be7b0a679ab4
+-        checkout_repo hypercurve https://github.com/timschmidt/hypercurve.git 9c79febdd0618081ed8b5fa6f8b108de8957b8d3
+-        checkout_repo hyperlattice https://github.com/timschmidt/hyperlattice.git e3c74e3acc462c38be0475e6381d210efbe35a5c
+-        checkout_repo hyperlimit https://github.com/timschmidt/hyperlimit.git 838887426941ff5af2060aacd03597929519207f
+-        checkout_repo hypermesh https://github.com/timschmidt/hypermesh.git 92effa8df5d0640a66af99a7145d722b0acd78ed
+-        checkout_repo hyperphysics https://github.com/timschmidt/hyperphysics.git 86f84d0e470fe68bdec66459595a63cb1d8c8d7f
+-        checkout_repo hyperreal https://github.com/timschmidt/hyperreal.git 6f8ce9a7e600b8f32acf8313d5be6c1972c207bc
+-        checkout_repo hypersdf https://github.com/timschmidt/hypersdf.git ecb9811f99fdca083faae8e97624679c8ce1970c
+-        checkout_repo hypersolve https://github.com/timschmidt/hypersolve.git 2ec9cd754e519197dc558a2b77f12dc43265064c
+-        checkout_repo hypertri https://github.com/timschmidt/hypertriangulate.git 2f9b27222e2108ceffe7e2a9cf669c3c3e63a5e0
+-        checkout_repo openscad-rs https://github.com/timschmidt/openscad-rs.git 695af0746d8df284a7c7976e5664f4aa35f6a32a
++        # The Hyper crates live in the csgrs monorepo under crates/.
++        checkout_repo csgrs https://github.com/timschmidt/csgrs.git 1a0972a2fcc700ac2f9ffd486ecbfaabf2127f23
++        checkout_repo openscad-rs https://github.com/timschmidt/openscad-rs.git c0d92e6ea47df4075d161d6d973f4dcfd8bf34c6
+diff --git a/AGENTS.md b/AGENTS.md
+index de513a4..1b1c3c9 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -62,6 +62,18 @@ Parts use a `@N` numbering scheme:
+ 
+ Each part gets a **unique color** (from `PART_PALETTE` or from `color()` in code). The label is rendered as a billboard overlay at the part's AABB center.
+ 
++A failed part keeps its number, so the other parts keep theirs. An exactly empty part also keeps its number and is reported as a warning.
++
++### Certainty badge
++
++Every label carries a small certainty badge (`PartLabel::badge`):
++
++- `✔` — the part succeeded. SynapsCAD evaluates everything under `GeometryContext::STRICT`, so a successful part's topology decisions are certified. There is no approximate state to show.
++- After the check mark, the qualifications recorded in the mesh's `construction_evidence()`: `approx-512` (`approximate_512_consumed`), `sampled` (`source_sampled`, e.g. a tessellated sphere), `projected` (`coordinates_projected`) and `no-history` (`source_history_missing`).
++- A failed part has no mesh, so its badge (`@N ✖ <kind> · line L:C`) is listed in the lower-left corner of the viewport, with the full message on hover. Failures are also posted to the chat panel.
++
++The AI context (`build_part_context` in `ai_chat.rs`) lists every part in number order with the same information: color and evidence for successful parts, failure kind, source location and message for failed parts.
++
+ ### Why This Matters for Agents
+ 
+ When a user says _"make @2 taller"_ or _"change the color of @1"_, the AI agent knows exactly which geometric part is being referenced. The label system provides:
+@@ -157,6 +169,13 @@ if ($view == "assembly") view_assembly();
+ 
+ When adding new features, use `self.warnings.push(...)` in the `Evaluator` for recoverable issues, and `return Err(...)` for fatal per-part failures.
+ 
++**Keep the exact stack's typed failures and certainty.** csgrs and the Hyper crates return typed failures and a certainty receipt (`Certified` or `Approximate512Consumed`) with every result.
++
++- A failed shape is `Shape::Failed(ShapeFailure)` (`src/compiler/failure.rs`). It keeps a `FailureKind` (csgrs's `ValidationErrorKind` via `Error::kind()`, or a SynapsCAD kind such as `InvalidArgument`, `MixedDimensions`, `Undecided`, `Unsupported` or `RenderConversion`), the underlying `csgrs::Error` as its `source()`, a human message, and the openscad-rs `Span` of the innermost statement that produced it (attached in `Evaluator::eval_statement`).
++- Wrap a csgrs error with `ShapeFailure::kernel(context, error)`; never format it into a `String` before display.
++- `compile_scad_code` returns failed top-level parts as `failed_parts: Vec<FailedPart>`, with their part number and source line and column. Successful parts carry `PartEvidence`, read from the mesh's `construction_evidence()`.
++- Do not drop a result's certainty when the value is unwrapped; carry it with the part so it can be shown.
++
+ ### Running
+ 
+ ```sh
+@@ -247,6 +266,22 @@ Before every `git push`, agents must:
+ 
+ A push is not allowed while any required check is failing. Hosted deployment actions, secret-dependent publication, and packaging for operating systems unavailable on the current host may be excluded only when they cannot be reproduced locally; inspect those workflow steps for consistency and report the limitation explicitly.
+ 
++## Planned work
++
++These directions come from an external review (3 November 2026). They are tracked with the stack's simplification and API program in csgrs (`docs/research/simplification-and-api-program.md`, packages D01-D03). Items 1-3 are implemented (see *Error Handling*, *Certainty badge* and the note below); item 4 is open.
++
++1. **Typed failures with source spans.**
++   - Replace `Shape::Failed(String)` with a typed failure that keeps the underlying csgrs/hypermesh error and the openscad-rs source span.
++   - Render the message only at display.
++   - The review cites alumina-interface as an example of carrying evidence through to the UI.
++2. **A certainty badge per part.** Show, in the viewport and in the part labels, whether each part was certified or used approximate decisions, and why a part failed. The exactness of the result is the selling point, so it must be visible.
++3. **One Boolean program per subtree.**
++   - `eval_boolean_op` folds children pairwise, so `union()` over N children builds N−1 separate arrangements.
++   - Lower each `union`/`difference`/`intersection` subtree into one hypermesh `BooleanProgram`, so intersection work is shared. Use csgrs's lazy CSG tree once it exists.
++   - Measure the change with `benches/compile_default.rs` on the same completed output.
++   - Implemented with `csgrs::SolidExpr`: a 3D Boolean is recorded as `Shape::Csg3D` (balanced for long child lists), nested Boolean subtrees and transforms are recorded into the same expression, and `Shape::resolve` evaluates it once under `GeometryContext::STRICT`. Top-level parts, `hull()`, `minkowski()`, `center` and extrusion children resolve it. 2D regions keep their pairwise region Booleans.
++4. **Differential corpus.** Evaluate openscad-rs's OpenSCAD test-suite corpus in SynapsCAD and diff the results against OpenSCAD with its Manifold backend. Classify every difference rather than silently absorbing it.
++
+ ## Maintaining This Document
+ 
+ **Keep `AGENTS.md` up to date.** When making architecture-relevant changes — new plugins, new resources/components, changed data flow, new UI patterns, or new conventions — update this file so that AI agents always have accurate context about the codebase.
+diff --git a/Cargo.lock b/Cargo.lock
+index 9772de6..74e246c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2078,7 +2078,6 @@ dependencies = [
+  "chrono",
+  "doc-image-embed",
+  "dxf",
+- "fast-surface-nets",
+  "gerber-types",
+  "gerber_parser",
+  "gltf",
+@@ -2096,7 +2095,6 @@ dependencies = [
+  "stl_io",
+  "thiserror 2.0.18",
+  "ttf-parser 0.25.1",
+- "ttf-parser-utils",
+  "uuid",
+ ]
+ 
+@@ -3333,7 +3331,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypercurve"
+-version = "0.3.1"
++version = "0.4.0"
+ dependencies = [
+  "hyperlimit",
+  "hyperreal",
+@@ -3344,14 +3342,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "hyperlattice"
+-version = "0.6.1"
++version = "0.7.0"
+ dependencies = [
+  "hyperreal",
+ ]
+ 
+ [[package]]
+ name = "hyperlimit"
+-version = "0.4.1"
++version = "0.5.0"
+ dependencies = [
+  "hyperlattice",
+  "hyperreal",
+@@ -3380,7 +3378,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hyperreal"
+-version = "0.13.1"
++version = "0.14.0"
+ dependencies = [
+  "num",
+ ]
+@@ -3397,7 +3395,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypersolve"
+-version = "0.3.1"
++version = "0.4.0"
+ dependencies = [
+  "hyperlattice",
+  "hyperlimit",
+@@ -3407,7 +3405,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypertri"
+-version = "0.4.1"
++version = "0.5.0"
+ dependencies = [
+  "hyperlimit",
+  "hyperreal",
+@@ -6849,15 +6847,6 @@ version = "0.25.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+ 
+-[[package]]
+-name = "ttf-parser-utils"
+-version = "0.1.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff2ad77abd4b1ab08adbab7f399be4cc1ff6958421cafa86af75824d9179b5c0"
+-dependencies = [
+- "ttf-parser 0.25.1",
+-]
+-
+ [[package]]
+ name = "twox-hash"
+ version = "1.6.3"
+diff --git a/Cargo.toml b/Cargo.toml
+index 78007ba..e2ce247 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,11 +23,11 @@ reqwest = { version = "0.13", features = ["json"] }
+ # corresponding crates.io dependency below.
+ csgrs = { path = "../csgrs", features = ["offset"] }
+ # csgrs = { version = "0.23.0", features = ["offset"] }
+-hyperlimit = { version = "0.4.1", path = "../hyperlimit" }
+-hypercurve = { path = "../hypercurve" }
+-hyperlattice = { path = "../hyperlattice" }
+-hypermesh = { path = "../hypermesh" }
+-hyperreal = { path = "../hyperreal", optional = true, features = ["dispatch-trace"] }
++hyperlimit = { version = "0.5.0", path = "../csgrs/crates/hyperlimit" }
++hypercurve = { path = "../csgrs/crates/hypercurve" }
++hyperlattice = { path = "../csgrs/crates/hyperlattice" }
++hypermesh = { path = "../csgrs/crates/hypermesh" }
++hyperreal = { path = "../csgrs/crates/hyperreal", optional = true, features = ["dispatch-trace"] }
+ url = "2"
+ web-time = "1"
+ 
+@@ -55,15 +55,15 @@ wasm-bindgen-futures = "0.4"
+ winresource = "0.1"
+ 
+ [patch.crates-io]
+-hypercurve = { path = "../hypercurve" }
+-hyperlattice = { path = "../hyperlattice" }
+-hyperlimit = { path = "../hyperlimit" }
+-hypermesh = { path = "../hypermesh" }
+-hyperphysics = { path = "../hyperphysics" }
+-hyperreal = { path = "../hyperreal" }
+-hypersdf = { path = "../hypersdf" }
+-hypersolve = { path = "../hypersolve" }
+-hypertri = { path = "../hypertri" }
++hypercurve = { path = "../csgrs/crates/hypercurve" }
++hyperlattice = { path = "../csgrs/crates/hyperlattice" }
++hyperlimit = { path = "../csgrs/crates/hyperlimit" }
++hypermesh = { path = "../csgrs/crates/hypermesh" }
++hyperphysics = { path = "../csgrs/crates/hyperphysics" }
++hyperreal = { path = "../csgrs/crates/hyperreal" }
++hypersdf = { path = "../csgrs/crates/hypersdf" }
++hypersolve = { path = "../csgrs/crates/hypersolve" }
++hypertri = { path = "../csgrs/crates/hypertri" }
+ 
+ [lints.rust]
+ unsafe_code = "forbid"
+diff --git a/benches/compile_default.rs b/benches/compile_default.rs
+index c2b722f..57efe39 100644
+--- a/benches/compile_default.rs
++++ b/benches/compile_default.rs
+@@ -38,12 +38,12 @@ fn time_phases(code: &str, fn_override: u32) -> PhaseTimes {
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+             }
+             Shape::CurveRegion2D(region) => {
+-                let mesh = csgrs::curve::try_triangulate(&region, &csgrs::GeometryContext::STRICT)
++                let mesh = csgrs::curve::try_triangulate(&region, csgrs::GeometryContext::STRICT)
+                     .ok()?
+                     .into_value();
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+             }
+-            Shape::Failed(_) => None,
++            Shape::Failed(_) | Shape::Csg3D { .. } => None,
+         })
+         .collect::<Vec<_>>();
+     let convert = start.elapsed();
+@@ -64,11 +64,20 @@ fn compile_once(code: &str, fn_override: u32, require_no_warnings: bool) -> usiz
+     match compile_scad_code(black_box(code), fn_override, None) {
+         CompilationResult::Success {
+             parts,
++            failed_parts,
+             views,
+             warnings,
+         } => {
+             if require_no_warnings {
+                 assert!(warnings.is_empty(), "default scene warnings: {warnings:?}");
++                assert!(
++                    failed_parts.is_empty(),
++                    "default scene failed parts: {:?}",
++                    failed_parts
++                        .iter()
++                        .map(synaps_cad::compiler::FailedPart::summary)
++                        .collect::<Vec<_>>()
++                );
+             }
+             parts.iter().map(|part| part.indices.len()).sum::<usize>()
+                 + views
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index 568eb0d..68bb0cf 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -2090,7 +2090,6 @@ dependencies = [
+  "chrono",
+  "doc-image-embed",
+  "dxf",
+- "fast-surface-nets",
+  "gerber-types",
+  "gerber_parser",
+  "gltf",
+@@ -2108,7 +2107,6 @@ dependencies = [
+  "stl_io",
+  "thiserror 2.0.19",
+  "ttf-parser 0.25.1",
+- "ttf-parser-utils",
+  "uuid",
+ ]
+ 
+@@ -3346,7 +3344,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypercurve"
+-version = "0.3.1"
++version = "0.4.0"
+ dependencies = [
+  "hyperlimit",
+  "hyperreal",
+@@ -3357,14 +3355,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "hyperlattice"
+-version = "0.6.1"
++version = "0.7.0"
+ dependencies = [
+  "hyperreal",
+ ]
+ 
+ [[package]]
+ name = "hyperlimit"
+-version = "0.4.1"
++version = "0.5.0"
+ dependencies = [
+  "hyperlattice",
+  "hyperreal",
+@@ -3393,7 +3391,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hyperreal"
+-version = "0.13.1"
++version = "0.14.0"
+ dependencies = [
+  "num",
+ ]
+@@ -3410,7 +3408,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypersolve"
+-version = "0.3.1"
++version = "0.4.0"
+ dependencies = [
+  "hyperlattice",
+  "hyperlimit",
+@@ -3420,7 +3418,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "hypertri"
+-version = "0.4.1"
++version = "0.5.0"
+ dependencies = [
+  "hyperlimit",
+  "hyperreal",
+@@ -6940,15 +6938,6 @@ version = "0.25.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+ 
+-[[package]]
+-name = "ttf-parser-utils"
+-version = "0.1.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff2ad77abd4b1ab08adbab7f399be4cc1ff6958421cafa86af75824d9179b5c0"
+-dependencies = [
+- "ttf-parser 0.25.1",
+-]
+-
+ [[package]]
+ name = "twox-hash"
+ version = "1.6.3"
+diff --git a/fuzz/Cargo.toml b/fuzz/Cargo.toml
+index 874191d..8ebffb3 100644
+--- a/fuzz/Cargo.toml
++++ b/fuzz/Cargo.toml
+@@ -9,24 +9,24 @@ cargo-fuzz = true
+ 
+ [dependencies]
+ csgrs = { path = "../../csgrs" }
+-hypercurve = { path = "../../hypercurve" }
+-hyperlattice = { path = "../../hyperlattice" }
+-hyperlimit = { path = "../../hyperlimit" }
+-hypermesh = { path = "../../hypermesh" }
++hypercurve = { path = "../../csgrs/crates/hypercurve" }
++hyperlattice = { path = "../../csgrs/crates/hyperlattice" }
++hyperlimit = { path = "../../csgrs/crates/hyperlimit" }
++hypermesh = { path = "../../csgrs/crates/hypermesh" }
+ libfuzzer-sys = "0.4"
+ openscad-rs = { path = "../../openscad-rs" }
+ synaps-cad = { path = "..", features = ["fuzz-bounded-campaign"] }
+ 
+ [patch.crates-io]
+-hypercurve = { path = "../../hypercurve" }
+-hyperlattice = { path = "../../hyperlattice" }
+-hyperlimit = { path = "../../hyperlimit" }
+-hypermesh = { path = "../../hypermesh" }
+-hyperphysics = { path = "../../hyperphysics" }
+-hyperreal = { path = "../../hyperreal" }
+-hypersdf = { path = "../../hypersdf" }
+-hypersolve = { path = "../../hypersolve" }
+-hypertri = { path = "../../hypertri" }
++hypercurve = { path = "../../csgrs/crates/hypercurve" }
++hyperlattice = { path = "../../csgrs/crates/hyperlattice" }
++hyperlimit = { path = "../../csgrs/crates/hyperlimit" }
++hypermesh = { path = "../../csgrs/crates/hypermesh" }
++hyperphysics = { path = "../../csgrs/crates/hyperphysics" }
++hyperreal = { path = "../../csgrs/crates/hyperreal" }
++hypersdf = { path = "../../csgrs/crates/hypersdf" }
++hypersolve = { path = "../../csgrs/crates/hypersolve" }
++hypertri = { path = "../../csgrs/crates/hypertri" }
+ 
+ [[bin]]
+ name = "fuzz_compile_arbitrary"
+diff --git a/fuzz/fuzz_targets/fuzz_full_pipeline.rs b/fuzz/fuzz_targets/fuzz_full_pipeline.rs
+index bbb6261..92b67ea 100644
+--- a/fuzz/fuzz_targets/fuzz_full_pipeline.rs
++++ b/fuzz/fuzz_targets/fuzz_full_pipeline.rs
+@@ -35,12 +35,18 @@ fuzz_target!(|data: &[u8]| {
+     match compile_scad_code(&source, u32::from(cursor.positive() + 2), None) {
+         CompilationResult::Success {
+             parts,
++            failed_parts,
+             views,
+             warnings: _,
+         } => {
+             for part in &parts {
+                 support::assert_render_mesh(part);
+             }
++            for failed in &failed_parts {
++                assert!(failed.part >= 1);
++                assert!(!failed.summary().is_empty());
++                assert!(parts.iter().all(|part| part.part != failed.part));
++            }
+             if !parts.is_empty() {
+                 assert!(!views.is_empty());
+                 assert!(
+diff --git a/fuzz/fuzz_targets/fuzz_shape_catalog.rs b/fuzz/fuzz_targets/fuzz_shape_catalog.rs
+index 553bd98..e9d883f 100644
+--- a/fuzz/fuzz_targets/fuzz_shape_catalog.rs
++++ b/fuzz/fuzz_targets/fuzz_shape_catalog.rs
+@@ -5,9 +5,9 @@ mod support;
+ use csgrs::{Real, curve, solid};
+ use hyperlattice::Point3;
+ use libfuzzer_sys::fuzz_target;
+-use synaps_cad::compiler::geometry::Shape;
++use synaps_cad::compiler::geometry::{Shape, ShapeFailure};
+ 
+-fn planar_shape(cursor: &mut support::ByteCursor<'_>) -> hypercurve::CurveRegion2 {
++fn planar_shape(cursor: &mut support::ByteCursor<'_>) -> csgrs::Result<hypercurve::CurveRegion2> {
+     let a = Real::from(cursor.positive());
+     let b = Real::from(cursor.positive());
+     let segments = cursor.choice(14) + 3;
+@@ -20,9 +20,8 @@ fn planar_shape(cursor: &mut support::ByteCursor<'_>) -> hypercurve::CurveRegion
+         4 => curve::heart(a, b, segments),
+         5 => curve::egg(a, b, segments),
+         6 => curve::teardrop(a.clone(), a + b, segments),
+-        7 => curve::ring(a, b, segments, &csgrs::GeometryContext::STRICT)
+-            .map(csgrs::GeometryOutcome::into_value)
+-            .unwrap_or_else(|_| curve::empty()),
++        7 => curve::ring(a, b, segments, csgrs::GeometryContext::STRICT)
++            .map(csgrs::GeometryOutcome::into_value),
+         8 => curve::involute_gear(
+             a,
+             teeth,
+@@ -57,7 +56,7 @@ fn planar_shape(cursor: &mut support::ByteCursor<'_>) -> hypercurve::CurveRegion
+     }
+ }
+ 
+-fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh {
++fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> csgrs::Result<hypermesh::TriangleMesh> {
+     let a = Real::from(cursor.positive());
+     let b = Real::from(cursor.positive());
+     let c = Real::from(cursor.positive());
+@@ -76,10 +75,9 @@ fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh
+             a + b,
+             c,
+             segments,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+-        .map(csgrs::GeometryOutcome::into_value)
+-        .unwrap_or_else(|_| solid::empty()),
++        .map(csgrs::GeometryOutcome::into_value),
+         8 => solid::spur_gear_involute(
+             a,
+             teeth,
+@@ -88,10 +86,9 @@ fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh
+             Real::zero(),
+             segments.clamp(2, 5),
+             c,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+-        .map(csgrs::GeometryOutcome::into_value)
+-        .unwrap_or_else(|_| solid::empty()),
++        .map(csgrs::GeometryOutcome::into_value),
+         9 => solid::spur_gear_cycloid(
+             a,
+             teeth,
+@@ -99,10 +96,9 @@ fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh
+             Real::zero(),
+             segments.clamp(2, 5),
+             c,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+-        .map(csgrs::GeometryOutcome::into_value)
+-        .unwrap_or_else(|_| solid::empty()),
++        .map(csgrs::GeometryOutcome::into_value),
+         10 => solid::helical_involute_gear(
+             a,
+             teeth,
+@@ -113,10 +109,9 @@ fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh
+             c,
+             Real::from(30_u8),
+             segments,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+-        .map(csgrs::GeometryOutcome::into_value)
+-        .unwrap_or_else(|_| solid::empty()),
++        .map(csgrs::GeometryOutcome::into_value),
+         _ => {
+             let bottom = vec![
+                 Point3::origin(),
+@@ -134,7 +129,7 @@ fn solid_shape(cursor: &mut support::ByteCursor<'_>) -> hypermesh::TriangleMesh
+                     )
+                 })
+                 .collect::<Vec<_>>();
+-            solid::loft(&[bottom, top]).unwrap_or_else(|_| solid::empty())
++            solid::loft(&[bottom, top])
+         }
+     }
+ }
+@@ -146,16 +141,25 @@ fuzz_target!(|data: &[u8]| {
+     let mut cursor = support::ByteCursor::new(data);
+     let is_planar = cursor.byte() & 1 == 0;
+     let shape = if is_planar {
+-        let region = planar_shape(&mut cursor);
++        let region = match planar_shape(&mut cursor) {
++            Ok(region) => region,
++            Err(error) => {
++                support::validate_shape(&Shape::Failed(ShapeFailure::kernel(
++                    "fuzz planar construction failed",
++                    error,
++                )));
++                return;
++            }
++        };
+         match cursor.choice(4) {
+             0 => Shape::CurveRegion2D(region),
+             1 => match curve::try_extrude(
+                 &region,
+                 Real::from(cursor.positive()),
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+-                Err(error) => Shape::Failed(format!("fuzz extrusion failed: {error}")),
++                Err(error) => Shape::Failed(ShapeFailure::kernel("fuzz extrusion failed", error)),
+             },
+             2 => match curve::extrude_twisted(
+                 &region,
+@@ -163,31 +167,37 @@ fuzz_target!(|data: &[u8]| {
+                 Real::from(cursor.integer() * 15),
+                 [Real::one(), Real::one()],
+                 cursor.choice(12) + 1,
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+-                Err(error) => Shape::Failed(format!("fuzz twisted extrusion failed: {error}")),
++                Err(error) => {
++                    Shape::Failed(ShapeFailure::kernel("fuzz twisted extrusion failed", error))
++                }
+             },
+             _ => {
+                 let offset = Real::from(32_u8);
+-                match curve::try_translated(&region, offset, Real::zero()) {
++                match curve::translated(&region, offset, Real::zero()) {
+                     Ok(radial) => {
+                         match curve::revolve(
+                             &radial,
+                             Real::from(360_u16),
+                             cursor.choice(12) + 3,
+-                            &csgrs::GeometryContext::STRICT,
++                            csgrs::GeometryContext::STRICT,
+                         ) {
+                             Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+-                            Err(error) => Shape::Failed(format!("fuzz revolution failed: {error}")),
++                            Err(error) => {
++                                Shape::Failed(ShapeFailure::kernel("fuzz revolution failed", error))
++                            }
+                         }
+                     }
+-                    Err(error) => Shape::Failed(format!("fuzz translation failed: {error}")),
++                    Err(error) => {
++                        Shape::Failed(ShapeFailure::kernel("fuzz translation failed", error))
++                    }
+                 }
+             }
+         }
+     } else {
+-        Shape::from_triangle_mesh(solid_shape(&mut cursor))
++        Shape::from_mesh_result("fuzz solid construction failed", solid_shape(&mut cursor))
+     };
+ 
+     support::validate_shape(&shape);
+diff --git a/fuzz/fuzz_targets/fuzz_shape_operations.rs b/fuzz/fuzz_targets/fuzz_shape_operations.rs
+index 485a6c4..0d2e77d 100644
+--- a/fuzz/fuzz_targets/fuzz_shape_operations.rs
++++ b/fuzz/fuzz_targets/fuzz_shape_operations.rs
+@@ -4,7 +4,7 @@ mod support;
+ 
+ use csgrs::{Real, curve, solid};
+ use libfuzzer_sys::fuzz_target;
+-use synaps_cad::compiler::geometry::Shape;
++use synaps_cad::compiler::geometry::{Shape, ShapeFailure};
+ 
+ fuzz_target!(|data: &[u8]| {
+     if data.len() < 2 {
+@@ -13,32 +13,36 @@ fuzz_target!(|data: &[u8]| {
+     let mut cursor = support::ByteCursor::new(data);
+     let is_2d = cursor.byte() & 1 == 0;
+     let mut left = if is_2d {
+-        Shape::CurveRegion2D(curve::rectangle(
+-            cursor.positive_real(),
+-            cursor.positive_real(),
+-        ))
++        Shape::from_region_result(
++            "fuzz rectangle failed",
++            curve::rectangle(cursor.positive_real(), cursor.positive_real()),
++        )
+     } else {
+-        Shape::from_triangle_mesh(solid::cuboid(
+-            cursor.positive_real(),
+-            cursor.positive_real(),
+-            cursor.positive_real(),
+-        ))
++        Shape::from_mesh_result(
++            "fuzz cuboid failed",
++            solid::cuboid(
++                cursor.positive_real(),
++                cursor.positive_real(),
++                cursor.positive_real(),
++            ),
++        )
+     };
+     let right = if is_2d {
+-        match curve::try_translated(
+-            &curve::circle(cursor.positive_real(), cursor.choice(8) + 3),
+-            cursor.real(),
+-            cursor.real(),
+-        ) {
++        match curve::circle(cursor.positive_real(), cursor.choice(8) + 3)
++            .and_then(|circle| curve::translated(&circle, cursor.real(), cursor.real()))
++        {
+             Ok(region) => Shape::CurveRegion2D(region),
+-            Err(error) => Shape::Failed(format!("fuzz translation failed: {error}")),
++            Err(error) => Shape::Failed(ShapeFailure::kernel("fuzz circle failed", error)),
+         }
+     } else {
+-        Shape::from_triangle_mesh(solid::sphere(
+-            cursor.positive_real(),
+-            cursor.choice(6) + 3,
+-            cursor.choice(6) + 3,
+-        ))
++        Shape::from_mesh_result(
++            "fuzz sphere failed",
++            solid::sphere(
++                cursor.positive_real(),
++                cursor.choice(6) + 3,
++                cursor.choice(6) + 3,
++            ),
++        )
+         .translate(cursor.real(), cursor.real(), cursor.real())
+     };
+ 
+diff --git a/fuzz/fuzz_targets/support.rs b/fuzz/fuzz_targets/support.rs
+index e7d9548..8bdb390 100644
+--- a/fuzz/fuzz_targets/support.rs
++++ b/fuzz/fuzz_targets/support.rs
+@@ -99,6 +99,7 @@ pub fn evaluate_source(source: &str, fragments: u8) {
+ 
+ pub fn validate_shape(shape: &Shape) {
+     match shape {
++        Shape::Csg3D { .. } => validate_shape(&shape.clone().resolve()),
+         Shape::TriangleMesh3D(mesh) => {
+             for triangle in mesh.triangles.iter() {
+                 assert!(
+@@ -121,7 +122,7 @@ pub fn validate_shape(shape: &Shape) {
+         }
+         Shape::CurveRegion2D(region) => {
+             if let Ok(outcome) =
+-                csgrs::curve::try_triangulate(region, &csgrs::GeometryContext::STRICT)
++                csgrs::curve::try_triangulate(region, csgrs::GeometryContext::STRICT)
+             {
+                 let mesh = outcome.into_value();
+                 assert!(
+@@ -134,8 +135,8 @@ pub fn validate_shape(shape: &Shape) {
+                 }
+             }
+         }
+-        Shape::Failed(error) => {
+-            assert!(!error.is_empty());
++        Shape::Failed(failure) => {
++            assert!(!failure.to_string().is_empty());
+         }
+     }
+ }
+diff --git a/src/compiler/evaluator/booleans.rs b/src/compiler/evaluator/booleans.rs
+index b7c2bed..6df2dae 100644
+--- a/src/compiler/evaluator/booleans.rs
++++ b/src/compiler/evaluator/booleans.rs
+@@ -3,16 +3,12 @@ use csgrs::solid;
+ use hypercurve::{CurveFamily2, CurveGeometry2, CurveRegion2, OffsetCornerStyle2, Point2};
+ use openscad_rs::ast::Statement;
+ use std::cmp::Ordering;
+-use std::fmt;
+ 
+ use super::{Evaluator, Value};
+-use crate::compiler::geometry::{BoolOp, Shape};
++use crate::compiler::geometry::{BoolOp, FailureKind, Shape, ShapeDimension, ShapeFailure};
+ 
+-fn offset_result<E: fmt::Display>(operation: &str, result: Result<CurveRegion2, E>) -> Shape {
+-    match result {
+-        Ok(offset) => Shape::CurveRegion2D(offset),
+-        Err(error) => Shape::Failed(format!("exact {operation} failed: {error}")),
+-    }
++fn offset_result<E: Into<csgrs::Error>>(operation: &str, result: Result<CurveRegion2, E>) -> Shape {
++    Shape::from_region_result(&format!("exact {operation} failed"), result)
+ }
+ 
+ impl Evaluator {
+@@ -52,47 +48,50 @@ impl Evaluator {
+         }
+     }
+ 
+-    #[allow(clippy::missing_panics_doc)]
+-    pub fn eval_boolean_op(&mut self, children: &[Statement], op: BoolOp) -> Option<Shape> {
+-        let child_shapes = self.eval_children(children);
+-        if child_shapes.is_empty() {
+-            return None;
++    /// Combines `shapes` by `op` with `OpenSCAD` semantics: the first shape
++    /// selects the dimension, and `difference` subtracts every later shape
++    /// from the first.
++    ///
++    /// 2D regions are combined pairwise. 3D shapes are recorded into one
++    /// expression, so a whole Boolean subtree, including nested subtrees, is
++    /// evaluated later as a single hypermesh Boolean program.
++    pub fn fold_boolean(&mut self, shapes: Vec<Shape>, op: BoolOp) -> Option<Shape> {
++        let mut iter = shapes.into_iter();
++        let first = iter.next()?;
++        if first.dimension() != Some(ShapeDimension::Three) {
++            let mut result = first;
++            for child in iter {
++                result = self.apply_boolean(result, child, op);
++            }
++            return Some(result);
+         }
+ 
+-        let mut iter = child_shapes.into_iter();
+-        let first = iter.next().unwrap();
+-
+-        match op {
+-            BoolOp::Union => {
+-                let rest: Vec<Shape> = iter.collect();
+-                if rest.is_empty() {
+-                    return Some(first);
++        // The same decisions as the pairwise fold: a failed child fails the
++        // operation, a mismatched child is ignored with a warning, and a
++        // mismatched intersection child empties the result.
++        let mut first = first;
++        let mut rest = Vec::new();
++        for child in iter {
++            match child.dimension() {
++                None => return Some(child),
++                Some(ShapeDimension::Three) => rest.push(child),
++                Some(child_dimension) => {
++                    self.warnings.push(format!(
++                        "Mixing 2D and 3D objects is not supported; ignoring {child_dimension} child object for 3D operation"
++                    ));
++                    if matches!(op, BoolOp::Intersection) {
++                        first = Shape::empty(ShapeDimension::Three);
++                        rest.clear();
++                    }
+                 }
+-                let mut result = first;
+-                for child in rest {
+-                    result = self.apply_boolean(result, child, BoolOp::Union);
+-                }
+-                Some(result)
+-            }
+-            BoolOp::Difference => {
+-                let rest: Vec<Shape> = iter.collect();
+-                if rest.is_empty() {
+-                    return Some(first);
+-                }
+-                let mut result = first;
+-                for child in rest {
+-                    result = self.apply_boolean(result, child, BoolOp::Difference);
+-                }
+-                Some(result)
+-            }
+-            BoolOp::Intersection => {
+-                let mut result = first;
+-                for child in iter {
+-                    result = self.apply_boolean(result, child, BoolOp::Intersection);
+-                }
+-                Some(result)
+             }
+         }
++        Some(Shape::boolean_all(op, first, rest))
++    }
++
++    pub fn eval_boolean_op(&mut self, children: &[Statement], op: BoolOp) -> Option<Shape> {
++        let child_shapes = self.eval_children(children);
++        self.fold_boolean(child_shapes, op)
+     }
+ 
+     pub fn eval_offset(
+@@ -161,10 +160,7 @@ impl Evaluator {
+         let mut planar_points = Vec::new();
+         for shape in child_shapes {
+             let Some(shape_dimension) = shape.dimension() else {
+-                let Shape::Failed(error) = shape else {
+-                    unreachable!();
+-                };
+-                return Some(Shape::Failed(error));
++                return Some(shape);
+             };
+             if shape_dimension != dimension {
+                 self.warnings.push(format!(
+@@ -172,32 +168,35 @@ impl Evaluator {
+                 ));
+                 continue;
+             }
+-            if dimension == crate::compiler::geometry::ShapeDimension::Two {
++            if dimension == ShapeDimension::Two {
+                 let Shape::CurveRegion2D(region) = shape else {
+                     unreachable!("the dimension check establishes a 2D curve region");
+                 };
+                 if let Err(error) = collect_linear_region_vertices(&region, &mut planar_points) {
+-                    return Some(Shape::Failed(format!("hull() failed: {error}")));
++                    return Some(Shape::Failed(error.context("hull() failed")));
+                 }
+                 continue;
+             }
+             let mesh = match shape.try_into_triangle_mesh() {
+                 Ok(mesh) => mesh,
+-                Err(error) => return Some(Shape::Failed(format!("hull() failed: {error}"))),
++                Err(error) => return Some(Shape::Failed(error.context("hull() failed"))),
+             };
+             meshes.push(mesh);
+         }
+-        if dimension == crate::compiler::geometry::ShapeDimension::Two {
++        if dimension == ShapeDimension::Two {
+             return Some(match exact_planar_hull(planar_points) {
+                 Ok(region) => Shape::CurveRegion2D(region),
+-                Err(error) => Shape::Failed(format!("hull() failed: {error}")),
++                Err(error) => Shape::Failed(error.context("hull() failed")),
+             });
+         }
+-        let combined = solid::merge(&meshes);
+-        match solid::convex_hull(&combined) {
+-            Ok(hull) => Some(Shape::from_triangle_mesh(hull)),
+-            Err(error) => Some(Shape::Failed(format!("hull() failed: {error}"))),
+-        }
++        let combined = match solid::merge(&meshes) {
++            Ok(combined) => combined,
++            Err(error) => return Some(Shape::Failed(ShapeFailure::kernel("hull() failed", error))),
++        };
++        Some(match solid::convex_hull(&combined) {
++            Ok(hull) => Shape::from_triangle_mesh(hull),
++            Err(error) => Shape::Failed(ShapeFailure::kernel("hull() failed", error)),
++        })
+     }
+ 
+     pub fn eval_color_into(
+@@ -243,7 +242,7 @@ impl Evaluator {
+ fn collect_linear_region_vertices(
+     region: &CurveRegion2,
+     points: &mut Vec<Point2>,
+-) -> Result<(), String> {
++) -> Result<(), ShapeFailure> {
+     for boundary in region.boundary_loops() {
+         for curve in boundary.curves() {
+             match curve.geometry() {
+@@ -252,18 +251,19 @@ fn collect_linear_region_vertices(
+                     let start = curve.start();
+                     let end = curve.end();
+                     let (Some(start), Some(end)) = (start.coordinates(), end.coordinates()) else {
+-                        return Err(
+-                            "2D hull cannot yet materialize algebraic boundary curves exactly"
+-                                .into(),
+-                        );
++                        return Err(ShapeFailure::new(
++                            FailureKind::Unsupported,
++                            "2D hull cannot yet materialize algebraic boundary curves exactly",
++                        ));
+                     };
+                     points.push(start.clone());
+                     points.push(end.clone());
+                 }
+                 None => {
+-                    return Err(
+-                        "2D hull cannot yet materialize algebraic boundary curves exactly".into(),
+-                    );
++                    return Err(ShapeFailure::new(
++                        FailureKind::Unsupported,
++                        "2D hull cannot yet materialize algebraic boundary curves exactly",
++                    ));
+                 }
+             }
+         }
+@@ -271,7 +271,10 @@ fn collect_linear_region_vertices(
+     Ok(())
+ }
+ 
+-fn push_linear_geometry(geometry: &CurveGeometry2, points: &mut Vec<Point2>) -> Result<(), String> {
++fn push_linear_geometry(
++    geometry: &CurveGeometry2,
++    points: &mut Vec<Point2>,
++) -> Result<(), ShapeFailure> {
+     let (start, end, controls) = match geometry {
+         CurveGeometry2::Line(line) => {
+             points.push(line.start().clone());
+@@ -292,14 +295,16 @@ fn push_linear_geometry(geometry: &CurveGeometry2, points: &mut Vec<Point2>) ->
+         }
+         CurveGeometry2::RationalBezier(curve) => {
+             let Some(controls) = curve.affine_control_points() else {
+-                return Err(
+-                    "2D hull cannot yet materialize algebraic boundary curves exactly".into(),
+-                );
++                return Err(ShapeFailure::new(
++                    FailureKind::Unsupported,
++                    "2D hull cannot yet materialize algebraic boundary curves exactly",
++                ));
+             };
+             if controls.len() < 2 {
+-                return Err(
+-                    "2D hull of retained curved boundaries is not yet implemented exactly".into(),
+-                );
++                return Err(ShapeFailure::new(
++                    FailureKind::Unsupported,
++                    "2D hull of retained curved boundaries is not yet implemented exactly",
++                ));
+             }
+             let start = &controls[0];
+             let end = &controls[controls.len() - 1];
+@@ -308,18 +313,20 @@ fn push_linear_geometry(geometry: &CurveGeometry2, points: &mut Vec<Point2>) ->
+         CurveGeometry2::CircularArc(_)
+         | CurveGeometry2::PolynomialBSpline(_)
+         | CurveGeometry2::Nurbs(_) => {
+-            return Err(
+-                "2D hull of retained curved boundaries is not yet implemented exactly".into(),
+-            );
++            return Err(ShapeFailure::new(
++                FailureKind::Unsupported,
++                "2D hull of retained curved boundaries is not yet implemented exactly",
++            ));
+         }
+     };
+     for control in controls {
+         match orient_curve_points(start, end, control)? {
+             hyperlimit::Sign::Zero => {}
+             _ => {
+-                return Err(
+-                    "2D hull of retained curved boundaries is not yet implemented exactly".into(),
+-                );
++                return Err(ShapeFailure::new(
++                    FailureKind::Unsupported,
++                    "2D hull of retained curved boundaries is not yet implemented exactly",
++                ));
+             }
+         }
+     }
+@@ -328,7 +335,7 @@ fn push_linear_geometry(geometry: &CurveGeometry2, points: &mut Vec<Point2>) ->
+     Ok(())
+ }
+ 
+-fn exact_planar_hull(mut points: Vec<Point2>) -> Result<CurveRegion2, String> {
++fn exact_planar_hull(mut points: Vec<Point2>) -> Result<CurveRegion2, ShapeFailure> {
+     for index in 1..points.len() {
+         let mut position = index;
+         while position > 0 {
+@@ -351,7 +358,10 @@ fn exact_planar_hull(mut points: Vec<Point2>) -> Result<CurveRegion2, String> {
+         unique.push(point);
+     }
+     if unique.len() < 3 {
+-        return Err("2D hull requires at least three distinct points".into());
++        return Err(ShapeFailure::new(
++            FailureKind::InvalidArgument,
++            "2D hull requires at least three distinct points",
++        ));
+     }
+ 
+     let mut lower = Vec::new();
+@@ -366,17 +376,21 @@ fn exact_planar_hull(mut points: Vec<Point2>) -> Result<CurveRegion2, String> {
+     upper.pop();
+     lower.extend(upper);
+     if lower.len() < 3 {
+-        return Err("2D hull points are collinear".into());
++        return Err(ShapeFailure::new(
++            FailureKind::InvalidArgument,
++            "2D hull points are collinear",
++        ));
+     }
+ 
+     let coordinates = lower
+         .into_iter()
+         .map(|point| [point.x().clone(), point.y().clone()])
+         .collect::<Vec<_>>();
+-    Ok(csgrs::curve::polygon(&coordinates))
++    csgrs::curve::polygon(&coordinates)
++        .map_err(|error| ShapeFailure::kernel("2D hull failed", error))
+ }
+ 
+-fn append_hull_point(hull: &mut Vec<Point2>, point: &Point2) -> Result<(), String> {
++fn append_hull_point(hull: &mut Vec<Point2>, point: &Point2) -> Result<(), ShapeFailure> {
+     while hull.len() >= 2 {
+         let turn = orient_curve_points(&hull[hull.len() - 2], &hull[hull.len() - 1], point)?;
+         if turn == hyperlimit::Sign::Positive {
+@@ -388,23 +402,37 @@ fn append_hull_point(hull: &mut Vec<Point2>, point: &Point2) -> Result<(), Strin
+     Ok(())
+ }
+ 
+-fn compare_curve_points(left: &Point2, right: &Point2) -> Result<Ordering, String> {
+-    let x = super::value::compare_reals(left.x(), right.x())
+-        .ok_or_else(|| "2D hull x-coordinate ordering is undecided".to_owned())?;
++fn compare_curve_points(left: &Point2, right: &Point2) -> Result<Ordering, ShapeFailure> {
++    let x = super::value::compare_reals(left.x(), right.x()).ok_or_else(|| {
++        ShapeFailure::new(
++            FailureKind::Undecided,
++            "2D hull x-coordinate ordering is undecided",
++        )
++    })?;
+     if x != Ordering::Equal {
+         return Ok(x);
+     }
+-    super::value::compare_reals(left.y(), right.y())
+-        .ok_or_else(|| "2D hull y-coordinate ordering is undecided".to_owned())
++    super::value::compare_reals(left.y(), right.y()).ok_or_else(|| {
++        ShapeFailure::new(
++            FailureKind::Undecided,
++            "2D hull y-coordinate ordering is undecided",
++        )
++    })
+ }
+ 
+-fn orient_curve_points(a: &Point2, b: &Point2, c: &Point2) -> Result<hyperlimit::Sign, String> {
++fn orient_curve_points(
++    a: &Point2,
++    b: &Point2,
++    c: &Point2,
++) -> Result<hyperlimit::Sign, ShapeFailure> {
+     let a = hyperlimit::Point2::new(a.x().clone(), a.y().clone());
+     let b = hyperlimit::Point2::new(b.x().clone(), b.y().clone());
+     let c = hyperlimit::Point2::new(c.x().clone(), c.y().clone());
+     hyperlimit::orient2(&a, &b, &c, crate::compiler::PREDICATE_POLICY)
+         .value()
+-        .ok_or_else(|| "2D hull orientation is undecided".to_owned())
++        .ok_or_else(|| {
++            ShapeFailure::new(FailureKind::Undecided, "2D hull orientation is undecided")
++        })
+ }
+ 
+ /// Parse a hex color string like "#D4A76A", "#fff", or "D4A76A" into [r, g, b] in 0.0–1.0 range.
+@@ -454,14 +482,18 @@ mod tests {
+     fn failed_offset_remains_an_explicit_failed_shape() {
+         let shape = offset_result(
+             "offset(delta=...)",
+-            Err::<CurveRegion2, _>("unsupported topology"),
++            Err::<CurveRegion2, _>(csgrs::Error::InvalidArguments),
+         );
+-        let Shape::Failed(error) = shape else {
++        let Shape::Failed(failure) = shape else {
+             panic!("an offset failure must not preserve the unchanged input");
+         };
+         assert_eq!(
+-            error,
+-            "exact offset(delta=...) failed: unsupported topology"
++            failure.kind(),
++            FailureKind::Kernel(csgrs::errors::ValidationErrorKind::InvalidInput)
++        );
++        assert_eq!(
++            failure.to_string(),
++            "exact offset(delta=...) failed: invalid arguments"
+         );
+     }
+ 
+@@ -478,7 +510,7 @@ mod tests {
+         let Shape::CurveRegion2D(region) = &shapes[0].0 else {
+             panic!("OpenSCAD 2D hull must remain a 2D curve region");
+         };
+-        let bounds = csgrs::curve::try_bounding_box(region).unwrap();
++        let bounds = csgrs::curve::bounding_box(region).unwrap().unwrap();
+         assert_eq!(bounds.mins.x, Real::zero());
+         assert_eq!(bounds.mins.y, Real::zero());
+         assert_eq!(bounds.maxs.x, Real::from(4_u8));
+diff --git a/src/compiler/evaluator/mod.rs b/src/compiler/evaluator/mod.rs
+index 91252bf..d3a1259 100644
+--- a/src/compiler/evaluator/mod.rs
++++ b/src/compiler/evaluator/mod.rs
+@@ -4,7 +4,7 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+-use super::geometry::{BoolOp, Shape, ShapeDimension, TransformKind};
++use super::geometry::{BoolOp, FailureKind, Shape, ShapeDimension, ShapeFailure, TransformKind};
+ 
+ pub mod value;
+ pub use value::Value;
+@@ -247,7 +247,11 @@ impl Evaluator {
+             }
+             self.eval_statement(stmt, &mut shapes);
+         }
++        // Each top-level part evaluates its recorded 3D Boolean subtree once.
+         shapes
++            .into_iter()
++            .map(|(shape, color)| (shape.resolve(), color))
++            .collect()
+     }
+ 
+     /// Recursively scan statements to register module/function definitions.
+@@ -294,6 +298,19 @@ impl Evaluator {
+         if self.is_canceled() {
+             return;
+         }
++        let before = shapes.len();
++        self.eval_statement_shapes(stmt, shapes);
++        // The innermost statement that produced a failure names it.
++        for (shape, _) in shapes.iter_mut().skip(before) {
++            shape.attach_span(stmt.span());
++        }
++    }
++
++    fn eval_statement_shapes(
++        &mut self,
++        stmt: &Statement,
++        shapes: &mut Vec<(Shape, Option<[f32; 3]>)>,
++    ) {
+         match stmt {
+             Statement::ModuleInstantiation {
+                 name,
+@@ -601,16 +618,10 @@ impl Evaluator {
+         self.children_cache_stack.pop();
+         self.children_stack.pop();
+ 
+-        if meshes.is_empty() {
+-            None
+-        } else {
+-            let mut iter = meshes.into_iter();
+-            let (mut result, _) = iter.next().unwrap();
+-            for (m, _) in iter {
+-                result = self.apply_boolean(result, m, BoolOp::Union);
+-            }
+-            Some(result)
+-        }
++        self.fold_boolean(
++            meshes.into_iter().map(|(shape, _)| shape).collect(),
++            BoolOp::Union,
++        )
+     }
+ 
+     pub fn eval_module_instantiation_inner(
+@@ -690,15 +701,15 @@ impl Evaluator {
+                         return Some(first);
+                     };
+                     if dimension == ShapeDimension::Two {
+-                        Some(Shape::Failed(
+-                            "exact 2D minkowski() is not supported; the input was not extruded"
+-                                .into(),
+-                        ))
++                        Some(Shape::Failed(ShapeFailure::new(
++                            FailureKind::Unsupported,
++                            "exact 2D minkowski() is not supported; the input was not extruded",
++                        )))
+                     } else {
+                         let mut result = match first.try_into_triangle_mesh() {
+                             Ok(mesh) => mesh,
+                             Err(error) => {
+-                                return Some(Shape::Failed(format!("minkowski() failed: {error}")));
++                                return Some(Shape::Failed(error.context("minkowski() failed")));
+                             }
+                         };
+                         for child in iter {
+@@ -714,16 +725,17 @@ impl Evaluator {
+                             let tool = match child.try_into_triangle_mesh() {
+                                 Ok(mesh) => mesh,
+                                 Err(error) => {
+-                                    return Some(Shape::Failed(format!(
+-                                        "minkowski() failed: {error}"
+-                                    )));
++                                    return Some(Shape::Failed(
++                                        error.context("minkowski() failed"),
++                                    ));
+                                 }
+                             };
+                             result = match solid::minkowski_sum(&result, &tool) {
+                                 Ok(mesh) => mesh,
+                                 Err(error) => {
+-                                    return Some(Shape::Failed(format!(
+-                                        "minkowski() failed: {error}"
++                                    return Some(Shape::Failed(ShapeFailure::kernel(
++                                        "minkowski() failed",
++                                        error,
+                                     )));
+                                 }
+                             };
+@@ -740,12 +752,7 @@ impl Evaluator {
+             }
+             "children" => {
+                 let shapes = self.eval_children_instantiation(&args);
+-                let mut iter = shapes.into_iter();
+-                let mut result = iter.next()?;
+-                for shape in iter {
+-                    result = self.apply_boolean(result, shape, BoolOp::Union);
+-                }
+-                Some(result)
++                self.fold_boolean(shapes, BoolOp::Union)
+             }
+ 
+             _ => {
+@@ -814,7 +821,7 @@ impl Evaluator {
+         name: &str,
+         pos: usize,
+         default: bool,
+-    ) -> Result<bool, String> {
++    ) -> Result<bool, ShapeFailure> {
+         Self::get_arg(args, name, pos).map_or(Ok(default), |value| {
+             value.try_as_bool().ok_or_else(|| {
+                 let label = if name.is_empty() {
+@@ -822,7 +829,10 @@ impl Evaluator {
+                 } else {
+                     format!("argument {name}")
+                 };
+-                format!("{label} truthiness is undecided")
++                ShapeFailure::new(
++                    FailureKind::Undecided,
++                    format!("{label} truthiness is undecided"),
++                )
+             })
+         })
+     }
+@@ -845,12 +855,9 @@ impl Evaluator {
+             }
+             let mut shapes = Vec::new();
+             self.eval_statement(stmt, &mut shapes);
+-            if !shapes.is_empty() {
+-                let mut iter = shapes.into_iter().map(|(s, _)| s);
+-                let mut merged = iter.next().unwrap();
+-                for s in iter {
+-                    merged = self.apply_boolean(merged, s, BoolOp::Union);
+-                }
++            if let Some(merged) =
++                self.fold_boolean(shapes.into_iter().map(|(s, _)| s).collect(), BoolOp::Union)
++            {
+                 result.push(merged);
+             }
+         }
+@@ -900,17 +907,8 @@ impl Evaluator {
+             .collect()
+     }
+ 
+-    #[allow(clippy::missing_panics_doc)]
+     pub fn eval_passthrough_children(&mut self, children: &[Statement]) -> Option<Shape> {
+         let child_shapes = self.eval_children(children);
+-        if child_shapes.is_empty() {
+-            return None;
+-        }
+-        let mut iter = child_shapes.into_iter();
+-        let mut result = iter.next().unwrap();
+-        for child in iter {
+-            result = self.apply_boolean(result, child, BoolOp::Union);
+-        }
+-        Some(result)
++        self.fold_boolean(child_shapes, BoolOp::Union)
+     }
+ }
+diff --git a/src/compiler/evaluator/primitives.rs b/src/compiler/evaluator/primitives.rs
+index 596e9c5..9f9445e 100644
+--- a/src/compiler/evaluator/primitives.rs
++++ b/src/compiler/evaluator/primitives.rs
+@@ -2,7 +2,7 @@ use csgrs::Real;
+ use csgrs::{curve, solid};
+ 
+ use super::{Evaluator, Value};
+-use crate::compiler::geometry::Shape;
++use crate::compiler::geometry::{Shape, ShapeFailure};
+ use crate::compiler::rendering::fonts::{
+     apply_text_alignment, render_text_with_direction, resolve_font_data,
+ };
+@@ -13,20 +13,17 @@ impl Evaluator {
+         let size_val = Self::get_arg(args, "size", 0).unwrap_or(&default_size);
+         let center = match Self::get_arg_bool(args, "center", 1, false) {
+             Ok(value) => value,
+-            Err(error) => return Some(Shape::Failed(format!("cube() failed: {error}"))),
++            Err(error) => return Some(Shape::Failed(error.context("cube() failed"))),
+         };
+ 
+         let mesh = match size_val {
+-            Value::Number(_) => {
+-                let mesh = solid::cube(size_val.as_real()?);
+-                if center { solid::center(&mesh) } else { mesh }
+-            }
++            Value::Number(_) => solid::cube(size_val.as_real()?),
+             Value::List(dims) => {
+                 let Some(nums): Option<Vec<Real>> = dims.iter().map(Value::as_real).collect()
+                 else {
+-                    return Some(Shape::Failed(
+-                        "cube() size vector must contain only numbers".into(),
+-                    ));
++                    return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                        "cube() size vector must contain only numbers",
++                    )));
+                 };
+                 let (x, y, z) = match nums.len() {
+                     1 => (nums[0].clone(), nums[0].clone(), nums[0].clone()),
+@@ -37,13 +34,17 @@ impl Evaluator {
+                         nums.get(2).cloned().unwrap_or_else(Real::one),
+                     ),
+                 };
+-                let mesh = solid::cuboid(x, y, z);
+-                if center { solid::center(&mesh) } else { mesh }
++                solid::cuboid(x, y, z)
+             }
+             _ => return None,
+         };
++        let mesh = if center {
++            mesh.and_then(|mesh| solid::center(&mesh))
++        } else {
++            mesh
++        };
+ 
+-        Some(Shape::from_triangle_mesh(mesh))
++        Some(Shape::from_mesh_result("cube() failed", mesh))
+     }
+ 
+     #[must_use]
+@@ -55,7 +56,10 @@ impl Evaluator {
+         let slices = self.resolve_fn_with_radius(args, Some(&r));
+         let stacks = slices / 2;
+ 
+-        Some(Shape::from_triangle_mesh(solid::sphere(r, slices, stacks)))
++        Some(Shape::from_mesh_result(
++            "sphere() failed",
++            solid::sphere(r, slices, stacks),
++        ))
+     }
+ 
+     #[must_use]
+@@ -77,7 +81,7 @@ impl Evaluator {
+ 
+         let center = match Self::get_arg_bool(args, "center", 99, false) {
+             Ok(value) => value,
+-            Err(error) => return Some(Shape::Failed(format!("cylinder() failed: {error}"))),
++            Err(error) => return Some(Shape::Failed(error.context("cylinder() failed"))),
+         };
+         // Tessellation follows the larger endpoint radius.
+         let max_radius = hyperlimit::real_max(&r1, &r2, crate::compiler::PREDICATE_POLICY)
+@@ -92,9 +96,13 @@ impl Evaluator {
+         } else {
+             solid::frustum(r1, r2, h, slices)
+         };
+-        let m = if center { solid::center(&m) } else { m };
++        let m = if center {
++            m.and_then(|m| solid::center(&m))
++        } else {
++            m
++        };
+ 
+-        Some(Shape::from_triangle_mesh(m))
++        Some(Shape::from_mesh_result("cylinder() failed", m))
+     }
+ 
+     #[allow(
+@@ -119,9 +127,9 @@ impl Evaluator {
+             })
+             .collect::<Option<Vec<[Real; 3]>>>()
+         else {
+-            return Some(Shape::Failed(
+-                "polyhedron() points must be numeric 3D vectors".into(),
+-            ));
++            return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                "polyhedron() points must be numeric 3D vectors",
++            )));
+         };
+ 
+         let Some(faces) = faces_val?
+@@ -136,9 +144,9 @@ impl Evaluator {
+             })
+             .collect::<Option<Vec<Vec<usize>>>>()
+         else {
+-            return Some(Shape::Failed(
+-                "polyhedron() faces must be vectors of nonnegative exact integers".into(),
+-            ));
++            return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                "polyhedron() faces must be vectors of nonnegative exact integers",
++            )));
+         };
+ 
+         let faces = {
+@@ -168,10 +176,10 @@ impl Evaluator {
+             return None;
+         }
+         let face_refs = faces.iter().map(Vec::as_slice).collect::<Vec<_>>();
+-        Some(match solid::polyhedron(&points, &face_refs) {
+-            Ok(mesh) => Shape::from_triangle_mesh(mesh),
+-            Err(error) => Shape::Failed(format!("polyhedron() failed: {error}")),
+-        })
++        Some(Shape::from_mesh_result(
++            "polyhedron() failed",
++            solid::polyhedron(&points, &face_refs),
++        ))
+     }
+ 
+     #[must_use]
+@@ -181,7 +189,10 @@ impl Evaluator {
+             .unwrap_or_else(Real::one);
+ 
+         let slices = self.resolve_fn_with_radius(args, Some(&r));
+-        Some(Shape::CurveRegion2D(curve::circle(r, slices)))
++        Some(Shape::from_region_result(
++            "circle() failed",
++            curve::circle(r, slices),
++        ))
+     }
+ 
+     pub fn eval_square(&mut self, args: &[(Option<String>, Value)]) -> Option<Shape> {
+@@ -189,7 +200,7 @@ impl Evaluator {
+         let size_val = Self::get_arg(args, "size", 0).unwrap_or(&default_size);
+         let center = match Self::get_arg_bool(args, "center", 1, false) {
+             Ok(value) => value,
+-            Err(error) => return Some(Shape::Failed(format!("square() failed: {error}"))),
++            Err(error) => return Some(Shape::Failed(error.context("square() failed"))),
+         };
+ 
+         let region = match size_val {
+@@ -197,9 +208,9 @@ impl Evaluator {
+             Value::List(dims) => {
+                 let Some(nums): Option<Vec<Real>> = dims.iter().map(Value::as_real).collect()
+                 else {
+-                    return Some(Shape::Failed(
+-                        "square() size vector must contain only numbers".into(),
+-                    ));
++                    return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                        "square() size vector must contain only numbers",
++                    )));
+                 };
+                 let w = nums.first().cloned().unwrap_or_else(Real::one);
+                 let h = nums.get(1).cloned().unwrap_or_else(|| w.clone());
+@@ -208,7 +219,7 @@ impl Evaluator {
+             _ => return None,
+         };
+ 
+-        let shape = Shape::CurveRegion2D(region);
++        let shape = Shape::from_region_result("square() failed", region);
+         Some(if center { shape.center() } else { shape })
+     }
+ 
+@@ -225,15 +236,18 @@ impl Evaluator {
+             })
+             .collect::<Option<Vec<[Real; 2]>>>()
+         else {
+-            return Some(Shape::Failed(
+-                "polygon() points must be numeric 2D vectors".into(),
+-            ));
++            return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                "polygon() points must be numeric 2D vectors",
++            )));
+         };
+ 
+         if points.len() < 3 {
+             return None;
+         }
+-        Some(Shape::CurveRegion2D(curve::polygon(&points)))
++        Some(Shape::from_region_result(
++            "polygon() failed",
++            curve::polygon(&points),
++        ))
+     }
+ 
+     #[must_use]
+diff --git a/src/compiler/evaluator/tests.rs b/src/compiler/evaluator/tests.rs
+index a70d7d7..c6f7ec6 100644
+--- a/src/compiler/evaluator/tests.rs
++++ b/src/compiler/evaluator/tests.rs
+@@ -148,7 +148,7 @@ fn top_level_2d_geometry_is_rendered_flat_without_invented_thickness() {
+         } => {
+             assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+             assert_eq!(parts.len(), 1);
+-            assert!(!parts[0].indices.is_empty());
++            assert_ne!(parts[0].indices.len(), 0);
+             assert!(
+                 parts[0].positions.iter().all(|position| position[1] == 0.0),
+                 "OpenSCAD 2D geometry must remain on the Z=0 modeling plane"
+@@ -177,15 +177,21 @@ fn collapsed_offset_is_empty_instead_of_preserving_the_input() {
+ fn singular_2d_transform_is_empty_with_a_diagnostic_like_openscad() {
+     match compile_with_timeout("scale([0, 1]) square(1);", 0) {
+         CompilationResult::Success {
+-            parts, warnings, ..
++            parts,
++            failed_parts,
++            ..
+         } => {
+             assert!(parts.is_empty(), "a collapsed 2D region must be empty");
++            assert_eq!(failed_parts.len(), 1);
+             assert!(
+-                warnings
+-                    .iter()
+-                    .any(|warning| warning.contains("collapsed or invalidated")),
+-                "missing singular-transform diagnostic: {warnings:?}"
++                failed_parts[0]
++                    .failure
++                    .to_string()
++                    .contains("collapsed or invalidated"),
++                "missing singular-transform diagnostic: {}",
++                failed_parts[0].summary()
+             );
++            assert!(failed_parts[0].failure.kernel_error().is_some());
+         }
+         CompilationResult::Error(error) => panic!("Compilation failed: {error}"),
+         CompilationResult::Canceled => panic!("Compilation was unexpectedly canceled"),
+@@ -234,12 +240,19 @@ fn near_coincident_rotated_cylinders_difference_compiles_without_warnings() {
+ fn assert_one_part_without_warnings(code: &str, label: &str) {
+     match compile_with_timeout(code, 0) {
+         CompilationResult::Success {
+-            parts, warnings, ..
++            parts,
++            failed_parts,
++            warnings,
++            ..
+         } => {
++            let failures = failed_parts
++                .iter()
++                .map(crate::compiler::FailedPart::summary)
++                .collect::<Vec<_>>();
+             assert_eq!(
+                 parts.len(),
+                 1,
+-                "{label}: expected one result; warnings={warnings:?}"
++                "{label}: expected one result; warnings={warnings:?}; failures={failures:?}"
+             );
+             assert!(
+                 !parts[0].indices.is_empty(),
+@@ -540,7 +553,7 @@ fn failed_assert_expression_reports_its_message() {
+         CompilationResult::Success {
+             parts, warnings, ..
+         } => {
+-            assert!(!parts.is_empty());
++            assert_ne!(parts.len(), 0);
+             assert!(
+                 warnings
+                     .iter()
+@@ -625,6 +638,8 @@ fn compile_to_merged_mesh(code: &str) -> MeshData {
+                 normals,
+                 indices,
+                 color: None,
++                part: 0,
++                evidence: crate::compiler::PartEvidence::default(),
+             }
+         }
+         CompilationResult::Error(e) => panic!("Failed: {e}"),
+@@ -654,7 +669,9 @@ fn exact_240_degree_rotation_places_rocket_fin_in_the_third_sector() {
+         let mesh = compile_to_triangle_mesh(&format!(
+             "rotate([0, 0, {degrees}]) translate([6, -1, 0]) cube([8, 2, 12]);"
+         ));
+-        let bounds = solid::bounding_box(&mesh);
++        let bounds = solid::bounding_box(&mesh)
++            .expect("exact bounds")
++            .expect("nonempty mesh");
+         let center_x = ((&bounds.mins.x + &bounds.maxs.x) / csgrs::Real::from(2))
+             .expect("nonzero center divisor")
+             .to_f64_lossy()
+@@ -673,7 +690,9 @@ fn exact_240_degree_rotation_places_rocket_fin_in_the_third_sector() {
+ #[test]
+ fn rational_arithmetic_reaches_mesh_coordinates_without_float_demotion() {
+     let mesh = compile_to_triangle_mesh("cube([1/3 + 1/6, 2/5, 3/7]);");
+-    let bounds = solid::bounding_box(&mesh);
++    let bounds = solid::bounding_box(&mesh)
++        .expect("exact bounds")
++        .expect("nonempty mesh");
+ 
+     assert_eq!(bounds.maxs.x, "1/2".parse::<csgrs::Real>().unwrap());
+     assert_eq!(bounds.maxs.y, "2/5".parse::<csgrs::Real>().unwrap());
+@@ -683,7 +702,9 @@ fn rational_arithmetic_reaches_mesh_coordinates_without_float_demotion() {
+ #[test]
+ fn symbolic_constants_and_trig_reach_transforms() {
+     let mesh = compile_to_triangle_mesh("translate([cos(60), sin(30), 0]) cube(1/7);");
+-    let bounds = solid::bounding_box(&mesh);
++    let bounds = solid::bounding_box(&mesh)
++        .expect("exact bounds")
++        .expect("nonempty mesh");
+     let half = "1/2".parse::<csgrs::Real>().unwrap();
+ 
+     assert_eq!(bounds.mins.x, half);
+@@ -809,11 +830,14 @@ fn polyhedron_with_independently_duplicated_patch_vertices_is_boolean_ready() {
+         12,
+         "the six quad patches should triangulate to twelve cube faces"
+     );
+-    let separate_cube = solid::cube(csgrs::Real::one()).translated(
+-        csgrs::Real::from(2_u8),
+-        csgrs::Real::zero(),
+-        csgrs::Real::zero(),
+-    );
++    let separate_cube = solid::cube(csgrs::Real::one())
++        .unwrap()
++        .translated(
++            csgrs::Real::from(2_u8),
++            csgrs::Real::zero(),
++            csgrs::Real::zero(),
++        )
++        .unwrap();
+     assert!(
+         mesh.try_union(&separate_cube).is_ok(),
+         "the exact Boolean boundary must canonicalize coincident point rows"
+@@ -858,7 +882,7 @@ fn openscad_math_builtins_return_hyperreal_results_directly() {
+         ),
+         &csgrs::Real::from(8_u8),
+     );
+-    assert!(evaluator.warnings.is_empty());
++    assert_eq!(evaluator.warnings, Vec::<String>::new());
+ }
+ 
+ #[test]
+@@ -916,7 +940,9 @@ fn expression_edge_cases_match_openscad_without_compacting_invalid_values() {
+ #[test]
+ fn decimal_and_scientific_literals_reach_geometry_as_exact_rationals() {
+     let mesh = compile_to_triangle_mesh("cube([0.1, 2.5e-1, 3E-1]);");
+-    let bounds = solid::bounding_box(&mesh);
++    let bounds = solid::bounding_box(&mesh)
++        .expect("exact bounds")
++        .expect("nonempty mesh");
+ 
+     assert_eq!(bounds.maxs.x, "1/10".parse::<csgrs::Real>().unwrap());
+     assert_eq!(bounds.maxs.y, "1/4".parse::<csgrs::Real>().unwrap());
+@@ -1061,9 +1087,9 @@ fn symbolic_rotated_hull_uses_exact_retained_facts() {
+         }
+     ";
+     let mesh = compile_to_triangle_mesh(code);
+-    assert!(!mesh.triangles.is_empty());
++    assert_ne!(mesh.triangles.len(), 0);
+     let rendered = triangle_mesh_to_mesh_data(&mesh).expect("mesh conversion failed");
+-    assert!(!rendered.indices.is_empty());
++    assert_ne!(rendered.indices.len(), 0);
+ }
+ 
+ #[test]
+@@ -1682,7 +1708,7 @@ fn test_cone_zero_r1() {
+     let code = "cylinder(h=5, r1=0, r2=10, $fn=12);";
+     match compile_with_timeout(code, 0) {
+         CompilationResult::Success { parts, .. } => {
+-            assert!(!parts.is_empty());
++            assert_ne!(parts.len(), 0);
+         }
+         CompilationResult::Error(e) => panic!("compilation failed: {e}"),
+         CompilationResult::Canceled => panic!("Compilation was unexpectedly canceled"),
+@@ -1826,3 +1852,272 @@ if ($view == "main") { view_main(); }
+         CompilationResult::Canceled => panic!("Compilation was unexpectedly canceled"),
+     }
+ }
++
++fn compile_failures(code: &str) -> (Vec<MeshData>, Vec<crate::compiler::FailedPart>, Vec<String>) {
++    match compile_with_timeout(code, 0) {
++        CompilationResult::Success {
++            parts,
++            failed_parts,
++            warnings,
++            ..
++        } => (parts, failed_parts, warnings),
++        CompilationResult::Error(error) => panic!("Compilation failed: {error}"),
++        CompilationResult::Canceled => panic!("Compilation was unexpectedly canceled"),
++    }
++}
++
++fn span_text(code: &str, failed: &crate::compiler::FailedPart) -> String {
++    let span = failed
++        .failure
++        .span()
++        .expect("the failure must name its statement");
++    code[span.start..span.end].to_owned()
++}
++
++#[test]
++fn kernel_failure_keeps_its_csgrs_kind_source_and_statement_span() {
++    let code = "cube(1);\ncube(-1);\nsphere(1);";
++    let (parts, failed_parts, _) = compile_failures(code);
++
++    assert_eq!(
++        parts.iter().map(|part| part.part).collect::<Vec<_>>(),
++        [1, 3],
++        "successful parts keep their source-order numbers"
++    );
++    assert_eq!(failed_parts.len(), 1);
++    let failed = &failed_parts[0];
++    assert_eq!(failed.part, 2);
++    assert_eq!(
++        failed.failure.kind(),
++        crate::compiler::FailureKind::Kernel(csgrs::errors::ValidationErrorKind::InvalidInput)
++    );
++    assert!(matches!(
++        failed.failure.kernel_error(),
++        Some(csgrs::Error::NegativeParameter { .. })
++    ));
++    assert!(span_text(code, failed).starts_with("cube(-1)"));
++    assert_eq!(
++        failed.location,
++        Some(crate::compiler::SourceLocation { line: 2, column: 1 })
++    );
++    assert!(
++        failed
++            .summary()
++            .starts_with("failed (invalid_input) at line 2:1: cube() failed")
++    );
++}
++
++#[test]
++fn invalid_argument_failure_names_the_transform_statement() {
++    let code = "cube(1);\n  translate(\"up\") cube(2);";
++    let (parts, failed_parts, _) = compile_failures(code);
++
++    assert_eq!(parts.len(), 1);
++    assert_eq!(failed_parts.len(), 1);
++    let failed = &failed_parts[0];
++    assert_eq!(failed.part, 2);
++    assert_eq!(
++        failed.failure.kind(),
++        crate::compiler::FailureKind::InvalidArgument
++    );
++    assert!(failed.failure.kernel_error().is_none());
++    assert!(span_text(code, failed).starts_with("translate(\"up\")"));
++    assert_eq!(
++        failed.location,
++        Some(crate::compiler::SourceLocation { line: 2, column: 3 })
++    );
++}
++
++#[test]
++fn nested_failure_names_the_innermost_statement_inside_a_boolean() {
++    let code = "difference() {\n    cube(10);\n    sphere(r = -1);\n}";
++    let (parts, failed_parts, _) = compile_failures(code);
++
++    assert!(parts.is_empty());
++    assert_eq!(failed_parts.len(), 1);
++    let failed = &failed_parts[0];
++    assert_eq!(
++        failed.failure.kind(),
++        crate::compiler::FailureKind::Kernel(csgrs::errors::ValidationErrorKind::InvalidInput)
++    );
++    assert!(span_text(code, failed).starts_with("sphere(r = -1)"));
++    assert_eq!(
++        failed.location,
++        Some(crate::compiler::SourceLocation { line: 3, column: 5 })
++    );
++}
++
++#[test]
++fn unsupported_2d_minkowski_is_a_typed_unsupported_failure() {
++    let code = "minkowski() { square(1); circle(1); }";
++    let (_, failed_parts, _) = compile_failures(code);
++
++    assert_eq!(failed_parts.len(), 1);
++    assert_eq!(
++        failed_parts[0].failure.kind(),
++        crate::compiler::FailureKind::Unsupported
++    );
++    assert!(span_text(code, &failed_parts[0]).starts_with("minkowski()"));
++}
++
++#[test]
++fn mixed_dimension_union_stays_a_warning_not_a_failed_part() {
++    // OpenSCAD ignores the mismatched child; SynapsCAD keeps that behavior.
++    let (parts, failed_parts, warnings) = compile_failures("union() { cube(1); square(1); }");
++
++    assert_eq!(parts.len(), 1);
++    assert!(failed_parts.is_empty());
++    assert!(
++        warnings
++            .iter()
++            .any(|warning| warning.contains("Mixing 2D and 3D"))
++    );
++}
++
++#[test]
++fn successful_parts_report_certified_mesh_evidence() {
++    let (parts, failed_parts, _) = compile_failures("cube(1);\nsphere(1, $fn = 8);");
++
++    assert!(failed_parts.is_empty());
++    assert_eq!(parts.len(), 2);
++    assert_eq!(
++        parts[0].evidence,
++        crate::compiler::PartEvidence::default(),
++        "an authored cube has declared coordinates and no qualification"
++    );
++    assert_eq!(parts[0].evidence.summary(), "certified");
++    assert!(
++        parts[1].evidence.source_sampled,
++        "a sphere is sampled from its continuous source"
++    );
++    assert!(!parts[1].evidence.approximate_512_consumed);
++    assert!(
++        parts[1]
++            .evidence
++            .summary()
++            .starts_with("certified; mesh evidence: source_sampled")
++    );
++}
++
++/// Asserts that two meshes bound the same exact rational volume.
++fn assert_same_exact_volume(left: &TriangleMesh, right: &csgrs::Real) {
++    let volume = solid::exact_mass_properties(left, csgrs::Real::one())
++        .expect("exact mass properties")
++        .volume
++        .exact_rational_normal_form();
++    assert!(
++        volume.is_some(),
++        "the volume must have an exact rational form"
++    );
++    assert_eq!(volume, right.exact_rational_normal_form());
++}
++
++fn exact_volume(mesh: &TriangleMesh) -> csgrs::Real {
++    solid::exact_mass_properties(mesh, csgrs::Real::one())
++        .expect("exact mass properties")
++        .volume
++}
++
++fn exact_bounds(mesh: &TriangleMesh) -> [csgrs::Real; 6] {
++    let bounds = solid::bounding_box(mesh)
++        .expect("exact bounds")
++        .expect("nonempty mesh");
++    [
++        bounds.mins.x,
++        bounds.mins.y,
++        bounds.mins.z,
++        bounds.maxs.x,
++        bounds.maxs.y,
++        bounds.maxs.z,
++    ]
++}
++
++/// The pairwise fold that `eval_boolean_op` used before D02.
++fn pairwise_reference(children: &[&str], op: hypermesh::BooleanOp) -> TriangleMesh {
++    let meshes: Vec<TriangleMesh> = children
++        .iter()
++        .map(|child| compile_to_triangle_mesh(child))
++        .collect();
++    meshes[1..].iter().fold(meshes[0].clone(), |acc, mesh| {
++        solid::boolean(&acc, mesh, op).expect("pairwise reference Boolean")
++    })
++}
++
++const UNION_CHILDREN: [&str; 4] = [
++    "cube(2);",
++    "translate([1, 1, 0]) cube(2);",
++    "translate([3, 0, 0]) cube([1, 3, 1]);",
++    "translate([0, 0, 2]) cube([4, 1, 1]);",
++];
++
++const DIFFERENCE_CHILDREN: [&str; 4] = [
++    "cube(10);",
++    "translate([2, 2, -1]) cube([2, 2, 12]);",
++    "translate([6, 6, -1]) cube([2, 2, 12]);",
++    "translate([4, -1, 8]) cube([2, 12, 3]);",
++];
++
++#[test]
++fn multi_child_union_is_one_recorded_program_with_the_pairwise_set() {
++    let code = format!("union() {{ {} }}", UNION_CHILDREN.join(" "));
++    let source = openscad_rs::parse(&code).unwrap();
++    let mut evaluator = Evaluator::new();
++    let shapes = evaluator.eval_statement_list(&source.statements);
++    assert_eq!(shapes.len(), 1);
++    assert!(
++        matches!(shapes[0].0, Shape::Csg3D { .. }),
++        "a 3D union is recorded, not folded eagerly"
++    );
++
++    let program = compile_to_triangle_mesh(&code);
++    let reference = pairwise_reference(&UNION_CHILDREN, hypermesh::BooleanOp::Union);
++    assert_same_exact_volume(&program, &exact_volume(&reference));
++    assert_eq!(exact_bounds(&program), exact_bounds(&reference));
++    hypermesh::polygon_soup(&crate::compiler::MESH_CONTEXT, &[program.as_ref()])
++        .expect("the one-program union is a closed manifold");
++}
++
++#[test]
++fn multi_child_difference_subtracts_every_later_child_from_the_first() {
++    let code = format!("difference() {{ {} }}", DIFFERENCE_CHILDREN.join(" "));
++    let program = compile_to_triangle_mesh(&code);
++    let reference = pairwise_reference(&DIFFERENCE_CHILDREN, hypermesh::BooleanOp::Difference);
++
++    assert_same_exact_volume(&program, &exact_volume(&reference));
++    // Independent closed form: 1000 - 2 * (2 * 2 * 10) - (2 * 10 * 2). The
++    // slot only touches each hole along a face: 1000 - 80 - 40 = 880.
++    assert_same_exact_volume(&program, &csgrs::Real::from(880));
++    assert_eq!(exact_bounds(&program), exact_bounds(&reference));
++}
++
++#[test]
++fn nested_boolean_subtrees_lower_into_one_expression() {
++    let code = "union() {
++        difference() { cube(4); translate([1, 1, 1]) cube(2); }
++        translate([5, 0, 0]) intersection() { cube(2); translate([1, 0, 0]) cube(2); }
++    }";
++    let source = openscad_rs::parse(code).unwrap();
++    let mut evaluator = Evaluator::new();
++    let shapes = evaluator.eval_statement_list(&source.statements);
++    assert!(matches!(shapes[0].0, Shape::Csg3D { .. }));
++
++    let program = compile_to_triangle_mesh(code);
++    // 64 - 8 for the hollow cube, plus the 1 x 2 x 2 intersection.
++    assert_same_exact_volume(&program, &csgrs::Real::from(60));
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn four_child_union_builds_one_arrangement() {
++    let code = format!("union() {{ {} }}", UNION_CHILDREN.join(" "));
++    let source = openscad_rs::parse(&code).unwrap();
++    hyperreal::dispatch_trace::reset();
++    hyperreal::dispatch_trace::with_recording(|| {
++        let mut evaluator = Evaluator::new();
++        let shapes = evaluator.eval_source_file(&source);
++        assert!(matches!(shapes[0].0, Shape::TriangleMesh3D(_)));
++    });
++    let arrangements =
++        hyperreal::dispatch_trace::take_trace().path_count("hypermesh", "boolean", "start");
++    assert_eq!(arrangements, 1, "pairwise folding built {arrangements}");
++}
+diff --git a/src/compiler/evaluator/transformations.rs b/src/compiler/evaluator/transformations.rs
+index 4431e1b..14c5a32 100644
+--- a/src/compiler/evaluator/transformations.rs
++++ b/src/compiler/evaluator/transformations.rs
+@@ -4,7 +4,7 @@ use hypercurve::CurveRegion2;
+ use openscad_rs::ast::Statement;
+ 
+ use super::{Evaluator, Value};
+-use crate::compiler::geometry::{Shape, TransformKind};
++use crate::compiler::geometry::{Shape, ShapeFailure, TransformKind};
+ 
+ impl Evaluator {
+     pub fn eval_transform(
+@@ -50,13 +50,15 @@ impl Evaluator {
+                     Some(Value::List(_)) => match value.and_then(Value::to_real_list) {
+                         Some(values) => values,
+                         None => {
+-                            return Shape::Failed(
+-                                "translate() vector must contain only numbers".into(),
+-                            );
++                            return Shape::Failed(ShapeFailure::invalid_argument(
++                                "translate() vector must contain only numbers",
++                            ));
+                         }
+                     },
+                     Some(_) => {
+-                        return Shape::Failed("translate() requires a numeric vector".into());
++                        return Shape::Failed(ShapeFailure::invalid_argument(
++                            "translate() requires a numeric vector",
++                        ));
+                     }
+                     None => Vec::new(),
+                 };
+@@ -73,14 +75,16 @@ impl Evaluator {
+                         match Self::get_named_arg(args, "v").and_then(Value::to_real_list) {
+                             Some(values) => Some(values),
+                             None => {
+-                                return Shape::Failed(
+-                                    "rotate() axis vector must contain only numbers".into(),
+-                                );
++                                return Shape::Failed(ShapeFailure::invalid_argument(
++                                    "rotate() axis vector must contain only numbers",
++                                ));
+                             }
+                         }
+                     }
+                     Some(_) => {
+-                        return Shape::Failed("rotate() axis must be a numeric vector".into());
++                        return Shape::Failed(ShapeFailure::invalid_argument(
++                            "rotate() axis must be a numeric vector",
++                        ));
+                     }
+                     None => None,
+                 };
+@@ -99,9 +103,9 @@ impl Evaluator {
+                     shape.rotate_axis_angle(&axis, &angle)
+                 } else if matches!(a_val, Some(Value::List(_))) {
+                     let Some(v) = a_val.and_then(Value::to_real_list) else {
+-                        return Shape::Failed(
+-                            "rotate() angle vector must contain only numbers".into(),
+-                        );
++                        return Shape::Failed(ShapeFailure::invalid_argument(
++                            "rotate() angle vector must contain only numbers",
++                        ));
+                     };
+                     let (x, y, z) = (
+                         v.first().cloned().unwrap_or_else(Real::zero),
+@@ -112,7 +116,9 @@ impl Evaluator {
+                 } else if let Some(angle) = a_val.and_then(Value::as_real) {
+                     shape.rotate(Real::zero(), Real::zero(), angle)
+                 } else if a_val.is_some() {
+-                    Shape::Failed("rotate() angle must be numeric".into())
++                    Shape::Failed(ShapeFailure::invalid_argument(
++                        "rotate() angle must be numeric",
++                    ))
+                 } else {
+                     shape
+                 }
+@@ -123,9 +129,9 @@ impl Evaluator {
+                 match val {
+                     Some(Value::List(_)) => {
+                         let Some(v) = val.and_then(Value::to_real_list) else {
+-                            return Shape::Failed(
+-                                "scale() vector must contain only numbers".into(),
+-                            );
++                            return Shape::Failed(ShapeFailure::invalid_argument(
++                                "scale() vector must contain only numbers",
++                            ));
+                         };
+                         let (x, y, z) = (
+                             v.first().cloned().unwrap_or_else(Real::one),
+@@ -148,12 +154,16 @@ impl Evaluator {
+                     Some(Value::List(_)) => match value.and_then(Value::to_real_list) {
+                         Some(values) => values,
+                         None => {
+-                            return Shape::Failed(
+-                                "mirror() vector must contain only numbers".into(),
+-                            );
++                            return Shape::Failed(ShapeFailure::invalid_argument(
++                                "mirror() vector must contain only numbers",
++                            ));
+                         }
+                     },
+-                    Some(_) => return Shape::Failed("mirror() requires a numeric vector".into()),
++                    Some(_) => {
++                        return Shape::Failed(ShapeFailure::invalid_argument(
++                            "mirror() requires a numeric vector",
++                        ));
++                    }
+                     None => vec![Real::one(), Real::zero(), Real::zero()],
+                 };
+                 let (nx, ny, nz) = (
+@@ -184,9 +194,9 @@ impl Evaluator {
+             Some(Value::List(_)) => {
+                 let Some(values) = Self::get_named_arg(args, "scale").and_then(Value::to_real_list)
+                 else {
+-                    return Some(Shape::Failed(
+-                        "linear_extrude() scale vector must contain only numbers".into(),
+-                    ));
++                    return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                        "linear_extrude() scale vector must contain only numbers",
++                    )));
+                 };
+                 [
+                     values.first().cloned().unwrap_or_else(Real::one),
+@@ -194,15 +204,15 @@ impl Evaluator {
+                 ]
+             }
+             Some(_) => {
+-                return Some(Shape::Failed(
+-                    "linear_extrude() scale must be a number or numeric vector".into(),
+-                ));
++                return Some(Shape::Failed(ShapeFailure::invalid_argument(
++                    "linear_extrude() scale must be a number or numeric vector",
++                )));
+             }
+         };
+         let center = match Self::get_arg_bool(args, "center", 99, false) {
+             Ok(value) => value,
+             Err(error) => {
+-                return Some(Shape::Failed(format!("linear_extrude() failed: {error}")));
++                return Some(Shape::Failed(error.context("linear_extrude() failed")));
+             }
+         };
+         let slices = Self::get_arg_real(args, "slices", 99)
+@@ -226,10 +236,13 @@ impl Evaluator {
+             && super::value::reals_equal(&scale[0], &Real::one()) == Some(true)
+             && super::value::reals_equal(&scale[1], &Real::one()) == Some(true);
+         let mesh = if is_plain_extrusion {
+-            match curve::try_extrude(&region, height, &csgrs::GeometryContext::STRICT) {
++            match curve::try_extrude(&region, height, csgrs::GeometryContext::STRICT) {
+                 Ok(outcome) => outcome.into_value(),
+                 Err(error) => {
+-                    return Some(Shape::Failed(format!("linear_extrude() failed: {error:?}")));
++                    return Some(Shape::Failed(ShapeFailure::kernel(
++                        "linear_extrude() failed",
++                        error,
++                    )));
+                 }
+             }
+         } else {
+@@ -239,16 +252,24 @@ impl Evaluator {
+                 twist,
+                 scale,
+                 slices.max(1),
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => outcome.into_value(),
+                 Err(error) => {
+-                    return Some(Shape::Failed(format!("linear_extrude() failed: {error:?}")));
++                    return Some(Shape::Failed(ShapeFailure::kernel(
++                        "linear_extrude() failed",
++                        error,
++                    )));
+                 }
+             }
+         };
+ 
+-        let mesh = if center { solid::center(&mesh) } else { mesh };
++        if center {
++            return Some(Shape::from_mesh_result(
++                "linear_extrude() failed",
++                solid::center(&mesh),
++            ));
++        }
+         Some(Shape::from_triangle_mesh(mesh))
+     }
+ 
+@@ -270,10 +291,13 @@ impl Evaluator {
+             Ok(None) => return None,
+             Err(error) => return Some(Shape::Failed(error)),
+         };
+-        let mesh = match curve::revolve(&region, angle, slices, &csgrs::GeometryContext::STRICT) {
++        let mesh = match curve::revolve(&region, angle, slices, csgrs::GeometryContext::STRICT) {
+             Ok(outcome) => outcome.into_value(),
+-            Err(e) => {
+-                return Some(Shape::Failed(format!("rotate_extrude() failed: {e:?}")));
++            Err(error) => {
++                return Some(Shape::Failed(ShapeFailure::kernel(
++                    "rotate_extrude() failed",
++                    error,
++                )));
+             }
+         };
+         Some(Shape::from_triangle_mesh(mesh))
+@@ -289,9 +313,18 @@ impl Evaluator {
+     pub fn shapes_to_curve_region(
+         &mut self,
+         shapes: &[Shape],
+-    ) -> Result<Option<CurveRegion2>, String> {
++    ) -> Result<Option<CurveRegion2>, ShapeFailure> {
+         let mut result: Option<CurveRegion2> = None;
+         for shape in shapes {
++            // A recorded 3D subtree is evaluated so that its failure is not
++            // hidden by the skip below.
++            let resolved;
++            let shape = if matches!(shape, Shape::Csg3D { .. }) {
++                resolved = shape.clone().resolve();
++                &resolved
++            } else {
++                shape
++            };
+             match shape {
+                 Shape::CurveRegion2D(region) => {
+                     result = match result {
+@@ -299,8 +332,9 @@ impl Evaluator {
+                             match current.boolean_region(region, hypercurve::BooleanOp::Union) {
+                                 Ok(union) => Some(union),
+                                 Err(error) => {
+-                                    return Err(format!(
+-                                        "exact 2D union inside extrusion failed: {error}"
++                                    return Err(ShapeFailure::kernel(
++                                        "exact 2D union inside extrusion failed",
++                                        error,
+                                     ));
+                                 }
+                             }
+@@ -308,12 +342,12 @@ impl Evaluator {
+                         None => Some(region.clone()),
+                     };
+                 }
+-                Shape::TriangleMesh3D(_) => {
++                Shape::TriangleMesh3D(_) | Shape::Csg3D { .. } => {
+                     self.warnings
+                         .push("3D mesh child inside extrude, skipping".into());
+                 }
+-                Shape::Failed(e) => {
+-                    return Err(format!("failed child inside extrusion: {e}"));
++                Shape::Failed(failure) => {
++                    return Err(failure.clone().context("failed child inside extrusion"));
+                 }
+             }
+         }
+diff --git a/src/compiler/geometry/conversions.rs b/src/compiler/geometry/conversions.rs
+index 2937c0a..1a97a25 100644
+--- a/src/compiler/geometry/conversions.rs
++++ b/src/compiler/geometry/conversions.rs
+@@ -1,38 +1,49 @@
+ use csgrs::TriangleMesh;
+ 
++use crate::compiler::failure::{FailureKind, ShapeFailure};
+ use crate::compiler::types::MeshData;
+ 
++fn render_failure(message: impl Into<String>) -> ShapeFailure {
++    ShapeFailure::new(FailureKind::RenderConversion, message)
++}
++
+ /// Converts exact native triangle geometry at the renderer's finite boundary.
+ ///
+ /// # Errors
+ ///
+ /// Returns an error when the mesh is empty or an exact coordinate or normal
+ /// cannot be represented as a finite `f32`.
+-pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, String> {
++pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, ShapeFailure> {
+     let valid = mesh
+         .has_unique_nondegenerate_triangles(&crate::compiler::MESH_CONTEXT)
+-        .map_err(|error| format!("exact triangle validation failed: {error}"))?;
++        .map_err(|error| ShapeFailure::kernel("exact triangle validation failed", error))?;
+     if !valid.value {
+-        return Err("mesh contains duplicate or degenerate exact triangles".into());
++        return Err(render_failure(
++            "mesh contains duplicate or degenerate exact triangles",
++        ));
+     }
+     let vertex_capacity = mesh
+         .triangles
+         .len()
+         .checked_mul(3)
+-        .ok_or_else(|| "finite mesh projection exceeds addressable memory".to_owned())?;
++        .ok_or_else(|| render_failure("finite mesh projection exceeds addressable memory"))?;
+     let mut positions = Vec::with_capacity(vertex_capacity);
+     let mut normals = Vec::with_capacity(vertex_capacity);
+     let mut indices = Vec::with_capacity(vertex_capacity);
+     for (triangle_index, triangle) in mesh.triangles.iter().enumerate() {
+-        let finite_position = |index: usize| -> Result<[f32; 3], String> {
++        let finite_position = |index: usize| -> Result<[f32; 3], ShapeFailure> {
+             mesh.positions
+                 .get(index)
+                 .ok_or_else(|| {
+-                    format!("triangle {triangle_index} references missing position {index}")
++                    render_failure(format!(
++                        "triangle {triangle_index} references missing position {index}"
++                    ))
+                 })?
+                 .to_f32_array_lossy()
+                 .ok_or_else(|| {
+-                    format!("triangle {triangle_index} has an unrepresentable finite position")
++                    render_failure(format!(
++                        "triangle {triangle_index} has an unrepresentable finite position"
++                    ))
+                 })
+         };
+         let [a, b, c] = triangle.indices().map(finite_position);
+@@ -47,26 +58,26 @@ pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, Strin
+         let squared_norm =
+             cross[0].mul_add(cross[0], cross[1].mul_add(cross[1], cross[2] * cross[2]));
+         if !squared_norm.is_finite() || squared_norm <= 0.0 {
+-            return Err(format!(
++            return Err(render_failure(format!(
+                 "triangle {triangle_index} collapses at the finite rendering boundary"
+-            ));
++            )));
+         }
+         let inverse_norm = squared_norm.sqrt().recip();
+         let normal = cross.map(|component| component * inverse_norm);
+         let base = u32::try_from(positions.len())
+-            .map_err(|_| "finite mesh projection exceeds u32 indexing".to_owned())?;
++            .map_err(|_| render_failure("finite mesh projection exceeds u32 indexing"))?;
+         let second = base
+             .checked_add(1)
+-            .ok_or_else(|| "finite mesh projection exceeds u32 indexing".to_owned())?;
++            .ok_or_else(|| render_failure("finite mesh projection exceeds u32 indexing"))?;
+         let third = base
+             .checked_add(2)
+-            .ok_or_else(|| "finite mesh projection exceeds u32 indexing".to_owned())?;
++            .ok_or_else(|| render_failure("finite mesh projection exceeds u32 indexing"))?;
+         positions.extend([a, b, c]);
+         normals.extend([normal; 3]);
+         indices.extend([base, second, third]);
+     }
+     if positions.is_empty() {
+-        return Err("mesh has no vertices".into());
++        return Err(render_failure("mesh has no vertices"));
+     }
+ 
+     // OpenSCAD Z-up -> Bevy Y-up (a proper rotation).
+@@ -78,6 +89,8 @@ pub fn triangle_mesh_to_mesh_data(mesh: &TriangleMesh) -> Result<MeshData, Strin
+         normals,
+         indices,
+         color: None,
++        part: 0,
++        evidence: crate::compiler::failure::PartEvidence::of_mesh(mesh),
+     })
+ }
+ 
+@@ -110,7 +123,7 @@ mod tests {
+ 
+     #[test]
+     fn renderer_boundary_rejects_duplicate_exact_triangle_geometry() {
+-        let cube = solid::cube(Real::one());
++        let cube = solid::cube(Real::one()).unwrap();
+         let mut triangles = cube.triangles.to_vec();
+         triangles.push(triangles[0]);
+         let duplicate = csgrs::TriangleMesh::new(cube.positions.to_vec(), triangles);
+@@ -118,6 +131,7 @@ mod tests {
+         assert!(
+             triangle_mesh_to_mesh_data(&duplicate)
+                 .unwrap_err()
++                .to_string()
+                 .contains("duplicate or degenerate")
+         );
+     }
+diff --git a/src/compiler/geometry/mod.rs b/src/compiler/geometry/mod.rs
+index 5236f38..1dc9706 100644
+--- a/src/compiler/geometry/mod.rs
++++ b/src/compiler/geometry/mod.rs
+@@ -1,10 +1,13 @@
+ use std::fmt;
+ 
+ use csgrs::solid::{self, SolidExt};
+-use csgrs::{Real, TriangleMesh};
++use csgrs::{Real, SolidExpr, TriangleMesh};
+ use hypercurve::CurveRegion2;
+ use hyperlattice::{Matrix4, Point3, Vector3};
+ use hypermesh::Plane;
++use openscad_rs::Span;
++
++pub use crate::compiler::failure::{FailureKind, ShapeFailure};
+ 
+ #[derive(Clone, Copy, Debug)]
+ pub enum BoolOp {
+@@ -40,21 +43,36 @@ pub enum TransformKind {
+ #[allow(clippy::large_enum_variant)]
+ pub enum Shape {
+     TriangleMesh3D(TriangleMesh),
++    /// A 3D Boolean subtree that is recorded, not yet evaluated. It is
++    /// evaluated as one hypermesh Boolean program by [`Shape::resolve`].
++    Csg3D {
++        /// The whole subtree, with transforms pushed to its leaves.
++        expr: SolidExpr,
++        /// Span of the outermost statement recorded in `expr`.
++        span: Option<Span>,
++    },
+     CurveRegion2D(CurveRegion2),
+-    /// Boolean/transform operations failed with this error.
+-    Failed(String),
++    /// The shape could not be produced.
++    Failed(ShapeFailure),
+ }
+ 
+ impl fmt::Debug for Shape {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+             Self::TriangleMesh3D(_) => write!(f, "Shape::TriangleMesh3D"),
++            Self::Csg3D { .. } => write!(f, "Shape::Csg3D"),
+             Self::CurveRegion2D(_) => write!(f, "Shape::CurveRegion2D"),
+             Self::Failed(e) => write!(f, "Shape::Failed({e})"),
+         }
+     }
+ }
+ 
++impl From<ShapeFailure> for Shape {
++    fn from(failure: ShapeFailure) -> Self {
++        Self::Failed(failure)
++    }
++}
++
+ impl Shape {
+     /// Creates a 3D shape from native triangle geometry.
+     #[must_use]
+@@ -62,27 +80,81 @@ impl Shape {
+         Self::TriangleMesh3D(mesh)
+     }
+ 
++    /// Creates a 3D shape from a csgrs constructor result.
++    #[must_use]
++    pub fn from_mesh_result(context: &str, mesh: Result<TriangleMesh, csgrs::Error>) -> Self {
++        match mesh {
++            Ok(mesh) => Self::TriangleMesh3D(mesh),
++            Err(error) => Self::Failed(ShapeFailure::kernel(context, error)),
++        }
++    }
++
++    /// Creates a 2D shape from a csgrs constructor result.
++    #[must_use]
++    pub fn from_region_result<E: Into<csgrs::Error>>(
++        context: &str,
++        region: Result<CurveRegion2, E>,
++    ) -> Self {
++        match region {
++            Ok(region) => Self::CurveRegion2D(region),
++            Err(error) => Self::Failed(ShapeFailure::kernel(context, error)),
++        }
++    }
++
++    /// Evaluates a recorded 3D Boolean subtree under `GeometryContext::STRICT`.
++    /// Other shapes are returned unchanged.
++    #[must_use]
++    pub fn resolve(self) -> Self {
++        match self {
++            Self::Csg3D { expr, span } => {
++                match expr.evaluate_with_context(csgrs::GeometryContext::STRICT) {
++                    Ok(outcome) => Self::TriangleMesh3D(outcome.into_value()),
++                    Err(error) => {
++                        let failure = ShapeFailure::kernel("exact 3D Boolean failed", error);
++                        Self::Failed(match span {
++                            Some(span) => failure.with_span(span),
++                            None => failure,
++                        })
++                    }
++                }
++            }
++            shape => shape,
++        }
++    }
++
++    /// Records the span of the statement that produced this shape on a
++    /// failure or a recorded Boolean subtree that does not have one yet.
++    pub const fn attach_span(&mut self, statement: Span) {
++        match self {
++            Self::Failed(failure) => failure.attach_span(statement),
++            Self::Csg3D { span, .. } if span.is_none() => *span = Some(statement),
++            _ => {}
++        }
++    }
++
+     /// Extract 3D mesh data without inventing thickness for a 2D curve region.
+     ///
+     /// # Errors
+     ///
+-    /// Returns the retained geometry error or rejects a 2D curve region that
+-    /// has not been explicitly extruded.
+-    pub fn try_into_triangle_mesh(self) -> Result<TriangleMesh, String> {
+-        match self {
++    /// Returns the retained geometry failure, the failure of a recorded
++    /// Boolean subtree, or rejects a 2D curve region that has not been
++    /// explicitly extruded.
++    pub fn try_into_triangle_mesh(self) -> Result<TriangleMesh, ShapeFailure> {
++        match self.resolve() {
+             Self::TriangleMesh3D(mesh) => Ok(mesh),
+-            Self::CurveRegion2D(_) => Err(
+-                "cannot implicitly coerce 2D geometry to 3D; use linear_extrude() explicitly"
+-                    .into(),
+-            ),
+-            Self::Failed(error) => Err(error),
++            Self::CurveRegion2D(_) => Err(ShapeFailure::new(
++                FailureKind::MixedDimensions,
++                "cannot implicitly coerce 2D geometry to 3D; use linear_extrude() explicitly",
++            )),
++            Self::Failed(failure) => Err(failure),
++            Self::Csg3D { .. } => unreachable!("resolve() evaluates every recorded subtree"),
+         }
+     }
+ 
+     #[must_use]
+     pub const fn dimension(&self) -> Option<ShapeDimension> {
+         match self {
+-            Self::TriangleMesh3D(_) => Some(ShapeDimension::Three),
++            Self::TriangleMesh3D(_) | Self::Csg3D { .. } => Some(ShapeDimension::Three),
+             Self::CurveRegion2D(_) => Some(ShapeDimension::Two),
+             Self::Failed(_) => None,
+         }
+@@ -96,82 +168,122 @@ impl Shape {
+         }
+     }
+ 
+-    #[must_use]
+-    pub fn union(self, other: Self) -> Self {
+-        if let Self::Failed(e) = &self {
+-            return Self::Failed(e.clone());
++    /// The lazy expression of a 3D shape; `None` for other shapes.
++    fn into_solid_expr(self) -> Option<SolidExpr> {
++        match self {
++            Self::TriangleMesh3D(mesh) => Some(SolidExpr::from(mesh)),
++            Self::Csg3D { expr, .. } => Some(expr),
++            _ => None,
+         }
+-        if let Self::Failed(e) = &other {
+-            return Self::Failed(e.clone());
++    }
++
++    /// Combines `first` with every shape in `rest` by `op`, in `OpenSCAD`
++    /// order: `difference` subtracts every later shape from the first.
++    ///
++    /// 3D shapes are recorded into one expression and evaluated later as a
++    /// single Boolean program; 2D regions are combined pairwise now. All
++    /// shapes must be non-failed and have the same dimension.
++    #[must_use]
++    pub fn boolean_all(op: BoolOp, first: Self, rest: Vec<Self>) -> Self {
++        if rest.is_empty() {
++            return first;
+         }
+-        match (self, other) {
+-            (Self::CurveRegion2D(a), Self::CurveRegion2D(b)) => {
+-                match a.boolean_region(&b, hypercurve::BooleanOp::Union) {
+-                    Ok(region) => Self::CurveRegion2D(region),
+-                    Err(error) => Self::Failed(format!("exact 2D union failed: {error}")),
++        if first.dimension() == Some(ShapeDimension::Three)
++            && rest
++                .iter()
++                .all(|shape| shape.dimension() == Some(ShapeDimension::Three))
++        {
++            let Some(first) = first.into_solid_expr() else {
++                unreachable!("the dimension check establishes a 3D shape");
++            };
++            let rest = rest
++                .into_iter()
++                .filter_map(Self::into_solid_expr)
++                .collect::<Vec<_>>();
++            let expr = match op {
++                BoolOp::Union => {
++                    let mut all = Vec::with_capacity(rest.len() + 1);
++                    all.push(first);
++                    all.extend(rest);
++                    balanced(&all, BoolOp::Union)
+                 }
+-            }
+-            (Self::TriangleMesh3D(a), Self::TriangleMesh3D(b)) => {
+-                triangle_mesh_boolean(a, b, BoolOp::Union)
+-            }
+-            _ => Self::Failed("cannot union mixed 2D and 3D geometry".into()),
++                BoolOp::Difference => first.difference(&balanced(&rest, BoolOp::Union)),
++                BoolOp::Intersection => {
++                    let mut all = Vec::with_capacity(rest.len() + 1);
++                    all.push(first);
++                    all.extend(rest);
++                    balanced(&all, BoolOp::Intersection)
++                }
++            };
++            return Self::Csg3D { expr, span: None };
++        }
++        let mut result = first;
++        for shape in rest {
++            result = match op {
++                BoolOp::Union => result.union(shape),
++                BoolOp::Difference => result.difference(shape),
++                BoolOp::Intersection => result.intersection(shape),
++            };
+         }
++        result
+     }
+ 
+-    #[must_use]
+-    pub fn difference(self, other: Self) -> Self {
+-        if let Self::Failed(e) = &self {
+-            return Self::Failed(e.clone());
++    fn boolean(self, other: Self, op: BoolOp) -> Self {
++        if let Self::Failed(e) = self {
++            return Self::Failed(e);
+         }
+-        if let Self::Failed(e) = &other {
+-            return Self::Failed(e.clone());
++        if let Self::Failed(e) = other {
++            return Self::Failed(e);
+         }
++        let (region_op, verb) = match op {
++            BoolOp::Union => (hypercurve::BooleanOp::Union, "union"),
++            BoolOp::Difference => (hypercurve::BooleanOp::Difference, "subtract"),
++            BoolOp::Intersection => (hypercurve::BooleanOp::Intersection, "intersect"),
++        };
+         match (self, other) {
+-            (Self::CurveRegion2D(a), Self::CurveRegion2D(b)) => {
+-                match a.boolean_region(&b, hypercurve::BooleanOp::Difference) {
+-                    Ok(region) => Self::CurveRegion2D(region),
+-                    Err(error) => Self::Failed(format!("exact 2D difference failed: {error}")),
+-                }
+-            }
+-            (Self::TriangleMesh3D(a), Self::TriangleMesh3D(b)) => {
+-                triangle_mesh_boolean(a, b, BoolOp::Difference)
+-            }
+-            _ => Self::Failed("cannot subtract mixed 2D and 3D geometry".into()),
++            (Self::CurveRegion2D(a), Self::CurveRegion2D(b)) => Self::from_region_result(
++                &format!("exact 2D {op:?} failed"),
++                a.boolean_region(&b, region_op),
++            ),
++            (a, b) if a.dimension() == b.dimension() => Self::boolean_all(op, a, vec![b]),
++            _ => Self::Failed(ShapeFailure::new(
++                FailureKind::MixedDimensions,
++                format!("cannot {verb} mixed 2D and 3D geometry"),
++            )),
+         }
+     }
+ 
++    #[must_use]
++    pub fn union(self, other: Self) -> Self {
++        self.boolean(other, BoolOp::Union)
++    }
++
++    #[must_use]
++    pub fn difference(self, other: Self) -> Self {
++        self.boolean(other, BoolOp::Difference)
++    }
++
+     #[must_use]
+     pub fn intersection(self, other: Self) -> Self {
+-        if let Self::Failed(e) = &self {
+-            return Self::Failed(e.clone());
+-        }
+-        if let Self::Failed(e) = &other {
+-            return Self::Failed(e.clone());
+-        }
+-        match (self, other) {
+-            (Self::CurveRegion2D(a), Self::CurveRegion2D(b)) => {
+-                match a.boolean_region(&b, hypercurve::BooleanOp::Intersection) {
+-                    Ok(region) => Self::CurveRegion2D(region),
+-                    Err(error) => Self::Failed(format!("exact 2D intersection failed: {error}")),
+-                }
+-            }
+-            (Self::TriangleMesh3D(a), Self::TriangleMesh3D(b)) => {
+-                triangle_mesh_boolean(a, b, BoolOp::Intersection)
+-            }
+-            _ => Self::Failed("cannot intersect mixed 2D and 3D geometry".into()),
+-        }
++        self.boolean(other, BoolOp::Intersection)
+     }
+ 
+     #[must_use]
+     pub fn translate(self, x: Real, y: Real, z: Real) -> Self {
+         match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(mesh.translated(x, y, z)),
++            Self::TriangleMesh3D(mesh) => {
++                Self::from_mesh_result("translate() failed", mesh.translated(x, y, z))
++            }
++            Self::Csg3D { expr, span } => match expr.translated(x, y, z) {
++                Ok(expr) => Self::Csg3D { expr, span },
++                Err(error) => Self::Failed(ShapeFailure::kernel("translate() failed", error)),
++            },
+             // OpenSCAD retains the projected result as a 2D object. The
+             // curve kernel applies the XY part of this exact transform.
+-            Self::CurveRegion2D(region) => match csgrs::curve::try_translated(&region, x, y) {
+-                Ok(region) => Self::CurveRegion2D(region),
+-                Err(error) => Self::Failed(format!("translate() failed: {error}")),
+-            },
++            Self::CurveRegion2D(region) => Self::from_region_result(
++                "translate() failed",
++                csgrs::curve::translated(&region, x, y),
++            ),
+             Self::Failed(e) => Self::Failed(e),
+         }
+     }
+@@ -179,7 +291,13 @@ impl Shape {
+     #[must_use]
+     pub fn rotate(self, x: Real, y: Real, z: Real) -> Self {
+         match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(solid::rotate(&mesh, x, y, z)),
++            Self::TriangleMesh3D(mesh) => {
++                Self::from_mesh_result("rotate() failed", solid::rotate(&mesh, x, y, z))
++            }
++            Self::Csg3D { expr, span } => match expr.rotated(x, y, z) {
++                Ok(expr) => Self::Csg3D { expr, span },
++                Err(error) => Self::Failed(ShapeFailure::kernel("rotate() failed", error)),
++            },
+             Self::CurveRegion2D(region) => {
+                 let matrix = Matrix4::rotation_z(z.to_radians())
+                     * Matrix4::rotation_y(y.to_radians())
+@@ -193,7 +311,13 @@ impl Shape {
+     #[must_use]
+     pub fn scale(self, sx: Real, sy: Real, sz: Real) -> Self {
+         match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(solid::scale(&mesh, sx, sy, sz)),
++            Self::TriangleMesh3D(mesh) => {
++                Self::from_mesh_result("scale() failed", solid::scale(&mesh, sx, sy, sz))
++            }
++            Self::Csg3D { expr, span } => match expr.scaled(sx, sy, sz) {
++                Ok(expr) => Self::Csg3D { expr, span },
++                Err(error) => Self::Failed(ShapeFailure::kernel("scale() failed", error)),
++            },
+             Self::CurveRegion2D(region) => {
+                 let matrix = Matrix4::affine_nonuniform_scale([sx, sy, Real::one()]);
+                 transform_curve_region(&region, &matrix, "scale()")
+@@ -202,6 +326,22 @@ impl Shape {
+         }
+     }
+ 
++    /// Applies an exact homogeneous matrix, lazily for a recorded subtree.
++    fn transform_matrix(self, matrix: Matrix4, operation: &str) -> Self {
++        match self {
++            Self::TriangleMesh3D(mesh) => Self::from_mesh_result(
++                &format!("{operation} failed"),
++                solid::transform(&mesh, &matrix),
++            ),
++            Self::Csg3D { expr, span } => Self::Csg3D {
++                expr: expr.transformed(matrix),
++                span,
++            },
++            Self::CurveRegion2D(region) => transform_curve_region(&region, &matrix, operation),
++            Self::Failed(e) => Self::Failed(e),
++        }
++    }
++
+     #[must_use]
+     pub fn mirror(self, nx: Real, ny: Real, nz: Real) -> Self {
+         if [&nx, &ny, &nz].into_iter().all(|coordinate| {
+@@ -213,13 +353,9 @@ impl Shape {
+         let plane = Plane::new(Point3::new(nx, ny, nz), Real::zero());
+         let matrix = match plane.reflection_matrix(&crate::compiler::MESH_CONTEXT) {
+             Ok(matrix) => matrix.into_value(),
+-            Err(error) => return Self::Failed(format!("mirror() failed: {error}")),
++            Err(error) => return Self::Failed(ShapeFailure::kernel("mirror() failed", error)),
+         };
+-        match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(solid::transform(&mesh, &matrix)),
+-            Self::CurveRegion2D(region) => transform_curve_region(&region, &matrix, "mirror()"),
+-            Self::Failed(e) => Self::Failed(e),
+-        }
++        self.transform_matrix(matrix, "mirror()")
+     }
+ 
+     /// Rotates around an arbitrary exact axis without a primitive-float Euler conversion.
+@@ -254,71 +390,87 @@ impl Shape {
+         }
+         let matrix = match Matrix4::rotation_axis_angle(axis, angle_degrees.to_radians()) {
+             Ok(matrix) => matrix,
+-            Err(error) => return Self::Failed(format!("axis-angle rotation failed: {error:?}")),
+-        };
+-        match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(solid::transform(&mesh, &matrix)),
+-            Self::CurveRegion2D(region) => {
+-                transform_curve_region(&region, &matrix, "axis-angle rotate()")
++            Err(error) => {
++                return Self::Failed(ShapeFailure::kernel("axis-angle rotation failed", error));
+             }
+-            Self::Failed(error) => Self::Failed(error),
+-        }
++        };
++        self.transform_matrix(matrix, "axis-angle rotate()")
+     }
+ 
+     #[must_use]
+-    #[allow(dead_code)]
+     pub fn center(self) -> Self {
+-        match self {
+-            Self::TriangleMesh3D(mesh) => Self::TriangleMesh3D(solid::center(&mesh)),
++        match self.resolve() {
++            Self::TriangleMesh3D(mesh) => {
++                Self::from_mesh_result("center() failed", solid::center(&mesh))
++            }
+             Self::CurveRegion2D(region) => {
+-                let bounds = match csgrs::curve::try_bounding_box(&region) {
+-                    Ok(bounds) => bounds,
+-                    Err(error) => return Self::Failed(format!("center() failed: {error}")),
++                let bounds = match csgrs::curve::bounding_box(&region) {
++                    Ok(Some(bounds)) => bounds,
++                    // The empty region is its own centered image.
++                    Ok(None) => return Self::CurveRegion2D(region),
++                    Err(error) => {
++                        return Self::Failed(ShapeFailure::kernel("center() failed", error));
++                    }
+                 };
+                 let two = Real::from(2_u8);
+-                let Ok(x) = (&bounds.mins.x + &bounds.maxs.x) / &two else {
+-                    return Self::Failed("center() could not divide the x bounds by two".into());
++                let x = match (&bounds.mins.x + &bounds.maxs.x) / &two {
++                    Ok(x) => x,
++                    Err(error) => {
++                        return Self::Failed(ShapeFailure::kernel(
++                            "center() could not halve the x bounds",
++                            error,
++                        ));
++                    }
+                 };
+-                let Ok(y) = (&bounds.mins.y + &bounds.maxs.y) / &two else {
+-                    return Self::Failed("center() could not divide the y bounds by two".into());
++                let y = match (&bounds.mins.y + &bounds.maxs.y) / &two {
++                    Ok(y) => y,
++                    Err(error) => {
++                        return Self::Failed(ShapeFailure::kernel(
++                            "center() could not halve the y bounds",
++                            error,
++                        ));
++                    }
+                 };
+-                match csgrs::curve::try_translated(&region, -x, -y) {
+-                    Ok(region) => Self::CurveRegion2D(region),
+-                    Err(error) => Self::Failed(format!("center() failed: {error}")),
+-                }
++                Self::from_region_result(
++                    "center() failed",
++                    csgrs::curve::translated(&region, -x, -y),
++                )
+             }
+-            Self::Failed(e) => Self::Failed(e),
++            shape => shape,
+         }
+     }
+ }
+ 
+-fn transform_curve_region(region: &CurveRegion2, matrix: &Matrix4, operation: &str) -> Shape {
+-    match region.transform_affine(
+-        &matrix.0[0][0],
+-        &matrix.0[0][1],
+-        &matrix.0[1][0],
+-        &matrix.0[1][1],
+-        &matrix.0[0][3],
+-        &matrix.0[1][3],
+-    ) {
+-        Ok(region) => Shape::CurveRegion2D(region),
+-        Err(error) => Shape::Failed(format!(
+-            "{operation} collapsed or invalidated a 2D curve region: {error}"
+-        )),
++/// Folds `operands` into a balanced tree of `op`. A balanced tree keeps the
++/// recorded expression shallow; the set is the same for any association.
++fn balanced(operands: &[SolidExpr], op: BoolOp) -> SolidExpr {
++    match operands {
++        [] => unreachable!("a Boolean fold always has an operand"),
++        [single] => single.clone(),
++        _ => {
++            let (left, right) = operands.split_at(operands.len() / 2);
++            let (left, right) = (balanced(left, op), balanced(right, op));
++            match op {
++                BoolOp::Union => left.union(&right),
++                BoolOp::Intersection => left.intersection(&right),
++                BoolOp::Difference => unreachable!("difference is never folded associatively"),
++            }
++        }
+     }
+ }
+ 
+-#[allow(clippy::needless_pass_by_value)]
+-fn triangle_mesh_boolean(lhs: TriangleMesh, rhs: TriangleMesh, op: BoolOp) -> Shape {
+-    let result = match op {
+-        BoolOp::Union => lhs.try_union(&rhs),
+-        BoolOp::Difference => lhs.try_difference(&rhs),
+-        BoolOp::Intersection => lhs.try_intersection(&rhs),
+-    };
+-    match result {
+-        Ok(mesh) => Shape::TriangleMesh3D(mesh),
+-        Err(error) => Shape::Failed(format!("exact {op:?} failed: {error}")),
+-    }
++fn transform_curve_region(region: &CurveRegion2, matrix: &Matrix4, operation: &str) -> Shape {
++    Shape::from_region_result(
++        &format!("{operation} collapsed or invalidated a 2D curve region"),
++        region.transform_affine(
++            &matrix.0[0][0],
++            &matrix.0[0][1],
++            &matrix.0[1][0],
++            &matrix.0[1][1],
++            &matrix.0[0][3],
++            &matrix.0[1][3],
++        ),
++    )
+ }
+ 
+ pub mod conversions;
+@@ -347,11 +499,14 @@ mod tests {
+             CurveRegion2::try_from_boundary_paths(&[boundary], hypercurve::FillRule::NonZero)
+                 .unwrap(),
+         );
+-        let cutter = Shape::CurveRegion2D(csgrs::curve::translated(
+-            &csgrs::curve::rectangle(Real::from(6), Real::from(3)),
+-            Real::from(-3),
+-            Real::from(2),
+-        ));
++        let cutter = Shape::CurveRegion2D(
++            csgrs::curve::translated(
++                &csgrs::curve::rectangle(Real::from(6), Real::from(3)).unwrap(),
++                Real::from(-3),
++                Real::from(2),
++            )
++            .unwrap(),
++        );
+ 
+         let result = curved
+             .difference(cutter)
+@@ -362,7 +517,7 @@ mod tests {
+ 
+         assert!(region.has_algebraic_fragments());
+         assert!(
+-            !csgrs::curve::try_extrude(&region, Real::one(), &csgrs::GeometryContext::STRICT,)
++            !csgrs::curve::try_extrude(&region, Real::one(), csgrs::GeometryContext::STRICT,)
+                 .unwrap()
+                 .into_value()
+                 .triangles
+@@ -374,7 +529,8 @@ mod tests {
+     fn exact_2d_transforms_never_invent_3d_thickness() {
+         let below_the_old_tolerance = (Real::one() / Real::from(10_000_000_000_000_u64))
+             .expect("the exact denominator is nonzero");
+-        let square = || Shape::CurveRegion2D(csgrs::curve::rectangle(Real::one(), Real::one()));
++        let square =
++            || Shape::CurveRegion2D(csgrs::curve::rectangle(Real::one(), Real::one()).unwrap());
+ 
+         assert!(matches!(
+             square().translate(Real::zero(), Real::zero(), below_the_old_tolerance.clone()),
+@@ -392,20 +548,28 @@ mod tests {
+ 
+     #[test]
+     fn implicit_2d_and_failed_shape_mesh_conversions_are_rejected() {
+-        let region = Shape::CurveRegion2D(csgrs::curve::rectangle(Real::one(), Real::one()));
+-        assert!(
+-            region
+-                .try_into_triangle_mesh()
+-                .unwrap_err()
+-                .contains("linear_extrude")
+-        );
++        let region =
++            Shape::CurveRegion2D(csgrs::curve::rectangle(Real::one(), Real::one()).unwrap());
++        let failure = region.try_into_triangle_mesh().unwrap_err();
++        assert_eq!(failure.kind(), FailureKind::MixedDimensions);
++        assert!(failure.to_string().contains("linear_extrude"));
++
++        let retained = ShapeFailure::invalid_argument("retained failure");
++        let failure = Shape::Failed(retained)
++            .try_into_triangle_mesh()
++            .unwrap_err();
++        assert_eq!(failure.kind(), FailureKind::InvalidArgument);
++        assert_eq!(failure.to_string(), "retained failure");
++    }
+ 
+-        assert_eq!(
+-            Shape::Failed("retained failure".into())
+-                .try_into_triangle_mesh()
+-                .unwrap_err(),
+-            "retained failure"
+-        );
++    #[test]
++    fn mixed_dimension_shape_booleans_are_typed_failures() {
++        let square = Shape::CurveRegion2D(csgrs::curve::square(Real::one()).unwrap());
++        let cube = Shape::from_triangle_mesh(solid::cube(Real::one()).unwrap());
++        let Shape::Failed(failure) = square.union(cube) else {
++            panic!("a mixed 2D/3D Shape union must fail");
++        };
++        assert_eq!(failure.kind(), FailureKind::MixedDimensions);
+     }
+ 
+     #[test]
+@@ -417,11 +581,22 @@ mod tests {
+         ];
+         let face = [0_usize, 1, 2];
+         let open = solid::polyhedron(&points, &[&face]).unwrap();
+-        let result = triangle_mesh_boolean(open, solid::cube(Real::from(2_u8)), BoolOp::Difference);
+-        let Shape::Failed(error) = result else {
++        let result = Shape::from_triangle_mesh(open).difference(Shape::from_triangle_mesh(
++            solid::cube(Real::from(2_u8)).unwrap(),
++        ));
++        assert!(
++            matches!(result, Shape::Csg3D { .. }),
++            "3D Booleans are recorded until resolved"
++        );
++        let Shape::Failed(failure) = result.resolve() else {
+             panic!("an open Boolean input must remain an explicit exact failure");
+         };
+-        assert!(error.contains("exact Difference failed"));
+-        assert!(error.contains("boundary edges"));
++        assert!(
++            matches!(failure.kind(), FailureKind::Kernel(_)),
++            "{failure}"
++        );
++        assert!(failure.kernel_error().is_some());
++        assert!(failure.to_string().contains("exact 3D Boolean failed"));
++        assert!(failure.to_string().contains("boundary edges"), "{failure}");
+     }
+ }
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index 14fb969..0eaad79 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -3,11 +3,13 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+ pub mod evaluator;
++pub mod failure;
+ pub mod geometry;
+ pub mod rendering;
+ pub mod types;
+ 
+ pub use evaluator::Evaluator;
++pub use failure::{FailedPart, FailureKind, PartEvidence, ShapeFailure, SourceLocation};
+ pub use rendering::render_orthographic_views;
+ pub use types::{CompilationResult, MeshData, ViewImage};
+ 
+@@ -117,64 +119,79 @@ pub fn compile_scad_code(
+     }
+ 
+     let mut parts = Vec::new();
+-    for (shape, color) in shapes {
++    let mut failed_parts = Vec::new();
++    for (index, (shape, color)) in shapes.into_iter().enumerate() {
+         if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+             return CompilationResult::Canceled;
+         }
+-        let mut mesh_data = match shape {
+-            geometry::Shape::TriangleMesh3D(mesh) => {
+-                match geometry::conversions::triangle_mesh_to_mesh_data(&mesh) {
+-                    Ok(m) => m,
+-                    Err(error) => {
+-                        evaluator
+-                            .warnings
+-                            .push(format!("Mesh conversion failed: {error}"));
+-                        continue;
+-                    }
+-                }
+-            }
+-            geometry::Shape::CurveRegion2D(region) => {
+-                // Match OpenSCAD's top-level 2D presentation with a flat
+-                // triangulated surface. Rendering must not invent thickness
+-                // or turn the curve region into a modeled 3D solid.
+-                let triangulated =
+-                    match csgrs::curve::try_triangulate(&region, &csgrs::GeometryContext::STRICT) {
+-                        Ok(outcome) => outcome.into_value(),
+-                        Err(error) => {
+-                            evaluator
+-                                .warnings
+-                                .push(format!("2D preview triangulation failed: {error}"));
+-                            continue;
+-                        }
+-                    };
+-                match geometry::conversions::triangle_mesh_to_mesh_data(&triangulated) {
+-                    Ok(m) => m,
+-                    Err(error) => {
+-                        evaluator
+-                            .warnings
+-                            .push(format!("2D preview conversion failed: {error}"));
+-                        continue;
+-                    }
+-                }
++        let part = index + 1;
++        match part_mesh_data(shape) {
++            Ok(Some(mut mesh_data)) => {
++                mesh_data.color = color;
++                mesh_data.part = part;
++                parts.push(mesh_data);
+             }
+-            geometry::Shape::Failed(e) => {
+-                evaluator.warnings.push(format!("Geometry failed: {e}"));
+-                continue;
++            // An exactly empty result is valid geometry with nothing to draw.
++            // It keeps its number so later parts keep theirs.
++            Ok(None) => evaluator
++                .warnings
++                .push(format!("Part @{part} is empty and is not rendered")),
++            Err(failure) => {
++                let location = failure
++                    .span()
++                    .map(|span| failure::SourceLocation::of_offset(code, span.start));
++                failed_parts.push(failure::FailedPart {
++                    part,
++                    failure,
++                    location,
++                });
+             }
+-        };
+-        mesh_data.color = color;
+-        parts.push(mesh_data);
++        }
+     }
+ 
+     let views = render_orthographic_views(&parts);
+ 
+     CompilationResult::Success {
+         parts,
++        failed_parts,
+         views,
+         warnings: evaluator.warnings,
+     }
+ }
+ 
++/// Projects one evaluated top-level shape to renderer mesh data, or `None`
++/// for an exactly empty shape.
++fn part_mesh_data(shape: geometry::Shape) -> Result<Option<MeshData>, ShapeFailure> {
++    match shape.resolve() {
++        geometry::Shape::TriangleMesh3D(mesh) if mesh.triangles.is_empty() => Ok(None),
++        geometry::Shape::CurveRegion2D(region) if region.is_empty() => Ok(None),
++        geometry::Shape::TriangleMesh3D(mesh) => {
++            geometry::conversions::triangle_mesh_to_mesh_data(&mesh)
++                .map(Some)
++                .map_err(|error| error.context("mesh conversion failed"))
++        }
++        geometry::Shape::CurveRegion2D(region) => {
++            // Match OpenSCAD's top-level 2D presentation with a flat
++            // triangulated surface. Rendering must not invent thickness
++            // or turn the curve region into a modeled 3D solid.
++            let triangulated =
++                csgrs::curve::try_triangulate(&region, csgrs::GeometryContext::STRICT)
++                    .map_err(|error| {
++                        ShapeFailure::kernel("2D preview triangulation failed", error)
++                    })?
++                    .into_value();
++            if triangulated.triangles.is_empty() {
++                return Ok(None);
++            }
++            geometry::conversions::triangle_mesh_to_mesh_data(&triangulated)
++                .map(Some)
++                .map_err(|error| error.context("2D preview conversion failed"))
++        }
++        geometry::Shape::Failed(failure) => Err(failure),
++        geometry::Shape::Csg3D { .. } => unreachable!("resolve() evaluates every recorded subtree"),
++    }
++}
++
+ /// Compiles `code` and returns only its rendered orthographic views.
+ ///
+ /// # Errors
+diff --git a/src/compiler/rendering/fonts.rs b/src/compiler/rendering/fonts.rs
+index 4048a78..1d51670 100644
+--- a/src/compiler/rendering/fonts.rs
++++ b/src/compiler/rendering/fonts.rs
+@@ -2,6 +2,8 @@ use csgrs::Real;
+ use csgrs::curve;
+ use hypercurve::CurveRegion2;
+ 
++use crate::compiler::failure::ShapeFailure;
++
+ /// Bundled Liberation Sans Regular font data.
+ const LIBERATION_SANS_REGULAR: &[u8] =
+     include_bytes!("../../../assets/fonts/LiberationSans-Regular.ttf");
+@@ -128,13 +130,17 @@ pub fn apply_text_alignment(
+     region: CurveRegion2,
+     halign: &str,
+     valign: &str,
+-) -> Result<CurveRegion2, String> {
++) -> Result<CurveRegion2, ShapeFailure> {
+     if region.is_empty() {
+         return Ok(region);
+     }
+ 
+-    let bounds = curve::try_bounding_box(&region)
+-        .map_err(|error| format!("exact text bounds failed: {error}"))?;
++    let bounds = match curve::bounding_box(&region) {
++        Ok(Some(bounds)) => bounds,
++        // An empty region has no extent to align.
++        Ok(None) => return Ok(region),
++        Err(error) => return Err(ShapeFailure::kernel("exact text bounds failed", error)),
++    };
+     let min_x = bounds.mins.x;
+     let max_x = bounds.maxs.x;
+     let min_y = bounds.mins.y;
+@@ -163,8 +169,8 @@ pub fn apply_text_alignment(
+     {
+         Ok(region)
+     } else {
+-        curve::try_translated(&region, dx, dy)
+-            .map_err(|error| format!("exact text alignment failed: {error}"))
++        curve::translated(&region, dx, dy)
++            .map_err(|error| ShapeFailure::kernel("exact text alignment failed", error))
+     }
+ }
+ 
+@@ -180,7 +186,7 @@ pub fn render_text_with_direction(
+     size: &Real,
+     spacing: &Real,
+     direction: &str,
+-) -> Result<CurveRegion2, String> {
++) -> Result<CurveRegion2, ShapeFailure> {
+     // OpenSCAD accepts ltr, rtl, ttb, and btt and dispatches on the first
+     // character, matching HarfBuzz direction parsing.
+     let dir = match direction.chars().next() {
+@@ -260,25 +266,30 @@ pub fn render_text_with_direction(
+             .is_some();
+ 
+         if has_outline {
+-            let glyph = curve::truetype_text(&ch.to_string(), font_data, corrected_size.clone());
++            let glyph = curve::truetype_text(&ch.to_string(), font_data, corrected_size.clone())
++                .map_err(|error| ShapeFailure::kernel("exact glyph outline failed", error))?;
+             let positioned = if is_vertical {
+                 // Vertical text extends down from the ascent line and centers
+                 // each glyph on the text axis.
+-                curve::try_translated(
++                curve::translated(
+                     &glyph,
+                     -(advance.clone() / Real::from(2_u8)).unwrap_or_else(|_| Real::zero()),
+                     -(&cursor + &ascender),
+                 )
+-                .map_err(|error| format!("exact vertical glyph placement failed: {error}"))?
++                .map_err(|error| {
++                    ShapeFailure::kernel("exact vertical glyph placement failed", error)
++                })?
+             } else {
+-                curve::try_translated(&glyph, cursor.clone(), Real::zero())
+-                    .map_err(|error| format!("exact glyph placement failed: {error}"))?
++                curve::translated(&glyph, cursor.clone(), Real::zero())
++                    .map_err(|error| ShapeFailure::kernel("exact glyph placement failed", error))?
+             };
+ 
+             combined = Some(match combined {
+                 Some(acc) => acc
+                     .boolean_region(&positioned, hypercurve::BooleanOp::Union)
+-                    .map_err(|error| format!("exact text glyph union failed: {error}"))?,
++                    .map_err(|error| {
++                        ShapeFailure::kernel("exact text glyph union failed", error)
++                    })?,
+                 None => positioned,
+             });
+         }
+diff --git a/src/compiler/types.rs b/src/compiler/types.rs
+index 1304452..f846eda 100644
+--- a/src/compiler/types.rs
++++ b/src/compiler/types.rs
+@@ -1,3 +1,5 @@
++use super::failure::{FailedPart, PartEvidence};
++
+ /// Triangle mesh data ready for Bevy rendering.
+ #[derive(Debug)]
+ pub struct MeshData {
+@@ -9,6 +11,10 @@ pub struct MeshData {
+     pub indices: Vec<u32>,
+     /// Optional color set via `color()` in the `OpenSCAD` code.
+     pub color: Option<[f32; 3]>,
++    /// 1-based part number (`@N`), shared with failed parts.
++    pub part: usize,
++    /// Construction evidence of the exact mesh this was projected from.
++    pub evidence: PartEvidence,
+ }
+ 
+ /// A rendered orthographic view encoded as base64 PNG.
+@@ -27,6 +33,8 @@ pub enum CompilationResult {
+     Success {
+         /// Independent top-level meshes in source order.
+         parts: Vec<MeshData>,
++        /// Top-level parts that failed, numbered with the successful ones.
++        failed_parts: Vec<FailedPart>,
+         /// Orthographic previews rendered from the completed parts.
+         views: Vec<ViewImage>,
+         /// Recoverable evaluator or mesh-conversion diagnostics.
+diff --git a/src/plugins/ai_chat.rs b/src/plugins/ai_chat.rs
+index aae89ac..8d8191e 100644
+--- a/src/plugins/ai_chat.rs
++++ b/src/plugins/ai_chat.rs
+@@ -962,13 +962,14 @@ fn ai_send_system(
+     ai_config: Res<AiConfig>,
+     model_views: Res<super::compilation::ModelViews>,
+     part_query: Query<&PartLabel>,
++    failed_parts: Res<super::compilation::FailedParts>,
+ ) {
+     if !chat_state.is_streaming || chat_state.stream_receiver.is_some() {
+         return;
+     }
+ 
+     let messages: Vec<ChatMessage> = chat_state.messages[chat_state.session_start..].to_vec();
+-    let part_context = build_part_context(&part_query);
++    let part_context = build_part_context(&part_query, &failed_parts);
+ 
+     let current_code = scad_code.text.clone();
+     let (active_view_name, _) = super::code_editor::detect_views(&current_code);
+@@ -1364,13 +1365,14 @@ fn ai_send_system(
+     ai_config: Res<AiConfig>,
+     model_views: Res<super::compilation::ModelViews>,
+     part_query: Query<&PartLabel>,
++    failed_parts: Res<super::compilation::FailedParts>,
+ ) {
+     if !chat_state.is_streaming || chat_state.stream_receiver.is_some() {
+         return;
+     }
+ 
+     let messages: Vec<ChatMessage> = chat_state.messages[chat_state.session_start..].to_vec();
+-    let part_context = build_part_context(&part_query);
++    let part_context = build_part_context(&part_query, &failed_parts);
+ 
+     let current_code = scad_code.text.clone();
+     let (active_view_name, _) = super::code_editor::detect_views(&current_code);
+@@ -2319,22 +2321,47 @@ fn ai_verify_system(
+ }
+ 
+ /// Build part context describing the compiled parts (@1, @2, ...) for the AI.
+-fn build_part_context(part_query: &Query<&PartLabel>) -> String {
++fn build_part_context(
++    part_query: &Query<&PartLabel>,
++    failed_parts: &super::compilation::FailedParts,
++) -> String {
++    let parts: Vec<&PartLabel> = part_query.iter().collect();
++    part_context_text(&parts, &failed_parts.parts)
++}
++
++/// Describes every part, successful or failed, in part-number order.
++fn part_context_text(parts: &[&PartLabel], failed_parts: &[crate::compiler::FailedPart]) -> String {
+     use std::fmt::Write;
+-    let mut parts: Vec<&PartLabel> = part_query.iter().collect();
+-    if parts.is_empty() {
++    if parts.is_empty() && failed_parts.is_empty() {
+         return String::new();
+     }
+-    parts.sort_by_key(|p| p.index);
++    let mut lines: Vec<(usize, String)> = parts
++        .iter()
++        .map(|part| {
++            let [r, g, b] = part.color;
++            (
++                part.index,
++                format!(
++                    "  {}: color=({r:.2}, {g:.2}, {b:.2}), {}",
++                    part.label,
++                    part.evidence.summary()
++                ),
++            )
++        })
++        .collect();
++    lines.extend(failed_parts.iter().map(|failed| {
++        (
++            failed.part,
++            format!("  @{}: {}", failed.part, failed.summary()),
++        )
++    }));
++    lines.sort_by_key(|(index, _)| *index);
+ 
+-    let mut ctx = String::from("Compiled parts:\n");
+-    for part in &parts {
+-        let [r, g, b] = part.color;
+-        let _ = writeln!(
+-            ctx,
+-            "  {}: color=({:.2}, {:.2}, {:.2})",
+-            part.label, r, g, b
+-        );
++    let mut ctx = String::from(
++        "Compiled parts (every operation runs under the STRICT exact policy, so a successful part is certified):\n",
++    );
++    for (_, line) in lines {
++        let _ = writeln!(ctx, "{line}");
+     }
+     ctx.push_str("When the user references @N, it refers to the part listed above.\n");
+     ctx
+@@ -2447,6 +2474,49 @@ fn extract_openscad_code(text: &str) -> Option<String> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn part_context_lists_certified_and_failed_parts_in_number_order() {
++        use crate::compiler::{
++            FailedPart, FailureKind, PartEvidence, ShapeFailure, SourceLocation,
++        };
++        use crate::plugins::compilation::PartLabel;
++
++        let sampled = PartLabel {
++            index: 3,
++            label: "@3".into(),
++            color: [1.0, 0.0, 0.0],
++            evidence: PartEvidence {
++                source_sampled: true,
++                ..PartEvidence::default()
++            },
++        };
++        let exact = PartLabel {
++            index: 1,
++            label: "@1".into(),
++            color: [0.0, 0.0, 1.0],
++            evidence: PartEvidence::default(),
++        };
++        let failed = FailedPart {
++            part: 2,
++            failure: ShapeFailure::new(FailureKind::InvalidArgument, "translate() failed"),
++            location: Some(SourceLocation { line: 4, column: 7 }),
++        };
++
++        let context = part_context_text(&[&sampled, &exact], &[failed]);
++        let lines = context.lines().collect::<Vec<_>>();
++
++        assert!(lines[0].contains("STRICT"));
++        assert!(lines[1].starts_with("  @1:") && lines[1].ends_with("certified"));
++        assert_eq!(
++            lines[2],
++            "  @2: failed (invalid_argument) at line 4:7: translate() failed"
++        );
++        assert!(lines[3].starts_with("  @3:"));
++        assert!(lines[3].ends_with("certified; mesh evidence: source_sampled"));
++        assert_eq!(sampled.badge(), "\u{2714} sampled");
++        assert_eq!(exact.badge(), "\u{2714}");
++    }
++
+     fn cached_model_views(code: &str, fn_value: u32) -> super::super::compilation::ModelViews {
+         super::super::compilation::ModelViews {
+             source_hash: Some(super::super::compilation::model_source_hash(code, fn_value)),
+@@ -2475,8 +2545,8 @@ mod tests {
+         let (source_changed, _) = model_views_for_request(&cached, "sphere(10);", 16, true);
+         let (settings_changed, _) = model_views_for_request(&cached, "cube(10);", 32, true);
+ 
+-        assert!(source_changed.is_empty());
+-        assert!(settings_changed.is_empty());
++        assert_eq!(source_changed.len(), 0);
++        assert_eq!(settings_changed.len(), 0);
+     }
+ 
+     #[test]
+@@ -2485,8 +2555,8 @@ mod tests {
+ 
+         let (views, other_views) = model_views_for_request(&cached, "cube(10);", 16, false);
+ 
+-        assert!(views.is_empty());
+-        assert!(other_views.is_empty());
++        assert_eq!(views.len(), 0);
++        assert_eq!(other_views.len(), 0);
+     }
+ 
+     #[test]
+@@ -2539,7 +2609,7 @@ mod tests {
+     fn test_parse_search_replace_none() {
+         let text = "Just some text without any replace blocks.";
+         let pairs = parse_search_replace(text);
+-        assert!(pairs.is_empty());
++        assert_eq!(pairs.len(), 0);
+     }
+ 
+     #[test]
+diff --git a/src/plugins/compilation.rs b/src/plugins/compilation.rs
+index 797b7d6..82874a4 100644
+--- a/src/plugins/compilation.rs
++++ b/src/plugins/compilation.rs
+@@ -8,6 +8,7 @@ use super::camera::OrbitCamera;
+ use super::code_editor::ScadCode;
+ use super::scene::CadModel;
+ use crate::compiler;
++use crate::compiler::{FailedPart, PartEvidence};
+ 
+ const PART_PALETTE: &[[f32; 3]] = &[
+     [0.40, 0.70, 1.00], // sky blue
+@@ -52,6 +53,41 @@ pub struct PartLabel {
+     pub label: String,
+     /// RGB color matching the part material.
+     pub color: [f32; 3],
++    /// Construction evidence of the part's exact mesh.
++    pub evidence: PartEvidence,
++}
++
++impl PartLabel {
++    /// Short certainty badge shown after the part number in the viewport.
++    ///
++    /// Every successful part is certified, because compilation runs under
++    /// `GeometryContext::STRICT`. Mesh evidence flags follow the check mark.
++    #[must_use]
++    pub fn badge(&self) -> String {
++        let flags = [
++            (self.evidence.approximate_512_consumed, "approx-512"),
++            (self.evidence.source_sampled, "sampled"),
++            (self.evidence.coordinates_projected, "projected"),
++            (self.evidence.source_history_missing, "no-history"),
++        ]
++        .into_iter()
++        .filter_map(|(set, name)| set.then_some(name))
++        .collect::<Vec<_>>();
++        if flags.is_empty() {
++            "\u{2714}".into()
++        } else {
++            format!("\u{2714} {}", flags.join(" "))
++        }
++    }
++}
++
++/// Top-level parts of the last compilation that produced no geometry.
++///
++/// They keep their `@N` numbers, so the numbering of the other parts does
++/// not depend on which parts failed.
++#[derive(Resource, Default)]
++pub struct FailedParts {
++    pub parts: Vec<FailedPart>,
+ }
+ 
+ /// Toggle visibility of part labels in the viewport.
+@@ -74,6 +110,10 @@ pub struct StlMeshData {
+     pub indices: Vec<u32>,
+     /// Optional color from `color()` in the code.
+     pub color: Option<[f32; 3]>,
++    /// 1-based part number (`@N`).
++    pub part: usize,
++    /// Construction evidence of the exact mesh.
++    pub evidence: PartEvidence,
+ }
+ 
+ pub type ModelView = (String, String);
+@@ -84,6 +124,8 @@ pub enum CompilationResult {
+         /// Hash of the source and render settings that produced this result.
+         source_hash: [u8; 32],
+         parts: Vec<StlMeshData>,
++        /// Parts that failed, numbered with the successful ones.
++        failed_parts: Vec<FailedPart>,
+         views: Vec<ModelView>, // (label, base64_png)
+         /// Views for non-active `$view` branches.
+         other_views: Vec<AlternateModelView>,
+@@ -181,8 +223,8 @@ mod model_view_cache_tests {
+         views.invalidate();
+ 
+         assert_eq!(views.source_hash, None);
+-        assert!(views.views.is_empty());
+-        assert!(views.other_views.is_empty());
++        assert_eq!(views.views.len(), 0);
++        assert_eq!(views.other_views.len(), 0);
+     }
+ }
+ 
+@@ -218,6 +260,7 @@ impl Plugin for CompilationPlugin {
+             .init_resource::<LoadedModel>()
+             .init_resource::<ModelViews>()
+             .init_resource::<LastCompiledParts>()
++            .init_resource::<FailedParts>()
+             .init_resource::<CompilationPollingTimer>()
+             .init_resource::<PartLabelVisibility>()
+             .add_systems(
+@@ -306,6 +349,7 @@ fn compile_openscad(
+         return CompilationResult::Success {
+             source_hash: model_source_hash(code, fn_value),
+             parts: Vec::new(),
++            failed_parts: Vec::new(),
+             views: Vec::new(),
+             other_views: Vec::new(),
+             warnings: Vec::new(),
+@@ -339,6 +383,7 @@ fn compile_openscad(
+     match result {
+         compiler::CompilationResult::Success {
+             parts,
++            failed_parts,
+             views,
+             warnings,
+         } => {
+@@ -357,6 +402,9 @@ fn compile_openscad(
+                     eprintln!("[SynapsCAD] Warning: {w}");
+                 }
+             }
++            for failed in &failed_parts {
++                eprintln!("[SynapsCAD] @{} {}", failed.part, failed.summary());
++            }
+ 
+             // Render inactive `$view` branches at the smaller default resolution.
+             let (active_view, all_views) = detect_views(code);
+@@ -399,8 +447,11 @@ fn compile_openscad(
+                         normals: m.normals,
+                         indices: m.indices,
+                         color: m.color,
++                        part: m.part,
++                        evidence: m.evidence,
+                     })
+                     .collect(),
++                failed_parts,
+                 views: views.into_iter().map(|v| (v.label, v.base64_png)).collect(),
+                 other_views,
+                 warnings,
+@@ -424,6 +475,7 @@ fn poll_compilation_system(
+     mut loaded_model: ResMut<LoadedModel>,
+     mut model_views: ResMut<ModelViews>,
+     mut last_compiled: ResMut<LastCompiledParts>,
++    mut failed_parts_state: ResMut<FailedParts>,
+     mut chat_state: ResMut<super::ai_chat::ChatState>,
+     mut meshes: ResMut<Assets<Mesh>>,
+     mut materials: ResMut<Assets<StandardMaterial>>,
+@@ -469,6 +521,7 @@ fn poll_compilation_system(
+         CompilationResult::Success {
+             source_hash,
+             parts,
++            failed_parts,
+             views,
+             other_views,
+             warnings,
+@@ -497,20 +550,51 @@ fn poll_compilation_system(
+                 });
+             }
+ 
++            // Failed parts render nothing, so report each one in the chat
++            // panel with its kind and source location.
++            if !failed_parts.is_empty() {
++                let mut failure_text = format!(
++                    "\u{26a0}\u{fe0f} Failed parts:\n{}",
++                    failed_parts
++                        .iter()
++                        .map(|failed| format!("\u{2022} @{} {}", failed.part, failed.summary()))
++                        .collect::<Vec<_>>()
++                        .join("\n")
++                );
++                if failed_parts
++                    .iter()
++                    .any(|failed| failed.failure.kind().suggests_bug_report())
++                {
++                    failure_text.push_str(
++                        "\n\nThis is likely a bug. Please report it with the code that caused it so we can fix it.",
++                    );
++                }
++                chat_state.messages.push(ChatMessage {
++                    role: "assistant".into(),
++                    content: failure_text,
++                    thinking: None,
++                    images: Vec::new(),
++                    auto_generated: true,
++                    is_error: true,
++                });
++            }
++            failed_parts_state.parts = failed_parts;
++
+             model_views.source_hash = Some(source_hash);
+             model_views.views = views;
+             model_views.other_views = other_views;
+             last_compiled.parts.clone_from(&parts);
+ 
+-            for (i, stl_data) in parts.into_iter().enumerate() {
++            for stl_data in parts {
+                 let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, default());
+                 mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, stl_data.positions);
+                 mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, stl_data.normals);
+                 mesh.insert_indices(Indices::U32(stl_data.indices));
+ 
+-                let part_color = stl_data
+-                    .color
+-                    .unwrap_or(PART_PALETTE[i % PART_PALETTE.len()]);
++                let part_index = stl_data.part; // 1-based, shared with failed parts
++                let part_color = stl_data.color.unwrap_or_else(|| {
++                    PART_PALETTE[part_index.saturating_sub(1) % PART_PALETTE.len()]
++                });
+                 let [r, g, b] = part_color;
+                 let material = materials.add(StandardMaterial {
+                     base_color: Color::srgb(r, g, b),
+@@ -521,7 +605,6 @@ fn poll_compilation_system(
+                     ..default()
+                 });
+ 
+-                let part_index = i + 1; // 1-based
+                 let entity = commands
+                     .spawn((
+                         Mesh3d(meshes.add(mesh)),
+@@ -532,6 +615,7 @@ fn poll_compilation_system(
+                             index: part_index,
+                             label: format!("@{part_index}"),
+                             color: part_color,
++                            evidence: stl_data.evidence,
+                         },
+                         PickingBehavior::default(),
+                     ))
+diff --git a/src/plugins/ui/viewport.rs b/src/plugins/ui/viewport.rs
+index e095add..efd0360 100644
+--- a/src/plugins/ui/viewport.rs
++++ b/src/plugins/ui/viewport.rs
+@@ -1,6 +1,6 @@
+ use crate::plugins::camera::OrbitCamera;
+ use crate::plugins::code_editor::ScadCode;
+-use crate::plugins::compilation::PartLabel;
++use crate::plugins::compilation::{FailedParts, PartLabel};
+ use crate::plugins::scene::{LabelVisibility, MainCamera};
+ use crate::plugins::ui::resources::{CheatsheetOpen, OccupiedScreenSpace, SplashScreen};
+ use bevy::prelude::*;
+@@ -217,6 +217,7 @@ pub fn draw_part_labels(
+     occupied: Res<OccupiedScreenSpace>,
+     splash: Res<SplashScreen>,
+     label_vis: Res<LabelVisibility>,
++    failed_parts: Res<FailedParts>,
+ ) {
+     if !label_vis.visible || splash.timer > -SPLASH_FADE_DURATION {
+         return;
+@@ -224,6 +225,7 @@ pub fn draw_part_labels(
+     let Some(ctx) = contexts.try_ctx_mut() else {
+         return;
+     };
++    draw_failed_part_badges(ctx, &failed_parts, occupied.left);
+     let Ok((camera, camera_transform)) = camera_query.get_single() else {
+         return;
+     };
+@@ -259,10 +261,10 @@ pub fn draw_part_labels(
+             egui::Color32::WHITE
+         };
+ 
+-        let label_text = &part_label.label;
++        let label_text = format!("{} {}", part_label.label, part_label.badge());
+         let char_width = 8.0;
+         #[allow(clippy::cast_precision_loss)]
+-        let label_w = (label_text.len() as f32).mul_add(char_width, 8.0);
++        let label_w = (label_text.chars().count() as f32).mul_add(char_width, 8.0);
+         let label_h = 18.0;
+ 
+         egui::Area::new(egui::Id::new(format!("part_label_{}", part_label.index)))
+@@ -279,7 +281,7 @@ pub fn draw_part_labels(
+                     .inner_margin(egui::Margin::symmetric(4, 2))
+                     .show(ui, |ui| {
+                         ui.label(
+-                            egui::RichText::new(label_text)
++                            egui::RichText::new(&label_text)
+                                 .color(text_color)
+                                 .strong()
+                                 .small(),
+@@ -289,6 +291,44 @@ pub fn draw_part_labels(
+     }
+ }
+ 
++/// Failed parts have no mesh to label, so their badges are listed in the
++/// lower-left corner of the viewport, above the axis indicator.
++fn draw_failed_part_badges(ctx: &egui::Context, failed_parts: &FailedParts, left: f32) {
++    if failed_parts.parts.is_empty() {
++        return;
++    }
++    egui::Area::new(egui::Id::new("failed_part_badges"))
++        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(left + 8.0, -80.0))
++        .interactable(true)
++        .order(egui::Order::Background)
++        .show(ctx, |ui| {
++            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
++            for failed in &failed_parts.parts {
++                let location = failed
++                    .location
++                    .map_or_else(String::new, |location| format!(" \u{b7} {location}"));
++                let badge = format!(
++                    "@{} \u{2716} {}{location}",
++                    failed.part,
++                    failed.failure.kind()
++                );
++                egui::Frame::new()
++                    .fill(egui::Color32::from_rgb(170, 40, 40))
++                    .corner_radius(egui::CornerRadius::same(3))
++                    .inner_margin(egui::Margin::symmetric(4, 2))
++                    .show(ui, |ui| {
++                        ui.label(
++                            egui::RichText::new(badge)
++                                .color(egui::Color32::WHITE)
++                                .strong()
++                                .small(),
++                        )
++                        .on_hover_text(failed.summary());
++                    });
++            }
++        });
++}
++
+ pub fn draw_axis_indicator(
+     mut contexts: EguiContexts,
+     camera_query: Query<&GlobalTransform, With<MainCamera>>,

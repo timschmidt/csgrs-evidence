@@ -1,0 +1,156 @@
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -175,7 +175,7 @@
+             // triangulated surface. Rendering must not invent thickness
+             // or turn the curve region into a modeled 3D solid.
+             let triangulated =
+-                csgrs::curve::try_triangulate(&region, &csgrs::GeometryContext::STRICT)
++                csgrs::curve::try_triangulate(&region, csgrs::GeometryContext::STRICT)
+                     .map_err(|error| {
+                         ShapeFailure::kernel("2D preview triangulation failed", error)
+                     })?
+--- a/src/compiler/geometry/mod.rs
++++ b/src/compiler/geometry/mod.rs
+@@ -107,7 +107,7 @@
+     pub fn resolve(self) -> Self {
+         match self {
+             Self::Csg3D { expr, span } => {
+-                match expr.evaluate_with_context(&csgrs::GeometryContext::STRICT) {
++                match expr.evaluate_with_context(csgrs::GeometryContext::STRICT) {
+                     Ok(outcome) => Self::TriangleMesh3D(outcome.into_value()),
+                     Err(error) => {
+                         let failure = ShapeFailure::kernel("exact 3D Boolean failed", error);
+@@ -517,7 +517,7 @@
+ 
+         assert!(region.has_algebraic_fragments());
+         assert!(
+-            !csgrs::curve::try_extrude(&region, Real::one(), &csgrs::GeometryContext::STRICT,)
++            !csgrs::curve::try_extrude(&region, Real::one(), csgrs::GeometryContext::STRICT,)
+                 .unwrap()
+                 .into_value()
+                 .triangles
+--- a/src/compiler/evaluator/transformations.rs
++++ b/src/compiler/evaluator/transformations.rs
+@@ -236,7 +236,7 @@
+             && super::value::reals_equal(&scale[0], &Real::one()) == Some(true)
+             && super::value::reals_equal(&scale[1], &Real::one()) == Some(true);
+         let mesh = if is_plain_extrusion {
+-            match curve::try_extrude(&region, height, &csgrs::GeometryContext::STRICT) {
++            match curve::try_extrude(&region, height, csgrs::GeometryContext::STRICT) {
+                 Ok(outcome) => outcome.into_value(),
+                 Err(error) => {
+                     return Some(Shape::Failed(ShapeFailure::kernel(
+@@ -252,7 +252,7 @@
+                 twist,
+                 scale,
+                 slices.max(1),
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => outcome.into_value(),
+                 Err(error) => {
+@@ -291,7 +291,7 @@
+             Ok(None) => return None,
+             Err(error) => return Some(Shape::Failed(error)),
+         };
+-        let mesh = match curve::revolve(&region, angle, slices, &csgrs::GeometryContext::STRICT) {
++        let mesh = match curve::revolve(&region, angle, slices, csgrs::GeometryContext::STRICT) {
+             Ok(outcome) => outcome.into_value(),
+             Err(error) => {
+                 return Some(Shape::Failed(ShapeFailure::kernel(
+--- a/benches/compile_default.rs
++++ b/benches/compile_default.rs
+@@ -38,7 +38,7 @@
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+             }
+             Shape::CurveRegion2D(region) => {
+-                let mesh = csgrs::curve::try_triangulate(&region, &csgrs::GeometryContext::STRICT)
++                let mesh = csgrs::curve::try_triangulate(&region, csgrs::GeometryContext::STRICT)
+                     .ok()?
+                     .into_value();
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+--- a/fuzz/fuzz_targets/fuzz_shape_catalog.rs
++++ b/fuzz/fuzz_targets/fuzz_shape_catalog.rs
+@@ -20,7 +20,7 @@
+         4 => curve::heart(a, b, segments),
+         5 => curve::egg(a, b, segments),
+         6 => curve::teardrop(a.clone(), a + b, segments),
+-        7 => curve::ring(a, b, segments, &csgrs::GeometryContext::STRICT)
++        7 => curve::ring(a, b, segments, csgrs::GeometryContext::STRICT)
+             .map(csgrs::GeometryOutcome::into_value),
+         8 => curve::involute_gear(
+             a,
+@@ -75,7 +75,7 @@
+             a + b,
+             c,
+             segments,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+         .map(csgrs::GeometryOutcome::into_value),
+         8 => solid::spur_gear_involute(
+@@ -86,7 +86,7 @@
+             Real::zero(),
+             segments.clamp(2, 5),
+             c,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+         .map(csgrs::GeometryOutcome::into_value),
+         9 => solid::spur_gear_cycloid(
+@@ -96,7 +96,7 @@
+             Real::zero(),
+             segments.clamp(2, 5),
+             c,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+         .map(csgrs::GeometryOutcome::into_value),
+         10 => solid::helical_involute_gear(
+@@ -109,7 +109,7 @@
+             c,
+             Real::from(30_u8),
+             segments,
+-            &csgrs::GeometryContext::STRICT,
++            csgrs::GeometryContext::STRICT,
+         )
+         .map(csgrs::GeometryOutcome::into_value),
+         _ => {
+@@ -156,7 +156,7 @@
+             1 => match curve::try_extrude(
+                 &region,
+                 Real::from(cursor.positive()),
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+                 Err(error) => Shape::Failed(ShapeFailure::kernel("fuzz extrusion failed", error)),
+@@ -167,7 +167,7 @@
+                 Real::from(cursor.integer() * 15),
+                 [Real::one(), Real::one()],
+                 cursor.choice(12) + 1,
+-                &csgrs::GeometryContext::STRICT,
++                csgrs::GeometryContext::STRICT,
+             ) {
+                 Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+                 Err(error) => {
+@@ -182,7 +182,7 @@
+                             &radial,
+                             Real::from(360_u16),
+                             cursor.choice(12) + 3,
+-                            &csgrs::GeometryContext::STRICT,
++                            csgrs::GeometryContext::STRICT,
+                         ) {
+                             Ok(outcome) => Shape::from_triangle_mesh(outcome.into_value()),
+                             Err(error) => {
+--- a/fuzz/fuzz_targets/support.rs
++++ b/fuzz/fuzz_targets/support.rs
+@@ -122,7 +122,7 @@
+         }
+         Shape::CurveRegion2D(region) => {
+             if let Ok(outcome) =
+-                csgrs::curve::try_triangulate(region, &csgrs::GeometryContext::STRICT)
++                csgrs::curve::try_triangulate(region, csgrs::GeometryContext::STRICT)
+             {
+                 let mesh = outcome.into_value();
+                 assert!(
