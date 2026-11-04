@@ -1,0 +1,127 @@
+diff --git a/crates/hypercurve/src/point.rs b/crates/hypercurve/src/point.rs
+index dfaf6804c6..cee434f6f4 100644
+--- a/crates/hypercurve/src/point.rs
++++ b/crates/hypercurve/src/point.rs
+@@ -31,9 +31,13 @@ impl fmt::Debug for Point2 {
+ 
+ impl PartialEq for Point2 {
+     fn eq(&self, other: &Self) -> bool {
++        fn coordinate_eq(left: &Real, right: &Real) -> bool {
++            left.immediate_equality(right)
++                .unwrap_or_else(|| (left - right).zero_status() == ZeroKnowledge::Zero)
++        }
++
+         Arc::ptr_eq(&self.0, &other.0)
+-            || ((self.x() - other.x()).zero_status() == ZeroKnowledge::Zero
+-                && (self.y() - other.y()).zero_status() == ZeroKnowledge::Zero)
++            || (coordinate_eq(self.x(), other.x()) && coordinate_eq(self.y(), other.y()))
+     }
+ }
+ 
+diff --git a/crates/hyperreal/src/rational/arithmetic/comparison.rs b/crates/hyperreal/src/rational/arithmetic/comparison.rs
+index 966681f3d3..7043b5673e 100644
+--- a/crates/hyperreal/src/rational/arithmetic/comparison.rs
++++ b/crates/hyperreal/src/rational/arithmetic/comparison.rs
+@@ -1,23 +1,33 @@
+-impl PartialEq for Rational {
+-    fn eq(&self, other: &Self) -> bool {
++impl Rational {
++    /// Exact equality from retained shape and borrowed arithmetic, without
++    /// constructing a difference or arbitrary-width cross products.
++    pub(crate) fn immediate_equality(&self, other: &Self) -> Option<bool> {
+         if std::sync::Arc::ptr_eq(&self.0, &other.0) {
+-            true
++            Some(true)
+         } else if self.sign != other.sign {
+-            false
++            Some(false)
+         } else if self.denominator == other.denominator {
+-            self.numerator == other.numerator
++            Some(self.numerator == other.numerator)
+         } else if let Some(ordering) = compare_dyadic_magnitudes(self, other) {
+-            ordering.is_eq()
++            Some(ordering.is_eq())
+         } else if let Some(ordering) = compare_word_magnitudes(self, other) {
+             crate::trace_dispatch!("rational", "comparison", "word-sized");
+-            ordering.is_eq()
++            Some(ordering.is_eq())
+         } else if self.msd_exact() != other.msd_exact() {
+             crate::trace_dispatch!("rational", "comparison", "magnitude-bits");
+-            false
++            Some(false)
+         } else {
++            None
++        }
++    }
++}
++
++impl PartialEq for Rational {
++    fn eq(&self, other: &Self) -> bool {
++        self.immediate_equality(other).unwrap_or_else(|| {
+             crate::trace_dispatch!("rational", "comparison", "biguint-cross-product");
+             &self.numerator * &other.denominator == &other.numerator * &self.denominator
+-        }
++        })
+     }
+ }
+ 
+diff --git a/crates/hyperreal/src/rational/arithmetic/tests.rs b/crates/hyperreal/src/rational/arithmetic/tests.rs
+index 8b273a4cd8..7c7ef212f8 100644
+--- a/crates/hyperreal/src/rational/arithmetic/tests.rs
++++ b/crates/hyperreal/src/rational/arithmetic/tests.rs
+@@ -5878,6 +5878,9 @@ mod tests {
+                     && &left.numerator * &right.denominator == &right.numerator * &left.denominator;
+                 for _ in 0..2 {
+                     assert_eq!(left == right, expected, "pair {i}, {j}");
++                    if let Some(equal) = left.immediate_equality(right) {
++                        assert_eq!(equal, expected, "immediate pair {i}, {j}");
++                    }
+                     assert_eq!(
+                         left.partial_cmp(right) == Some(Ordering::Equal),
+                         expected,
+diff --git a/crates/hyperreal/src/real/arithmetic/facts.rs b/crates/hyperreal/src/real/arithmetic/facts.rs
+index 4ea535d30e..fac897e118 100644
+--- a/crates/hyperreal/src/real/arithmetic/facts.rs
++++ b/crates/hyperreal/src/real/arithmetic/facts.rs
+@@ -162,6 +162,27 @@ impl Real {
+         }
+     }
+ 
++    /// Returns an exact equality fact available from known rational structure.
++    ///
++    /// Both `Some(true)` and `Some(false)` certify the stated equality or
++    /// inequality. `None` is inconclusive: symbolic values and rational pairs
++    /// requiring wider arithmetic retain their ordinary comparison paths.
++    /// This query reuses shared storage, signs, common denominators, dyadic
++    /// comparisons, checked word products, and disjoint binary magnitudes. It
++    /// does not construct a difference or arbitrary-width cross products.
++    /// Borrowed digit comparisons are not a constant-time resource bound.
++    ///
++    /// ```
++    /// use hyperreal::Real;
++    /// assert_eq!(Real::one().immediate_equality(&Real::from(2)), Some(false));
++    /// assert_eq!(Real::from(3).immediate_equality(&Real::from(3)), Some(true));
++    /// ```
++    #[inline]
++    pub fn immediate_equality(&self, other: &Self) -> Option<bool> {
++        self.exact_rational_ref()?
++            .immediate_equality(other.exact_rational_ref()?)
++    }
++
+     /// Return an exact sign available without walking the computable graph.
+     ///
+     /// Exact rationals, certified symbolic classes, and facts already retained
+diff --git a/crates/hyperreal/src/real/mod.rs b/crates/hyperreal/src/real/mod.rs
+index 37575e161f..3d3ac72247 100644
+--- a/crates/hyperreal/src/real/mod.rs
++++ b/crates/hyperreal/src/real/mod.rs
+@@ -17,6 +17,9 @@ mod linear_combination;
+ mod normal_reference;
+ mod tests;
+ 
++#[cfg(test)]
++mod immediate_equality_tests;
++
+ pub use arithmetic::*;
+ pub use exact_set::{
+     RealExactSetDenominatorKind, RealExactSetDyadicExponentClass, RealExactSetFacts,

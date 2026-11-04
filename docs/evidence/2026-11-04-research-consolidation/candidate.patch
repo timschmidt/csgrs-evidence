@@ -1,0 +1,76 @@
+diff --git a/src/solid_expr.rs b/src/solid_expr.rs
+index 3263dad84b..7eec4331e0 100644
+--- a/src/solid_expr.rs
++++ b/src/solid_expr.rs
+@@ -267,10 +267,12 @@ impl Program {
+                     };
+                     mesh = decisions.record(apply(&mesh, transform, context)?);
+                 }
++                // Empty geometry still carries construction ancestry. Keep it
++                // before replacing its geometry with the constant false node.
++                decisions.record_construction(mesh.construction_evidence());
+                 if mesh.positions.is_empty() && mesh.triangles.is_empty() {
+                     self.false_node()
+                 } else {
+-                    decisions.record_construction(mesh.construction_evidence());
+                     self.meshes.push(mesh);
+                     let operand = u32::try_from(self.meshes.len() - 1)
+                         .expect("a CSG expression exceeds u32 operands");
+diff --git a/tests/solid_expr.rs b/tests/solid_expr.rs
+index eef3b8729d..004342a75b 100644
+--- a/tests/solid_expr.rs
++++ b/tests/solid_expr.rs
+@@ -137,6 +137,53 @@ fn empty_leaves_are_the_empty_set() {
+     assert!(evaluate(&(&empty | &empty)).triangles.is_empty());
+ }
+ 
++/// Regularization can produce an empty mesh while retaining approximate
++/// construction ancestry. Lowering that leaf to `false` must keep its receipt.
++#[test]
++fn empty_leaves_keep_construction_evidence_through_further_operations() {
++    let approximate = Csg::approximate_512();
++    let sine = Real::e().sin();
++    let cosine = Real::e().cos();
++    let zero = uncertainty::terminal_zero(&sine * &sine + &cosine * &cosine - Real::one());
++    let cube = approximate.cube(1).unwrap();
++    let touching = approximate
++        .translate(&cube, Real::one() + zero, 0, 0)
++        .unwrap();
++    let empty = approximate.intersection(&cube, &touching).unwrap();
++    assert!(empty.positions.is_empty() && empty.triangles.is_empty());
++    assert!(empty.construction_evidence().approximate_512_consumed());
++
++    for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
++        let leaf = SolidExpr::from(empty.clone());
++        let body = SolidExpr::from(cube.clone());
++        for expression in [
++            leaf.clone(),
++            &leaf | &body,
++            &body | &leaf,
++            &leaf & &body,
++            &body - &leaf,
++            &leaf - &body,
++            &leaf ^ &body,
++            &leaf | &leaf,
++        ] {
++            let outcome = expression.evaluate_with_context(context).unwrap();
++            assert_eq!(outcome.certainty, GeometryCertainty::Certified);
++            assert!(
++                outcome
++                    .value
++                    .construction_evidence()
++                    .approximate_512_consumed()
++            );
++
++            let strict = Csg::strict();
++            let moved = strict.translate(&outcome.value, 3, 0, 0).unwrap();
++            let next = strict.union(&moved, &cube).unwrap();
++            assert_eq!(strict.certainty(), GeometryCertainty::Certified);
++            assert!(next.construction_evidence().approximate_512_consumed());
++        }
++    }
++}
++
+ #[test]
+ fn shared_subtrees_and_an_approximate_step_keep_their_meaning() {
+     // A strict session cannot decide the touching union; an approximate one
