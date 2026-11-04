@@ -1,0 +1,384 @@
+# Future work
+
+## Vertical component topology (R06, 2026-11-04)
+
+Rational first-coordinate content now reconstructs the original polynomial
+with its residual equation. Whole closed vertical intervals retain selected
+coordinates, defining exponents and all residual event/half-branch incidence.
+`graph_equation()` separates the residual support from the full geometric
+support; event point roots and interval components are distinct. The
+[qualification](PERFORMANCE.md#r06-vertical-topology-components-2026-11-04)
+records exact reconstruction, singular/boundary and algebraic-coordinate cases,
+replay, native/WASM execution, costs and resource limits.
+
+The subsequent [native R06 qualification](../hypercurve/PERFORMANCE.md#r06-native-vertical-charts-2026-11-04)
+records selected vertical charts, planar operations, BRep lifting and replay;
+the earlier importer refusal is historical. General algebraic coefficients
+and rectangle bounds, general rational-map incidence, complete total-work/heap/
+cancellation accounting and broader R06/R07 closure remain open. The new
+selected-coefficient resultant primitive below does not itself close topology.
+Earlier finite-fiber records describe their historical domains.
+
+## Strict polynomial sign laws (2026-11-04)
+
+`certify_univariate_polynomial_nonnegative` shares one exact Sturm chain and
+checks inward Taylor signs on cells with at most one distinct root. It handles
+stationary endpoints, repeated roots and negative pockets without sampling or
+an approximate terminal. The explicit requested policy is restricted through
+`PredicatePolicy::certified_only`, including after a warmed terminal query.
+`None` retains unresolved arithmetic or invalid input;
+it is never a negative classification. Only cells with multiple roots stay
+pending, so a narrow cluster does not accumulate empty sibling intervals.
+
+The four acceptance groups include 486 independently derived rational
+root-multiset sign laws, algebraic coefficients, a `2^-80` negative pocket,
+endpoint roots and strict/terminal/strict cache behavior. HyperBRep R21 consumes
+this proof for straight sweep images; its
+[qualification](../hyperbrep/PERFORMANCE.md#r21-stationary-straight-sweep-images-2026-11-04)
+records native/WASM execution and cost. The sign-cell subdivisions, root counts
+and coefficient arithmetic are outside `WorkBudget`; a zero usage receipt does
+not bound their work. Total work, coefficient growth, heap and cancellation
+remain separate open contracts.
+
+## Recursive quadratic field contracts
+
+Two contract gaps were found while writing the independent recursive quadratic
+field tests (`tests/recursive_quadratic_field*.rs`). Neither gives a wrong
+result for current callers.
+
+- **`RecursiveQuadraticValue::is_stored_equivalent_to` field identity.** The
+  documentation describes a comparison of representations in the same
+  recursive field. Its exact-witness fallback, however, never checks field
+  identity: the value `1 + 2√2 + 3√3 + 4√6`, built in two separately
+  constructed but equivalent base fields, compares equivalent. Its two
+  production callers, `joined_with` and `recursive_embed_foreign_field`, only
+  compare values from one field. Either require the same field or document
+  the cross-field case as a value comparison.
+- **`embed_value` with equivalent-base embeddings.** Embeddings from
+  `rebased_to_equivalent_base` or `extension_embeddings_to_equivalent_tower`
+  map base-level values only when the base is the identical object. A value
+  with base-level components therefore embeds as `None`. Downstream callers
+  pair these embeddings with `RecursiveQuadraticValue::rebased_to_equivalent_base`
+  instead. Composing them directly would remove that two-step requirement.
+
+### Unused tensor generators (2026-10-29)
+
+Three acceptance tests fail on `146cc0804f` because exact zero padding
+requires a witness for an unused source axis. The evaluator now scans the
+positive-power slices for stored exact zeros and evaluates the constant slice
+when the axis is unused. It retains the full native field and only caches
+successful exact values. Mixed axis orders and coefficients of `2^-80` check
+that a genuine dependency is never discarded.
+
+The original `2*sqrt(2)-sqrt(8)` fixtures now require a zero witness. A new
+`2*c*sqrt(2)-c*sqrt(8)` fixture retains a genuinely used cubic source and
+checks the exact sign fallback. All 26 local qualification groups pass,
+including 106 native regression tests, full
+Hypersolve (1,293 passed), Hypercurve
+(2,990 passed), CSGRS
+(691 passed), six downstream suites, strict MSRV
+Clippy, minimal builds, docs and fuzz checks, allocation lifetime checks and
+the existing capability matrix. Raw logs distinguish ignored tests.
+
+Evidence: `docs/evidence/2026-10-29-hypercurve-closure-native-tensor-witnesses`, SHA-256 `147e1b34d3a35e74f3961c9f21a0a62fa3007cd4f9f8337aca568ed602e38c67`. Original failures, source patches,
+commands and local cost samples are retained. No repeated-chamfer completion,
+universal closure, total-work bound or publication is claimed by this record.
+
+## Modular certificates for tower remainders
+
+The H14 lead (a modular/CRT gcd over a selected field, with a maximality
+certificate) was evaluated on the equality that dominated the chamfered
+bevel stroke in Hypercurve. That proof is not a gcd: it is the
+sign-preserving remainder of a degree-192 rational eliminant by a degree-6
+relation over a two-source, one-extension tower, and the remainder is
+identically zero. A modular image of a nonzero remainder proves only
+nonzero, and a modular proof of zero would need a height bound for tower
+coefficients after reduction modulo the source polynomials, which this crate
+does not compute. The remainder schedule and the source-quotient reduction
+were made cheaper instead (`PERFORMANCE.md`). A modular gcd over Q(alpha)
+was also proposed for Hypercurve's remaining common-fiber stalls. The R16
+captures on 2026-10-25 separate two cases: the degree-36/40 rational pair has
+a verified degree-36 GCD that already finishes in about 26 diagnostic ms,
+followed by an unfinished Sturm sequence. The other pair has degrees 4/40
+over `Q(sqrt(89))`, a degree-10 carrier and selected rational degree 20;
+its verified GCD has degree 4, and general coefficient arithmetic dominates.
+The existing quotient-reduction API suffices for the first zero identity,
+but both tested consumer variants remain unadopted. See
+[Hypercurve's captured evidence](../hypercurve/FUTURE_WORK.md#3-selected-fiber-common-root-counting).
+No modular/CRT implementation is justified by assuming these are the same
+rational-field workload.
+
+## Finite-fiber topology domains
+
+`decompose_bivariate_curve` reproduces its documented blockers at
+`61da737db3`. With the circle `F = 16x^2 + 16y^2 - 4` on `[-1, 1]^2`:
+
+| Input | Result |
+| --- | --- |
+| `F`, `(x - 3)F`, `(x - 3)^2 F` | Topology; rootless `x`-content is already harmless |
+| `(2y - 1)F` | Topology; the horizontal line is a graph component |
+| `F^2`, `(2y - 1)^2 F` | `RepeatedComponent` |
+| `(2x - 1)F`, `(x + 1)F` | `VerticalComponent`, also with the root on the boundary |
+| `(y - 1)F` | `BoundaryComponent` |
+
+Square-free reduction is exact and needs no selected field: divide the
+`x`-content `c(x)` out first, then any common factor of the primitive part
+`p` and `p_y` has every irreducible factor at least squared in `p`, so
+dividing it out keeps the zero set. Dividing `F` by a common factor of `F` and
+`F_y` instead would remove a simple vertical component `c(x)`. The reduction
+was not adopted inside `decompose_bivariate_curve`. The topology is a set
+package, and its consumers read multiplicity from the absence of the blocker:
+HyperBRep's plane–tensor section expects `RepeatedComponent` for a plane
+tangent along a line (`(y - 1/2)^2`), and admitting it as an ordinary section
+would present a tangential contact as a crossing curve. Admission needs a
+published multiplicity record for each branch and isolated point, and
+consumers that read it. Vertical components need a topology carrier for
+vertical segments and their adjacency to graph branches. Both are new public
+API on a crate prepared for release, so they are deferred.
+
+### Horizontal boundary components (2026-10-27)
+
+The historical `BoundaryComponent` result above and the original `y+2=0`
+fixture are retained in the qualification corpus. The extension on
+`5de7f0cb05` keeps a horizontal boundary factor in the original equation,
+closed fibers and selected graph. Its identically zero boundary specialization
+has no isolated entry events; contacts with other branches already occur in
+`resultant(F,F_y)`. Root-free separators and exact closed root counts retain
+all incident arcs. No factor or multiplicity is discarded.
+
+Ten focused solver witnesses cover both boundaries, distinct components,
+parabola and circle tangencies, partial-domain crossings, algebraic event
+parameters, `2^-80` separation, exact source replay and reached budget failure
+with larger retry. Independent rational Sturm counts audit closed connection
+bands. Hypercurve consumes the result through selected trims, overlaps, further
+intersections, reversal and similarity transport. The original BRep boundary
+section is now a positive native-replay witness. Its reversed restricted pcurve
+exposed a separate directed-chart correspondence bug, fixed in BRep's shared
+materialization owner without changing topology validation. A later plane contact also requires a
+checked similarity view of the retained rational maps; the original definitions
+and denominator guards remain authoritative.
+
+The [Hypercurve qualification ledger](../hypercurve/FUTURE_WORK.md) records
+commands, raw evidence and the remaining pre-push gate. Vertical and repeated
+components, algebraic coefficient fields and total resource bounds remain open;
+this does not adopt the multiplicity reduction discussed above.
+
+## Represented-root completeness
+
+`represented_strict_sign` refines a represented value's image interval at
+most 16 times. A tiny but nonzero value, such as `p√3 - q` near `2^-78` for
+consecutive Pell numbers, stays undecided. Nested and tensor ratios with such
+a denominator then return `Predicate`, although the quotient is well defined.
+The answer is honest but incomplete. `tests/represented_roots.rs`
+(`nearly_vanishing_denominators_are_never_misclassified`) accepts either the
+correct value or `Predicate`. A deeper refinement schedule, or an exact
+algebraic sign for the denominator, would decide these cases.
+
+## Selected-field chord composition (2026-10-29)
+
+The original second polynomial chamfer exposed repeated quotient expansion and
+a later selected-scalar enclosure stall. Unit quotients now use exact Bezout
+inverses modulo retained relations; nonunit quotients keep their original local
+representation. Optional parent images retain and validate the original
+equations and selectors. Exact interval filters refine selected roots only
+when endpoint signs certify a bracket, preserve denominator guards, and leave
+zero or unresolved signs to the complete exact path. Rational sign queries
+retain their earlier remainder path and resource behavior.
+
+The maintained 405-node scalar capture replays in a fresh process and proves
+`-1 < value < 0`; independent rational interval arithmetic checks that claim.
+Zero-budget refusal permits a larger retry. Original six-refinement budget
+regressions remain unchanged. The unused-tensor witness correction from local
+`b6ec1de05f` is included with its original zero and nonzero dependency tests.
+
+All four focused groups and all 27 affected qualification groups pass.
+The latter include full Hypersolve (1,304 passed),
+Hypercurve (3,031 passed), CSGRS
+(693 passed), six downstream suites, strict MSRV
+Clippy, minimal builds, strict docs and fuzz checks, allocation lifetime checks,
+the capability matrix and hygiene. Logs retain ignored-test counts. Evidence:
+`docs/evidence/2026-10-29-hypercurve-closure-selected-chord-composition`, SHA-256 `0e16db489d3a194f55c9d7763a8ab6ae21184fe6ce7d4f5be0969cc003967ca3`. These are local admission checks; full pre-push
+qualification and package publication are separate.
+
+Individual normalization and enclosure experiments did not complete the
+original geometry. Failed attempts, invalid cache attribution and the repaired
+filter-budget regression remain in the archive. New bisections use the shared
+refinement counter; it is not a total arithmetic-work or memory bound.
+
+## Repeated rational polynomial factors (2026-10-29)
+
+Finite-fiber bivariate topology now reduces repeated generic factors with exact
+GCDs of the polynomial and both partial derivatives. Axis content is retained;
+checked reconstruction preserves the original rational unit and factor powers.
+The original equation remains authoritative while geometric consumers use the
+reduced support. Each selected event root keeps all factor memberships, and
+each open-slab branch keeps its defining exponent.
+
+The six original circle, parabola, node, cusp, isolated-point and mixed-power
+witnesses failed with `RepeatedComponent` on clean `6296155cf7`. They now pass,
+with independent Sturm fiber counts, exact incidence, factor reconstruction,
+rootless axis factors, degree refusal, exhaustion during reduction and retry.
+Original zero-polynomial and vertical-component rejections remain unchanged.
+
+All eight focused groups and all 24 affected qualification groups pass.
+The latter include full Hypersolve (1,312 passed),
+Hypercurve (3,039 passed), CSGRS
+(693 passed), six downstream suites, strict MSRV
+Clippy, minimal builds, strict docs and fuzz-target checks, allocation lifetime
+checks, the capability matrix and hygiene. Counts are harness-reported passes;
+logs retain ignored counts. The matrix verifies 361
+advertised outcomes, including explicit blocker witnesses. Evidence:
+`docs/evidence/2026-10-29-hypercurve-closure-polynomial-multiplicities`, SHA-256 `b71cabb2d4267a8bfe032a6f09fe06b479ed2b5f90b40eb0a22cd2310c37e0b3`. These local admission checks do not establish
+full pre-push qualification or complete general algebraic operation closure.
+
+The bounded component path respects configured projection limits. Existing
+work counters do not bound total arithmetic, coefficient growth, retained heap
+or cancellation. Recorded process RSS and command timings include builds;
+allocation lifetime checks are not a matched multiplicity benchmark. No
+performance improvement is claimed. Arbitrary algebraic coefficients, vertical
+components and the broader exact-closure target remain open.
+
+## Empty first-coordinate polynomial topology (2026-10-29)
+
+Removing an early nonconstant-axis rejection lets the existing exact projection
+and closed-fiber census distinguish an empty rectangle from a live vertical
+component. Every first-coordinate root in the closed domain enters that census;
+an identically zero fiber still returns `VerticalComponent`. The original
+equation, domain checks, root selection and resource controls remain authoritative.
+
+On unchanged `d31ef199c3`, `x^2+1` and `x-3` incorrectly failed on
+`[-1,1] x [-2,2]`. They now return empty topology and accept later fiber queries.
+Seven owner tests include repeated and degree-six sources, algebraic live roots,
+boundary roots, malformed domains, degree limits, zero-budget refusal and retry.
+A one-promotion budget completes the rational census; a mistaken new exhaustion
+expectation is recorded and corrected against the existing budget contract.
+
+All eight focused groups and all 24 affected qualification groups pass.
+The latter include full Hypersolve (1,311 passed),
+Hypercurve (3,032 passed), CSGRS
+(693 passed), six downstream suites, strict MSRV
+Clippy, minimal builds, strict docs and fuzz-target checks, allocation lifetime
+checks, the capability matrix and hygiene. Counts are harness-reported passes;
+logs retain ignored counts. The matrix verifies 354
+advertised outcomes, including explicit blocker witnesses. Evidence:
+`docs/evidence/2026-10-29-hypercurve-closure-empty-axis-topology`, SHA-256 `87bc3fab2d2ee245cab8b2877f1966e8eeeb563b01c54c60d6679f86d79b447c`. These local admission checks do not establish
+full pre-push qualification or complete general algebraic operation closure.
+
+This is empty-support admission. Actual vertical components and algebraic
+coefficient topology remain open. Existing work counters do not bound total
+arithmetic, coefficient growth, retained memory or cancellation. Command timing
+and process RSS include builds; no performance improvement is claimed.
+
+## Cooperative cancellation (2026-10-30)
+
+Closure-plan M4 requires cooperative cancellation that releases temporary
+state and does not poison a retry. Before this change, `work_budget` had no
+cancellation. A request could only take the form of a reached unit limit, and
+the stalled Hypercurve bevel stroke of a filleted hyperbola pair spends minutes
+in loops that charge no units.
+
+`CancellationToken`, `with_cancellable_budget` and `WorkBudget::UNLIMITED`
+add a thread-safe request to the existing scope stack. The next admitted unit
+or `exhaustion()` check observes it as `WorkKind::Cancellation`, and the scope
+publishes no value. Outer tokens stop nested scopes; nested tokens leave their
+parents running. Integer polynomial Bareiss determinants, pseudo-quotient
+multiplication matrices and dense tensor products now check `exhaustion()`
+between steps and return their existing "unavailable" outcome. Dense
+square-root sum signs label that outcome `BudgetExhausted` rather than
+`Unsupported`. Hypercurve exposes `evaluate_with_cancellable_budget`.
+
+Measured on the stalled stroke (release, Rust 1.99.1): before these
+checkpoints, a request issued after 60 s had not been honored after 21 minutes,
+and one issued after 3 s took 21 s. With them, requests issued after 3, 5, 20,
+60 and 150 s returned `Cancellation` within 0.16-0.45 s. A counting allocator
+shows warm cancelled attempts leave 24-2,520 bytes of a 4.7 MB peak; the first
+attempts initialize about 1.2 MiB of bounded process-wide tables.
+
+Witnesses: five `work_budget` owner tests (pre-cancelled, mid-operation,
+nesting, another thread, cancelled native refinement then retry), the Bareiss
+unit test, `cancelled_intersections_publish_nothing_and_retry_with_a_new_token`,
+`concurrent_cancellation_never_publishes_a_partial_intersection`,
+`cancellation_stops_the_stalled_filleted_hyperbola_bevel_stroke` and
+`cancelled_stalled_stroke_releases_its_temporary_heap`. The stalled-stroke
+witness fails its 10 s bound without the three checkpoint sites.
+
+Final checks on `a605f5748f`: formatting; Clippy with `-D warnings`, all
+targets and features, on 1.99.1 (Hypersolve, Hypercurve, HyperBRep) and MSRV
+1.95.0 (Hypersolve, Hypercurve); full Hypersolve (1,329 passed); full
+Hypercurve release (3,056 passed, 34 existing ignored); a workspace check of
+all targets and features; both new capability rows; typos and the repository
+budget. Evidence: `docs/evidence/2026-10-30-hypercurve-closure-cooperative-cancellation`,
+SHA-256 `60e5aed4a6cd2d66120be39eaa3bcbd7ec9c6d931fcf5d4a1741191043436d96`.
+No performance improvement is claimed.
+
+A sweep over the 24 ignored composition workloads, cancelled after 20 s,
+returned `Cancellation` from 21 of them within 8 s and from two more in 19 and
+32 s; one completed first. `miter_stroke_of_a_filleted_heavy_rational_cubic_completes`
+was still running 30 s after the request. Its samples, and those of the 32 s
+case, sit in Hyperreal's recursive `Computable` approximation under Bareiss
+pivot signs. Hyperreal's per-value abort signal returns placeholder zeros for
+discarded results, so it is not a sound operation-wide interrupt for shared
+values. Evidence: `docs/evidence/2026-10-30-hypercurve-closure-cancellation-sweep`,
+SHA-256 `b2cf2680abf5a20c7efb01b53c9b1feb98ce9cb655e58754e7bd81523d1c1005`.
+
+Remaining limits: cancellation is observed only at instrumented units and
+these checkpoints. One large integer product, scalar precision refinement and
+other uninstrumented loops still run to completion, so this is not an
+elapsed-time bound. Total arithmetic, coefficient growth and retained-memory
+limits remain open. Cancellation does not cross threads by itself: a worker
+joins a request by entering its own scope with a cloned token.
+
+## Coefficient growth limits (2026-10-30)
+
+Closure-plan M4 also asks for separately defined coefficient-growth limits.
+`with_coefficient_bit_limit` pushes a scope frame with a bit limit;
+`observe_coefficient_bits` checks every enclosing limit, and the outermost one
+exceeded fails with `WorkKind::CoefficientGrowth` for itself and its nested
+scopes, as a smaller inner budget does. Integer polynomial Bareiss entries,
+pseudo-quotient matrix entries and exact rational dense tensor product
+coefficients report their sizes only while a scope is active, and fail through
+their existing "unavailable" outcome.
+
+On the stalled hyperbola bevel stroke, limits of 1,024 and 4,096 bits both fail
+on a 7,950-bit coefficient and 16,384 bits on a 23,826-bit one, each after the
+same 24,238 refinements and 30 promotions (release, Rust 1.99.1; 9.7, 13.7 and
+55.6 s under concurrent load). Unlike cancellation the stopping point does not
+depend on timing. Witnesses: two `work_budget` owner tests, a Bareiss unit test
+(`t^2 - 2^80` fails at 64 bits and succeeds at 128) and
+`coefficient_bit_limit_stops_the_stalled_filleted_hyperbola_bevel_stroke`.
+
+Open: subresultant and Sturm sequences, recursive field arithmetic and scalar
+approximations do not report sizes, so the limit does not bound all coefficient
+growth or memory. Arithmetic work, projected-system size and retained memory
+remain without limits. Evidence:
+`docs/evidence/2026-10-30-hypercurve-closure-coefficient-limits-and-ph-offsets`,
+SHA-256 `ec3646428eada106e37ebdd690544487843ea60119033adc5af7a4d04282a5ac`.
+
+## Simplification program: current dispositions (2026-11-04)
+
+The [program outcomes](../../docs/research/simplification-and-api-program.md#outcomes)
+supersede the original planned inventory. Current source has one
+`sort_reals_exact` in `algebraic.rs`; the former four private Real endpoint
+structs use `RealInterval`. Derivative and trimming helpers retain distinct
+failure/predicate contracts. K05 was rejected because the rational Bézier
+isolator is not equivalent to Hypersolve's row/field isolators; Hypercurve
+already delegates its nonrational coefficient path to the shared ordered-field
+solver. These are historical package dispositions, not a new universal
+completion claim or authorization for merging unlike kernels.
+
+## Selected coefficient resultants (R06, 2026-11-04)
+
+`ordered_field_resultant_bivariate` now eliminates one axis directly over an
+admitted exact ordered field, including selected algebraic coefficient towers.
+It shares the existing pivot-free determinant recurrence, retains exact
+polynomial magnitude and coefficient dependencies, and feeds complete root
+isolation and further selection without coordinate projection. The
+[owner qualification](PERFORMANCE.md#r06-selected-coefficient-bivariate-resultants-2026-11-04)
+records the reproduced gap, independent polynomial identities, cold replay,
+actual cancellation/denial, source-preserving storage and practical envelope.
+
+This supplies elimination arithmetic for the R06/R07 target. Generic common
+components, full algebraic-coefficient topology/selected rectangles, rational-map
+preimage incidence and the complete filled/BRep operation chains still need
+integration and qualification. Total arithmetic, coefficient-growth and heap
+bounds remain open. A zero resultant is not evidence of a selected real arc.
