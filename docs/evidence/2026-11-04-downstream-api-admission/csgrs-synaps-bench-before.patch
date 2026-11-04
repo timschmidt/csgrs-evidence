@@ -1,0 +1,40 @@
+diff --git a/benches/compile_default.rs b/benches/compile_default.rs
+index c2b722f..57efe39 100644
+--- a/benches/compile_default.rs
++++ b/benches/compile_default.rs
+@@ -38,12 +38,12 @@ fn time_phases(code: &str, fn_override: u32) -> PhaseTimes {
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+             }
+             Shape::CurveRegion2D(region) => {
+-                let mesh = csgrs::curve::try_triangulate(&region, &csgrs::GeometryContext::STRICT)
++                let mesh = csgrs::curve::try_triangulate(&region, csgrs::GeometryContext::STRICT)
+                     .ok()?
+                     .into_value();
+                 synaps_cad::compiler::geometry::conversions::triangle_mesh_to_mesh_data(&mesh).ok()
+             }
+-            Shape::Failed(_) => None,
++            Shape::Failed(_) | Shape::Csg3D { .. } => None,
+         })
+         .collect::<Vec<_>>();
+     let convert = start.elapsed();
+@@ -64,11 +64,20 @@ fn compile_once(code: &str, fn_override: u32, require_no_warnings: bool) -> usiz
+     match compile_scad_code(black_box(code), fn_override, None) {
+         CompilationResult::Success {
+             parts,
++            failed_parts,
+             views,
+             warnings,
+         } => {
+             if require_no_warnings {
+                 assert!(warnings.is_empty(), "default scene warnings: {warnings:?}");
++                assert!(
++                    failed_parts.is_empty(),
++                    "default scene failed parts: {:?}",
++                    failed_parts
++                        .iter()
++                        .map(synaps_cad::compiler::FailedPart::summary)
++                        .collect::<Vec<_>>()
++                );
+             }
+             parts.iter().map(|part| part.indices.len()).sum::<usize>()
+                 + views
