@@ -1,0 +1,13 @@
+# Nonlinear chart closure qualification
+
+Hypercurve owns rational-map incidence, original branch selection and joint-domain injectivity. HyperBRep consumes mapped section endpoints through the existing planar lift; it delegates scalar map evaluation to Hypercurve. This extends the pending initial chart work rather than replacing its source definitions.
+
+Line supports pull back through finite map chains and final similarities. The original source branch validates isolated contacts, including isolated zero-set components. Crossing signs follow the pulled line derivative and denominator sign. Shared nonlinear pair incidence and loop orientation require injectivity on a single common source enclosure. Distinct affine charts use two candidate sets and exact point equality. Point preimage construction paths require injectivity before they can imply a complete singleton preimage set.
+
+Exact expectations include parabola sections, complex-squaring collisions between disjoint charts, an isolated sum-of-squares pullback, reflected/reversed finite map chains with negative weight, and the nonuniform tensor cap. The full transverse recut remains a separately executed failing target. Neither sampled membership nor serialization equality is used as the sole geometric proof.
+
+Logs and the source patch accompany this record. Validation totals and the archive digest are recorded in the main implementation ledger after process completion. This local evidence branch has not been published; no completed-workload speed or memory improvement is claimed.
+
+Final scoped qualification: 66 curve integration tests, 33 downstream BRep tests, 127 IO tests including doctests, and one source-chart unit test pass (227 total); the separate full recut target fails Unsupported and remains ignored in the ordinary tensor suite. Final strict all-target/all-feature Clippy, warning-denied rustdoc, WASM compilation, formatting and diff checks pass. Source reconstruction and selected-coordinate counterexamples have failing and repaired receipts. A stale unsupported-only expectation for a translated disjoint pair was replaced with an independently justified complete-empty requirement on the unchanged inputs.
+
+The broad exploratory library/polynomial campaigns remain live at this snapshot. Their logs and partial driver receipts are not completed qualification. The initial release runtime suite passed, while IO doctests hit E0460 during concurrent shared-artifact rebuilds; all four serial release doctests and the final serial IO suite pass. No concurrent rebuild failure is hidden or counted as a geometric failure or a passing full command.
