@@ -1,0 +1,77 @@
+diff --git a/crates/hyperbrep/src/geometry/pcurve.rs b/crates/hyperbrep/src/geometry/pcurve.rs
+index 6097163cda..194519b41d 100644
+--- a/crates/hyperbrep/src/geometry/pcurve.rs
++++ b/crates/hyperbrep/src/geometry/pcurve.rs
+@@ -295,18 +295,30 @@ impl SurfaceIntersectionPcurve {
+                 u,
+                 v,
+             } = &self.mapping
+-                && let CurveGeometry3::PlanarImage(image) = &spatial.data.geometry
++                && match &spatial.data.geometry {
++                    CurveGeometry3::PlanarImage(_) => true,
++                    CurveGeometry3::TensorImage(image) => {
++                        image.source.polynomial_branch().is_some()
++                    }
++                    _ => false,
++                }
+             {
+                 let range = self
+                     .domain
+                     .affine_image(&self.source_scale, &self.source_offset)?;
+-                let projected = image
+-                    .restricted_to(&range)?
+-                    .materialize_plane_projection(origin, u, v)?;
++                let projected = match &spatial.data.geometry {
++                    CurveGeometry3::PlanarImage(image) => image
++                        .restricted_to(&range)?
++                        .materialize_plane_projection(origin, u, v)?,
++                    CurveGeometry3::TensorImage(image) => image
++                        .restricted_to(&range)?
++                        .materialize_plane_projection(origin, u, v)?,
++                    _ => unreachable!("the retained projection guard checked the source kind"),
++                };
+                 let SurfacePcurveCorrespondence::Affine { scale, offset } =
+                     projected.correspondence
+                 else {
+-                    unreachable!("planar projection retains an affine source chart");
++                    unreachable!("retained projection preserves an affine source chart");
+                 };
+                 return orient_affine_surface_pcurve(
+                     projected.curve,
+diff --git a/crates/hyperbrep/src/geometry/tensor_image.rs b/crates/hyperbrep/src/geometry/tensor_image.rs
+index b70e74c8df..ee3cf61e2c 100644
+--- a/crates/hyperbrep/src/geometry/tensor_image.rs
++++ b/crates/hyperbrep/src/geometry/tensor_image.rs
+@@ -168,6 +168,32 @@ impl Curve3 {
+ }
+ 
+ impl TensorCurve3 {
++    /// Projects the retained UV definition without replacing its selected
++    /// coefficient field with independently materialized scalar coordinates.
++    pub(super) fn materialize_plane_projection(
++        &self,
++        origin: &Point3,
++        u: &Vector3,
++        v: &Vector3,
++    ) -> GeometryResult<MaterializedSurfacePcurve> {
++        let SurfaceGeometry::RationalBezier(tensor) = &self.surface.data.geometry else {
++            return Err(GeometryError::UnsupportedPcurveContour);
++        };
++        let plane = PlaneSurface {
++            origin: origin.clone(),
++            u: u.clone(),
++            v: v.clone(),
++        };
++        let (_, projection) = super::plane_tensor::pullback(&plane, tensor)?;
++        let curve = self.source.rational_image(&projection)?;
++        let scale = (Real::one() / &self.source_scale).map_err(GeometryError::Numeric)?;
++        let offset = -&self.source_offset * &scale;
++        Ok(MaterializedSurfacePcurve {
++            curve,
++            correspondence: SurfacePcurveCorrespondence::Affine { scale, offset },
++        })
++    }
++
+     pub(super) fn parameter(&self, s: &Real) -> Real {
+         &self.source_offset + &self.source_scale * s
+     }
