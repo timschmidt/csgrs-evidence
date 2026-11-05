@@ -1,0 +1,884 @@
+diff --git a/crates/hyperbrep/src/topology/error.rs b/crates/hyperbrep/src/topology/error.rs
+index c366149f6c..ce0ba9182d 100644
+--- a/crates/hyperbrep/src/topology/error.rs
++++ b/crates/hyperbrep/src/topology/error.rs
+@@ -572,3 +572,9 @@ impl fmt::Display for ValidationReport {
+ }
+ 
+ impl std::error::Error for ValidationReport {}
++
++#[track_caller]
++pub(crate) fn diagnostic_edge_mismatch() -> BuildError {
++    eprintln!("REPLAY_DIAGNOSTIC mismatch_construction_site={}", std::panic::Location::caller());
++    BuildError::EdgeUseSupportMismatch
++}
+diff --git a/crates/hyperbrep/src/topology/validation/analytic_image.rs b/crates/hyperbrep/src/topology/validation/analytic_image.rs
+index e0f9c7404c..ca3cfa3406 100644
+--- a/crates/hyperbrep/src/topology/validation/analytic_image.rs
++++ b/crates/hyperbrep/src/topology/validation/analytic_image.rs
+@@ -55,7 +55,7 @@ impl ArenaModelBuilder {
+             offset,
+         } = &edge_use.parameter_correspondence
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         if surface.kind() == SurfaceKind::Plane {
+             return self
+@@ -65,7 +65,7 @@ impl ArenaModelBuilder {
+         // full iso image, including selected endpoints. Endpoint coincidence
+         // alone does not establish either assertion.
+         if pcurve.kind() != CurveFamily2::Line {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let first = pcurve.curve().start();
+         let last = pcurve.curve().end();
+@@ -86,7 +86,7 @@ impl ArenaModelBuilder {
+                 .map_err(GeometryError::from)?,
+         )?;
+         if constant.compare(&last_constant)? != std::cmp::Ordering::Equal {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         if surface.kind() == SurfaceKind::Revolution {
+             return self.validate_coordinate_revolution_image(
+@@ -94,7 +94,7 @@ impl ArenaModelBuilder {
+             );
+         }
+         let Some((profile, direction)) = surface.extrusion_profile_and_direction() else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         match axis {
+             hypercurve::Axis2::X => {
+@@ -103,17 +103,17 @@ impl ArenaModelBuilder {
+                     .ok_or(GeometryError::UnrepresentableParameter)?;
+                 let expected = translated_curve(profile, &(direction.clone() * v))?;
+                 if curve_parameterizations_equal(curve, &expected)? {
+-                    require_real_equal(scale, &Real::one(), BuildError::EdgeUseSupportMismatch)?;
+-                    require_real_equal(offset, &Real::zero(), BuildError::EdgeUseSupportMismatch)
++                    require_real_equal(scale, &Real::one(), crate::topology::error::diagnostic_edge_mismatch())?;
++                    require_real_equal(offset, &Real::zero(), crate::topology::error::diagnostic_edge_mismatch())
+                 } else if curve_parameterizations_equal(curve, &expected.reversed()?)? {
+-                    require_real_equal(scale, &(-Real::one()), BuildError::EdgeUseSupportMismatch)?;
++                    require_real_equal(scale, &(-Real::one()), crate::topology::error::diagnostic_edge_mismatch())?;
+                     require_real_equal(
+                         offset,
+                         &expected.reversal_pivot(),
+-                        BuildError::EdgeUseSupportMismatch,
++                        crate::topology::error::diagnostic_edge_mismatch(),
+                     )
+                 } else {
+-                    Err(BuildError::EdgeUseSupportMismatch)
++                    Err(crate::topology::error::diagnostic_edge_mismatch())
+                 }
+             }
+             hypercurve::Axis2::Y => {
+@@ -127,7 +127,7 @@ impl ArenaModelBuilder {
+                 if curve_parameterizations_equal(curve, &expected)? {
+                     Ok(())
+                 } else {
+-                    Err(BuildError::EdgeUseSupportMismatch)
++                    Err(crate::topology::error::diagnostic_edge_mismatch())
+                 }
+             }
+         }
+@@ -146,7 +146,7 @@ impl ArenaModelBuilder {
+         offset: &Real,
+     ) -> Result<(), BuildError> {
+         let Curve3ExactData::Line(line) = curve.exact_data() else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let source = pcurve
+             .curve()
+@@ -161,11 +161,11 @@ impl ArenaModelBuilder {
+             Some(CurveGeometry2::RationalBezier(source)) => (
+                 source
+                     .affine_control_points()
+-                    .ok_or(BuildError::EdgeUseSupportMismatch)?
++                    .ok_or(crate::topology::error::diagnostic_edge_mismatch())?
+                     .to_vec(),
+                 source.weights().to_vec(),
+             ),
+-            _ => return Err(BuildError::EdgeUseSupportMismatch),
++            _ => return Err(crate::topology::error::diagnostic_edge_mismatch()),
+         };
+         let origin = surface.plane_origin().expect("plane image");
+         let (u, v) = surface.plane_directions().expect("plane image");
+@@ -178,7 +178,7 @@ impl ArenaModelBuilder {
+                 hypercurve::Axis2::X => point.y(),
+                 hypercurve::Axis2::Y => point.x(),
+             };
+-            require_real_equal(coefficient, constant, BuildError::EdgeUseSupportMismatch)?;
++            require_real_equal(coefficient, constant, crate::topology::error::diagnostic_edge_mismatch())?;
+         }
+         let lifted = points
+             .iter()
+@@ -190,7 +190,7 @@ impl ArenaModelBuilder {
+         Curve3::rational_bezier(lifted.clone(), weights.clone())?;
+         if crate::geometry::certified_straight_sweep_image(&lifted, &weights, &direction)?.is_none()
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         for (point, lifted) in points.iter().zip(lifted) {
+             let coordinate = match axis {
+@@ -199,7 +199,7 @@ impl ArenaModelBuilder {
+             };
+             let parameter = scale * coordinate + offset;
+             if !points_equal(&lifted, &line.start.lerp(&line.end, &parameter))? {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             }
+         }
+         Ok(())
+@@ -221,7 +221,7 @@ impl ArenaModelBuilder {
+                 } else if real_values_equal(scale, &(-Real::one()))? {
+                     -1
+                 } else {
+-                    return Err(BuildError::EdgeUseSupportMismatch);
++                    return Err(crate::topology::error::diagnostic_edge_mismatch());
+                 };
+                 // The complete angular chart is u = direction * (edge - offset).
+                 let expected = surface.revolution_rotation_curve(
+@@ -233,7 +233,7 @@ impl ArenaModelBuilder {
+                 if curve_parameterizations_equal(curve, &expected)? {
+                     Ok(())
+                 } else {
+-                    Err(BuildError::EdgeUseSupportMismatch)
++                    Err(crate::topology::error::diagnostic_edge_mismatch())
+                 }
+             }
+             hypercurve::Axis2::Y => {
+@@ -242,17 +242,17 @@ impl ArenaModelBuilder {
+                     .ok_or(GeometryError::UnrepresentableParameter)?;
+                 let expected = surface.revolution_meridian_curve(angle)?;
+                 if curve_parameterizations_equal(curve, &expected)? {
+-                    require_real_equal(scale, &Real::one(), BuildError::EdgeUseSupportMismatch)?;
+-                    require_real_equal(offset, &Real::zero(), BuildError::EdgeUseSupportMismatch)
++                    require_real_equal(scale, &Real::one(), crate::topology::error::diagnostic_edge_mismatch())?;
++                    require_real_equal(offset, &Real::zero(), crate::topology::error::diagnostic_edge_mismatch())
+                 } else if curve_parameterizations_equal(curve, &expected.reversed()?)? {
+-                    require_real_equal(scale, &(-Real::one()), BuildError::EdgeUseSupportMismatch)?;
++                    require_real_equal(scale, &(-Real::one()), crate::topology::error::diagnostic_edge_mismatch())?;
+                     require_real_equal(
+                         offset,
+                         &expected.reversal_pivot(),
+-                        BuildError::EdgeUseSupportMismatch,
++                        crate::topology::error::diagnostic_edge_mismatch(),
+                     )
+                 } else {
+-                    Err(BuildError::EdgeUseSupportMismatch)
++                    Err(crate::topology::error::diagnostic_edge_mismatch())
+                 }
+             }
+         }
+@@ -267,18 +267,18 @@ impl ArenaModelBuilder {
+         surface: &Surface,
+     ) -> Result<(), BuildError> {
+         let SurfaceExactData::Plane { origin, u, v } = surface.exact_data() else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let ParameterCorrespondence::Affine { scale, offset, .. } =
+             &edge_use.parameter_correspondence
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         if pcurve.curve().polynomial_branch().is_some()
+             || edge.domain.try_real_endpoints().is_none()
+         {
+             let Curve3ExactData::PlanarImage(actual) = curve.exact_data() else {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             };
+             // Compare the complete definitions in the spatial chart,
+             // without evaluating beyond the pcurve's selected restriction.
+@@ -296,7 +296,7 @@ impl ArenaModelBuilder {
+             return if actual.parameterization_equals(&expected)? {
+                 Ok(())
+             } else {
+-                Err(BuildError::EdgeUseSupportMismatch)
++                Err(crate::topology::error::diagnostic_edge_mismatch())
+             };
+         };
+         let (start, end) = edge
+@@ -314,7 +314,7 @@ impl ArenaModelBuilder {
+         if curve_parameterizations_equal(&curve.subcurve(start, end)?, &expected)? {
+             Ok(())
+         } else {
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         }
+     }
+ 
+@@ -330,12 +330,12 @@ impl ArenaModelBuilder {
+         surface: &Surface,
+     ) -> Result<(), BuildError> {
+         let Curve3ExactData::TensorImage(actual) = curve.exact_data() else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let ParameterCorrespondence::Affine { scale, offset, .. } =
+             &edge_use.parameter_correspondence
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let expected = crate::geometry::TensorCurve3 {
+             surface: surface.clone(),
+@@ -346,7 +346,7 @@ impl ArenaModelBuilder {
+         if actual.parameterization_equals(&expected)? {
+             Ok(())
+         } else {
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         }
+     }
+ 
+@@ -370,7 +370,7 @@ impl ArenaModelBuilder {
+         require_point_equal(
+             &mapped_center,
+             &data.center,
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+ 
+         let mapped_start = surface.evaluate_real(&Point2::new(
+@@ -387,12 +387,12 @@ impl ArenaModelBuilder {
+             &mapped_start,
+             self.vertex_ref(directed_start_vertex)?
+                 .represented_point()?,
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         require_point_equal(
+             &mapped_end,
+             self.vertex_ref(directed_end_vertex)?.represented_point()?,
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+ 
+         // A linear plane map carries a circle to the same spatial circle for
+@@ -424,7 +424,7 @@ impl ArenaModelBuilder {
+         require_vector_equal(
+             &mapped_tangent,
+             &expected_tangent,
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )
+     }
+ 
+@@ -442,7 +442,7 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         let Curve3ExactData::Line(curve_data) = curve.exact_data() else {
+             unreachable!("line kind carries line exact data");
+@@ -465,12 +465,12 @@ impl ArenaModelBuilder {
+             require_real_equal(
+                 &offset.dot(&x),
+                 &expected_x,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+             require_real_equal(
+                 &offset.dot(&y),
+                 &expected_y,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+         }
+         for parameter in [pcurve.represented_start()?, pcurve.represented_end()?] {
+@@ -490,7 +490,7 @@ impl ArenaModelBuilder {
+             require_real_equal(
+                 &axial,
+                 &surface_parameter.y,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+         }
+         Ok(())
+@@ -510,7 +510,7 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         let Curve3ExactData::EllipseArc(curve_data) = curve.exact_data() else {
+             unreachable!("circle kind carries ellipse-arc exact data");
+@@ -550,13 +550,13 @@ impl ArenaModelBuilder {
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         let v_constant = real_values_equal(line.start().y(), line.end().y())?;
+         if u_constant == v_constant {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let Curve3ExactData::EllipseArc(curve_data) = curve.exact_data() else {
+             unreachable!("circle kind carries ellipse-arc exact data");
+         };
+         if !curve_data.circle {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let SurfaceExactData::Sphere {
+             center,
+@@ -612,7 +612,7 @@ impl ArenaModelBuilder {
+             unreachable!("circle kind carries ellipse-arc exact data");
+         };
+         if !curve_data.circle {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let SurfaceExactData::Torus {
+             center,
+@@ -628,7 +628,7 @@ impl ArenaModelBuilder {
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         let v_constant = real_values_equal(line.start().y(), line.end().y())?;
+         if u_constant == v_constant {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let (expected_center, expected_x, expected_y, expected_radius, first_angle, second_angle) =
+             if v_constant {
+@@ -637,17 +637,17 @@ impl ArenaModelBuilder {
+                 require_real_equal(
+                     &center_offset.dot(&x),
+                     &Real::zero(),
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 require_real_equal(
+                     &center_offset.dot(&y),
+                     &Real::zero(),
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 require_real_equal(
+                     &center_offset.dot(&axis),
+                     &(&minor_radius * v.clone().sin()),
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 (
+                     curve_data.center.clone(),
+@@ -667,17 +667,17 @@ impl ArenaModelBuilder {
+                 require_real_equal(
+                     &center_offset.dot(&axis),
+                     &Real::zero(),
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 require_real_equal(
+                     &center_offset.dot(&radial),
+                     &major_radius,
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 require_real_equal(
+                     &center_offset.dot(&tangent),
+                     &Real::zero(),
+-                    BuildError::EdgeUseSupportMismatch,
++                    crate::topology::error::diagnostic_edge_mismatch(),
+                 )?;
+                 (
+                     curve_data.center.clone(),
+@@ -709,7 +709,7 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )
+     }
+ 
+@@ -727,13 +727,13 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         let Curve3ExactData::EllipseArc(curve_data) = curve.exact_data() else {
+             unreachable!("circle kind carries ellipse-arc exact data");
+         };
+         if !curve_data.circle {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let SurfaceExactData::Cone {
+             apex,
+@@ -776,7 +776,7 @@ impl ArenaModelBuilder {
+         if v_constant && matches!(*profile, Curve3ExactData::Line(_)) {
+             Ok(())
+         } else {
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         }
+     }
+ 
+@@ -794,10 +794,10 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         if real_values_equal(line.start().x(), line.end().x())? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let (profile_start, profile_end) = if decided_model_order(compare_reals(
+             line.start().x(),
+@@ -823,7 +823,7 @@ impl ArenaModelBuilder {
+         } else if profile_parameterizations_equal(&actual, &expected.reversed()?)? {
+             true
+         } else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+ 
+         let edge_domain_span = edge.domain.represented_end()? - edge.domain.represented_start()?;
+@@ -861,7 +861,7 @@ impl ArenaModelBuilder {
+             require_real_equal(
+                 &actual_parameter,
+                 &expected_parameter,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+         }
+         Ok(())
+@@ -881,10 +881,10 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().x(),
+             line.end().x(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         if real_values_equal(line.start().y(), line.end().y())? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let (profile_start, profile_end) = if decided_model_order(compare_reals(
+             line.start().y(),
+@@ -904,7 +904,7 @@ impl ArenaModelBuilder {
+             edge.domain.represented_end()?,
+         )?;
+         if !curve_parameterizations_equal(&actual, &expected)? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let edge_domain_span = edge.domain.represented_end()? - edge.domain.represented_start()?;
+         let actual_span =
+@@ -936,7 +936,7 @@ impl ArenaModelBuilder {
+             require_real_equal(
+                 &actual_parameter,
+                 &expected_parameter,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+         }
+         Ok(())
+@@ -956,10 +956,10 @@ impl ArenaModelBuilder {
+         require_real_equal(
+             line.start().y(),
+             line.end().y(),
+-            BuildError::EdgeUseSupportMismatch,
++            crate::topology::error::diagnostic_edge_mismatch(),
+         )?;
+         if real_values_equal(line.start().x(), line.end().x())? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let actual = curve.subcurve(
+             edge.domain.represented_start()?,
+@@ -990,7 +990,7 @@ impl ArenaModelBuilder {
+                     .try_real()
+                     .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+                 actual.domain().represented_end()?,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+             (line.start().x(), line.end().x())
+         } else {
+@@ -999,14 +999,14 @@ impl ArenaModelBuilder {
+                     .try_real()
+                     .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+                 actual.domain().represented_end()?,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+             require_real_equal(
+                 second_edge_parameter
+                     .try_real()
+                     .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+                 actual.domain().represented_start()?,
+-                BuildError::EdgeUseSupportMismatch,
++                crate::topology::error::diagnostic_edge_mismatch(),
+             )?;
+             (line.end().x(), line.start().x())
+         };
+@@ -1016,7 +1016,7 @@ impl ArenaModelBuilder {
+         } else if real_values_equal(&angle_delta, &(-actual_span.clone()))? {
+             -1
+         } else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let support =
+             surface.revolution_latitude_curve(line.start().y(), Real::zero(), Real::one())?;
+@@ -1032,7 +1032,7 @@ impl ArenaModelBuilder {
+                 ..*support
+             })))?;
+         if !circle_parameterizations_equal(&actual, &expected)? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         Ok(())
+     }
+@@ -1074,7 +1074,7 @@ fn validate_circle_iso_image(
+     } else if real_values_equal(&angle_delta, &(-actual_span.clone()))? {
+         -1
+     } else {
+-        return Err(BuildError::EdgeUseSupportMismatch);
++        return Err(crate::topology::error::diagnostic_edge_mismatch());
+     };
+     let [x, y] = axes;
+     let expected = EllipseArcExactData {
+@@ -1092,6 +1092,6 @@ fn validate_circle_iso_image(
+     if circle_data_parameterizations_equal(&actual, &expected)? {
+         Ok(())
+     } else {
+-        Err(BuildError::EdgeUseSupportMismatch)
++        Err(crate::topology::error::diagnostic_edge_mismatch())
+     }
+ }
+diff --git a/crates/hyperbrep/src/topology/validation/image.rs b/crates/hyperbrep/src/topology/validation/image.rs
+index 4afd14f577..e7ae6f9ec0 100644
+--- a/crates/hyperbrep/src/topology/validation/image.rs
++++ b/crates/hyperbrep/src/topology/validation/image.rs
+@@ -273,7 +273,7 @@ impl ArenaModelBuilder {
+                 // iso-curve, whose planar spline image proof applies.
+                 let iso = curve
+                     .tensor_image_as_iso_curve()?
+-                    .ok_or(BuildError::EdgeUseSupportMismatch)?;
++                    .ok_or(crate::topology::error::diagnostic_edge_mismatch())?;
+                 self.validate_planar_spline_image(&iso, edge, edge_use, pcurve, surface)?;
+             }
+             (
+@@ -501,11 +501,11 @@ impl ArenaModelBuilder {
+     ) -> Result<(), BuildError> {
+         let ParameterCorrespondence::Affine { scale, offset } = &edge_use.parameter_correspondence
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let (Some(origin), Some((u, v))) = (surface.plane_origin(), surface.plane_directions())
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let expected = crate::geometry::lift_curve_from_plane_frame_with_affine_parameter(
+             pcurve.curve(),
+@@ -515,7 +515,7 @@ impl ArenaModelBuilder {
+             scale,
+             offset,
+         )?
+-        .ok_or(BuildError::EdgeUseSupportMismatch)?;
++        .ok_or(crate::topology::error::diagnostic_edge_mismatch())?;
+         // Native subdivision may rebase a Bezier pcurve to [0,1], while a
+         // NURBS keeps its knot chart. Compare the actual edge interval with
+         // the lift in its mapped chart, not with the whole spatial source.
+@@ -528,7 +528,7 @@ impl ArenaModelBuilder {
+         if curve_parameterizations_equal(&actual, &expected)? {
+             Ok(())
+         } else {
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         }
+     }
+ }
+diff --git a/crates/hyperbrep/src/topology/validation/image/tests.rs b/crates/hyperbrep/src/topology/validation/image/tests.rs
+index df0d6e98b7..5982c597bb 100644
+--- a/crates/hyperbrep/src/topology/validation/image/tests.rs
++++ b/crates/hyperbrep/src/topology/validation/image/tests.rs
+@@ -80,8 +80,8 @@ fn cylinder_image_rejects_wrong_radial_phase_and_tilted_plane() {
+     assert_eq!(
+         results,
+         [
+-            Err(BuildError::EdgeUseSupportMismatch),
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch()),
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         ]
+     );
+ }
+@@ -101,8 +101,8 @@ fn sphere_image_rejects_wrong_radial_phase_and_tilted_plane() {
+     assert_eq!(
+         results,
+         [
+-            Err(BuildError::EdgeUseSupportMismatch),
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch()),
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         ]
+     );
+ }
+@@ -128,8 +128,8 @@ fn cone_image_rejects_wrong_radial_phase_and_tilted_plane() {
+     assert_eq!(
+         results,
+         [
+-            Err(BuildError::EdgeUseSupportMismatch),
+-            Err(BuildError::EdgeUseSupportMismatch)
++            Err(crate::topology::error::diagnostic_edge_mismatch()),
++            Err(crate::topology::error::diagnostic_edge_mismatch())
+         ]
+     );
+ }
+diff --git a/crates/hyperbrep/src/topology/validation/prism_topology.rs b/crates/hyperbrep/src/topology/validation/prism_topology.rs
+index ed0711a68a..7f98fbdc54 100644
+--- a/crates/hyperbrep/src/topology/validation/prism_topology.rs
++++ b/crates/hyperbrep/src/topology/validation/prism_topology.rs
+@@ -262,7 +262,7 @@ impl ArenaModelBuilder {
+                 let Curve3ExactData::EllipseArc(data) = curve.exact_data() else {
+                     unreachable!("circle kind carries ellipse-arc exact data");
+                 };
+-                require_real_equal(&data.center.z, &start.z, BuildError::EdgeUseSupportMismatch)?;
++                require_real_equal(&data.center.z, &start.z, crate::topology::error::diagnostic_edge_mismatch())?;
+                 let parameter = match edge_use.direction {
+                     Direction::Forward => edge.domain.start(),
+                     Direction::Reversed => edge.domain.end(),
+@@ -285,7 +285,7 @@ impl ArenaModelBuilder {
+                     std::cmp::Ordering::Less => true,
+                     std::cmp::Ordering::Greater => false,
+                     std::cmp::Ordering::Equal => {
+-                        return Err(BuildError::EdgeUseSupportMismatch);
++                        return Err(crate::topology::error::diagnostic_edge_mismatch());
+                     }
+                 };
+                 Ok(Segment2::Arc(
+diff --git a/crates/hyperbrep/src/topology/validation/tensor.rs b/crates/hyperbrep/src/topology/validation/tensor.rs
+index 8481c52c2c..e73bf59ed9 100644
+--- a/crates/hyperbrep/src/topology/validation/tensor.rs
++++ b/crates/hyperbrep/src/topology/validation/tensor.rs
+@@ -55,21 +55,21 @@ impl ArenaModelBuilder {
+             {
+                 return Ok(());
+             }
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let SurfaceExactData::RationalBezier {
+             control_points: surface_points,
+             weights: surface_weights,
+         } = surface.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let Curve3ExactData::RationalBezier {
+             control_points: curve_points,
+             weights: curve_weights,
+         } = curve.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let oriented_pcurve = match edge_use.direction {
+             Direction::Forward => pcurve.clone(),
+@@ -116,7 +116,7 @@ impl ArenaModelBuilder {
+         let Some((transposed_points, transposed_weights)) =
+             transpose_two_row_tensor(&surface_points, &surface_weights)
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let trimmed = self.trim_rational_tensor_profile(
+             &transposed_points,
+@@ -187,7 +187,7 @@ impl ArenaModelBuilder {
+             ..
+         } = surface.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let Curve3ExactData::Nurbs {
+             degree,
+@@ -196,7 +196,7 @@ impl ArenaModelBuilder {
+             knots: curve_knots,
+         } = curve.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         if u_degree == 1
+             && degree == v_degree
+@@ -245,12 +245,12 @@ impl ArenaModelBuilder {
+                 .zip(&surface_weights)
+                 .any(|(points, weights)| points.is_empty() || points.len() != weights.len())
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let Some((transposed_points, transposed_weights)) =
+             transpose_two_row_tensor(&surface_points, &surface_weights)
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let trimmed = self.trim_nurbs_tensor_profile(
+             degree,
+@@ -262,7 +262,7 @@ impl ArenaModelBuilder {
+             SurfaceIsoAxis::U,
+         )?;
+         if !real_slices_equal(&curve_knots, &trimmed.knots)? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let coefficient_offset = v_knots[v_degree].clone();
+         let coefficient_scale = &v_knots[surface_points.len()] - &coefficient_offset;
+@@ -351,7 +351,7 @@ impl ArenaModelBuilder {
+         if decided_model_order(compare_reals(start, end, crate::STRICT_PREDICATES))?
+             != std::cmp::Ordering::Less
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         Ok((start.clone(), end.clone()))
+     }
+@@ -375,7 +375,7 @@ impl ArenaModelBuilder {
+             weights,
+         } = profile.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let direction = &surface_points[0][1] - &surface_points[0][0];
+         Ok(TrimmedRationalTensorProfile {
+@@ -412,7 +412,7 @@ impl ArenaModelBuilder {
+             ..
+         } = profile.exact_data()
+         else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let direction = &surface_points[0][1] - &surface_points[0][0];
+         Ok(TrimmedNurbsTensorProfile {
+@@ -490,7 +490,7 @@ impl ArenaModelBuilder {
+             Direction::Reversed => pcurve.reversed()?,
+         };
+         let Some(CurveGeometry2::RationalBezier(graph)) = oriented_pcurve.curve().geometry() else {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         };
+         let graph_coefficients = coefficients
+             .iter()
+@@ -523,11 +523,11 @@ impl ArenaModelBuilder {
+                 .zip(surface_weights)
+                 .any(|(points, weights)| points.len() != 2 || weights.len() != 2)
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         for weights in surface_weights {
+             if !real_values_equal(&weights[0], &weights[1])? {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             }
+         }
+         let direction = &surface_points[0][1] - &surface_points[0][0];
+@@ -545,17 +545,17 @@ impl ArenaModelBuilder {
+                 }
+             })
+             .transpose()?
+-            .ok_or(BuildError::EdgeUseSupportMismatch)?;
++            .ok_or(crate::topology::error::diagnostic_edge_mismatch())?;
+         for row in surface_points {
+             if !points_equal(&(row[0].clone() + direction.clone()), &row[1])? {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             }
+         }
+ 
+         if curve_points.len() != surface_points.len()
+             || curve_weights.len() != surface_weights.len()
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let weight_scale =
+             (&curve_weights[0] / &surface_weights[0][0]).map_err(GeometryError::Numeric)?;
+@@ -566,7 +566,7 @@ impl ArenaModelBuilder {
+             .zip(surface_points.iter().zip(surface_weights))
+         {
+             if !real_values_equal(curve_weight, &(&surface_row_weights[0] * &weight_scale))? {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             }
+             let coefficient = ((point3_component(curve_point, direction_axis)
+                 - point3_component(&surface_row[0], direction_axis))
+@@ -576,7 +576,7 @@ impl ArenaModelBuilder {
+                 &(surface_row[0].clone() + direction.clone() * &coefficient),
+                 curve_point,
+             )? {
+-                return Err(BuildError::EdgeUseSupportMismatch);
++                return Err(crate::topology::error::diagnostic_edge_mismatch());
+             }
+             coefficients.push(coefficient);
+         }
+@@ -597,7 +597,7 @@ impl ArenaModelBuilder {
+         let u_constant = real_values_equal(line.start().x(), line.end().x())?;
+         let v_constant = real_values_equal(line.start().y(), line.end().y())?;
+         if u_constant == v_constant {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let (axis, constant, lower, upper) = if v_constant {
+             (
+@@ -616,7 +616,7 @@ impl ArenaModelBuilder {
+         };
+         let complete = surface.iso_curve(axis, constant)?;
+         if !complete.domain().contains_real(lower)? || !complete.domain().contains_real(upper)? {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         let (source_start, source_end) = match edge_use.direction {
+             Direction::Forward => (lower, upper),
+@@ -631,7 +631,7 @@ impl ArenaModelBuilder {
+             std::cmp::Ordering::Greater => {
+                 complete.subcurve(source_end, source_start)?.reversed()?
+             }
+-            std::cmp::Ordering::Equal => return Err(BuildError::EdgeUseSupportMismatch),
++            std::cmp::Ordering::Equal => return Err(crate::topology::error::diagnostic_edge_mismatch()),
+         };
+         let edge_curve = curve.subcurve(
+             (edge.domain.start())
+@@ -644,7 +644,7 @@ impl ArenaModelBuilder {
+         if !tensor_curve_images_equal(&edge_curve, &complete)?
+             && !tensor_curve_images_equal(&edge_curve, &segment)?
+         {
+-            return Err(BuildError::EdgeUseSupportMismatch);
++            return Err(crate::topology::error::diagnostic_edge_mismatch());
+         }
+         Ok(())
+     }
+diff --git a/crates/hyperbrep/tests/tensor_graph_solids.rs b/crates/hyperbrep/tests/tensor_graph_solids.rs
+index 5292aa9ef6..f245cde299 100644
+--- a/crates/hyperbrep/tests/tensor_graph_solids.rs
++++ b/crates/hyperbrep/tests/tensor_graph_solids.rs
+@@ -1780,6 +1780,8 @@ fn nonlinear_tensor_caps_support_transverse_recuts() {
+     assert_eq!(cut.len(), 1);
+     verify(&cut);
+     let text = cut.model().to_json().unwrap();
++    std::fs::write("/home/tim/Documents/GitHub/workspace/csgrs/target/native-contact-admission-20261105/failing-native-model.json", &text).unwrap();
++
+     let model = RawModel::from_json(&text, &ArchiveLimits::default())
+         .unwrap()
+         .validate()
