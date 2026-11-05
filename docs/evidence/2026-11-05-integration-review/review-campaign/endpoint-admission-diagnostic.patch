@@ -1,0 +1,128 @@
+diff --git a/crates/hypercurve/src/curve_support_intersection.rs b/crates/hypercurve/src/curve_support_intersection.rs
+index 00d2b16272..95c4177cf1 100644
+--- a/crates/hypercurve/src/curve_support_intersection.rs
++++ b/crates/hypercurve/src/curve_support_intersection.rs
+@@ -10,6 +10,9 @@ use crate::bezier_offset::{
+ use crate::curve_support::CurveSupport2;
+ use crate::{BezierSplitFragment2, BezierSubcurve2, CurveFamily2};
+ 
++#[cfg(test)]
++mod endpoint_admission_tests;
++
+ #[derive(Default)]
+ struct Evidence {
+     contacts: Vec<CurveIntersectionContact2>,
+@@ -403,19 +406,18 @@ impl Pair<'_> {
+         parameter: &mut CurveParameter2,
+         point: &CurvePoint2,
+     ) -> ExactCurveResult<bool> {
+-        let outcome = crate::bezier_split::CurveParameterDomain2::new(&span.range, None)
+-            .contains_finite_parameter(parameter, self.policy)
+-            .map_err(|cause| {
+-                ExactCurveError::invalid(
+-                    CurveOperation2::Intersection,
+-                    span.support.family(),
+-                    cause,
+-                )
+-            })?;
+-        let reason = match outcome {
+-            Classification::Decided(inside) => return Ok(inside),
+-            Classification::Uncertain(reason) => reason,
+-        };
++        let domain = crate::bezier_split::CurveParameterDomain2::new(&span.range, None);
++        // Complete scalar refinement cannot prove every equality to a retained
++        // endpoint expression. Give the existing correlated point proof its
++        // opportunity before replaying the complete domain predicate.
++        let outcome = self.policy.bounded_exact_predicate_pass(|| {
++            domain.contains_finite_parameter(parameter, self.policy)
++        });
++        match decided(outcome, span.support.family()) {
++            Ok(inside) => return Ok(inside),
++            Err(ExactCurveError::Blocked(blocker)) if !blocker.reason().is_resource_failure() => {}
++            Err(error) => return Err(error),
++        }
+         if let Some(points) = &span.endpoint_points {
+             let strict = self.policy.strict_counterpart();
+             let endpoint = strict.bounded_exact_predicate_pass(|| {
+@@ -423,39 +425,57 @@ impl Pair<'_> {
+                 let domain = crate::bezier_split::CurveParameterDomain2::new(&unit, None);
+                 // Point equality identifies a parameter only in an injective
+                 // chart containing both the contact and retained endpoints.
+-                if !span.support.has_certified_injective_image(&unit, &strict)
+-                    || !matches!(
+-                        domain.contains_finite_range(&span.range, &strict),
+-                        Ok(Classification::Decided(true))
+-                    )
+-                    || !matches!(
+-                        domain.contains_finite_parameter(parameter, &strict),
+-                        Ok(Classification::Decided(true))
+-                    )
+-                {
+-                    return None;
++                let injective = span.support.has_certified_injective_image(&unit, &strict);
++                eprintln!("ADMIT_DIAGNOSTIC injective={injective}");
++                if !injective {
++                    return Ok(Classification::Decided(None));
+                 }
+-                [span.range.start(), span.range.end()]
++                let coverage = domain.contains_finite_range(&span.range, &strict)?;
++                eprintln!("ADMIT_DIAGNOSTIC unit_range={coverage:?}");
++                match coverage {
++                    Classification::Decided(true) => {}
++                    Classification::Uncertain(reason) if reason.is_resource_failure() => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                    _ => return Ok(Classification::Decided(None)),
++                }
++                let coverage = domain.contains_finite_parameter(parameter, &strict)?;
++                eprintln!("ADMIT_DIAGNOSTIC unit_parameter={coverage:?}");
++                match coverage {
++                    Classification::Decided(true) => {}
++                    Classification::Uncertain(reason) if reason.is_resource_failure() => {
++                        return Ok(Classification::Uncertain(reason));
++                    }
++                    _ => return Ok(Classification::Decided(None)),
++                }
++                for (boundary, endpoint) in [span.range.start(), span.range.end()]
+                     .into_iter()
+                     .zip(points)
+-                    .find_map(|(boundary, endpoint)| {
+-                        matches!(
+-                            point.same_point(endpoint, &strict),
+-                            Classification::Decided(true)
+-                        )
+-                        .then(|| boundary.clone())
+-                    })
++                {
++                    let same = point.same_point(endpoint, &strict);
++                    eprintln!("ADMIT_DIAGNOSTIC same_endpoint={same:?}");
++                    match same {
++                        Classification::Decided(true) => {
++                            return Ok(Classification::Decided(Some(boundary.clone())));
++                        }
++                        Classification::Uncertain(reason) if reason.is_resource_failure() => {
++                            return Ok(Classification::Uncertain(reason));
++                        }
++                        _ => {}
++                    }
++                }
++                Ok(Classification::Decided(None))
+             });
+-            if let Some(endpoint) = endpoint {
++            if let Some(endpoint) = decided(endpoint, span.support.family())? {
+                 *parameter = endpoint;
+                 return Ok(true);
+             }
+         }
+-        Err(ExactCurveError::blocked(
+-            CurveOperation2::Intersection,
++        eprintln!("ADMIT_DIAGNOSTIC full_fallback support={:?} points={} scalar_parameter={}", span.support.family(), span.endpoint_points.is_some(), parameter.as_bezier_parameter().is_some());
++        decided(
++            domain.contains_finite_parameter(parameter, self.policy),
+             span.support.family(),
+-            reason,
+-        ))
++        )
+     }
+ 
+     fn admit_contact(

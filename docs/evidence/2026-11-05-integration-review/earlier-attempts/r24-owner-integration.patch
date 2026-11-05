@@ -1,0 +1,294 @@
+diff --git a/crates/hypercurve/src/bezier_offset/parallel_construction.rs b/crates/hypercurve/src/bezier_offset/parallel_construction.rs
+index 56e8a9a80f..fe63049c24 100644
+--- a/crates/hypercurve/src/bezier_offset/parallel_construction.rs
++++ b/crates/hypercurve/src/bezier_offset/parallel_construction.rs
+@@ -2,7 +2,8 @@
+ 
+ use super::*;
+ use crate::curve::{
+-    ParallelFidelityConstruction2, ParallelFidelityReceipt2, ParallelFidelitySource2,
++    ParallelFidelityConstruction2, ParallelFidelityConstructionData2, ParallelFidelityReceipt2,
++    ParallelFidelitySource2,
+ };
+ 
+ /// Exact rational parallel certified from a homogeneous Pythagorean hodograph.
+@@ -744,19 +745,20 @@ impl CurvePath2 {
+             return Ok(Classification::Uncertain(UncertaintyReason::RealSign));
+         }
+ 
+-        let fidelity_construction = Arc::new(ParallelFidelityConstruction2 {
+-            path: self.clone(),
+-            distance: distance.clone(),
+-            max_verification_depth: options.max_depth(),
+-            qualified: std::sync::OnceLock::new(),
+-        });
++        let fidelity_construction =
++            ParallelFidelityConstruction2::new(ParallelFidelityConstructionData2 {
++                path: self.clone(),
++                distance: distance.clone(),
++                max_verification_depth: options.max_depth(),
++                qualified: std::sync::OnceLock::new(),
++            });
+         let mut output = Vec::new();
+         let mut exact_source_curve_count = 0;
+         let mut approximated_source_curve_count = 0;
+         let mut verification_leaf_count = 0;
+         for (index, source) in self.curves().iter().enumerate() {
+             let fidelity_source = Arc::new(ParallelFidelitySource2 {
+-                construction: Arc::clone(&fidelity_construction),
++                construction: fidelity_construction.clone(),
+                 index,
+             });
+             match source.geometry() {
+diff --git a/crates/hypercurve/src/curve.rs b/crates/hypercurve/src/curve.rs
+index 7a2e6d9d38..d24ea09b5b 100644
+--- a/crates/hypercurve/src/curve.rs
++++ b/crates/hypercurve/src/curve.rs
+@@ -18,8 +18,8 @@ pub use curve_fidelity::{
+     CurveParallelFidelity2, CurveParallelFidelityMetric2, CurveParallelFidelityTransform2,
+ };
+ pub(crate) use curve_fidelity::{
+-    ParallelFidelityConstruction2, ParallelFidelityEdit2, ParallelFidelityReceipt2,
+-    ParallelFidelitySource2, ParallelFidelityStep2,
++    ParallelFidelityConstruction2, ParallelFidelityConstructionData2, ParallelFidelityEdit2,
++    ParallelFidelityReceipt2, ParallelFidelitySource2, ParallelFidelityStep2,
+ };
+ #[path = "curve_vector.rs"]
+ mod curve_vector;
+diff --git a/crates/hypercurve/src/curve_fidelity.rs b/crates/hypercurve/src/curve_fidelity.rs
+index 382aebb533..5fc96aa45c 100644
+--- a/crates/hypercurve/src/curve_fidelity.rs
++++ b/crates/hypercurve/src/curve_fidelity.rs
+@@ -12,16 +12,54 @@ pub enum CurveParallelFidelityMetric2 {
+     SameParameterEuclidean,
+ }
+ 
+-pub(crate) struct ParallelFidelityConstruction2 {
++pub(crate) struct ParallelFidelityConstructionData2 {
+     pub(crate) path: CurvePath2,
+     pub(crate) distance: Real,
+     pub(crate) max_verification_depth: usize,
+     pub(crate) qualified: OnceLock<bool>,
+ }
+ 
++// Stop public auto-trait proofs at this existing shared allocation rather than
++// expanding the entire recursive provenance graph in every consumer. The
++// concrete definition must still satisfy every bound here; no manual unsafe
++// Send/Sync assertion or omitted source relation is involved.
++trait SharedFidelityConstruction2:
++    Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
++{
++    fn definition(&self) -> &ParallelFidelityConstructionData2;
++}
++
++impl SharedFidelityConstruction2 for ParallelFidelityConstructionData2 {
++    fn definition(&self) -> &ParallelFidelityConstructionData2 {
++        self
++    }
++}
++
++#[derive(Clone)]
++pub(crate) struct ParallelFidelityConstruction2(Arc<dyn SharedFidelityConstruction2>);
++
++impl ParallelFidelityConstruction2 {
++    pub(crate) fn new(definition: ParallelFidelityConstructionData2) -> Self {
++        Self(Arc::new(definition))
++    }
++
++    #[cfg(feature = "svg")]
++    pub(crate) fn allocation_key(&self) -> *const () {
++        Arc::as_ptr(&self.0).cast()
++    }
++}
++
++impl std::ops::Deref for ParallelFidelityConstruction2 {
++    type Target = ParallelFidelityConstructionData2;
++
++    fn deref(&self) -> &Self::Target {
++        self.0.definition()
++    }
++}
++
+ #[derive(Debug)]
+ pub(crate) struct ParallelFidelitySource2 {
+-    pub(crate) construction: Arc<ParallelFidelityConstruction2>,
++    pub(crate) construction: ParallelFidelityConstruction2,
+     pub(crate) index: usize,
+ }
+ 
+diff --git a/crates/hypercurve/src/svg/exact/graph.rs b/crates/hypercurve/src/svg/exact/graph.rs
+index c3e1a05d5f..4482b3fd30 100644
+--- a/crates/hypercurve/src/svg/exact/graph.rs
++++ b/crates/hypercurve/src/svg/exact/graph.rs
+@@ -91,7 +91,7 @@ struct GraphWriter {
+             u32,
+         ),
+     >,
+-    fidelity_constructions: HashMap<*const crate::curve::ParallelFidelityConstruction2, u32>,
++    fidelity_constructions: HashMap<*const (), u32>,
+     fidelity_roots: HashMap<*const crate::curve::ParallelFidelityReceipt2, u32>,
+     fidelity_steps: HashMap<*const crate::curve::ParallelFidelityStep2, u32>,
+     active_fidelity_depth: usize,
+@@ -319,7 +319,7 @@ impl GraphWriter {
+ }
+ 
+ enum Definition {
+-    FidelityConstruction(std::sync::Arc<crate::curve::ParallelFidelityConstruction2>),
++    FidelityConstruction(crate::curve::ParallelFidelityConstruction2),
+     PolynomialSource(crate::PolynomialCurveSet2),
+     Curve(Curve2),
+     Parameter(BezierParameter2),
+diff --git a/crates/hypercurve/src/svg/exact/graph/fidelity.rs b/crates/hypercurve/src/svg/exact/graph/fidelity.rs
+index 81d0712b37..2bec24fbc5 100644
+--- a/crates/hypercurve/src/svg/exact/graph/fidelity.rs
++++ b/crates/hypercurve/src/svg/exact/graph/fidelity.rs
+@@ -1,8 +1,8 @@
+ //! Replay fidelity from source definitions and checked edits, never flags.
+ use super::*;
+ use crate::curve::{
+-    ParallelFidelityConstruction2, ParallelFidelityEdit2, ParallelFidelityReceipt2,
+-    ParallelFidelitySource2, ParallelFidelityStep2,
++    ParallelFidelityConstruction2, ParallelFidelityConstructionData2, ParallelFidelityEdit2,
++    ParallelFidelityReceipt2, ParallelFidelitySource2, ParallelFidelityStep2,
+ };
+ use crate::{
+     BezierParallelApproximationCurve2, BezierParallelVerificationOptions,
+@@ -74,9 +74,9 @@ impl GraphWriter {
+ 
+     fn fidelity_construction(
+         &mut self,
+-        construction: &Arc<ParallelFidelityConstruction2>,
++        construction: &ParallelFidelityConstruction2,
+     ) -> SvgResult<u32> {
+-        let key = Arc::as_ptr(construction);
++        let key = construction.allocation_key();
+         if let Some(index) = self.fidelity_constructions.get(&key) {
+             return Ok(*index);
+         }
+@@ -216,12 +216,14 @@ pub(super) fn read_definition(
+             .set(reader.read_bool()?)
+             .expect("new construction");
+         return Ok((
+-            Definition::FidelityConstruction(Arc::new(ParallelFidelityConstruction2 {
+-                path,
+-                distance,
+-                max_verification_depth,
+-                qualified,
+-            })),
++            Definition::FidelityConstruction(ParallelFidelityConstruction2::new(
++                ParallelFidelityConstructionData2 {
++                    path,
++                    distance,
++                    max_verification_depth,
++                    qualified,
++                },
++            )),
+             depth,
+         ));
+     }
+@@ -315,7 +317,7 @@ fn read_root(
+     let strict = &CurveContext::STRICT;
+     let construction_index = reader.read_len()?;
+     let construction = match definitions.get(construction_index) {
+-        Some(Definition::FidelityConstruction(source)) => Arc::clone(source),
++        Some(Definition::FidelityConstruction(source)) => source.clone(),
+         _ => return Err(malformed("invalid fidelity construction reference")),
+     };
+     let index = reader.read_len()?;
+diff --git a/crates/hypercurve/src/svg/exact/graph/fidelity/tests.rs b/crates/hypercurve/src/svg/exact/graph/fidelity/tests.rs
+index 0242f60ffd..73a8795512 100644
+--- a/crates/hypercurve/src/svg/exact/graph/fidelity/tests.rs
++++ b/crates/hypercurve/src/svg/exact/graph/fidelity/tests.rs
+@@ -32,14 +32,14 @@ fn recipe(
+         let flag = OnceLock::new();
+         flag.set(qualified.unwrap_or(*old.qualified.get().unwrap()))
+             .unwrap();
+-        Arc::new(ParallelFidelityConstruction2 {
++        ParallelFidelityConstruction2::new(ParallelFidelityConstructionData2 {
+             path: old.path.clone(),
+             distance: old.distance.clone(),
+             max_verification_depth: depth_request.unwrap_or(old.max_verification_depth),
+             qualified: flag,
+         })
+     } else {
+-        Arc::clone(&receipt.source.construction)
++        receipt.source.construction.clone()
+     };
+     let source = writer.fidelity_construction(&construction).unwrap();
+     let candidate = writer
+diff --git a/crates/hypercurve/tests/curve_carrier_traits.rs b/crates/hypercurve/tests/curve_carrier_traits.rs
+new file mode 100644
+index 0000000000..17cc54e7fb
+--- /dev/null
++++ b/crates/hypercurve/tests/curve_carrier_traits.rs
+@@ -0,0 +1,57 @@
++//! This integration test is a separate consumer crate with Rust's default
++//! recursion limit. A larger limit in the library must not hide a failure to
++//! use its native carriers with standard thread and unwind bounds.
++use hypercurve::{
++    BezierParallelVerificationOptions, Curve2, CurveParallelFidelityMetric2, CurvePath2,
++    CurveRegion2, LineSeg2, Point2, Real,
++};
++
++fn standard_traits<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
++
++#[test]
++fn native_curve_carriers_keep_standard_consumer_traits() {
++    standard_traits::<Curve2>();
++    standard_traits::<CurvePath2>();
++    standard_traits::<CurveRegion2>();
++    standard_traits::<std::sync::Arc<std::sync::Mutex<Vec<CurveRegion2>>>>();
++}
++
++#[test]
++fn generated_curve_keeps_source_after_thread_transfer_and_unwind() {
++    let source = CurvePath2::try_new(vec![
++        LineSeg2::try_new(Point2::from_values(0, 0), Point2::from_values(2, 0))
++            .unwrap()
++            .into(),
++    ])
++    .unwrap();
++    let options =
++        BezierParallelVerificationOptions::try_new((Real::one() / Real::from(20)).unwrap(), 16)
++            .unwrap();
++    let output = source
++        .approximate_parallel_blend2d_certified(Real::one(), &options)
++        .unwrap();
++    let curve = output.path().curves()[0].clone();
++    let curve = std::thread::spawn(move || curve.reversed().unwrap())
++        .join()
++        .unwrap();
++    assert_eq!(
++        curve.start().coordinates(),
++        Some(&Point2::from_values(2, 1))
++    );
++    assert_eq!(curve.end().coordinates(), Some(&Point2::from_values(0, 1)));
++    let original_bounds = curve.bounds().unwrap();
++    assert!(
++        std::panic::catch_unwind(|| {
++            assert_eq!(curve.bounds().unwrap(), original_bounds);
++            panic!("discard this consumer operation");
++        })
++        .is_err()
++    );
++    assert_eq!(curve.bounds().unwrap(), original_bounds);
++    let receipt = curve.parallel_fidelity().unwrap();
++    assert_eq!(receipt.source_path(), &source);
++    assert_eq!(receipt.source_curve_index(), 0);
++    assert_eq!(receipt.source_distance(), &Real::one());
++    assert_eq!(receipt.metric(), CurveParallelFidelityMetric2::ExactImage);
++    assert_eq!(receipt.error_bound(), Real::zero());
++}
+diff --git a/scripts/release-consumer/user_path.rs b/scripts/release-consumer/user_path.rs
+index 4fe32fe446..5ce854ffc8 100644
+--- a/scripts/release-consumer/user_path.rs
++++ b/scripts/release-consumer/user_path.rs
+@@ -67,7 +67,7 @@ fn main() -> Result<()> {
+ 
+     // Transform: a translation and an exact quarter turn.
+     let drill = bar.translated(Real::from(4), Real::from(4), Real::from(-2))?;
+-    let cross = solid::try_rotate(&bar, Real::from(90), Real::zero(), Real::zero())?
++    let cross = solid::rotate(&bar, Real::from(90), Real::zero(), Real::zero())?
+         .translated(Real::from(4), Real::from(14), Real::from(4))?;
+ 
+     // Compose, keeping the aggregate certainty of every consumed decision.
