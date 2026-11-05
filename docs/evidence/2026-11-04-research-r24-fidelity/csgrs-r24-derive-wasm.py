@@ -1,0 +1,12 @@
+from pathlib import Path
+import json,hashlib
+root=Path.cwd();p=Path('/tmp/csgrs-r24-wasm');(p/'src').mkdir(parents=True,exist_ok=True)
+source=root/'crates/hypercurve/tests/parallel_fidelity.rs';s=source.read_text();s=s.replace('mod support;','#[path="'+str(root/'crates/hypercurve/tests/support/mod.rs')+'"]\nmod support;').replace('#[test]\n','')
+names=['restriction_reversal_and_scale_preserve_the_pointwise_source_map','selected_restrictions_keep_the_selected_parameter_without_projection','zero_distance_keeps_inherited_fidelity_and_unverified_geometry_stays_unverified','extracted_parallel_curves_keep_their_individual_source_and_metric','repeated_exact_edits_keep_a_compact_replay_and_the_pointwise_bound']
+for name in names:s=s.replace('fn '+name+'(', 'pub fn '+name+'(')
+(p/'src/cases.rs').write_text(s)
+(p/'src/lib.rs').write_text('// Other fixture helpers remain uncalled in this shared-recipe probe.\n#[allow(dead_code)]\n#[path="'+str(root/'crates/hyperbrep/tests/support/selected_planar_images.rs')+'"] mod brep_cases;\n#[unsafe(no_mangle)] pub extern "C" fn fidelity_5(){brep_cases::parallel_fidelity_survives_spatial_restriction_and_native_replay();}\nmod cases;\n'+''.join('#[unsafe(no_mangle)] pub extern "C" fn fidelity_'+str(i)+'(){cases::'+n+'();}\n' for i,n in enumerate(names)))
+(p/'Cargo.toml').write_text('[package]\nname="csgrs-r24-wasm"\nversion="0.0.0"\nedition="2024"\n[workspace]\n[lib]\ncrate-type=["cdylib"]\n[dependencies]\nhypercurve={path="'+str(root/'crates/hypercurve')+'"}\nhyperreal={path="'+str(root/'crates/hyperreal')+'"}\nhyperbrep={path="'+str(root/'crates/hyperbrep')+'"}\nhyperlimit={path="'+str(root/'crates/hyperlimit')+'"}\nserde_json="1.0.149"\n[features]\nsvg=[]\n[profile.release]\npanic="abort"\nopt-level=3\n')
+
+if not (p/'Cargo.lock').exists(): (p/'Cargo.lock').write_bytes((root/'Cargo.lock').read_bytes())
+(p/'derivation.json').write_text(json.dumps({'source':str(source),'sha256':hashlib.sha256(source.read_bytes()).hexdigest(),'recipes':names+['parallel_fidelity_survives_spatial_restriction_and_native_replay'],'brep_source_sha256':hashlib.sha256((root/'crates/hyperbrep/tests/support/selected_planar_images.rs').read_bytes()).hexdigest(),'changes':['absolute support module path','remove test attributes','expose five unchanged recipe bodies','exclude SVG/native subprocess paths through existing feature gates','include unchanged BRep receipt consumer body by absolute path']},indent=2)+'\n')

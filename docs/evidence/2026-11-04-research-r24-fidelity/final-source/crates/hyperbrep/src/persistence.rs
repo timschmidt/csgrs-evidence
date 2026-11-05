@@ -1,0 +1,1621 @@
+//! Deterministic exact persistence through an untrusted raw model.
+
+use std::fmt;
+
+use hypercurve::{
+    CircularArc2, Curve2, CurveFamily2, CurveGeometry2, LineSeg2, Point2 as CurvePoint2,
+    RationalBezier2, RationalQuadraticBezier2,
+};
+use hyperlattice::{Point3, Real, Vector3};
+use serde::{Deserialize, Serialize};
+
+use crate::geometry::{Curve3ExactData, EllipseArcExactData, Line3ExactData, SurfaceExactData};
+use crate::{
+    ArenaModel, ArenaModelBuilder, BuildError, Curve3, Curve3Id, Curve3Kind, Direction, EdgeId,
+    EdgeUseId, FaceId, GeometryError, Orientation, ParameterCorrespondence, ParameterRange, Pcurve,
+    PcurveId, ShellId, Surface, SurfaceId, SurfaceKind, ValidationReport, VertexId, WireId,
+};
+
+mod admission;
+mod limits;
+pub use limits::{ArchiveLimitExceeded, ArchiveLimits, ArchiveResource};
+mod parallel;
+use parallel::{RawParallelPcurve, raw_parallel_source};
+mod planar_points;
+mod polynomial;
+use polynomial::{RawPolynomialBranch, RawPolynomialSource};
+mod selection;
+mod spatial_points;
+
+// Selected point and parameter definitions recurse once per dependency level
+// when they are encoded or replayed. Grow the stack on demand so admitted
+// graph depth, not the caller's thread stack or the build profile's frame
+// sizes, bounds those walks.
+fn grow_stack<T>(walk: impl FnOnce() -> T) -> T {
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, walk)
+}
+use planar_points::RawPlanarPoint;
+use selection::{GraphEncoder, RawParameter, RawSelectionGraph, RawVertex, SelectionGraph};
+use spatial_points::{RawSpatialPoint, RawSurfacePoint};
+
+const FORMAT_VERSION: u32 = 15;
+
+/// Failure while encoding, decoding, or validating an exact model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistenceError {
+    /// Input exceeds an explicit archive admission limit.
+    ResourceLimit(ArchiveLimitExceeded),
+    /// JSON syntax or exact-scalar decoding failed.
+    Json(String),
+    /// Native planar fidelity definition or its strict proof replay failed.
+    NativeCurve(hypercurve::SvgError),
+    /// The encoded format version is not supported.
+    UnsupportedVersion(u32),
+    /// This persistence version does not support a spatial curve family.
+    UnsupportedCurve(Curve3Kind),
+    /// This persistence version does not support a pcurve family.
+    UnsupportedPcurve(CurveFamily2),
+    /// This persistence version does not support a surface family.
+    UnsupportedSurface(SurfaceKind),
+    /// An archive graph reference is absent, forward, or of the wrong kind.
+    InvalidReference {
+        /// Referenced graph node kind.
+        kind: &'static str,
+        /// Invalid zero-based index.
+        index: usize,
+    },
+    /// Staged raw data failed a local model invariant.
+    Build(BuildError),
+    /// Staged raw data failed whole-model validation.
+    Validation(ValidationReport),
+}
+
+impl fmt::Display for PersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResourceLimit(error) => error.fmt(formatter),
+            Self::Json(error) => write!(formatter, "model JSON failed: {error}"),
+            Self::NativeCurve(error) => error.fmt(formatter),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported model format version {version}")
+            }
+            Self::UnsupportedCurve(kind) => {
+                write!(formatter, "model persistence does not support {kind:?}")
+            }
+            Self::UnsupportedPcurve(kind) => {
+                write!(formatter, "model persistence does not support {kind:?}")
+            }
+            Self::UnsupportedSurface(kind) => {
+                write!(formatter, "model persistence does not support {kind:?}")
+            }
+            Self::InvalidReference { kind, index } => {
+                write!(formatter, "invalid {kind} archive reference {index}")
+            }
+            Self::Build(error) => write!(formatter, "raw model is invalid: {error}"),
+            Self::Validation(report) => write!(formatter, "raw model is invalid: {report}"),
+        }
+    }
+}
+
+impl std::error::Error for PersistenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResourceLimit(error) => Some(error),
+            Self::NativeCurve(error) => Some(error),
+            Self::Build(error) => Some(error),
+            Self::Validation(report) => Some(report),
+            _ => None,
+        }
+    }
+}
+
+impl From<BuildError> for PersistenceError {
+    fn from(value: BuildError) -> Self {
+        Self::Build(value)
+    }
+}
+
+impl From<GeometryError> for PersistenceError {
+    fn from(value: GeometryError) -> Self {
+        Self::Build(BuildError::Geometry(value))
+    }
+}
+
+impl From<ValidationReport> for PersistenceError {
+    fn from(value: ValidationReport) -> Self {
+        Self::Validation(value)
+    }
+}
+
+/// Untrusted serialized-model carrier.
+///
+/// A `ImportedModel` deliberately has no geometry or measurement operations.
+/// [`ImportedModel::validate`] replays all records through [`ArenaModelBuilder`] before
+/// returning a trusted [`ArenaModel`].
+#[derive(Clone, Debug)]
+pub struct ImportedModel {
+    data: RawModelData,
+}
+
+impl ImportedModel {
+    /// Admits JSON syntax and record structure before decoding exact scalar data.
+    pub fn from_json(json: &str, limits: &ArchiveLimits) -> Result<Self, PersistenceError> {
+        limits.admit_json(json)?;
+        crate::context::strict(|| {
+            admission::check_records(json, limits)?;
+            let mut deserializer = serde_json::Deserializer::from_str(json);
+            deserializer.disable_recursion_limit();
+            let data =
+                RawModelData::deserialize(serde_stacker::Deserializer::new(&mut deserializer))
+                    .map_err(|error| PersistenceError::Json(error.to_string()))?;
+            deserializer
+                .end()
+                .map_err(|error| PersistenceError::Json(error.to_string()))?;
+            Ok(Self { data })
+        })
+    }
+
+    /// Encodes this raw carrier deterministically as compact JSON.
+    pub fn to_json(&self) -> Result<String, PersistenceError> {
+        crate::context::strict(|| {
+            serde_json::to_string(&self.data)
+                .map_err(|error| PersistenceError::Json(error.to_string()))
+        })
+    }
+
+    /// Validates every local and global invariant and publishes a trusted model.
+    pub fn validate(self) -> Result<ArenaModel, PersistenceError> {
+        crate::context::strict(|| {
+            if self.data.version != FORMAT_VERSION {
+                return Err(PersistenceError::UnsupportedVersion(self.data.version));
+            }
+            let mut builder = ArenaModelBuilder::new();
+            let graph = SelectionGraph::validate(self.data.selection)?;
+            let curves = self
+                .data
+                .curves
+                .into_iter()
+                .map(|raw| curve3(raw, &graph))
+                .collect::<Result<Vec<_>, _>>()?;
+            for point in self.data.vertices {
+                builder.vertex(graph.point(point, &curves)?)?;
+            }
+            for curve in curves {
+                builder.curve(curve)?;
+            }
+            for raw in self.data.pcurves {
+                builder.pcurve(Pcurve::new(pcurve(raw, &graph)?))?;
+            }
+            for surface in self.data.surfaces {
+                builder.surface(surface3(surface, &graph)?)?;
+            }
+            for edge in self.data.edges {
+                let [start, end] = edge.domain;
+                let domain = ParameterRange::new(graph.parameter(start)?, graph.parameter(end)?)?;
+                builder.edge(
+                    vertex_id(edge.start),
+                    vertex_id(edge.end),
+                    curve_id(edge.curve),
+                    domain,
+                )?;
+            }
+            for edge_use in self.data.edge_uses {
+                builder.edge_use(
+                    edge_id(edge_use.edge),
+                    edge_use.direction.into(),
+                    pcurve_id(edge_use.pcurve),
+                    match edge_use.parameter_correspondence {
+                        RawParameterCorrespondence::Affine { scale, offset } => {
+                            ParameterCorrespondence::affine(scale, offset)?
+                        }
+                        RawParameterCorrespondence::Coordinate {
+                            axis,
+                            scale,
+                            offset,
+                        } => ParameterCorrespondence::coordinate(
+                            match axis {
+                                RawCoordinateAxis::U => hypercurve::Axis2::X,
+                                RawCoordinateAxis::V => hypercurve::Axis2::Y,
+                            },
+                            scale,
+                            offset,
+                        )?,
+                        RawParameterCorrespondence::AngularSweep => {
+                            ParameterCorrespondence::angular_sweep()
+                        }
+                    },
+                )?;
+            }
+            for wire in self.data.wires {
+                builder.wire(wire.edge_uses.into_iter().map(edge_use_id).collect())?;
+            }
+            for face in self.data.faces {
+                match face.outer {
+                    Some(outer) => {
+                        builder.face(
+                            surface_id(face.surface),
+                            face.orientation.into(),
+                            wire_id(outer),
+                            face.inner.into_iter().map(wire_id).collect(),
+                        )?;
+                    }
+                    None => {
+                        if !face.inner.is_empty() {
+                            return Err(BuildError::WholeSurfaceHasInnerBoundaries.into());
+                        }
+                        builder.whole_face(surface_id(face.surface), face.orientation.into())?;
+                    }
+                }
+            }
+            for shell in self.data.shells {
+                builder.shell(shell.into_iter().map(face_id).collect())?;
+            }
+            for solid in self.data.solids {
+                builder.solid(
+                    shell_id(solid.outer),
+                    solid.voids.into_iter().map(shell_id).collect(),
+                )?;
+            }
+            Ok(builder.finish()?)
+        })
+    }
+}
+
+impl ArenaModel {
+    /// Converts this trusted model into an untrusted persistence carrier.
+    ///
+    /// Every current `Curve3` and `Surface` family is retained exactly.
+    /// Pcurves retain native lines, circular arcs, rational quadratics,
+    /// general rational Béziers, and NURBS; other Hypercurve families return
+    /// an explicit unsupported-family error.
+    pub fn to_raw(&self) -> Result<ImportedModel, PersistenceError> {
+        crate::context::strict(|| {
+            let mut graph = GraphEncoder::new(self);
+            let mut vertices = self
+                .vertices()
+                .map(|(_, vertex)| graph.point(vertex.point()))
+                .collect::<Result<Vec<_>, PersistenceError>>()?;
+            let mut curves = self
+                .curves()
+                .map(|(_, curve)| raw_curve3(curve.exact_data(), &mut graph))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut canonicalized_vertices = vec![false; vertices.len()];
+            // Split analytic arcs may retain an exact endpoint-incidence proof
+            // whose two independently serialized expressions do not replay as a
+            // scalar equality. Publish the trusted curve evaluation as the
+            // canonical vertex representation; raw import still reconstructs the
+            // curve independently and verifies every endpoint.
+            for (_, edge) in self.edges() {
+                let curve = self
+                    .curve(edge.curve())
+                    .expect("trusted edge references a validated curve");
+                if !matches!(curve.kind(), Curve3Kind::CircleArc | Curve3Kind::EllipseArc) {
+                    continue;
+                }
+                vertices[edge.start().index()] = RawVertex::Coordinates(point_array(
+                    &curve.evaluate_real(
+                        (edge.domain().start())
+                            .try_real()
+                            .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+                    )?,
+                ));
+                vertices[edge.end().index()] = RawVertex::Coordinates(point_array(
+                    &curve.evaluate_real(
+                        (edge.domain().end())
+                            .try_real()
+                            .ok_or(crate::GeometryError::UnrepresentableParameter)?,
+                    )?,
+                ));
+                canonicalized_vertices[edge.start().index()] = true;
+                canonicalized_vertices[edge.end().index()] = true;
+            }
+            let mut pcurves = self
+                .pcurves()
+                .map(|(_, pcurve)| graph.pcurve(pcurve.curve()))
+                .collect::<Result<Vec<_>, PersistenceError>>()?;
+            let mut pcurve_use_counts = vec![0_usize; pcurves.len()];
+            for (_, edge_use) in self.edge_uses() {
+                pcurve_use_counts[edge_use.pcurve().index()] += 1;
+            }
+            for (edge_use_id, edge_use) in self.edge_uses() {
+                let pcurve_index = edge_use.pcurve().index();
+                if pcurve_use_counts[pcurve_index] != 1 {
+                    continue;
+                }
+                let wire = self
+                    .wire_of_edge_use(edge_use_id)
+                    .expect("trusted edge use belongs to a validated wire");
+                let face = self
+                    .face_of_wire(wire)
+                    .and_then(|face| self.face(face))
+                    .expect("trusted wire belongs to a validated face");
+                let surface = self
+                    .surface(face.surface())
+                    .expect("trusted face references a validated surface");
+                let (Some(origin), Some((u, v))) =
+                    (surface.plane_origin(), surface.plane_directions())
+                else {
+                    continue;
+                };
+                let edge = self
+                    .edge(edge_use.edge())
+                    .expect("trusted edge use references a validated edge");
+                let (start_id, end_id) = match edge_use.direction() {
+                    Direction::Forward => (edge.start(), edge.end()),
+                    Direction::Reversed => (edge.end(), edge.start()),
+                };
+                // Only changed analytic endpoints need a new planar image.
+                // Preserve every other pcurve's exact definition: projecting
+                // its unchanged spatial vertex reconstructs an equal scalar
+                // expression whose form can depend on warm proof caches.
+                // Repeating that reconstruction after import can grow the
+                // archive despite unchanged geometry and topology.
+                if !canonicalized_vertices[start_id.index()]
+                    && !canonicalized_vertices[end_id.index()]
+                {
+                    continue;
+                }
+                let (RawVertex::Coordinates(start), RawVertex::Coordinates(end)) =
+                    (&vertices[start_id.index()], &vertices[end_id.index()])
+                else {
+                    continue;
+                };
+                if canonicalized_vertices[start_id.index()] {
+                    let start = project_raw_plane_point(start, origin, u, v)?;
+                    set_raw_pcurve_start(&mut pcurves[pcurve_index], start);
+                }
+                if canonicalized_vertices[end_id.index()] {
+                    let end = project_raw_plane_point(end, origin, u, v)?;
+                    set_raw_pcurve_end(&mut pcurves[pcurve_index], end);
+                }
+            }
+            let mut surfaces = self
+                .surfaces()
+                .map(|(_, surface)| raw_surface(surface.exact_data(), &mut graph))
+                .collect::<Result<Vec<_>, _>>()?;
+            let edges = self
+                .edges()
+                .map(|(_, edge)| {
+                    Ok(RawEdge {
+                        start: edge.start().index(),
+                        end: edge.end().index(),
+                        curve: edge.curve().index(),
+                        domain: [
+                            graph.parameter(edge.domain().start())?,
+                            graph.parameter(edge.domain().end())?,
+                        ],
+                    })
+                })
+                .collect::<Result<Vec<_>, PersistenceError>>()?;
+            // A trusted model may retain a stronger endpoint-connectivity proof
+            // than two independently represented algebraic coordinates can replay
+            // after JSON decoding. Canonicalize full-domain rational endpoints to
+            // their already-certified topological vertices before crossing the
+            // untrusted persistence boundary. Raw validation still checks those
+            // explicit coordinates normally; no certificate is accepted from JSON.
+            for (_, edge) in self.edges() {
+                let curve = self
+                    .curve(edge.curve())
+                    .expect("trusted edge references a validated curve");
+                if edge.domain().start().compare(curve.domain().start())?
+                    != std::cmp::Ordering::Equal
+                    || edge.domain().end().compare(curve.domain().end())?
+                        != std::cmp::Ordering::Equal
+                {
+                    continue;
+                }
+                let RawCurve3::RationalBezier { control_points, .. } =
+                    &mut curves[edge.curve().index()]
+                else {
+                    continue;
+                };
+                control_points[0] =
+                    raw_vertex_coordinates(&vertices[edge.start().index()])?.clone();
+                *control_points
+                    .last_mut()
+                    .expect("validated rational Bezier has controls") =
+                    raw_vertex_coordinates(&vertices[edge.end().index()])?.clone();
+            }
+            // Extrusion surfaces clone their profile curve rather than referring
+            // to the edge arena. Canonicalize a full-profile rational carrier to
+            // the same already-certified bottom vertices as its matching edge so
+            // independent JSON expression trees replay endpoint incidence.
+            for (surface_id, surface) in self.surfaces() {
+                let Some((profile, _)) = surface.extrusion_profile_and_direction() else {
+                    continue;
+                };
+                let RawSurface::Extrusion {
+                    profile: raw_profile,
+                    ..
+                } = &mut surfaces[surface_id.index()]
+                else {
+                    unreachable!("extrusion surface maps to extrusion persistence data");
+                };
+                let RawCurve3::RationalBezier { control_points, .. } = raw_profile.as_mut() else {
+                    continue;
+                };
+                let Some((edge_use, line)) = self
+                    .faces()
+                    .filter(|(_, face)| face.surface() == surface_id)
+                    .filter_map(|(_, face)| face.outer())
+                    .filter_map(|wire| self.wire(wire))
+                    .flat_map(|wire| wire.edge_uses())
+                    .filter_map(|edge_use| {
+                        let edge_use_record = self.edge_use(*edge_use)?;
+                        let pcurve = self.pcurve(edge_use_record.pcurve())?;
+                        let line = pcurve.line_segment()?;
+                        ((line.start().y() - Real::zero()).zero_status()
+                            == hyperreal::ZeroKnowledge::Zero
+                            && (line.end().y() - Real::zero()).zero_status()
+                                == hyperreal::ZeroKnowledge::Zero)
+                            .then_some((edge_use_record, line))
+                    })
+                    .find(|(_, line)| {
+                        let Some((start, end)) = profile.domain().try_real_endpoints() else {
+                            return false;
+                        };
+                        ((line.start().x() - start).zero_status() == hyperreal::ZeroKnowledge::Zero
+                            && (line.end().x() - end).zero_status()
+                                == hyperreal::ZeroKnowledge::Zero)
+                            || ((line.start().x() - end).zero_status()
+                                == hyperreal::ZeroKnowledge::Zero
+                                && (line.end().x() - start).zero_status()
+                                    == hyperreal::ZeroKnowledge::Zero)
+                    })
+                else {
+                    continue;
+                };
+                let edge = self
+                    .edge(edge_use.edge())
+                    .expect("trusted edge use references a validated edge");
+                let (directed_start, directed_end) = match edge_use.direction() {
+                    Direction::Forward => (edge.start(), edge.end()),
+                    Direction::Reversed => (edge.end(), edge.start()),
+                };
+                let starts_at_profile_start =
+                    (line.start().x() - profile.domain().represented_start()?).zero_status()
+                        == hyperreal::ZeroKnowledge::Zero;
+                let (profile_start, profile_end) = if starts_at_profile_start {
+                    (directed_start, directed_end)
+                } else {
+                    (directed_end, directed_start)
+                };
+                control_points[0] =
+                    raw_vertex_coordinates(&vertices[profile_start.index()])?.clone();
+                *control_points
+                    .last_mut()
+                    .expect("validated rational Bezier profile has controls") =
+                    raw_vertex_coordinates(&vertices[profile_end.index()])?.clone();
+            }
+            let edge_uses = self
+                .edge_uses()
+                .map(|(_, edge_use)| RawEdgeUse {
+                    edge: edge_use.edge().index(),
+                    direction: edge_use.direction().into(),
+                    pcurve: edge_use.pcurve().index(),
+                    parameter_correspondence: match edge_use.parameter_correspondence() {
+                        ParameterCorrespondence::Affine { scale, offset, .. } => {
+                            RawParameterCorrespondence::Affine {
+                                scale: scale.clone(),
+                                offset: offset.clone(),
+                            }
+                        }
+                        ParameterCorrespondence::Coordinate {
+                            axis,
+                            scale,
+                            offset,
+                        } => RawParameterCorrespondence::Coordinate {
+                            axis: match axis {
+                                hypercurve::Axis2::X => RawCoordinateAxis::U,
+                                hypercurve::Axis2::Y => RawCoordinateAxis::V,
+                            },
+                            scale: scale.clone(),
+                            offset: offset.clone(),
+                        },
+                        ParameterCorrespondence::AngularSweep => {
+                            RawParameterCorrespondence::AngularSweep
+                        }
+                    },
+                })
+                .collect();
+            let wires = self
+                .wires()
+                .map(|(_, wire)| RawWire {
+                    edge_uses: wire.edge_uses().iter().map(|id| id.index()).collect(),
+                })
+                .collect();
+            let faces = self
+                .faces()
+                .map(|(_, face)| RawFace {
+                    surface: face.surface().index(),
+                    orientation: face.orientation().into(),
+                    outer: face.outer().map(WireId::index),
+                    inner: face.inner().iter().map(|id| id.index()).collect(),
+                })
+                .collect();
+            let shells = self
+                .shells()
+                .map(|(_, shell)| shell.faces().iter().map(|id| id.index()).collect())
+                .collect();
+            let solids = self
+                .solids()
+                .map(|(_, solid)| RawSolid {
+                    outer: solid.outer().index(),
+                    voids: solid.voids().iter().map(|id| id.index()).collect(),
+                })
+                .collect();
+            Ok(ImportedModel {
+                data: RawModelData {
+                    version: FORMAT_VERSION,
+                    selection: graph.finish(),
+                    vertices,
+                    curves,
+                    pcurves,
+                    surfaces,
+                    edges,
+                    edge_uses,
+                    wires,
+                    faces,
+                    shells,
+                    solids,
+                },
+            })
+        })
+    }
+
+    /// Encodes the trusted model as deterministic exact JSON.
+    pub fn to_json(&self) -> Result<String, PersistenceError> {
+        crate::context::strict(|| self.to_raw()?.to_json())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawModelData {
+    version: u32,
+    selection: RawSelectionGraph,
+    vertices: Vec<RawVertex>,
+    curves: Vec<RawCurve3>,
+    pcurves: Vec<RawPcurve>,
+    surfaces: Vec<RawSurface>,
+    edges: Vec<RawEdge>,
+    edge_uses: Vec<RawEdgeUse>,
+    wires: Vec<RawWire>,
+    faces: Vec<RawFace>,
+    shells: Vec<Vec<usize>>,
+    solids: Vec<RawSolid>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum RawCurve3 {
+    AffineImage(Box<RawAffineCurve3>),
+    Rotation(Box<RawRotationCurve3>),
+    Translation(Box<RawTranslationCurve3>),
+    PlanarImage(Box<RawPlanarCurve3>),
+    Line(Box<RawLine3>),
+    RationalBezier {
+        control_points: Vec<[Real; 3]>,
+        weights: Vec<Real>,
+    },
+    Nurbs {
+        degree: usize,
+        control_points: Vec<[Real; 3]>,
+        weights: Vec<Real>,
+        knots: Vec<Real>,
+    },
+    EllipseArc(Box<RawEllipseArc3>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawAffineCurve3 {
+    source: RawCurve3,
+    transform: [[Real; 4]; 4],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawRotationCurve3 {
+    origin: RawSpatialPoint,
+    axis_origin: [Real; 3],
+    axis: [Real; 3],
+    domain: [Real; 2],
+    angle_direction: i8,
+    angle_offset: Real,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawTranslationCurve3 {
+    origin: RawSpatialPoint,
+    displacement: [Real; 3],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawPlanarCurve3 {
+    source: Box<RawPcurve>,
+    origin: [Real; 3],
+    u: [Real; 3],
+    v: [Real; 3],
+    source_chart: [Real; 2],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawLine3 {
+    start: [Real; 3],
+    end: [Real; 3],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawEllipseArc3 {
+    circle: bool,
+    center: [Real; 3],
+    x: [Real; 3],
+    y: [Real; 3],
+    x_radius: Real,
+    y_radius: Real,
+    domain: [Real; 2],
+    angle_at_start: Real,
+    direction: i8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum RawPcurve {
+    ParallelFidelity {
+        definition: String,
+        verification_depth: usize,
+    },
+    ChordReference(usize),
+    PolynomialBranch(Box<RawPolynomialBranch>),
+    Chord {
+        start: Box<RawPlanarPoint>,
+        end: Box<RawPlanarPoint>,
+    },
+    QuadraticBezier([[Real; 2]; 3]),
+    CubicBezier([[Real; 2]; 4]),
+    AnalyticParallel(Box<RawParallelPcurve>),
+    SourceRange {
+        source: usize,
+        range: [RawParameter; 2],
+        reversed: bool,
+    },
+    Line {
+        start: [Real; 2],
+        end: [Real; 2],
+    },
+    CircularArc {
+        start: [Real; 2],
+        end: [Real; 2],
+        center: [Real; 2],
+        clockwise: bool,
+    },
+    RationalBezier {
+        homogeneous_controls: Vec<[Real; 3]>,
+    },
+    RationalQuadraticBezier {
+        control_points: [[Real; 2]; 3],
+        weights: [Real; 3],
+    },
+    Nurbs {
+        degree: usize,
+        homogeneous_controls: Vec<[Real; 3]>,
+        knots: Vec<Real>,
+        period: Option<Real>,
+    },
+}
+
+fn set_raw_pcurve_start(curve: &mut RawPcurve, start: [Real; 2]) {
+    match curve {
+        RawPcurve::Line {
+            start: curve_start, ..
+        }
+        | RawPcurve::CircularArc {
+            start: curve_start, ..
+        } => *curve_start = start,
+        RawPcurve::RationalBezier {
+            homogeneous_controls,
+        } => {
+            let weight = homogeneous_controls[0][2].clone();
+            homogeneous_controls[0] = [&start[0] * &weight, &start[1] * &weight, weight];
+        }
+        RawPcurve::RationalQuadraticBezier { control_points, .. } => {
+            control_points[0] = start;
+        }
+        RawPcurve::QuadraticBezier(points) => points[0] = start,
+        RawPcurve::CubicBezier(points) => points[0] = start,
+        RawPcurve::ChordReference(_)
+        | RawPcurve::PolynomialBranch(_)
+        | RawPcurve::Nurbs { .. }
+        | RawPcurve::Chord { .. }
+        | RawPcurve::SourceRange { .. }
+        | RawPcurve::AnalyticParallel(_)
+        | RawPcurve::ParallelFidelity { .. } => {}
+    }
+}
+
+fn set_raw_pcurve_end(curve: &mut RawPcurve, end: [Real; 2]) {
+    match curve {
+        RawPcurve::Line { end: curve_end, .. } | RawPcurve::CircularArc { end: curve_end, .. } => {
+            *curve_end = end
+        }
+        RawPcurve::RationalBezier {
+            homogeneous_controls,
+        } => {
+            let control = homogeneous_controls
+                .last_mut()
+                .expect("validated rational Bezier pcurve has controls");
+            let weight = control[2].clone();
+            *control = [&end[0] * &weight, &end[1] * &weight, weight];
+        }
+        RawPcurve::RationalQuadraticBezier { control_points, .. } => {
+            control_points[2] = end;
+        }
+        RawPcurve::QuadraticBezier(points) => points[2] = end,
+        RawPcurve::CubicBezier(points) => points[3] = end,
+        RawPcurve::ChordReference(_)
+        | RawPcurve::PolynomialBranch(_)
+        | RawPcurve::Nurbs { .. }
+        | RawPcurve::Chord { .. }
+        | RawPcurve::SourceRange { .. }
+        | RawPcurve::AnalyticParallel(_)
+        | RawPcurve::ParallelFidelity { .. } => {}
+    }
+}
+
+fn project_raw_plane_point(
+    point: &[Real; 3],
+    origin: &Point3,
+    u: &Vector3,
+    v: &Vector3,
+) -> Result<[Real; 2], PersistenceError> {
+    let point = Point3::new(point[0].clone(), point[1].clone(), point[2].clone());
+    let projected = crate::geometry::project_point_to_plane_frame(origin, u, v, &point)?;
+    Ok([projected.x, projected.y])
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum RawSurface {
+    Plane {
+        origin: [Real; 3],
+        u: [Real; 3],
+        v: [Real; 3],
+    },
+    Cylinder {
+        origin: [Real; 3],
+        x: [Real; 3],
+        y: [Real; 3],
+        axis: [Real; 3],
+        radius: Real,
+    },
+    Sphere {
+        center: [Real; 3],
+        x: [Real; 3],
+        y: [Real; 3],
+        axis: [Real; 3],
+        radius: Real,
+    },
+    Cone {
+        apex: [Real; 3],
+        x: [Real; 3],
+        y: [Real; 3],
+        axis: [Real; 3],
+        semi_angle: Real,
+    },
+    Torus {
+        center: [Real; 3],
+        x: [Real; 3],
+        y: [Real; 3],
+        axis: [Real; 3],
+        major_radius: Real,
+        minor_radius: Real,
+    },
+    Extrusion {
+        profile: Box<RawCurve3>,
+        direction: [Real; 3],
+    },
+    Revolution {
+        profile: Box<RawCurve3>,
+        axis_origin: [Real; 3],
+        axis: [Real; 3],
+    },
+    RationalBezier {
+        control_points: Vec<Vec<[Real; 3]>>,
+        weights: Vec<Vec<Real>>,
+    },
+    Nurbs {
+        u_degree: usize,
+        v_degree: usize,
+        control_points: Vec<Vec<[Real; 3]>>,
+        weights: Vec<Vec<Real>>,
+        u_knots: Vec<Real>,
+        v_knots: Vec<Real>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawEdge {
+    start: usize,
+    end: usize,
+    curve: usize,
+    domain: [RawParameter; 2],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawEdgeUse {
+    edge: usize,
+    direction: RawDirection,
+    pcurve: usize,
+    parameter_correspondence: RawParameterCorrespondence,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawWire {
+    edge_uses: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum RawCoordinateAxis {
+    U,
+    V,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum RawParameterCorrespondence {
+    Coordinate {
+        axis: RawCoordinateAxis,
+        scale: Real,
+        offset: Real,
+    },
+    Affine {
+        scale: Real,
+        offset: Real,
+    },
+    AngularSweep,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawFace {
+    surface: usize,
+    orientation: RawOrientation,
+    outer: Option<usize>,
+    inner: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawSolid {
+    outer: usize,
+    voids: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum RawDirection {
+    Forward,
+    Reversed,
+}
+
+impl From<RawDirection> for Direction {
+    fn from(value: RawDirection) -> Self {
+        match value {
+            RawDirection::Forward => Self::Forward,
+            RawDirection::Reversed => Self::Reversed,
+        }
+    }
+}
+
+impl From<Direction> for RawDirection {
+    fn from(value: Direction) -> Self {
+        match value {
+            Direction::Forward => Self::Forward,
+            Direction::Reversed => Self::Reversed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum RawOrientation {
+    Forward,
+    Reversed,
+}
+
+impl From<RawOrientation> for Orientation {
+    fn from(value: RawOrientation) -> Self {
+        match value {
+            RawOrientation::Forward => Self::Forward,
+            RawOrientation::Reversed => Self::Reversed,
+        }
+    }
+}
+
+impl From<Orientation> for RawOrientation {
+    fn from(value: Orientation) -> Self {
+        match value {
+            Orientation::Forward => Self::Forward,
+            Orientation::Reversed => Self::Reversed,
+        }
+    }
+}
+
+fn raw_curve3(
+    curve: Curve3ExactData,
+    graph: &mut GraphEncoder,
+) -> Result<RawCurve3, PersistenceError> {
+    Ok(match curve {
+        Curve3ExactData::AffineImage(image) => RawCurve3::AffineImage(Box::new(RawAffineCurve3 {
+            source: raw_curve3(image.source.exact_data(), graph)?,
+            transform: image.transform.0,
+        })),
+        Curve3ExactData::Rotation(rotation) => RawCurve3::Rotation(Box::new(RawRotationCurve3 {
+            origin: graph.spatial_point(&rotation.origin)?,
+            axis_origin: point_array(&rotation.axis_origin),
+            axis: vector_array(&rotation.axis),
+            domain: [
+                rotation.domain.start().clone(),
+                rotation.domain.end().clone(),
+            ],
+            angle_direction: rotation.angle_direction,
+            angle_offset: rotation.angle_offset,
+        })),
+        Curve3ExactData::Translation(line) => {
+            RawCurve3::Translation(Box::new(RawTranslationCurve3 {
+                origin: graph.spatial_point(&line.origin)?,
+                displacement: vector_array(&line.displacement),
+            }))
+        }
+        Curve3ExactData::PlanarImage(image) => RawCurve3::PlanarImage(Box::new(RawPlanarCurve3 {
+            source: Box::new(graph.pcurve(&image.source)?),
+            origin: point_array(&image.origin),
+            u: vector_array(&image.u),
+            v: vector_array(&image.v),
+            source_chart: [image.source_scale, image.source_offset],
+        })),
+        Curve3ExactData::Line(data) => RawCurve3::Line(Box::new(RawLine3 {
+            start: point_array(&data.start),
+            end: point_array(&data.end),
+        })),
+        Curve3ExactData::RationalBezier {
+            control_points,
+            weights,
+        } => RawCurve3::RationalBezier {
+            control_points: control_points.iter().map(point_array).collect(),
+            weights,
+        },
+        Curve3ExactData::Nurbs {
+            degree,
+            control_points,
+            weights,
+            knots,
+        } => RawCurve3::Nurbs {
+            degree,
+            control_points: control_points.iter().map(point_array).collect(),
+            weights,
+            knots,
+        },
+        Curve3ExactData::EllipseArc(data) => {
+            let EllipseArcExactData {
+                circle,
+                center,
+                x,
+                y,
+                x_radius,
+                y_radius,
+                domain_start,
+                domain_end,
+                angle_at_start,
+                direction,
+            } = *data;
+            RawCurve3::EllipseArc(Box::new(RawEllipseArc3 {
+                circle,
+                center: point_array(&center),
+                x: vector_array(&x),
+                y: vector_array(&y),
+                x_radius,
+                y_radius,
+                domain: [domain_start, domain_end],
+                angle_at_start,
+                direction,
+            }))
+        }
+    })
+}
+
+fn curve3(curve: RawCurve3, graph: &SelectionGraph) -> Result<Curve3, PersistenceError> {
+    let data = match curve {
+        RawCurve3::AffineImage(image) => {
+            let RawAffineCurve3 { source, transform } = *image;
+            return Ok(Curve3::affine_image(
+                curve3(source, graph)?,
+                crate::Matrix4::new(transform),
+            )?);
+        }
+        RawCurve3::Rotation(rotation) => {
+            let origin = graph.spatial_point(rotation.origin)?;
+            let [start, end] = rotation.domain;
+            Curve3ExactData::Rotation(Box::new(crate::geometry::RotationCurve3 {
+                origin,
+                axis_origin: point3(rotation.axis_origin),
+                axis: vector3(rotation.axis),
+                domain: crate::ParameterDomain::new(start, end)?,
+                angle_direction: rotation.angle_direction,
+                angle_offset: rotation.angle_offset,
+            }))
+        }
+        RawCurve3::Translation(line) => {
+            let RawTranslationCurve3 {
+                origin,
+                displacement,
+            } = *line;
+            return Ok(Curve3::translation(
+                graph.spatial_point(origin)?,
+                Vector3::new(displacement),
+            )?);
+        }
+        RawCurve3::PlanarImage(image) => {
+            let RawPlanarCurve3 {
+                source,
+                origin,
+                u,
+                v,
+                source_chart: [source_scale, source_offset],
+            } = *image;
+            Curve3ExactData::PlanarImage(Box::new(crate::geometry::PlanarCurve3 {
+                source: pcurve(*source, graph)?,
+                origin: point3(origin),
+                u: vector3(u),
+                v: vector3(v),
+                source_scale,
+                source_offset,
+            }))
+        }
+        RawCurve3::Line(data) => Curve3ExactData::Line(Box::new(Line3ExactData {
+            start: point3(data.start),
+            end: point3(data.end),
+        })),
+        RawCurve3::RationalBezier {
+            control_points,
+            weights,
+        } => Curve3ExactData::RationalBezier {
+            control_points: control_points.into_iter().map(point3).collect(),
+            weights,
+        },
+        RawCurve3::Nurbs {
+            degree,
+            control_points,
+            weights,
+            knots,
+        } => Curve3ExactData::Nurbs {
+            degree,
+            control_points: control_points.into_iter().map(point3).collect(),
+            weights,
+            knots,
+        },
+        RawCurve3::EllipseArc(data) => {
+            let RawEllipseArc3 {
+                circle,
+                center,
+                x,
+                y,
+                x_radius,
+                y_radius,
+                domain,
+                angle_at_start,
+                direction,
+            } = *data;
+            let [domain_start, domain_end] = domain;
+            Curve3ExactData::EllipseArc(Box::new(EllipseArcExactData {
+                circle,
+                center: point3(center),
+                x: vector3(x),
+                y: vector3(y),
+                x_radius,
+                y_radius,
+                domain_start,
+                domain_end,
+                angle_at_start,
+                direction,
+            }))
+        }
+    };
+    Ok(Curve3::from_exact_data(data)?)
+}
+
+fn raw_surface(
+    surface: SurfaceExactData,
+    graph: &mut GraphEncoder,
+) -> Result<RawSurface, PersistenceError> {
+    Ok(match surface {
+        SurfaceExactData::Plane { origin, u, v } => RawSurface::Plane {
+            origin: point_array(&origin),
+            u: vector_array(&u),
+            v: vector_array(&v),
+        },
+        SurfaceExactData::Cylinder {
+            origin,
+            x,
+            y,
+            axis,
+            radius,
+        } => RawSurface::Cylinder {
+            origin: point_array(&origin),
+            x: vector_array(&x),
+            y: vector_array(&y),
+            axis: vector_array(&axis),
+            radius,
+        },
+        SurfaceExactData::Sphere {
+            center,
+            x,
+            y,
+            axis,
+            radius,
+        } => RawSurface::Sphere {
+            center: point_array(&center),
+            x: vector_array(&x),
+            y: vector_array(&y),
+            axis: vector_array(&axis),
+            radius,
+        },
+        SurfaceExactData::Cone {
+            apex,
+            x,
+            y,
+            axis,
+            semi_angle,
+        } => RawSurface::Cone {
+            apex: point_array(&apex),
+            x: vector_array(&x),
+            y: vector_array(&y),
+            axis: vector_array(&axis),
+            semi_angle,
+        },
+        SurfaceExactData::Torus {
+            center,
+            x,
+            y,
+            axis,
+            major_radius,
+            minor_radius,
+        } => RawSurface::Torus {
+            center: point_array(&center),
+            x: vector_array(&x),
+            y: vector_array(&y),
+            axis: vector_array(&axis),
+            major_radius,
+            minor_radius,
+        },
+        SurfaceExactData::Extrusion { profile, direction } => RawSurface::Extrusion {
+            profile: Box::new(raw_curve3(*profile, graph)?),
+            direction: vector_array(&direction),
+        },
+        SurfaceExactData::Revolution {
+            profile,
+            axis_origin,
+            axis,
+        } => RawSurface::Revolution {
+            profile: Box::new(raw_curve3(*profile, graph)?),
+            axis_origin: point_array(&axis_origin),
+            axis: vector_array(&axis),
+        },
+        SurfaceExactData::RationalBezier {
+            control_points,
+            weights,
+        } => RawSurface::RationalBezier {
+            control_points: control_points
+                .iter()
+                .map(|row| row.iter().map(point_array).collect())
+                .collect(),
+            weights,
+        },
+        SurfaceExactData::Nurbs {
+            u_degree,
+            v_degree,
+            control_points,
+            weights,
+            u_knots,
+            v_knots,
+        } => RawSurface::Nurbs {
+            u_degree,
+            v_degree,
+            control_points: control_points
+                .iter()
+                .map(|row| row.iter().map(point_array).collect())
+                .collect(),
+            weights,
+            u_knots,
+            v_knots,
+        },
+    })
+}
+
+fn surface3(surface: RawSurface, graph: &SelectionGraph) -> Result<Surface, PersistenceError> {
+    let data = match surface {
+        RawSurface::Plane { origin, u, v } => SurfaceExactData::Plane {
+            origin: point3(origin),
+            u: vector3(u),
+            v: vector3(v),
+        },
+        RawSurface::Cylinder {
+            origin,
+            x,
+            y,
+            axis,
+            radius,
+        } => SurfaceExactData::Cylinder {
+            origin: point3(origin),
+            x: vector3(x),
+            y: vector3(y),
+            axis: vector3(axis),
+            radius,
+        },
+        RawSurface::Sphere {
+            center,
+            x,
+            y,
+            axis,
+            radius,
+        } => SurfaceExactData::Sphere {
+            center: point3(center),
+            x: vector3(x),
+            y: vector3(y),
+            axis: vector3(axis),
+            radius,
+        },
+        RawSurface::Cone {
+            apex,
+            x,
+            y,
+            axis,
+            semi_angle,
+        } => SurfaceExactData::Cone {
+            apex: point3(apex),
+            x: vector3(x),
+            y: vector3(y),
+            axis: vector3(axis),
+            semi_angle,
+        },
+        RawSurface::Torus {
+            center,
+            x,
+            y,
+            axis,
+            major_radius,
+            minor_radius,
+        } => SurfaceExactData::Torus {
+            center: point3(center),
+            x: vector3(x),
+            y: vector3(y),
+            axis: vector3(axis),
+            major_radius,
+            minor_radius,
+        },
+        RawSurface::Extrusion { profile, direction } => SurfaceExactData::Extrusion {
+            profile: Box::new(curve3(*profile, graph)?.exact_data()),
+            direction: vector3(direction),
+        },
+        RawSurface::Revolution {
+            profile,
+            axis_origin,
+            axis,
+        } => SurfaceExactData::Revolution {
+            profile: Box::new(curve3(*profile, graph)?.exact_data()),
+            axis_origin: point3(axis_origin),
+            axis: vector3(axis),
+        },
+        RawSurface::RationalBezier {
+            control_points,
+            weights,
+        } => SurfaceExactData::RationalBezier {
+            control_points: control_points
+                .into_iter()
+                .map(|row| row.into_iter().map(point3).collect())
+                .collect(),
+            weights,
+        },
+        RawSurface::Nurbs {
+            u_degree,
+            v_degree,
+            control_points,
+            weights,
+            u_knots,
+            v_knots,
+        } => SurfaceExactData::Nurbs {
+            u_degree,
+            v_degree,
+            control_points: control_points
+                .into_iter()
+                .map(|row| row.into_iter().map(point3).collect())
+                .collect(),
+            weights,
+            u_knots,
+            v_knots,
+        },
+    };
+    Ok(Surface::from_exact_data(data)?)
+}
+
+fn raw_vertex_coordinates(vertex: &RawVertex) -> Result<&[Real; 3], GeometryError> {
+    match vertex {
+        RawVertex::Coordinates(coordinates) => Ok(coordinates),
+        _ => Err(GeometryError::UnrepresentablePoint),
+    }
+}
+
+fn point_array(point: &Point3) -> [Real; 3] {
+    [point.x.clone(), point.y.clone(), point.z.clone()]
+}
+
+fn curve_point_array(point: &CurvePoint2) -> [Real; 2] {
+    [point.x().clone(), point.y().clone()]
+}
+
+fn vector_array(vector: &Vector3) -> [Real; 3] {
+    [
+        vector.0[0].clone(),
+        vector.0[1].clone(),
+        vector.0[2].clone(),
+    ]
+}
+
+fn point3(point: [Real; 3]) -> Point3 {
+    let [x, y, z] = point;
+    Point3::new(x, y, z)
+}
+
+fn vector3(vector: [Real; 3]) -> Vector3 {
+    Vector3::new(vector)
+}
+
+fn curve_point2(point: [Real; 2]) -> CurvePoint2 {
+    let [x, y] = point;
+    CurvePoint2::new(x, y)
+}
+
+fn vertex_id(index: usize) -> VertexId {
+    VertexId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn curve_id(index: usize) -> Curve3Id {
+    Curve3Id::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn pcurve_id(index: usize) -> PcurveId {
+    PcurveId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn surface_id(index: usize) -> SurfaceId {
+    SurfaceId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn edge_id(index: usize) -> EdgeId {
+    EdgeId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn edge_use_id(index: usize) -> EdgeUseId {
+    EdgeUseId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn wire_id(index: usize) -> WireId {
+    WireId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn face_id(index: usize) -> FaceId {
+    FaceId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn shell_id(index: usize) -> ShellId {
+    ShellId::from_index(index.min(u32::MAX as usize)).expect("bounded model ID")
+}
+
+fn pcurve(raw: RawPcurve, graph: &SelectionGraph) -> Result<Curve2, PersistenceError> {
+    match raw {
+        RawPcurve::ParallelFidelity {
+            definition,
+            verification_depth,
+        } => {
+            // Input admission has already bounded actual graph sizes/depth and
+            // this declared verifier control. Recompute syntax, never trust a
+            // serialized summary or proof flag. Byte/depth limits here match
+            // the admitted payload; the independent verifier limit stays explicit.
+            let shape =
+                Curve2::inspect_native_parallel_fidelity_definition(&definition, definition.len())
+                    .map_err(PersistenceError::NativeCurve)?;
+            Curve2::from_native_parallel_fidelity_definition(
+                &definition,
+                hypercurve::SvgOptions {
+                    max_extension_bytes: definition.len(),
+                    max_point_definition_depth: shape.dependency_depth,
+                    max_parallel_verification_depth: verification_depth,
+                    ..Default::default()
+                },
+            )
+            .map_err(PersistenceError::NativeCurve)
+        }
+        RawPcurve::ChordReference(index) => graph.chord_reference(index),
+        RawPcurve::PolynomialBranch(branch) => branch.into_curve(graph),
+        RawPcurve::Chord { start, end } => Ok(Curve2::try_line(
+            graph.planar_point(*start)?,
+            graph.planar_point(*end)?,
+        )
+        .map_err(GeometryError::from)?),
+        RawPcurve::QuadraticBezier(points) => {
+            let [a, b, c] = points.map(curve_point2);
+            Ok(Curve2::from(hypercurve::QuadraticBezier2::new(a, b, c)))
+        }
+        RawPcurve::CubicBezier(points) => {
+            let [a, b, c, d] = points.map(curve_point2);
+            Ok(Curve2::from(hypercurve::CubicBezier2::new(a, b, c, d)))
+        }
+        RawPcurve::AnalyticParallel(raw) => raw.into_curve(graph),
+        RawPcurve::Line { start, end } => {
+            let line = LineSeg2::try_new(curve_point2(start), curve_point2(end))
+                .map_err(GeometryError::from)
+                .map_err(BuildError::from)?;
+            Ok(Curve2::from(line))
+        }
+        RawPcurve::CircularArc {
+            start,
+            end,
+            center,
+            clockwise,
+        } => {
+            let arc = CircularArc2::try_from_center(
+                curve_point2(start),
+                curve_point2(end),
+                curve_point2(center),
+                clockwise,
+            )
+            .map_err(GeometryError::from)
+            .map_err(BuildError::from)?;
+            Ok(Curve2::from(arc))
+        }
+        RawPcurve::RationalBezier {
+            homogeneous_controls,
+        } => {
+            let curve = crate::error::classified(RationalBezier2::from_homogeneous_controls(
+                homogeneous_controls
+                    .into_iter()
+                    .map(|[x, y, w]| hypercurve::HomogeneousControl2::new(x, y, w))
+                    .collect(),
+            ))
+            .map_err(GeometryError::from)?;
+            let hypercurve::Classification::Decided(curve) = curve else {
+                return Err(GeometryError::UnsupportedPcurveContour.into());
+            };
+            Ok(Curve2::from(curve))
+        }
+        RawPcurve::RationalQuadraticBezier {
+            control_points,
+            weights,
+        } => {
+            let [start, control, end] = control_points.map(curve_point2);
+            let [start_weight, control_weight, end_weight] = weights;
+            let curve = RationalQuadraticBezier2::try_new(
+                start,
+                control,
+                end,
+                start_weight,
+                control_weight,
+                end_weight,
+            )
+            .map_err(GeometryError::from)
+            .map_err(BuildError::from)?;
+            Ok(Curve2::from(curve))
+        }
+        RawPcurve::Nurbs {
+            degree,
+            homogeneous_controls,
+            knots,
+            period,
+        } => {
+            let curve = hypercurve::NurbsCurve2::from_homogeneous_controls(
+                degree,
+                homogeneous_controls
+                    .into_iter()
+                    .map(|[x, y, weight]| hypercurve::HomogeneousControl2::new(x, y, weight))
+                    .collect(),
+                knots,
+                match period {
+                    Some(period) => hypercurve::SplinePeriodicity2::Periodic { period },
+                    None => hypercurve::SplinePeriodicity2::NonPeriodic,
+                },
+            )
+            .map_err(GeometryError::from)
+            .map_err(BuildError::from)?;
+            Ok(Curve2::from(curve))
+        }
+        RawPcurve::SourceRange {
+            source,
+            range,
+            reversed,
+        } => {
+            let source =
+                graph
+                    .pcurve_sources
+                    .get(source)
+                    .ok_or(PersistenceError::InvalidReference {
+                        kind: "pcurve source",
+                        index: source,
+                    })?;
+            let [start, end] = range;
+            let range = hypercurve::CurveParameterRange2::try_new(
+                graph.parameter(start)?.curve_parameter(),
+                graph.parameter(end)?.curve_parameter(),
+            )
+            .map_err(GeometryError::from)?;
+            let curve = source.restrict_source(range).map_err(GeometryError::from)?;
+            if reversed {
+                Ok(curve.reversed().map_err(GeometryError::from)?)
+            } else {
+                Ok(curve)
+            }
+        }
+    }
+}
+
+fn raw_native_pcurve(curve: &Curve2) -> Result<RawPcurve, PersistenceError> {
+    if curve.parallel_fidelity().is_some() {
+        return Ok(RawPcurve::ParallelFidelity {
+            definition: curve
+                .to_native_parallel_fidelity_definition()
+                .map_err(PersistenceError::NativeCurve)?,
+            verification_depth: hypercurve::SvgOptions::default().max_parallel_verification_depth,
+        });
+    }
+    match curve.geometry() {
+        Some(CurveGeometry2::QuadraticBezier(curve)) => Ok(RawPcurve::QuadraticBezier(
+            curve.control_points().map(curve_point_array),
+        )),
+        Some(CurveGeometry2::CubicBezier(curve)) => Ok(RawPcurve::CubicBezier(
+            curve.control_points().map(curve_point_array),
+        )),
+        Some(CurveGeometry2::Line(_)) => {
+            let (start, end) = Pcurve::new(curve.clone())
+                .endpoints()
+                .map_err(BuildError::from)?;
+            Ok(RawPcurve::Line {
+                start: [start.x, start.y],
+                end: [end.x, end.y],
+            })
+        }
+        Some(CurveGeometry2::CircularArc(arc)) => Ok(RawPcurve::CircularArc {
+            start: curve_point_array(arc.start()),
+            end: curve_point_array(arc.end()),
+            center: curve_point_array(arc.center()),
+            clockwise: arc.is_clockwise(),
+        }),
+        Some(CurveGeometry2::RationalBezier(curve)) => Ok(RawPcurve::RationalBezier {
+            homogeneous_controls: curve
+                .homogeneous_controls()
+                .iter()
+                .map(|control| {
+                    [
+                        control.x().clone(),
+                        control.y().clone(),
+                        control.weight().clone(),
+                    ]
+                })
+                .collect(),
+        }),
+        Some(CurveGeometry2::RationalQuadraticBezier(curve)) => {
+            Ok(RawPcurve::RationalQuadraticBezier {
+                control_points: curve.control_points().map(curve_point_array),
+                weights: curve.weights().map(Clone::clone),
+            })
+        }
+        Some(CurveGeometry2::Nurbs(curve)) => Ok(RawPcurve::Nurbs {
+            degree: curve.degree(),
+            homogeneous_controls: curve
+                .homogeneous_controls()
+                .iter()
+                .map(|control| {
+                    [
+                        control.x().clone(),
+                        control.y().clone(),
+                        control.weight().clone(),
+                    ]
+                })
+                .collect(),
+            knots: curve.knots().to_vec(),
+            period: curve.periodicity().period().cloned(),
+        }),
+        _ => Err(PersistenceError::UnsupportedPcurve(curve.family())),
+    }
+}
+
+#[cfg(test)]
+mod tests;
