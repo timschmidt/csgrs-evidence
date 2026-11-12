@@ -1,0 +1,458 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index b92234204..89edd3e4f 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -2447,6 +2447,86 @@ is evidence infrastructure, not an adopted optimization. Jacobian carriers,
+ independent authored center/radius, remaining specializations and later phases
+ stay open. No phase completion, full pre-push run or push is claimed.
+ 
++## Phase 2/6 admission: fixed exact-integer division and Clarke specialization
++
++Baseline `434b6e09a1b8edae9df7764254eb07442342dc0c`. Owner: Hyperinterval fixed
++arithmetic, consumed by the unpublished FOC conformance client. P1, P5–P7,
++P18–P20 and P31–P33. The missing-method witness fails on that revision and now
++passes: raw i64/F63 `[-5,7] / 3` has tight grid bounds `[-2,3]`, although the
++point integer three is not representable in that format.
++
++`div_integer(i64)` covers both fixed endpoint widths, every valid fractional
++scale and every signed i64 divisor. It retains the grid, normalizes negative
++order in i128, and reuses `quotient_bounds` and `from_wide`. Zero is rejected
++before empty propagation; nonzero division preserves empty. Signed extremes,
++including i64::MIN divisors, remain exact; MIN/-1 is typed overflow where the
++endpoint cannot fit. This constant-size operation allocates nothing. Existing
++fixed method bodies and their ordering are byte-identical after removing the
++new method and its reciprocal documentation link; 171 other previously audited
++production/support files remain byte-identical. No decision policy, certainty
++receipt, dispatch sequence, production dependency or firmware source changes.
++
++The FOC client reuses the existing affine image for `2*a`, then subtracts b and
++c before integer division by three. All integer linear intermediates fit i64
++for Q30 i32 inputs; no intermediate rounding or new failure occurs. The balance
++check remains first. Park and its original overflow/rounding witnesses remain
++unchanged. This extends the fixed domain and specializes an evidence client;
++it does not claim completion of firmware adoption or the general refactor gates.
++
++Independent cross-product inequalities prove tightness for 1,673,100 small
++interval/divisor cases across twelve scale instantiations, plus full endpoint/
++divisor extremes and 20,000 seeded full-width cases (seed 20261113). Tests cover
++point-denominator equivalence where representable, zero/empty priority, typed
++overflow, subsequent division, storage widening and fresh-process checked replay.
++A separate executable measures zero allocations for successful and failing
++arithmetic. An initial hand-computed replay expectation was wrong by one lower
++ulp; its failing log is retained. Exact inequalities corrected the expectation
++and added an explicit first-stage bound assertion; no implementation or existing
++fixture was weakened.
++
++All 38 final matrix commands pass: Rust 1.88/stable debug and release tests,
++Clippy with warnings denied, documentation with warnings denied, ARM/Wasm
++library checks and Clippy, formatting, the fixed-only lattice suite (23 tests/
++doctests), all 83 original FOC tests and dependency inspection. Scalar fixed+
++serde suites each pass 33 tests/doctests. Additional fixed-only targeted tests,
++the formerly failing witness, and ASan with leak detection pass. The unchanged
++399,950-outcome FOC corpus and repeated operation chains pass on both compilers.
++Focused scalar coverage exercises all 15 emitted div_integer instances and
++27/28 distinct source regions; the remaining region is scale-validation error
++propagation, unreachable through safe constructors of valid intervals. Client
++coverage is 168/170 lines, 364/385 regions and 16/16 functions; this is scoped
++coverage, not whole-crate completeness. No new fuzz, hosted-OS or HIL claim.
++
++The rebuilt allocator-free Wasm module has zero imports and passes the same
++independent Python integer oracle: 1,660 completed transform calls and 405
++full-range Park checks (335 successes, 70 range errors). It is 40,006 bytes,
++SHA-256 `28f5514ceb76f127a8dfedc8998a7b9d3798d368262d023a9bcdfbb12f0fc3e5`;
++maximum observed fuel is 19,081 under a one-million-per-call cap. This measures
++that artifact, not hardware cycles or a general resource bound.
++
++Six alternating baseline/final rounds per compiler contain 4,800 samples total,
++512 completed calls per sample, including materialized outputs and digest work.
++All full-output prechecks, checksums and five footprint-probe seeds agree, with
++zero measured allocations. Median shared/native ratios change from 3.048 to
++1.588 for Clarke and 1.642 to 0.859 for the chain on Rust 1.88; stable changes
++from 4.307 to 2.144 and 3.280 to 1.734. Final shared/baseline shared time is
++0.441/0.504 for Clarke and 0.519/0.532 for the chain (1.88/stable). These short,
++unpinned shared-host measurements do not establish universal speed or any
++firmware cycle/stack, monomorphized-size or whole-workload acceptance gate.
++Matched final native/shared executables are 444,776/446,168 bytes on 1.88 and
++460,656/465,072 on stable: shared still grows by 1,392/4,416 bytes. Shared probe
++size falls by 4,432/5,576 bytes relative to the baseline shared probes.
++
++| Candidate | Decision | Evidence |
++| --- | --- | --- |
++| Exact-integer division, affine/subtract Clarke numerator, ordinary inline hint on the new method | kept | expanded divisor domain, tight exact bounds, unchanged FOC outcomes, lower measured completed cost and footprint |
++| Additional inline hint on the private narrowing adapter | rejected | shared-probe and cost .text sections identical on both compilers |
++| Production transform migration | still rejected | Clarke and stable chain slower than native; matched shared binaries remain larger |
++
++Source/evidence registration pending for this checkpoint. Remaining Phase 6
++carriers/specializations, firmware and solver adoption gates, hardware evidence,
++and all later phases remain open. No full pre-push matrix or push was performed.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 993057f0a..8c46cce5a 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add tight fixed-point division by an exact signed integer, including divisors
++  outside the fixed-point value range and signed extremes, with allocation-free
++  arithmetic and checked replay into further operations.
++
+ - Add explicit tight midpoint/radius enclosures for fixed, rational, dyadic and
+   strict IEEE intervals, including half-grid and minimum-exponent cases.
+ 
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index c8d83c79a..bf718285f 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -124,6 +124,9 @@ overflow is an error, never saturation. Integer powers use a bounded sequence
+ of outward-rounded products and may be wider than the tight hull. Storage
+ conversion is exact or fails; scale coarsening rounds outward. Strict division
+ rejects any zero-containing denominator, even with an empty numerator.
++`div_integer` divides by an exact signed integer without requiring that integer
++to fit as a fixed-point value. It retains the source grid, rounds outward, and
++rejects zero even for an empty numerator.
+ 
+ No default feature enables allocation, `std`, Hyperreal or serialization.
+ The `integer` and `fixed` builds are allocation-free `no_std` and target Rust
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index b9410c8f6..5a3a9f049 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -288,6 +288,9 @@ macro_rules! arithmetic {
+             }
+ 
+             /// Tight reciprocal enclosure, without requiring 1 to fit this lattice.
++            ///
++            /// See also [`Self::div_integer`] for division by an exact integer
++            /// that need not be representable as a fixed-point denominator.
+             pub fn reciprocal(&self) -> Result<Self, IntervalError> {
+                 let scale = Self::scale()?;
+                 if self.contains_point(0) {
+@@ -303,6 +306,44 @@ macro_rules! arithmetic {
+                 }
+             }
+ 
++            /// Tight outward enclosure of `self / divisor`, retaining this grid.
++            ///
++            /// `divisor` is an exact integer, not a lattice numerator. It need
++            /// not fit as a point of this fixed-point family. Zero is rejected
++            /// with [`IntervalError::ContainsZero`] even for an empty numerator;
++            /// otherwise empty maps to empty. Negative divisors reverse order.
++            /// An unrepresentable endpoint returns [`IntervalError::Overflow`],
++            /// including a signed minimum divided by -1. There is no saturation,
++            /// allocation, or implicit rescaling.
++            ///
++            /// ```
++            /// use hyperinterval::FixedInterval;
++            /// // This format cannot represent the point 3, but raw [-5,7]/3
++            /// // has tight outward bounds [-2,3] on the original 2^-63 grid.
++            /// let x = FixedInterval::<i64, 63>::new(-5, 7)?;
++            /// assert_eq!(x.div_integer(3)?.bounds(), Some((-2, 3)));
++            /// # Ok::<(), hyperinterval::IntervalError>(())
++            /// ```
++            #[inline]
++            pub fn div_integer(&self, divisor: i64) -> Result<Self, IntervalError> {
++                Self::scale()?;
++                if divisor == 0 {
++                    return Err(IntervalError::ContainsZero);
++                }
++                let Some((a, b)) = self.bounds() else {
++                    return Self::empty();
++                };
++                let (lower, upper, denominator) = if divisor < 0 {
++                    (-i128::from(b), -i128::from(a), -i128::from(divisor))
++                } else {
++                    (i128::from(a), i128::from(b), i128::from(divisor))
++                };
++                Self::from_wide(
++                    quotient_bounds(lower, denominator).0,
++                    quotient_bounds(upper, denominator).1,
++                )
++            }
++
+             /// Tight outward principal square root on this fixed-point lattice.
+             /// Negative source members are excluded with `Partial` coverage;
+             /// strictly negative nonempty input returns `EmptyDomain`. Empty
+diff --git a/crates/hyperinterval/tests/integer_division.rs b/crates/hyperinterval/tests/integer_division.rs
+new file mode 100644
+index 000000000..5f5dcbe71
+--- /dev/null
++++ b/crates/hyperinterval/tests/integer_division.rs
+@@ -0,0 +1,184 @@
++#![cfg(feature = "fixed")]
++use hyperinterval::{FixedInterval, IntervalError};
++
++// Independent exact cross-product witness for containment and tightness. It
++// performs no integer division and does not call the implementation's helper.
++fn tight(bounds: (i128, i128), a: i128, b: i128, divisor: i64) {
++    let (lower, upper, denominator) = if divisor < 0 {
++        (-b, -a, -i128::from(divisor))
++    } else {
++        (a, b, i128::from(divisor))
++    };
++    let (lo, hi) = bounds;
++    assert!(lo * denominator <= lower && (lo + 1) * denominator > lower);
++    assert!(hi * denominator >= upper && (hi - 1) * denominator < upper);
++}
++
++macro_rules! qualify {
++    ($name:ident, $endpoint:ty, $($frac:literal),+) => {
++        #[test]
++        fn $name() {
++            $(
++                check_scale::<$frac>();
++            )+
++            fn check_scale<const F: u32>() {
++                for a in -32..=32 {
++                    for b in a..=32 {
++                        let x = FixedInterval::<$endpoint, F>::new(a, b).unwrap();
++                        for divisor in -32..=32 {
++                            if divisor == 0 {
++                                assert_eq!(x.div_integer(0), Err(IntervalError::ContainsZero));
++                            } else {
++                                let (lo, hi) = x.div_integer(divisor).unwrap().bounds().unwrap();
++                                tight((lo.into(), hi.into()), a.into(), b.into(), divisor);
++                            }
++                        }
++                    }
++                }
++                let endpoints = [<$endpoint>::MIN, <$endpoint>::MIN + 1, -1, 0, 1, <$endpoint>::MAX - 1, <$endpoint>::MAX];
++                let divisors = [i64::MIN, i64::MIN + 1, -(1_i64 << 32), -3, -2, -1, 1, 2, 3, 1_i64 << 32, i64::MAX - 1, i64::MAX];
++                for (index, &a) in endpoints.iter().enumerate() {
++                    for &b in &endpoints[index..] {
++                        let x = FixedInterval::<$endpoint, F>::new(a, b).unwrap();
++                        for divisor in divisors {
++                            let result = x.div_integer(divisor);
++                            if a == <$endpoint>::MIN && divisor == -1 {
++                                assert_eq!(result, Err(IntervalError::Overflow));
++                            } else {
++                                let (lo, hi) = result.unwrap().bounds().unwrap();
++                                tight((lo.into(), hi.into()), a.into(), b.into(), divisor);
++                                // The exact result remains a valid subsequent operand.
++                                assert_eq!(result.unwrap().div_integer(1).unwrap(), result.unwrap());
++                            }
++                        }
++                    }
++                }
++                let empty = FixedInterval::<$endpoint, F>::empty().unwrap();
++                assert_eq!(empty.div_integer(0), Err(IntervalError::ContainsZero));
++                for divisor in divisors { assert_eq!(empty.div_integer(divisor).unwrap(), empty); }
++            }
++        }
++    }
++}
++
++qualify!(i32_all_selected_scales, i32, 0, 1, 4, 30, 31);
++qualify!(i64_all_selected_scales, i64, 0, 1, 4, 30, 32, 62, 63);
++
++#[test]
++fn point_denominator_equivalence_and_nonrepresentable_integer_divisors() {
++    // Exact point lifting is admitted only when it fits. The new operation
++    // agrees there; it also admits integers outside the point representation.
++    macro_rules! case {
++        ($ty:ty, $frac:literal) => {{
++            type I = FixedInterval<$ty, $frac>;
++            let points: [$ty; 7] = [
++                <$ty>::MIN,
++                <$ty>::MIN + 1,
++                -1,
++                0,
++                1,
++                <$ty>::MAX - 1,
++                <$ty>::MAX,
++            ];
++            for (i, &a) in points.iter().enumerate() {
++                for &b in &points[i..] {
++                    let x = I::new(a, b).unwrap();
++                    for divisor in [i64::MIN, -3, -2, -1, 0, 1, 2, 3, i64::MAX] {
++                        if let Ok(point) = I::from_ratio(divisor, 1) {
++                            assert_eq!(x.div_integer(divisor), x.checked_div(&point));
++                        }
++                    }
++                }
++            }
++        }};
++    }
++    case!(i32, 0);
++    case!(i32, 30);
++    case!(i32, 31);
++    case!(i64, 0);
++    case!(i64, 32);
++    case!(i64, 63);
++    type I = FixedInterval<i64, 63>;
++    assert_eq!(I::from_ratio(3, 1), Err(IntervalError::Overflow));
++    let x = I::new(i64::MIN, i64::MAX).unwrap();
++    assert_eq!(x.div_integer(i64::MIN).unwrap().bounds(), Some((-1, 1)));
++    let zero = I::point(0).unwrap();
++    assert_eq!(zero.div_integer(i64::MIN).unwrap(), zero);
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn replayed_output_feeds_widening_and_further_division() {
++    type I = FixedInterval<i32, 31>;
++    const KEY: &str = "HYPERINTERVAL_INTEGER_DIV_REPLAY";
++    if let Ok(text) = std::env::var(KEY) {
++        let replay: I = serde_json::from_str(&text).unwrap();
++        assert_eq!(replay.bounds(), Some((-715_827_883, 715_827_883)));
++        assert_eq!(
++            replay
++                .convert::<i64>()
++                .unwrap()
++                .div_integer(-2)
++                .unwrap()
++                .bounds(),
++            Some((-357_913_942, 357_913_942))
++        );
++        assert_eq!(serde_json::to_string(&replay).unwrap(), text);
++        return;
++    }
++    let source = I::new(i32::MIN, i32::MAX).unwrap();
++    let output = source.div_integer(3).unwrap();
++    assert_eq!(output.bounds(), Some((-715_827_883, 715_827_883)));
++    let text = serde_json::to_string(&output).unwrap();
++    let replay: I = serde_json::from_str(&text).unwrap();
++    assert_eq!(output, replay);
++    assert_eq!(
++        replay
++            .convert::<i64>()
++            .unwrap()
++            .div_integer(-2)
++            .unwrap()
++            .bounds(),
++        Some((-357_913_942, 357_913_942))
++    );
++    assert_eq!(serde_json::to_string(&replay).unwrap(), text);
++    let child = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "replayed_output_feeds_widening_and_further_division",
++            "--nocapture",
++        ])
++        .env(KEY, text)
++        .output()
++        .unwrap();
++    assert!(
++        child.status.success(),
++        "{} {}",
++        String::from_utf8_lossy(&child.stdout),
++        String::from_utf8_lossy(&child.stderr)
++    );
++}
++
++#[test]
++fn seeded_full_width_divisors_satisfy_exact_tightness() {
++    let mut state = 20_261_113_u64;
++    let mut next = || {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        state as i64
++    };
++    for _ in 0..20_000 {
++        let a = next();
++        let b = next();
++        let divisor = next();
++        let (a, b) = (a.min(b), a.max(b));
++        let x = FixedInterval::<i64, 63>::new(a, b).unwrap();
++        if divisor == 0 {
++            assert_eq!(x.div_integer(divisor), Err(IntervalError::ContainsZero));
++        } else {
++            let (lo, hi) = x.div_integer(divisor).unwrap().bounds().unwrap();
++            tight((lo.into(), hi.into()), a.into(), b.into(), divisor);
++        }
++    }
++}
+diff --git a/crates/hyperinterval/tests/integer_division_no_alloc.rs b/crates/hyperinterval/tests/integer_division_no_alloc.rs
+new file mode 100644
+index 000000000..6f55c1e17
+--- /dev/null
++++ b/crates/hyperinterval/tests/integer_division_no_alloc.rs
+@@ -0,0 +1,38 @@
++#![cfg(feature = "fixed")]
++use hyperinterval::FixedInterval;
++#[path = "../../hyperlattice-interval/conformance/allocations.rs"]
++mod allocations;
++
++#[test]
++fn integer_divisors_and_failures_allocate_nothing() {
++    let (_, calls, bytes) = allocations::measure(|| {
++        macro_rules! case {
++            ($i:ty,$endpoint:ty) => {{
++                let all = <$i>::new(<$endpoint>::MIN, <$endpoint>::MAX).unwrap();
++                let empty = <$i>::empty().unwrap();
++                for divisor in [
++                    i64::MIN,
++                    i64::MIN + 1,
++                    -3,
++                    -2,
++                    -1,
++                    0,
++                    1,
++                    2,
++                    3,
++                    i64::MAX - 1,
++                    i64::MAX,
++                ] {
++                    for source in [all, empty] {
++                        let _ = std::hint::black_box(
++                            std::hint::black_box(source).div_integer(std::hint::black_box(divisor)),
++                        );
++                    }
++                }
++            }};
++        }
++        case!(FixedInterval<i32,31>,i32);
++        case!(FixedInterval<i64,63>,i64);
++    });
++    assert_eq!((calls, bytes), (0, 0));
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/README.md b/crates/hyperlattice-interval/conformance/alumina-foc/README.md
+index 3653e4c81..247feaafa 100644
+--- a/crates/hyperlattice-interval/conformance/alumina-foc/README.md
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/README.md
+@@ -21,7 +21,9 @@ FOC/protocol and Hyperinterval/Hyperlattice interval algebra. The library and Wa
+ consumer are `no_std` and need no allocator; tests and native probes use `std`.
+ 
+ `clarke` keeps wide Q30 numerators until division/scaling, including differences
+-that exceed i32 but have representable outputs. Park and its inverse retain the
++that exceed i32 but have representable outputs. Its alpha path uses an exact
++integer affine image and subtractions, followed by `div_integer(3)`. Park and
++its inverse retain the
+ current sequence of rounded products and sums/differences. For example, the
+ current Park implementation can reject an intermediate `MIN * -1` even when the
+ mathematical final result fits. A signed matrix rewrite must not silently change
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs
+index 4421d3d2f..d0cd55c9e 100644
+--- a/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs
+@@ -83,17 +83,14 @@ pub fn clarke(phases: Phase3, maximum_zero_sequence: Q30) -> Result<AlphaBeta, F
+         return Err(FocError::UnbalancedPhases);
+     }
+     // All i32 source values and these integer linear combinations fit i64.
+-    let coefficient = |n| Wide::point(n * SCALE).expect("small constant");
+-    let matrix = IntervalMatrix::new([[coefficient(2), coefficient(-1), coefficient(-1)]])
+-        .expect("valid scalar family");
+-    let vector = IntervalVector::new([a, b, c]).expect("valid scalar family");
+-    let numerator = matrix.mul_vector(&vector, &mut ()).map_err(lattice_error)?;
+-    let numerator = numerator.into_lanes().expect("nonempty numerator")[0];
+-    let alpha = narrow(
+-        numerator
+-            .checked_div(&coefficient(3))
+-            .map_err(scalar_error)?,
+-    )?;
++    let numerator = a
++        .affine(2 * SCALE, 0)
++        .map_err(scalar_error)?
++        .checked_sub(&b)
++        .map_err(scalar_error)?
++        .checked_sub(&c)
++        .map_err(scalar_error)?;
++    let alpha = narrow(numerator.div_integer(3).map_err(scalar_error)?)?;
+     let difference = b.checked_sub(&c).map_err(scalar_error)?;
+     let scale = input(alumina_foc::INV_SQRT_3)
+         .convert::<i64>()
