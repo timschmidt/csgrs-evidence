@@ -1,0 +1,1599 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 1c1f815ba..e7e296c21 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -2641,6 +2641,82 @@ canonical-profile differentials and full browser/schedule measurements remain
+ open. The earlier solver/firmware adoption blockers and all later phases remain.
+ No push was attempted.
+ 
++## 2026-11-12: Phase 6 primitive layout experiment
++
++Admission: CSGRS baseline `6c2ebd9647bd2a171881acb265084851ab3b9351`; all four
++managed repositories were clean. The plan explicitly requires primitive
++structure-of-arrays experiments. Hyperlattice owns Cartesian storage;
++Hyperinterval retains all scalar arithmetic and validation authority
++(P1, P5–P7, P18–P20, P31–P33). The missing witness was a measured, complete
++operation comparison against separate lower/upper endpoint arrays. This
++checkpoint adds an unpublished conformance package only; no production scalar,
++Cartesian carrier, Interface, firmware, policy, or wire format changes.
++
++The prototype retains one canonical Cartesian empty discriminator and private
++endpoint arrays for i32/i64 fixed and qualified f32/f64. It imports validated
++vectors and reconstructs through existing scalar constructors. Arithmetic calls
++remain left-to-right; intersections evaluate later lanes after finding an empty
++lane, and dot products retain multiply-then-add order. There is no unchecked
++endpoint ingress, SIMD arithmetic, rational/dyadic layout change, or new replay
++format. Reconstruction does perform extra scalar validation, so this is not an
++accepted predicate-preserving production refactor.
++
++Six conformance tests pass under Rust 1.88 debug/release, stable debug, and
++nightly AddressSanitizer. Independent integer bounds cover 23,409 pairs of
++small intervals and two-dimensional dot products with outward rounding. Tests
++also cover 3,136 full-range fixed pairs across four width/scale combinations,
++4,000 seeded finite IEEE bit-pattern pairs, subnormal rounding, overflow,
++negative zero canonicalization, invalid families and replay, and dimensions
++0, 1, 2, 3, 4, 16, 64, 256, 1024. Generated outputs feed further operations.
++An injected late scalar failure verifies that empty intermediate lanes do not
++hide failure. Existing owner tests/doctests pass (45). All 15 final selected
++commands pass, including strict Clippy on both toolchains, docs, no_std ARM
++compilation, Wasm Clippy/build, root formatting and diff checks. Initial type
++inference and Clippy diagnostics remain in the evidence; no assertion was
++removed. No full-coverage, new fuzz campaign, full pre-push or HIL claim.
++
++The headless Wasm consumer passes an independent integer endpoint oracle for
++612 completed pairs / 1,224 calls across both fixed families, nine dimensions,
++17 seeds and both layouts. Four malformed fixture selectors trap. Both IEEE
++ingress probes return `UnqualifiedEnvironment`, not fabricated success. The
++module has no imports, is 297,168 bytes, and has SHA-256
++`f405cd86543a80d62f86cc7e6da2510efd0f4f45bbc3bd0b64bf03bc7634bfa5`.
++Maximum fuel for both endpoint calls is 9,134,806, with 100,000,000 allowed per
++call. Fuel is a Wasmtime instruction metric, not wall time or MCU cycles.
++
++Native complete-output comparisons pass for 17 fresh-process seeds and all
++four families at dimensions 4 and 64. The final local cost probe records 6,912
++samples (four families, nine dimensions, eight workloads, twelve alternating
++samples per provider), 16 warmups, and zero allocations in every timed scope.
++It runs on allowed CPU 0 without frequency or governor control. Conversion and
++canonical output materialization are included for operations 0–6; operation 7
++separately measures retained chains with the same final scalar output. At N=64,
++SoA/native median time ratios for imported/retained chains are 0.781/0.743 for
++i32, 0.696/0.660 for i64, 1.184/1.181 for f32 and 1.183/1.189 for f64. Individual
++add/subtract/hull and many other paths regress. These short local probes do not
++establish a general speedup or latency bound; timer-scale rows remain raw data.
++
++At N=64 retained storage is 768→516 bytes for i32/f32 and 1,536→1,032 for
++i64/f64; N=0 and N=1 do not improve. Temporary stack peaks are not measured.
++The corrected single-provider native probe grows from 545,288 to 591,712 bytes;
++GNU size text grows 424,966→469,166. Unique-address out-of-line named kernel
++symbols sum to 72,971→113,342 bytes; this excludes inlined code and is not a
++complete monomorphized-code accounting. The initial runtime-bool size harness
++linked both providers and is retained as a rejected measurement. Its timing
++run also overlapped root formatting; final measurements ran after checks ended.
++
++Decision: **keep the experiment; reject a transparent production layout
++replacement**. Storage savings and faster fixed chains do not overcome the
++measured operation/IEEE regressions, larger executable, additional validation,
++or inability to preserve borrowed `lanes()` without a migration or duplicate
++storage. No production adoption or completed Phase 6 claim. Independent
++center/radius, Jacobian carriers, facts, additional specialized kernels and
++consumer adoption remain open. Machine-profile migration still needs proof
++transport to avoid repeated positivity checks. All other phases and earlier
++adoption blockers remain in scope. No push was attempted.
++
++Source and evidence registration: pending.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.lock b/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.lock
+new file mode 100644
+index 000000000..441c5c62d
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.lock
+@@ -0,0 +1,296 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "autocfg"
++version = "1.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "ciborium"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
++dependencies = [
++ "ciborium-io",
++ "ciborium-ll",
++ "serde",
++]
++
++[[package]]
++name = "ciborium-io"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
++
++[[package]]
++name = "ciborium-ll"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
++dependencies = [
++ "ciborium-io",
++ "half",
++]
++
++[[package]]
++name = "crunchy"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
++
++[[package]]
++name = "half"
++version = "2.7.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
++dependencies = [
++ "cfg-if",
++ "crunchy",
++ "zerocopy",
++]
++
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "serde",
++]
++
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++ "serde",
++]
++
++[[package]]
++name = "hyperreal"
++version = "0.14.0"
++dependencies = [
++ "ciborium",
++ "num",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "interval-layout-conformance"
++version = "0.0.0"
++dependencies = [
++ "hyperlattice-interval",
++ "serde_json",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "num"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
++dependencies = [
++ "num-bigint",
++ "num-complex",
++ "num-integer",
++ "num-iter",
++ "num-rational",
++ "num-traits",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
++dependencies = [
++ "num-integer",
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-complex"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
++dependencies = [
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-integer"
++version = "0.1.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-iter"
++version = "0.1.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-rational"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
++dependencies = [
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.10",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.154"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
++[[package]]
++name = "zerocopy"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.toml b/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.toml
+new file mode 100644
+index 000000000..20e89bb72
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/Cargo.toml
+@@ -0,0 +1,18 @@
++[package]
++name = "interval-layout-conformance"
++version = "0.0.0"
++edition = "2024"
++rust-version = "1.88"
++license = "MIT OR Apache-2.0"
++publish = false
++
++[workspace]
++
++[dependencies]
++hyperlattice-interval = { path = "../..", default-features = false, features = ["fixed", "float-enclosure", "serde"] }
++
++[dev-dependencies]
++serde_json = "1.0"
++
++[profile.release]
++overflow-checks = true
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/README.md b/crates/hyperlattice-interval/conformance/primitive-layouts/README.md
+new file mode 100644
+index 000000000..9b7c63409
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/README.md
+@@ -0,0 +1,36 @@
++# Primitive interval layout experiment
++
++This unpublished, standalone package compares Hyperlattice's Cartesian vector
++with private separate lower/upper arrays. Both use Hyperinterval scalar kernels;
++there is no SIMD or duplicate arithmetic. It covers i32/i64 fixed-point and
++x86_64-qualified f32/f64 enclosures, empty sets, zero-dimensional unit products,
++addition, subtraction, hull, intersection, dot products, and repeated chains.
++
++Reconstruction validates through existing constructors. Canonical replay uses
++the existing `IntervalVector` format. The prototype cannot provide the current
++borrowed `lanes()` API. It is an experiment, not a production layout replacement.
++
++From this directory:
++
++```sh
++cargo +1.88.0 test --locked
++cargo +1.88.0 test --locked --release
++cargo +1.88.0 clippy --locked --all-targets -- -D warnings
++cargo +1.88.0 run --locked --release --bin cost
++cargo +1.88.0 run --locked --release --bin native-probe -- 7
++cargo +1.88.0 run --locked --release --bin soa-probe -- 7
++cargo +1.88.0 build --locked --release --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown
++```
++
++The cost probe emits sizes and alternating samples for operations 0–7:
++round trip/copy, add, subtract, hull, intersection, dot, imported chain, and
++retained chain. Operations 0–6 include SoA ingress; vector outputs also include
++canonical materialization. Operation 7 starts with each provider's native
++storage and returns the same scalar endpoint enclosure. Each chain performs
++four add/subtract pairs, intersection, hull, and dot. Exact outputs are compared
++before timing, and every measured path asserts zero allocations.
++
++The Wasm consumer exports full fixed-point result endpoints. IEEE ingress on
++Wasm remains explicitly unqualified. The execution ledger and evidence archive
++hold the independent Wasm oracle, raw measurements, adverse results, and the
++adoption decision. Timing probes do not establish general performance bounds.
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/cost.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/cost.rs
+new file mode 100644
+index 000000000..af33dc517
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/cost.rs
+@@ -0,0 +1,149 @@
++#[path = "../../../allocations.rs"]
++mod allocations;
++use hyperlattice_interval::IntervalVector;
++use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure, FixedInterval};
++use interval_layout_conformance::Soa;
++use interval_layout_conformance::workload::{Fixture, inputs, native_chain, soa_chain};
++use std::{fmt::Debug, hint::black_box, mem::size_of, time::Instant};
++
++fn run<I: Fixture + Eq + Debug, const N: usize>(name: &str) {
++    let (a, b) = inputs::<I, N>(7);
++    let x = Soa::from_vector(&a);
++    let y = Soa::from_vector(&b);
++    println!(
++        "size,{name},{N},{},{}",
++        size_of::<IntervalVector<I, N>>(),
++        size_of::<Soa<I, N>>()
++    );
++    for operation in 0..8 {
++        // Check full materialized outputs before timing; checksums alone are
++        // insufficient. Operation 7 is the separately reported retained path.
++        if operation < 5 {
++            let native = match operation {
++                0 => a,
++                1 => a.add(&b, &mut ()).unwrap(),
++                2 => a.sub(&b, &mut ()).unwrap(),
++                3 => a.hull(&b, &mut ()).unwrap(),
++                _ => a.intersection(&b, &mut ()).unwrap(),
++            };
++            let soa = match operation {
++                0 => x,
++                1 => x.add(&y).unwrap(),
++                2 => x.sub(&y).unwrap(),
++                3 => x.hull(&y).unwrap(),
++                _ => x.intersection(&y).unwrap(),
++            }
++            .to_vector()
++            .unwrap();
++            assert_eq!(native, soa);
++        } else if operation == 5 {
++            assert_eq!(a.dot(&b, &mut ()), x.dot(&y));
++        } else {
++            assert_eq!(native_chain(&a, &b), soa_chain(&x, &y));
++        }
++        let repetitions = (256 / (N + 1)).max(4);
++        let execute = |soa: bool| {
++            if soa {
++                if operation == 7 {
++                    black_box(soa_chain(black_box(&x), black_box(&y)).unwrap());
++                    return;
++                }
++                let (x, y) = (
++                    Soa::from_vector(black_box(&a)),
++                    Soa::from_vector(black_box(&b)),
++                );
++                match operation {
++                    0 => {
++                        black_box(x.to_vector().unwrap());
++                    }
++                    1 => {
++                        black_box(x.add(&y).unwrap().to_vector().unwrap());
++                    }
++                    2 => {
++                        black_box(x.sub(&y).unwrap().to_vector().unwrap());
++                    }
++                    3 => {
++                        black_box(x.hull(&y).unwrap().to_vector().unwrap());
++                    }
++                    4 => {
++                        black_box(x.intersection(&y).unwrap().to_vector().unwrap());
++                    }
++                    5 => {
++                        black_box(x.dot(&y).unwrap());
++                    }
++                    _ => {
++                        black_box(soa_chain(&x, &y).unwrap());
++                    }
++                }
++            } else {
++                let (a, b) = (black_box(&a), black_box(&b));
++                match operation {
++                    0 => {
++                        black_box(*a);
++                    }
++                    1 => {
++                        black_box(a.add(b, &mut ()).unwrap());
++                    }
++                    2 => {
++                        black_box(a.sub(b, &mut ()).unwrap());
++                    }
++                    3 => {
++                        black_box(a.hull(b, &mut ()).unwrap());
++                    }
++                    4 => {
++                        black_box(a.intersection(b, &mut ()).unwrap());
++                    }
++                    5 => {
++                        black_box(a.dot(b, &mut ()).unwrap());
++                    }
++                    _ => {
++                        black_box(native_chain(a, b).unwrap());
++                    }
++                }
++            }
++        };
++        for _ in 0..16 {
++            execute(false);
++            execute(true);
++        }
++        for sample in 0..12 {
++            for soa in if sample % 2 == 0 {
++                [false, true]
++            } else {
++                [true, false]
++            } {
++                let (elapsed, count, bytes) = allocations::measure(|| {
++                    let start = Instant::now();
++                    for _ in 0..repetitions {
++                        execute(soa);
++                    }
++                    start.elapsed().as_nanos()
++                });
++                assert_eq!((count, bytes), (0, 0));
++                println!(
++                    "sample,{name},{N},{operation},{sample},{soa},{repetitions},{elapsed},{count},{bytes}"
++                );
++            }
++        }
++    }
++}
++
++fn main() {
++    macro_rules! family {
++        ($i:ty, $name:literal) => {
++            run::<$i, 0>($name);
++            run::<$i, 1>($name);
++            run::<$i, 2>($name);
++            run::<$i, 3>($name);
++            run::<$i, 4>($name);
++            run::<$i, 16>($name);
++            run::<$i, 64>($name);
++            run::<$i, 256>($name);
++            run::<$i, 1024>($name);
++        };
++    }
++    family!(FixedInterval<i32, 8>, "i32q8");
++    family!(FixedInterval<i64, 32>, "i64q32");
++    family!(F32Enclosure, "f32");
++    family!(F64Enclosure, "f64");
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/native-probe.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/native-probe.rs
+new file mode 100644
+index 000000000..eb87c01cd
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/native-probe.rs
+@@ -0,0 +1,5 @@
++#[path = "../probe.rs"]
++mod probe;
++fn main() {
++    probe::run::<false>();
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/soa-probe.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/soa-probe.rs
+new file mode 100644
+index 000000000..1c1ce8482
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/bin/soa-probe.rs
+@@ -0,0 +1,5 @@
++#[path = "../probe.rs"]
++mod probe;
++fn main() {
++    probe::run::<true>();
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/lib.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/lib.rs
+new file mode 100644
+index 000000000..471409483
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/lib.rs
+@@ -0,0 +1,192 @@
++//! Unpublished layout experiment; no production API or arithmetic authority.
++//!
++//! The scalar constructors validate reconstruction, including on platforms
++//! where IEEE ingress is unqualified. Separate arrays cannot implement the
++//! production vector's borrowed `lanes()` API without extra storage.
++#![no_std]
++#![forbid(unsafe_code)]
++
++use hyperlattice_interval::hyperinterval::{
++    F32Enclosure, F64Enclosure, FixedInterval, IntervalError,
++};
++use hyperlattice_interval::{IntervalArithmetic, IntervalLatticeError, IntervalVector};
++
++pub mod workload;
++
++/// Only the four primitive families participate in this experiment.
++pub trait Primitive: IntervalArithmetic<Context = ()> + Copy {
++    type Endpoint: Copy + Default;
++    fn bounds(&self) -> Option<(Self::Endpoint, Self::Endpoint)>;
++    fn restore(lower: Self::Endpoint, upper: Self::Endpoint) -> Result<Self, IntervalError>;
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn empty_lane_does_not_skip_later_failure() {
++        type I = FixedInterval<i32, 8>;
++        let v = Soa::from_vector(&IntervalVector::new([I::point(0).unwrap(); 3]).unwrap());
++        let mut calls = 0;
++        let result = v.zip(&v, |_, _, _| {
++            calls += 1;
++            if calls == 2 {
++                Err(IntervalError::Overflow)
++            } else {
++                I::empty()
++            }
++        });
++        assert_eq!(calls, 2);
++        assert_eq!(
++            result.err(),
++            Some(IntervalLatticeError::Scalar(IntervalError::Overflow))
++        );
++        let mut calls = 0;
++        assert!(
++            v.zip(&v, |_, _, _| {
++                calls += 1;
++                I::empty()
++            })
++            .unwrap()
++            .to_vector()
++            .unwrap()
++            .is_empty()
++        );
++        assert_eq!(calls, 3);
++    }
++}
++
++macro_rules! fixed {
++    ($endpoint:ty) => {
++        impl<const F: u32> Primitive for FixedInterval<$endpoint, F> {
++            type Endpoint = $endpoint;
++            fn bounds(&self) -> Option<($endpoint, $endpoint)> {
++                self.bounds()
++            }
++            fn restore(lower: $endpoint, upper: $endpoint) -> Result<Self, IntervalError> {
++                Self::new(lower, upper)
++            }
++        }
++    };
++}
++fixed!(i32);
++fixed!(i64);
++
++macro_rules! float {
++    ($interval:ty, $endpoint:ty) => {
++        impl Primitive for $interval {
++            type Endpoint = $endpoint;
++            fn bounds(&self) -> Option<($endpoint, $endpoint)> {
++                self.bounds()
++            }
++            fn restore(lower: $endpoint, upper: $endpoint) -> Result<Self, IntervalError> {
++                Self::new(lower, upper)
++            }
++        }
++    };
++}
++float!(F32Enclosure, f32);
++float!(F64Enclosure, f64);
++
++/// Separate endpoint arrays with one canonical Cartesian empty discriminator.
++/// Fields are private; there is no unchecked ingress or separate wire format.
++#[derive(Clone, Copy)]
++pub struct Soa<I: Primitive, const N: usize> {
++    bounds: Option<EndpointArrays<I::Endpoint, N>>,
++}
++
++type EndpointArrays<E, const N: usize> = ([E; N], [E; N]);
++
++impl<I: Primitive, const N: usize> Soa<I, N> {
++    pub fn from_vector(vector: &IntervalVector<I, N>) -> Self {
++        Self {
++            bounds: vector.lanes().map(|lanes| {
++                let pairs = lanes.map(|lane| lane.bounds().expect("nonempty Cartesian lane"));
++                (pairs.map(|p| p.0), pairs.map(|p| p.1))
++            }),
++        }
++    }
++
++    /// Restore through the existing scalar and Cartesian constructors.
++    pub fn to_vector(&self) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
++        match &self.bounds {
++            None => IntervalVector::empty(),
++            Some((lower, upper)) => {
++                let mut lanes = [I::empty()?; N];
++                for i in 0..N {
++                    lanes[i] = I::restore(lower[i], upper[i])?;
++                }
++                IntervalVector::new(lanes)
++            }
++        }
++    }
++
++    fn zip(
++        &self,
++        other: &Self,
++        mut operation: impl FnMut(&I, &I, &mut ()) -> Result<I, IntervalError>,
++    ) -> Result<Self, IntervalLatticeError> {
++        let (Some((al, au)), Some((bl, bu))) = (&self.bounds, &other.bounds) else {
++            I::validate_family()?;
++            return Ok(Self { bounds: None });
++        };
++        let mut lower = [I::Endpoint::default(); N];
++        let mut upper = lower;
++        let mut empty = false;
++        for i in 0..N {
++            let a = I::restore(al[i], au[i])?;
++            let b = I::restore(bl[i], bu[i])?;
++            match operation(&a, &b, &mut ())?.bounds() {
++                Some((l, u)) => {
++                    lower[i] = l;
++                    upper[i] = u;
++                }
++                // Keep evaluating later lanes, just as IntervalVector::zip
++                // does before canonicalization. No partial output is published.
++                None => empty = true,
++            }
++        }
++        I::validate_family()?;
++        Ok(Self {
++            bounds: if empty { None } else { Some((lower, upper)) },
++        })
++    }
++
++    pub fn add(&self, other: &Self) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, I::add)
++    }
++
++    pub fn sub(&self, other: &Self) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, I::sub)
++    }
++
++    pub fn intersection(&self, other: &Self) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, I::intersection)
++    }
++
++    pub fn hull(&self, other: &Self) -> Result<Self, IntervalLatticeError> {
++        // Empty/nonempty hull copies through the native path, including its
++        // family validation and scalar copy calls.
++        if self.bounds.is_none() || other.bounds.is_none() {
++            return Ok(Self::from_vector(
++                &self.to_vector()?.hull(&other.to_vector()?, &mut ())?,
++            ));
++        }
++        self.zip(other, I::hull)
++    }
++
++    pub fn dot(&self, other: &Self) -> Result<I, IntervalLatticeError> {
++        let (Some((al, au)), Some((bl, bu))) = (&self.bounds, &other.bounds) else {
++            return Ok(I::empty()?);
++        };
++        let mut sum = I::zero()?;
++        for i in 0..N {
++            let a = I::restore(al[i], au[i])?;
++            let b = I::restore(bl[i], bu[i])?;
++            let product = a.mul(&b, &mut ())?;
++            sum = sum.add(&product, &mut ())?;
++        }
++        Ok(sum)
++    }
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/probe.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/probe.rs
+new file mode 100644
+index 000000000..ab99a8be6
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/probe.rs
+@@ -0,0 +1,26 @@
++use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure, FixedInterval};
++use interval_layout_conformance::Soa;
++use interval_layout_conformance::workload::{Fixture, inputs, native_chain, soa_chain};
++use std::fmt::Debug;
++
++fn family<I: Fixture + Debug, const N: usize, const SOA: bool>(seed: u32) {
++    let (a, b) = inputs::<I, N>(seed);
++    let result = if SOA {
++        soa_chain(&Soa::from_vector(&a), &Soa::from_vector(&b))
++    } else {
++        native_chain(&a, &b)
++    };
++    println!("{} {N} {result:?}", core::any::type_name::<I>());
++}
++
++pub fn run<const SOA: bool>() {
++    let seed = std::env::args().nth(1).unwrap().parse().unwrap();
++    family::<FixedInterval<i32, 8>, 4, SOA>(seed);
++    family::<FixedInterval<i32, 8>, 64, SOA>(seed);
++    family::<FixedInterval<i64, 32>, 4, SOA>(seed);
++    family::<FixedInterval<i64, 32>, 64, SOA>(seed);
++    family::<F32Enclosure, 4, SOA>(seed);
++    family::<F32Enclosure, 64, SOA>(seed);
++    family::<F64Enclosure, 4, SOA>(seed);
++    family::<F64Enclosure, 64, SOA>(seed);
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/src/workload.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/src/workload.rs
+new file mode 100644
+index 000000000..44ad48921
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/src/workload.rs
+@@ -0,0 +1,67 @@
++//! Common, bounded fixtures for native and Wasm probes.
++use crate::{Primitive, Soa};
++use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure, FixedInterval};
++use hyperlattice_interval::{IntervalLatticeError, IntervalVector};
++
++pub trait Fixture: Primitive {
++    fn lane(numerator: i32, width: i32) -> Self;
++}
++
++impl Fixture for FixedInterval<i32, 8> {
++    fn lane(n: i32, w: i32) -> Self {
++        Self::new(n * 16, (n + w) * 16).unwrap()
++    }
++}
++impl Fixture for FixedInterval<i64, 32> {
++    fn lane(n: i32, w: i32) -> Self {
++        Self::new(i64::from(n) << 28, i64::from(n + w) << 28).unwrap()
++    }
++}
++impl Fixture for F32Enclosure {
++    fn lane(n: i32, w: i32) -> Self {
++        Self::new(n as f32 / 16.0, (n + w) as f32 / 16.0).unwrap()
++    }
++}
++impl Fixture for F64Enclosure {
++    fn lane(n: i32, w: i32) -> Self {
++        Self::new(f64::from(n) / 16.0, f64::from(n + w) / 16.0).unwrap()
++    }
++}
++
++/// Seeds are reduced to a bounded domain before any arithmetic. Native float
++/// arithmetic here only constructs exact binary fixture inputs, never results.
++pub fn inputs<I: Fixture, const N: usize>(
++    seed: u32,
++) -> (IntervalVector<I, N>, IntervalVector<I, N>) {
++    let seed = (seed % 17) as usize;
++    let a = core::array::from_fn(|i| I::lane(((i + seed) % 17) as i32 - 8, (i % 3) as i32));
++    let b = core::array::from_fn(|i| I::lane(((i + 2 * seed) % 13) as i32 - 6, (i % 2) as i32));
++    (
++        IntervalVector::new(a).unwrap(),
++        IntervalVector::new(b).unwrap(),
++    )
++}
++
++pub fn native_chain<I: Primitive, const N: usize>(
++    a: &IntervalVector<I, N>,
++    b: &IntervalVector<I, N>,
++) -> Result<I, IntervalLatticeError> {
++    let mut value = *a;
++    for _ in 0..4 {
++        value = value.add(b, &mut ())?.sub(b, &mut ())?;
++    }
++    value = value.intersection(a, &mut ())?.hull(b, &mut ())?;
++    value.dot(a, &mut ())
++}
++
++pub fn soa_chain<I: Primitive, const N: usize>(
++    a: &Soa<I, N>,
++    b: &Soa<I, N>,
++) -> Result<I, IntervalLatticeError> {
++    let mut value = *a;
++    for _ in 0..4 {
++        value = value.add(b)?.sub(b)?;
++    }
++    value = value.intersection(a)?.hull(b)?;
++    value.dot(a)
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/tests/layouts.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/tests/layouts.rs
+new file mode 100644
+index 000000000..39b0b204c
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/tests/layouts.rs
+@@ -0,0 +1,260 @@
++use hyperlattice_interval::hyperinterval::{
++    F32Enclosure, F64Enclosure, FixedInterval, IntervalError,
++};
++use hyperlattice_interval::{IntervalLatticeError, IntervalVector};
++use interval_layout_conformance::{Primitive, Soa};
++use std::fmt::Debug;
++
++fn compare<I: Primitive + Eq + Debug, const N: usize>(
++    a: IntervalVector<I, N>,
++    b: IntervalVector<I, N>,
++) {
++    let x = Soa::from_vector(&a);
++    let y = Soa::from_vector(&b);
++    assert_eq!(x.to_vector(), Ok(a));
++    assert_eq!(y.to_vector(), Ok(b));
++    assert_eq!(x.add(&y).and_then(|v| v.to_vector()), a.add(&b, &mut ()));
++    assert_eq!(x.sub(&y).and_then(|v| v.to_vector()), a.sub(&b, &mut ()));
++    assert_eq!(x.hull(&y).and_then(|v| v.to_vector()), a.hull(&b, &mut ()));
++    assert_eq!(
++        x.intersection(&y).and_then(|v| v.to_vector()),
++        a.intersection(&b, &mut ())
++    );
++    assert_eq!(x.dot(&y), a.dot(&b, &mut ()));
++    // Feed generated results back in, including canonical empty intersections.
++    let native = a
++        .intersection(&b, &mut ())
++        .unwrap()
++        .hull(&a, &mut ())
++        .unwrap();
++    let soa = x.intersection(&y).unwrap().hull(&x).unwrap();
++    assert_eq!(soa.to_vector(), Ok(native));
++    assert_eq!(soa.dot(&y), native.dot(&b, &mut ()));
++}
++
++#[test]
++fn independent_fixed_oracle_and_composition() {
++    type I = FixedInterval<i32, 3>;
++    for al in -8..=8 {
++        for au in al..=8 {
++            for bl in -8..=8 {
++                for bu in bl..=8 {
++                    let a =
++                        IntervalVector::new([I::new(al, au).unwrap(), I::new(-au, -al).unwrap()])
++                            .unwrap();
++                    let b = IntervalVector::new([I::new(bl, bu).unwrap(), I::new(bl, bu).unwrap()])
++                        .unwrap();
++                    let x = Soa::from_vector(&a);
++                    let y = Soa::from_vector(&b);
++                    let bounds = |v: Soa<I, 2>| {
++                        v.to_vector()
++                            .unwrap()
++                            .lanes()
++                            .map(|l| l.map(|i| i.bounds().unwrap()))
++                    };
++                    assert_eq!(
++                        bounds(x.add(&y).unwrap()),
++                        Some([(al + bl, au + bu), (-au + bl, -al + bu)])
++                    );
++                    assert_eq!(
++                        bounds(x.sub(&y).unwrap()),
++                        Some([(al - bu, au - bl), (-au - bu, -al - bl)])
++                    );
++                    let products = |l: i32, u: i32| {
++                        let corners = [l * bl, l * bu, u * bl, u * bu];
++                        let low = *corners.iter().min().unwrap();
++                        let high = *corners.iter().max().unwrap();
++                        (low.div_euclid(8), -(-high).div_euclid(8))
++                    };
++                    let p = products(al, au);
++                    let q = products(-au, -al);
++                    assert_eq!(x.dot(&y).unwrap().bounds(), Some((p.0 + q.0, p.1 + q.1)));
++                    let retained = [(al.max(bl), au.min(bu)), ((-au).max(bl), (-al).min(bu))];
++                    assert_eq!(
++                        bounds(x.intersection(&y).unwrap()),
++                        retained.iter().all(|(l, u)| l <= u).then_some(retained)
++                    );
++                    assert_eq!(
++                        bounds(x.hull(&y).unwrap()),
++                        Some([(al.min(bl), au.max(bu)), ((-au).min(bl), (-al).max(bu))])
++                    );
++                    compare(a, b);
++                }
++            }
++        }
++    }
++}
++
++fn dimensions<I: Primitive + Eq + Debug>(a: I, b: I) {
++    macro_rules! check {
++        ($($n:literal),*) => { $(
++            compare(IntervalVector::<_, $n>::new([a; $n]).unwrap(), IntervalVector::new([b; $n]).unwrap());
++            compare(IntervalVector::<I, $n>::empty().unwrap(), IntervalVector::new([a; $n]).unwrap());
++            compare(IntervalVector::<I, $n>::empty().unwrap(), IntervalVector::empty().unwrap());
++        )* };
++    }
++    check!(0, 1, 2, 3, 4, 16, 64, 256, 1024);
++    let unit = IntervalVector::<I, 0>::new([]).unwrap();
++    assert!(unit.is_singleton());
++    assert!(!Soa::from_vector(&unit).to_vector().unwrap().is_empty());
++    assert_eq!(
++        Soa::from_vector(&unit).dot(&Soa::from_vector(&unit)),
++        Ok(I::zero().unwrap())
++    );
++}
++
++#[test]
++fn all_families_and_dimensions() {
++    dimensions(
++        FixedInterval::<i32, 8>::new(-16, 32).unwrap(),
++        FixedInterval::new(0, 16).unwrap(),
++    );
++    dimensions(
++        FixedInterval::<i64, 32>::new(-1 << 28, 2 << 28).unwrap(),
++        FixedInterval::new(0, 1 << 28).unwrap(),
++    );
++    dimensions(
++        F32Enclosure::new(-0.0625, 0.125).unwrap(),
++        F32Enclosure::new(0.0, 0.0625).unwrap(),
++    );
++    dimensions(
++        F64Enclosure::new(-0.0625, 0.125).unwrap(),
++        F64Enclosure::new(0.0, 0.0625).unwrap(),
++    );
++}
++
++#[test]
++fn full_domain_extremes_and_failure_order() {
++    macro_rules! fixed {
++        ($int:ty, $frac:literal) => {{
++            type I = FixedInterval<$int, $frac>;
++            let extremes = [
++                <$int>::MIN,
++                <$int>::MIN + 1,
++                -1,
++                0,
++                1,
++                <$int>::MAX - 1,
++                <$int>::MAX,
++            ];
++            for &al in &extremes {
++                for &au in &extremes {
++                    if al > au {
++                        continue;
++                    }
++                    for &bl in &extremes {
++                        for &bu in &extremes {
++                            if bl > bu {
++                                continue;
++                            }
++                            compare(
++                                IntervalVector::new([I::new(al, au).unwrap()]).unwrap(),
++                                IntervalVector::new([I::new(bl, bu).unwrap()]).unwrap(),
++                            );
++                        }
++                    }
++                }
++            }
++        }};
++    }
++    fixed!(i32, 0);
++    fixed!(i32, 31);
++    fixed!(i64, 0);
++    fixed!(i64, 63);
++    assert_eq!(
++        IntervalVector::<FixedInterval<i32, 32>, 0>::new([]),
++        Err(IntervalLatticeError::Scalar(IntervalError::InvalidScale))
++    );
++    assert_eq!(
++        IntervalVector::<FixedInterval<i64, 64>, 0>::empty(),
++        Err(IntervalLatticeError::Scalar(IntervalError::InvalidScale))
++    );
++    // An overflowing first product cannot be hidden by a later cancellation.
++    type I = FixedInterval<i32, 0>;
++    let a =
++        IntervalVector::new([I::point(i32::MAX).unwrap(), I::point(-i32::MAX).unwrap()]).unwrap();
++    let b = IntervalVector::new([I::point(2).unwrap(); 2]).unwrap();
++    assert_eq!(
++        Soa::from_vector(&a).dot(&Soa::from_vector(&b)),
++        Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++    );
++}
++
++#[test]
++fn ieee_bits_subnormals_rounding_and_overflow() {
++    macro_rules! floats {
++        ($interval:ty, $float:ty, $bits:ty) => {{
++            let point = |v| IntervalVector::new([<$interval>::point(v).unwrap()]).unwrap();
++            let tiny = <$float>::from_bits(1);
++            let a = Soa::from_vector(&point(tiny));
++            assert_eq!(
++                a.add(&a).unwrap().to_vector().unwrap().lanes().unwrap()[0].bounds(),
++                Some((<$float>::from_bits(2), <$float>::from_bits(2)))
++            );
++            assert_eq!(
++                a.dot(&Soa::from_vector(&point(0.5))).unwrap().bounds(),
++                Some((0.0, tiny))
++            );
++            assert_eq!(
++                Soa::from_vector(&point(<$float>::MAX)).add(&a).err(),
++                Some(IntervalLatticeError::Scalar(IntervalError::Overflow))
++            );
++            let zero = Soa::from_vector(&point(-0.0)).to_vector().unwrap();
++            assert_eq!(zero.lanes().unwrap()[0].bounds().unwrap().0.to_bits(), 0);
++            assert!(<$interval>::new(<$float>::NAN, 0.0).is_err());
++            assert!(<$interval>::new(0.0, <$float>::INFINITY).is_err());
++            assert_eq!(
++                <$interval>::new(1.0, -1.0),
++                Err(IntervalError::ReversedEndpoints)
++            );
++            let mut state = 20261112_u64;
++            for _ in 0..2000 {
++                let mut next = || {
++                    loop {
++                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
++                        let value = <$float>::from_bits(state as $bits);
++                        if value.is_finite() {
++                            break value;
++                        }
++                    }
++                };
++                let a = next();
++                let b = next();
++                let vector =
++                    IntervalVector::new([<$interval>::new(a.min(b), a.max(b)).unwrap()]).unwrap();
++                compare(vector, point(next()));
++                // Existing canonical wire validation remains the replay authority.
++                let text = serde_json::to_string(&vector).unwrap();
++                let restored: IntervalVector<$interval, 1> = serde_json::from_str(&text).unwrap();
++                assert_eq!(Soa::from_vector(&restored).to_vector(), Ok(vector));
++                assert_eq!(
++                    serde_json::to_string(&Soa::from_vector(&restored).to_vector().unwrap())
++                        .unwrap(),
++                    text
++                );
++            }
++        }};
++    }
++    floats!(F32Enclosure, f32, u32);
++    floats!(F64Enclosure, f64, u64);
++}
++
++#[test]
++fn canonical_replay_revalidates_and_consumes() {
++    type V = IntervalVector<FixedInterval<i64, 32>, 2>;
++    for wire in [
++        "null",
++        "[[0,1],[-9223372036854775808,9223372036854775807]]",
++        "[null,[0,1]]",
++    ] {
++        let native: V = serde_json::from_str(wire).unwrap();
++        let restored = Soa::from_vector(&native).to_vector().unwrap();
++        assert_eq!(restored, native);
++        let encoded = serde_json::to_string(&restored).unwrap();
++        assert_eq!(serde_json::from_str::<V>(&encoded).unwrap(), native);
++        compare(native, restored);
++    }
++    for bad in ["[[2,1],[0,1]]", "[null,[2,1]]", "[]", "[[0,1]]"] {
++        assert!(serde_json::from_str::<V>(bad).is_err(), "{bad}");
++    }
++}
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.lock b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.lock
+new file mode 100644
+index 000000000..98a4a88c7
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.lock
+@@ -0,0 +1,303 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "autocfg"
++version = "1.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "ciborium"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
++dependencies = [
++ "ciborium-io",
++ "ciborium-ll",
++ "serde",
++]
++
++[[package]]
++name = "ciborium-io"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
++
++[[package]]
++name = "ciborium-ll"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
++dependencies = [
++ "ciborium-io",
++ "half",
++]
++
++[[package]]
++name = "crunchy"
++version = "0.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
++
++[[package]]
++name = "half"
++version = "2.7.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
++dependencies = [
++ "cfg-if",
++ "crunchy",
++ "zerocopy",
++]
++
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "serde",
++]
++
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++ "serde",
++]
++
++[[package]]
++name = "hyperreal"
++version = "0.14.0"
++dependencies = [
++ "ciborium",
++ "num",
++ "serde",
++ "serde_json",
++]
++
++[[package]]
++name = "interval-layout-conformance"
++version = "0.0.0"
++dependencies = [
++ "hyperlattice-interval",
++]
++
++[[package]]
++name = "interval-layout-wasm"
++version = "0.0.0"
++dependencies = [
++ "hyperlattice-interval",
++ "interval-layout-conformance",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "num"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
++dependencies = [
++ "num-bigint",
++ "num-complex",
++ "num-integer",
++ "num-iter",
++ "num-rational",
++ "num-traits",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
++dependencies = [
++ "num-integer",
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-complex"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
++dependencies = [
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-integer"
++version = "0.1.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-iter"
++version = "0.1.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-rational"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
++dependencies = [
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++ "serde",
++]
++
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.10",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.154"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4ae9ccbea3a7b0b09443036490c8f34a8b1b760fd345e5c0dae0aac718faea79"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
++[[package]]
++name = "zerocopy"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.63"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.toml b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.toml
+new file mode 100644
+index 000000000..a2cf2bc37
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/Cargo.toml
+@@ -0,0 +1,19 @@
++[package]
++name = "interval-layout-wasm"
++version = "0.0.0"
++edition = "2024"
++rust-version = "1.88"
++publish = false
++
++[workspace]
++
++[lib]
++crate-type = ["cdylib"]
++
++[dependencies]
++interval-layout-conformance = { path = ".." }
++hyperlattice-interval = { path = "../../..", default-features = false, features = ["fixed", "float-enclosure"] }
++
++[profile.release]
++panic = "abort"
++overflow-checks = true
+diff --git a/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/src/lib.rs b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/src/lib.rs
+new file mode 100644
+index 000000000..3cfdb12f1
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/primitive-layouts/wasm/src/lib.rs
+@@ -0,0 +1,58 @@
++use hyperlattice_interval::hyperinterval::{
++    F32Enclosure, F64Enclosure, FixedInterval, IntervalError,
++};
++use interval_layout_conformance::workload::{Fixture, inputs, native_chain, soa_chain};
++use interval_layout_conformance::{Primitive, Soa};
++
++fn evaluate<I: Fixture, const N: usize>(soa: bool, seed: u32) -> I {
++    let (a, b) = inputs::<I, N>(seed);
++    if soa {
++        soa_chain(&Soa::from_vector(&a), &Soa::from_vector(&b)).unwrap()
++    } else {
++        native_chain(&a, &b).unwrap()
++    }
++}
++
++fn endpoint<I: Fixture, const N: usize>(soa: bool, seed: u32, upper: bool) -> I::Endpoint {
++    let (l, u) = Primitive::bounds(&evaluate::<I, N>(soa, seed)).unwrap();
++    if upper { u } else { l }
++}
++
++/// Full final endpoints, returned independently so i64 values are not truncated
++/// or replaced by checksums. Invalid fixture selectors trap, never certify.
++#[unsafe(no_mangle)]
++pub extern "C" fn fixed(soa: u32, wide: u32, dimension: u32, seed: u32, upper: u32) -> i64 {
++    assert!(soa <= 1 && wide <= 1 && upper <= 1);
++    macro_rules! dimension {
++        ($n:literal) => {
++            if wide == 0 {
++                i64::from(endpoint::<FixedInterval<i32, 8>, $n>(
++                    soa == 1,
++                    seed,
++                    upper == 1,
++                ))
++            } else {
++                endpoint::<FixedInterval<i64, 32>, $n>(soa == 1, seed, upper == 1)
++            }
++        };
++    }
++    match dimension {
++        0 => dimension!(0),
++        1 => dimension!(1),
++        2 => dimension!(2),
++        3 => dimension!(3),
++        4 => dimension!(4),
++        16 => dimension!(16),
++        64 => dimension!(64),
++        256 => dimension!(256),
++        1024 => dimension!(1024),
++        _ => panic!("invalid fixture dimension"),
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn float_qualification() -> u32 {
++    u32::from(F32Enclosure::new(0.0, 1.0) == Err(IntervalError::UnqualifiedEnvironment))
++        | (u32::from(F64Enclosure::new(0.0, 1.0) == Err(IntervalError::UnqualifiedEnvironment))
++            << 1)
++}
