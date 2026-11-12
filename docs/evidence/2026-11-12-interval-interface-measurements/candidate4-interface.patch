@@ -1,0 +1,119 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index d3da237..5d3b9da 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -194,6 +194,7 @@ dependencies = [
+  "csgrs",
+  "hypercurve",
+  "hypergraphics",
++ "hyperinterval",
+  "hyperlimit",
+  "hyperpath",
+  "hyperreal",
+@@ -1546,6 +1547,13 @@ dependencies = [
+  "nalgebra",
+ ]
+ 
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++]
++
+ [[package]]
+ name = "hyperlattice"
+ version = "0.7.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 6d3c8c9..2d198e8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,6 +38,7 @@ serde_json = "1"
+ csgrs = { path = "../csgrs", default-features = false }
+ hypercurve = { path = "../csgrs/crates/hypercurve", default-features = false }
+ hypergraphics = { path = "../csgrs/crates/hypergraphics" }
++hyperinterval = { path = "../csgrs/crates/hyperinterval", default-features = false, features = ["rational"] }
+ hyperlimit = { path = "../csgrs/crates/hyperlimit", default-features = false }
+ hyperpath = { path = "../csgrs/crates/hyperpath", default-features = false }
+ hyperreal = { path = "../csgrs/crates/hyperreal", default-features = false, features = ["serde"] }
+diff --git a/crates/alumina-interface-core/Cargo.toml b/crates/alumina-interface-core/Cargo.toml
+index 71e1d96..25dde24 100644
+--- a/crates/alumina-interface-core/Cargo.toml
++++ b/crates/alumina-interface-core/Cargo.toml
+@@ -23,6 +23,7 @@ alumina-storage.workspace = true
+ csgrs.workspace = true
+ hypercurve.workspace = true
+ hypergraphics.workspace = true
++hyperinterval.workspace = true
+ hyperlimit.workspace = true
+ hyperpath.workspace = true
+ hyperreal.workspace = true
+diff --git a/crates/alumina-interface-core/src/boundary.rs b/crates/alumina-interface-core/src/boundary.rs
+index e362def..3844b18 100644
+--- a/crates/alumina-interface-core/src/boundary.rs
++++ b/crates/alumina-interface-core/src/boundary.rs
+@@ -4,6 +4,7 @@ use core::fmt;
+ use core::marker::PhantomData;
+ 
+ use alumina_machine_ir::{ExecutionSegment, StreamTick};
++use hyperinterval::{IntervalError, RationalInterval};
+ use hyperreal::{Problem, Rational, Real};
+ 
+ /// A compile-time physical unit carried by exact and measured values.
+@@ -88,12 +89,18 @@ impl<U: Unit> BoundedMeasurement<U> {
+         nominal: Rational,
+         uncertainty: Rational,
+     ) -> Result<Self, BoundaryError> {
+-        if uncertainty.is_negative() {
+-            return Err(BoundaryError::NegativeUncertainty);
+-        }
++        let interval = RationalInterval::from_nominal_uncertainty(&nominal, &uncertainty).map_err(
++            |error| match error {
++                IntervalError::NegativeRadius => BoundaryError::NegativeUncertainty,
++                other => BoundaryError::Interval(other),
++            },
++        )?;
++        let (lower, upper) = interval
++            .into_bounds()
++            .expect("nonempty nominal-radius interval");
+         Ok(Self {
+-            lower: nominal.clone() - uncertainty.clone(),
+-            upper: nominal + uncertainty,
++            lower,
++            upper,
+             unit: PhantomData,
+         })
+     }
+@@ -205,6 +212,8 @@ pub enum BoundaryError {
+     ExactValue(Problem),
+     /// A measurement radius cannot be negative.
+     NegativeUncertainty,
++    /// An interval operation failed with its original typed diagnostic.
++    Interval(IntervalError),
+     /// An exact value could not be represented as a finite display `f64`.
+     DisplayProjection,
+     /// A canonical segment must have a strictly positive tick duration.
+@@ -216,6 +225,7 @@ impl fmt::Display for BoundaryError {
+         match self {
+             Self::ExactValue(error) => write!(formatter, "invalid exact value: {error}"),
+             Self::NegativeUncertainty => formatter.write_str("measurement uncertainty is negative"),
++            Self::Interval(_) => formatter.write_str("measurement interval failed"),
+             Self::DisplayProjection => {
+                 formatter.write_str("exact value has no finite display projection")
+             }
+@@ -226,7 +236,14 @@ impl fmt::Display for BoundaryError {
+     }
+ }
+ 
+-impl std::error::Error for BoundaryError {}
++impl std::error::Error for BoundaryError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Interval(error) => Some(error),
++            _ => None,
++        }
++    }
++}
+ 
+ #[cfg(test)]
+ mod tests {
