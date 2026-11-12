@@ -1,0 +1,467 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1493204c0..1e5cea68e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2733,6 +2733,7 @@ name = "hypersolve"
+ version = "0.4.0"
+ dependencies = [
+  "criterion 0.5.1",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index a2531a2e4..dee06f93d 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -245,6 +245,29 @@ No repository has been pushed and the full 15-phase goal remains active.
+   implementation. Previously registered evidence rows remain unchanged. Local
+   archival does not claim hosted publication or full-plan completion.
+ 
++## Rational Horner migration admission
++
++Owner: Hyperinterval arithmetic; Hypersolve retains polynomial/root proofs and
++policy/report ownership. Properties P1/P4/P6/P10/P19/P35/P36. Input domain:
++finite Real coefficient lists whose consumed coefficients have exact rational
++representations, over ordered rational endpoint pairs. Empty lists, reversed
++bounds and a nonrational coefficient preserve their existing `None` fallback.
++
++Targeted paths are algebraic rational polynomial enclosure and the polynomial/
++derivative zero-exclusion filters in root_isolation. Each already checks input
++order exactly once. That comparison can construct the shared carrier without
++adding a decision. The loop must keep coefficient extraction, product, addition,
++and final sign checks in their current order. Symbolic Real adapters and their
++policy-owned endpoint comparisons remain unchanged in this increment.
++
++Missing witnesses before edits: differential original/new Horner results and
++cold/warm dispatch for both successful and declined rational paths; identical
++public root reports under STRICT and APPROXIMATE_512; matched owner/downstream
++cost and allocation/size evidence. Baseline checkout is detached at `8f5c14723`
++in `/mnt/development/csgrs-interval-baseline`; raw staging is
++`/tmp/interval-refactor/horner`. No migration is accepted from source sharing
++alone; a failed gate requires a fix or rejection of the candidate.
++
+ ## Implementation and open gates
+ 
+ - [API/feature proposal](docs/research/interval-api-design.md) preceded the
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 9d820710b..20956f217 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -21,6 +21,7 @@ all-features = true
+ # Cargo uses these paths in the workspace and retains the version requirements
+ # in the published manifest.
+ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = false }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features = false }
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+@@ -39,6 +40,7 @@ serde_json = "1.0.149"
+ default = []
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
++    "hyperinterval/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+     "hyperlimit/dispatch-trace",
+ ]
+diff --git a/crates/hypersolve/examples/allocation_profile.rs b/crates/hypersolve/examples/allocation_profile.rs
+index e669399c9..870668486 100644
+--- a/crates/hypersolve/examples/allocation_profile.rs
++++ b/crates/hypersolve/examples/allocation_profile.rs
+@@ -243,6 +243,10 @@ fn main() {
+         .map(|value| value.parse().expect("iteration count must be an integer"))
+         .unwrap_or(DEFAULT_ITERATIONS);
+     assert!(iterations > 0, "iteration count must be positive");
++    if std::env::var_os("HYPERSOLVE_INTERVAL_MIGRATION").is_some() {
++        interval_migration_profile(iterations);
++        return;
++    }
+ 
+     let values = representation_values();
+     assert_eq!(values.len(), 22, "update the Real allocation corpus");
+@@ -311,3 +315,90 @@ fn main() {
+         );
+     }
+ }
++
++// The same public client is compiled against both isolated revisions. Reuse
++// this example's counting epochs instead of introducing another allocator.
++fn interval_migration_profile(iterations: usize) {
++    use hypersolve::{
++        AlgebraicRootRepresentation, AlgebraicRootValidationReport, AlgebraicRootValidationStatus,
++        IsolatedRootInterval, evaluate_polynomial_at_algebraic_root,
++        polynomial_has_one_distinct_root_in_open_interval, validate_algebraic_root_representation,
++    };
++    for defining in [
++        vec![-2, 0, 0, 1],
++        vec![-2, 0, 0, 0, 0, 1],
++        vec![4, 0, 0, -4, 0, 0, 1],
++    ] {
++        let mut root = AlgebraicRootRepresentation {
++            constraint_index: 0,
++            symbol: SymbolId(0),
++            interval_index: 0,
++            polynomial_coefficients: defining.iter().copied().map(Real::from).collect(),
++            interval: IsolatedRootInterval {
++                lower: Real::one(),
++                upper: Real::from(2),
++                exact_root: None,
++                distinct_root_count: 1,
++            },
++            validation: AlgebraicRootValidationReport {
++                status: AlgebraicRootValidationStatus::Valid,
++                message: None,
++            },
++        };
++        root.validation = validate_algebraic_root_representation(&root, PredicatePolicy::STRICT);
++        assert!(root.is_valid(), "{:?}", root.validation);
++        for policy in [PredicatePolicy::STRICT, PredicatePolicy::APPROXIMATE_512] {
++            for degree in [0, 1, 3, 8, 16] {
++                let coefficients = (0..=degree)
++                    .map(|i| fraction((i * 7 % 17) - 3, (i % 5 + 1) as u64))
++                    .collect::<Vec<_>>();
++                let report = evaluate_polynomial_at_algebraic_root(&root, &coefficients, policy);
++                let encoded = serde_json::json!([
++                    defining,
++                    format!("{policy:?}"),
++                    degree,
++                    format!("{:?}", report.status),
++                    report.sign.map(|s| format!("{s:?}")),
++                    report.message,
++                    report.exact_value.as_ref().map(Real::to_json),
++                    report
++                        .interval_value
++                        .as_ref()
++                        .map(|v| [v.lower.to_json(), v.upper.to_json()]),
++                ]);
++                println!("REPORT {encoded}");
++                print_row(
++                    &format!(
++                        "root-degree-{} query-degree-{degree} {policy:?}",
++                        defining.len() - 1
++                    ),
++                    "interval Horner",
++                    iterations,
++                    measure(iterations, || {
++                        evaluate_polynomial_at_algebraic_root(&root, &coefficients, policy)
++                    }),
++                );
++            }
++            let proof = polynomial_has_one_distinct_root_in_open_interval(
++                &root.polynomial_coefficients,
++                &root.interval.lower,
++                &root.interval.upper,
++                policy,
++            );
++            assert_eq!(proof, Some(true));
++            print_row(
++                &format!("root-degree-{} {policy:?}", defining.len() - 1),
++                "root interval proof",
++                iterations,
++                measure(iterations, || {
++                    polynomial_has_one_distinct_root_in_open_interval(
++                        &root.polynomial_coefficients,
++                        &root.interval.lower,
++                        &root.interval.upper,
++                        policy,
++                    )
++                }),
++            );
++        }
++    }
++}
+diff --git a/crates/hypersolve/src/algebraic.rs b/crates/hypersolve/src/algebraic.rs
+index c4fa34890..e14188537 100644
+--- a/crates/hypersolve/src/algebraic.rs
++++ b/crates/hypersolve/src/algebraic.rs
+@@ -3541,19 +3541,17 @@ fn evaluate_rational_polynomial_interval(
+ ) -> Option<AlgebraicPolynomialValueInterval> {
+     let point_lower = point.lower.exact_rational_ref()?;
+     let point_upper = point.upper.exact_rational_ref()?;
+-    if point_lower > point_upper {
+-        return None;
+-    }
++    let point =
++        hyperinterval::RationalInterval::new(point_lower.clone(), point_upper.clone()).ok()?;
+     let mut coefficients = polynomial.iter().rev();
+     let leading = coefficients.next()?.exact_rational_ref()?;
+-    let mut lower = leading.clone();
+-    let mut upper = leading.clone();
++    let mut value = hyperinterval::RationalInterval::point(leading.clone());
+     for coefficient in coefficients {
+         let coefficient = coefficient.exact_rational_ref()?;
+-        (lower, upper) = rational_interval_product(&lower, &upper, point_lower, point_upper);
+-        lower = lower + coefficient;
+-        upper = upper + coefficient;
++        value = value.mul(&point);
++        value = value.add(&hyperinterval::RationalInterval::point(coefficient.clone()));
+     }
++    let (lower, upper) = value.into_bounds()?;
+     Some(AlgebraicPolynomialValueInterval {
+         lower: Real::from(lower),
+         upper: Real::from(upper),
+@@ -7213,3 +7211,7 @@ mod tests {
+         }
+     }
+ }
++
++#[cfg(test)]
++#[path = "interval_migration/algebraic.rs"]
++mod interval_migration;
+diff --git a/crates/hypersolve/src/root_isolation.rs b/crates/hypersolve/src/root_isolation.rs
+index fe974efdc..b2e13e422 100644
+--- a/crates/hypersolve/src/root_isolation.rs
++++ b/crates/hypersolve/src/root_isolation.rs
+@@ -25,7 +25,6 @@ use crate::integer_interpolation::{
+     primitive_integer_polynomial, primitive_integer_polynomial_gcd,
+     primitive_integer_sturm_sequence, rational_polynomial_exact_quotient,
+ };
+-use crate::interval::rational_interval_product;
+ use crate::model::{ConstraintKind, Problem};
+ use crate::symbolic::{Expr, SymbolId};
+ 
+@@ -2602,20 +2601,16 @@ fn exact_rational_polynomial_interval_excludes_zero(
+ ) -> Option<bool> {
+     let lower = lower.exact_rational_ref()?;
+     let upper = upper.exact_rational_ref()?;
+-    if lower > upper {
+-        return None;
+-    }
++    let point = hyperinterval::RationalInterval::new(lower.clone(), upper.clone()).ok()?;
+     let mut coefficients = polynomial.iter().rev();
+     let leading = coefficients.next()?.exact_rational_ref()?;
+-    let mut range_lower = leading.clone();
+-    let mut range_upper = leading.clone();
++    let mut range = hyperinterval::RationalInterval::point(leading.clone());
+     for coefficient in coefficients {
+         let coefficient = coefficient.exact_rational_ref()?;
+-        let (product_lower, product_upper) =
+-            rational_interval_product(&range_lower, &range_upper, lower, upper);
+-        range_lower = product_lower + coefficient;
+-        range_upper = product_upper + coefficient;
++        range = range.mul(&point);
++        range = range.add(&hyperinterval::RationalInterval::point(coefficient.clone()));
+     }
++    let (range_lower, range_upper) = range.bounds()?;
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
+ 
+@@ -2626,23 +2621,19 @@ fn exact_rational_polynomial_derivative_interval_excludes_zero(
+ ) -> Option<bool> {
+     let lower = lower.exact_rational_ref()?;
+     let upper = upper.exact_rational_ref()?;
+-    if lower > upper {
+-        return None;
+-    }
++    let point = hyperinterval::RationalInterval::new(lower.clone(), upper.clone()).ok()?;
+     let mut coefficients = polynomial.iter().enumerate().skip(1).rev();
+     let (degree, leading) = coefficients.next()?;
+     let degree = HyperRational::new(i64::try_from(degree).ok()?);
+     let leading = leading.exact_rational_ref()? * &degree;
+-    let mut range_lower = leading.clone();
+-    let mut range_upper = leading;
++    let mut range = hyperinterval::RationalInterval::point(leading);
+     for (degree, coefficient) in coefficients {
+-        let (product_lower, product_upper) =
+-            rational_interval_product(&range_lower, &range_upper, lower, upper);
++        range = range.mul(&point);
+         let degree = HyperRational::new(i64::try_from(degree).ok()?);
+         let coefficient = coefficient.exact_rational_ref()? * degree;
+-        range_lower = product_lower + &coefficient;
+-        range_upper = product_upper + coefficient;
++        range = range.add(&hyperinterval::RationalInterval::point(coefficient));
+     }
++    let (range_lower, range_upper) = range.bounds()?;
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
+ 
+@@ -5576,3 +5567,7 @@ mod primitive_root_evidence_regression {
+         }
+     }
+ }
++
++#[cfg(test)]
++#[path = "interval_migration/root_isolation.rs"]
++mod interval_migration;
+diff --git a/crates/hypersolve/src/test_support.rs b/crates/hypersolve/src/test_support.rs
+index 926a9c6e9..85c5f3d6a 100644
+--- a/crates/hypersolve/src/test_support.rs
++++ b/crates/hypersolve/src/test_support.rs
+@@ -34,3 +34,144 @@ pub(crate) fn terminal_zero() -> Real {
+         - Real::e().sin() * Real::one().cos()
+         - Real::e().cos() * Real::one().sin()
+ }
++
++/// Finite rational/sign/degeneracy corpus, plus declined symbolic inputs.
++pub(crate) fn rational_horner_cases() -> Vec<(Vec<Real>, Real, Real)> {
++    use hyperreal::Rational;
++    let mut polynomials = vec![vec![], vec![Real::zero()], vec![Real::one()]];
++    for degree in 1..=16 {
++        polynomials.push(
++            (0..=degree)
++                .map(|i| {
++                    Real::from(
++                        Rational::fraction(
++                            ((i * 37 + degree * 13) % 41) as i64 - 20,
++                            ((i * 11 + degree) % 19 + 1) as u64,
++                        )
++                        .unwrap(),
++                    )
++                })
++                .collect(),
++        );
++    }
++    polynomials.extend([
++        vec![Real::one(), Real::pi(), Real::one()],
++        vec![Real::one(), Real::pi()],
++        vec![Real::pi(), Real::one()],
++        vec![Real::pi()],
++        vec![Real::from(2), Real::zero(), Real::zero(), Real::one()],
++        vec![Real::one(), Real::zero(), Real::zero()],
++        vec![
++            Real::from(
++                "12345678901234567890123456789/17"
++                    .parse::<Rational>()
++                    .unwrap(),
++            ),
++            Real::one(),
++            Real::from(
++                "-98765432109876543210987654321/19"
++                    .parse::<Rational>()
++                    .unwrap(),
++            ),
++        ],
++    ]);
++    let mut cases = Vec::new();
++    for polynomial in polynomials {
++        for lower in [-7, -1, 0, 1, 7] {
++            for upper in [-7, -1, 0, 1, 7] {
++                cases.push((
++                    polynomial.clone(),
++                    Real::from(Rational::fraction(lower, 3).unwrap()),
++                    Real::from(Rational::fraction(upper, 3).unwrap()),
++                ));
++            }
++        }
++        cases.push((polynomial.clone(), Real::pi(), Real::from(4)));
++        cases.push((polynomial, Real::zero(), Real::pi()));
++    }
++    cases
++}
++
++#[cfg(feature = "dispatch-trace")]
++pub(crate) fn compare_horner_processes(
++    test: &str,
++    expected_windows: usize,
++    run: impl FnOnce(bool),
++) {
++    const KEY: &str = "HYPERSOLVE_HORNER_BACKEND";
++    if let Ok(backend) = std::env::var(KEY) {
++        assert!(backend == "legacy" || backend == "shared");
++        run(backend == "legacy");
++        return;
++    }
++    let process = |backend| {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", test, "--nocapture"])
++            .env(KEY, backend)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        String::from_utf8(output.stdout)
++            .unwrap()
++            .lines()
++            .filter(|line| line.starts_with("HORNER "))
++            .map(str::to_owned)
++            .collect::<Vec<_>>()
++    };
++    let old = process("legacy");
++    let new = process("shared");
++    assert_eq!(old.len(), expected_windows);
++    assert_eq!(new, old);
++}
++
++// Frozen kernel from 8f5c14723 for interval migration differentials.
++pub(crate) fn legacy_rational_interval_product(
++    left_lower: &hyperreal::Rational,
++    left_upper: &hyperreal::Rational,
++    right_lower: &hyperreal::Rational,
++    right_upper: &hyperreal::Rational,
++) -> (hyperreal::Rational, hyperreal::Rational) {
++    if !left_lower.is_negative() {
++        if !right_lower.is_negative() {
++            return (left_lower * right_lower, left_upper * right_upper);
++        }
++        if !right_upper.is_positive() {
++            return (left_upper * right_lower, left_lower * right_upper);
++        }
++        return (left_upper * right_lower, left_upper * right_upper);
++    }
++    if !left_upper.is_positive() {
++        if !right_lower.is_negative() {
++            return (left_lower * right_upper, left_upper * right_lower);
++        }
++        if !right_upper.is_positive() {
++            return (left_upper * right_upper, left_lower * right_lower);
++        }
++        return (left_lower * right_upper, left_lower * right_lower);
++    }
++    if !right_lower.is_negative() {
++        return (left_lower * right_upper, left_upper * right_upper);
++    }
++    if !right_upper.is_positive() {
++        return (left_upper * right_lower, left_lower * right_lower);
++    }
++    let first_lower = left_lower * right_upper;
++    let second_lower = left_upper * right_lower;
++    let first_upper = left_lower * right_lower;
++    let second_upper = left_upper * right_upper;
++    let lower = if first_lower <= second_lower {
++        first_lower
++    } else {
++        second_lower
++    };
++    let upper = if first_upper >= second_upper {
++        first_upper
++    } else {
++        second_upper
++    };
++    (lower, upper)
++}
+diff --git a/interval-inventory.tsv b/interval-inventory.tsv
+index 6dee9cf70..d67ac592a 100644
+--- a/interval-inventory.tsv
++++ b/interval-inventory.tsv
+@@ -1164,7 +1164,7 @@ csgrs	crates/hypersolve/src/algebraic.rs	2265	algebraic_root_interval_endpoints_
+ csgrs	crates/hypersolve/src/algebraic.rs	3157	point_lies_in_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/algebraic.rs	3444	affine_transformed_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/algebraic.rs	3511	evaluate_polynomial_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-csgrs	crates/hypersolve/src/algebraic.rs	3537	evaluate_rational_polynomial_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
++csgrs	crates/hypersolve/src/algebraic.rs	3537	evaluate_rational_polynomial_interval	fn	exact Hyperreal Rational; symbolic Real only at solver boundary	solver set / certificate	Rational shared storage and arbitrary-precision arithmetic; no endpoint demotion	host std; Rust >=1.95	private	no local codec; exact Real/report/native format remains consumer-owned	evaluate_polynomial_interval; algebraic root evaluation/report	hyperinterval arithmetic; hypersolve proof/report	shared carrier candidate under differential/performance qualification	623 baseline library tests; interval_migration exact and fresh-process dispatch corpus	certification, dispatch_trace, matched allocation/native client, successive_operations	body and immediate callers audited at 8f5c14723; migration gates still pending
+ csgrs	crates/hypersolve/src/algebraic.rs	3562	interval_add	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/algebraic.rs	3572	interval_mul	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/algebraic.rs	3603	interval_reciprocal_after_certified_nonzero	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+@@ -1242,7 +1242,7 @@ csgrs	crates/hypersolve/src/curve_substitution.rs	980	bspline_span_reports_bad_k
+ csgrs	crates/hypersolve/src/domain_certification.rs	508	classify_closed_unit_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/domain_certification.rs	522	classify_open_unit_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/exact_factor.rs	700	polynomial_restrict_to_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-csgrs	crates/hypersolve/src/interval.rs	35	rational_interval_product	fn	requires body review	exact rational set hull	requires body review	requires manifest/feature review	pub(crate)	requires derive/codec review	requires call-site review	hypersolve	move arithmetic to hyperinterval after differential gates	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
++csgrs	crates/hypersolve/src/interval.rs	35	rational_interval_product	fn	exact Hyperreal Rational; symbolic Real only at solver boundary	exact rational set hull	Rational shared storage and arbitrary-precision arithmetic; no endpoint demotion	host std; Rust >=1.95	pub(crate)	no local codec; exact Real/report/native format remains consumer-owned	algebraic, algebraic_rational_image, root_isolation and root_sign exact paths	hyperinterval arithmetic; hypersolve proof/report	retain remaining symbolic-adapter callers until complete migration; shared candidate already qualified locally	623 baseline library tests; interval_migration exact and fresh-process dispatch corpus	certification, dispatch_trace, matched allocation/native client, successive_operations	body and immediate callers audited at 8f5c14723; migration gates still pending
+ csgrs	crates/hypersolve/src/interval.rs	84	VariableBall	struct	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/interval.rs	93	IntervalBoxCertificationPackage	enum	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/interval.rs	104	IntervalBoxCertificationStatus	enum	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+@@ -1307,8 +1307,8 @@ csgrs	crates/hypersolve/src/root_isolation.rs	2496	polynomial_has_no_distinct_ro
+ csgrs	crates/hypersolve/src/root_isolation.rs	2527	polynomial_interval_enclosure	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/root_isolation.rs	2562	polynomial_interval_excludes_zero	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/root_isolation.rs	2580	polynomial_derivative_interval_excludes_zero	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-csgrs	crates/hypersolve/src/root_isolation.rs	2597	exact_rational_polynomial_interval_excludes_zero	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-csgrs	crates/hypersolve/src/root_isolation.rs	2621	exact_rational_polynomial_derivative_interval_excludes_zero	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
++csgrs	crates/hypersolve/src/root_isolation.rs	2597	exact_rational_polynomial_interval_excludes_zero	fn	exact Hyperreal Rational; symbolic Real only at solver boundary	solver set / certificate	Rational shared storage and arbitrary-precision arithmetic; no endpoint demotion	host std; Rust >=1.95	private	no local codec; exact Real/report/native format remains consumer-owned	polynomial_interval_excludes_zero; distinct-root interval proof	hyperinterval arithmetic; hypersolve proof/report	shared carrier candidate under differential/performance qualification	623 baseline library tests; interval_migration exact and fresh-process dispatch corpus	certification, dispatch_trace, matched allocation/native client, successive_operations	body and immediate callers audited at 8f5c14723; migration gates still pending
++csgrs	crates/hypersolve/src/root_isolation.rs	2621	exact_rational_polynomial_derivative_interval_excludes_zero	fn	exact Hyperreal Rational; symbolic Real only at solver boundary	solver set / certificate	Rational shared storage and arbitrary-precision arithmetic; no endpoint demotion	host std; Rust >=1.95	private	no local codec; exact Real/report/native format remains consumer-owned	polynomial_derivative_interval_excludes_zero; monotonicity proof	hyperinterval arithmetic; hypersolve proof/report	shared carrier candidate under differential/performance qualification	623 baseline library tests; interval_migration exact and fresh-process dispatch corpus	certification, dispatch_trace, matched allocation/native client, successive_operations	body and immediate callers audited at 8f5c14723; migration gates still pending
+ csgrs	crates/hypersolve/src/root_isolation.rs	2652	AlgebraicImageEnclosure	struct	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub(crate)	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/root_isolation.rs	2698	certify_algebraic_image_interval	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	pub(crate)	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ csgrs	crates/hypersolve/src/root_isolation.rs	2797	polynomial_interval_bernstein_variations	fn	requires body review	solver set / certificate	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	hypersolve	retain solver semantics; review generic arithmetic extraction	cargo test -p hypersolve (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
