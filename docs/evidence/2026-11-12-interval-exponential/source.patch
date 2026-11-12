@@ -1,0 +1,899 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index 412acf0c1..0b0bd5f10 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -130,7 +130,7 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
+-          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots" "$RUNNER_TEMP/interval-exponential"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+@@ -139,3 +139,4 @@ jobs:
+           cargo +nightly fuzz run rational_powers --features rational "$RUNNER_TEMP/interval-rational-powers" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261115
+           cargo +nightly fuzz run square_roots --features rational "$RUNNER_TEMP/interval-square-roots" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261116
+           cargo +nightly fuzz run primitive_roots "$RUNNER_TEMP/interval-primitive-roots" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261117
++          cargo +nightly fuzz run exponential --features rational "$RUNNER_TEMP/interval-exponential" -- -runs=10000 -max_len=8 -max_total_time=30 -seed=20261118
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index b1657d99b..2e566d9b4 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -46,7 +46,7 @@ No existing arithmetic or predicate dispatch has been changed.
+ | 2 integer/fixed | local correctness/cost probes passed | firmware cycles/HIL and coordinated baseline gaps remain |
+ | 3 rational/dyadic/ball | carriers and local acceptance implemented | solver kernel migration, full coverage and consumer cost gates |
+ | 4 proposals/float | proposal wrappers and strict integer IEEE core implemented; local x86_64 qualification passed | full surface/coverage, further targets and shipped consumers |
+-| 5 elementary functions | abs/min/max, rational signed powers and rational/dyadic/fixed/IEEE square roots implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
++| 5 elementary functions | abs/min/max, rational signed powers and rational/dyadic/fixed/IEEE square roots and rational/dyadic exponentials implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
+ | 6 lattice | not started | component oracles and allocation/cost evidence |
+ | 7 solver | qualification started; production migration rejected | satisfy size/performance gates with unchanged statuses, certificates and dispatch |
+ | 8 interface | not started | unchanged canonical bytes and profiles |
+@@ -960,6 +960,85 @@ Later elementary functions, remaining signed-power surfaces, symbolic-ball
+ function adapters, consumer migrations, full coverage and release
+ qualification remain open. No phase completion is inferred from this addition.
+ 
++## Exponential admission (2026-11-12)
++
++Owner: Hyperinterval's interval evaluation layer, P1/P3/P5/P6/P19. Baseline
++`97f0d1d0c`; the missing `exp` witness was reproduced before implementation.
++Domain: finite rational/dyadic closed intervals, canonical empty, signed i32
++output grids. Output is a Complete-domain dyadic range with tight outward
++endpoint bounds. Size/work exhaustion or intermediate exponent-storage
++Overflow is typed before publishing an image. No consumer kernel is changed.
++
++Hyperreal's existing computable exponential has precision and abort controls,
++but no cumulative work contract that a Hyperinterval wrapper can enforce.
++The new interval algorithm has a distinct bounded-work contract and reuses
++existing DyadicInterval arithmetic, scaled quotient, normalization and output
++validation. It does not change or duplicate the computable graph machinery.
++Rational exact numerators/denominators remain the authoritative source at each
++refinement. A shared test-only exact GMP dyadic conversion was extracted from
++the square-root oracle without dropping assertions.
++
++For r in [0,1/2], each successive positive Taylor term ratio is at most 1/2;
++after S_n the tail is at most twice t_(n+1). Directed arithmetic encloses the
++argument, every term, the sum and this tail. Binary argument reduction and
++repeated directed squaring reconstruct exp(abs(x)); reciprocal reconstructs
++negative arguments. Success requires each endpoint enclosure, after output
++regridding, to have adjacent grid bounds. Exp(0) is treated exactly. For
++nonzero rational input exp(x) is not dyadic, so convergent refinement can
++separate the grid boundaries, subject to resource/storage limits. No uncertain
++predicate is treated as a successful bound.
++
++Every attempt and nested arithmetic call shares the caller's DyadicBudget.
++No refinement counter alone claims total work control; intermediate size and
++cumulative deterministic work units are separately limited. There is no
++cache or retained expression graph. These units are not heap bytes, CPU
++instructions or cancellation support; those broader controls remain open.
++For p<=0 and x<=p, exp(x)<=2^p; for p>=0 and x<0, exp(x)<1<=2^p. Exact
++bit-length comparisons establish these negative tails without materializing
++huge magnitudes. Very small nonzero arguments retain the correct side of one.
++
++Two completion regressions were reproduced during review: retaining the unused
++half of a point enclosure during interval assembly forced scale-sized growth,
++and aligning a selected zero unnecessarily exhausted the budget at the minimum
++grid exponent. Assembly now selects only the monotone extrema and constructs
++zero-based results directly through the existing validated constructor. Both
++failed logs and pre-fix source snapshots are retained alongside the original
++extreme-scale witnesses.
++
++The 26-command qualification matrix at `/tmp/interval-refactor/exponential`
++passes: 101 all-feature unit/integration tests and 11 doctests, affected Rust
++1.88/1.95/stable features/release/strict lint/docs, formatting, fuzz harnesses,
++whole-repository zizmor and retention budget, unchanged solver value/dispatch
++witnesses, primitive dependency closure and ARM/WASM compilation. Strengthened
++large-rational and coarse-tail fixtures also pass final release, dyadic-only
++MSRV and strict-lint checks. No hosted OS or distribution claim follows.
++
++Independent directed MPFR grid bounds cover rational sources, values through
++±1024, precision through -2048, coefficients beyond 1024 bits, tiny inputs,
++empty/zero, small budgets and retries, refinement, serialization and further
++operations. The maintained final ASan campaign completes 10,000 cases in
++13 seconds, seed 20261118, 8-byte cap and 30-second limit, with no failure.
++Its precision generator includes every grid exponent from -72 through zero;
++earlier campaigns restricted that band to -72 through -8 and are retained.
++
++Fresh Rust 1.95 coverage reports 2,388/2,432 production lines (98.19%) and
++4,583/4,790 regions (95.68%). Tests, dependencies and probes are excluded;
++LLVM supplies no branch denominator. Report/export/dump all succeed and all
++four mismatch records identify excluded Rug OptRational::parts. Earlier
++profiles remain separate, not mixed into the final report. Full coverage is
++still open.
++
++All 480 cost samples complete: four source widths, three grid precisions,
++and both backends; 128 warmups and 20 samples of 128 owned images per group.
++The crate performance ledger has the full median table. Raw samples also
++retain deterministic work units, which are distinct from measured CPU time.
++No speedup or consumer/firmware claim follows. The separate
++`2026-11-12-interval-exponential` evidence record is pending registration.
++
++Later elementary functions, primitive exponential backends, symbolic-ball
++adapters, consumer migrations, actual memory/cancellation bounds, full coverage
++and release qualification remain open.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 742b7ea8d..43e813b8d 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add tight rational/dyadic exponential images using budgeted interval Taylor
++  tails, range reconstruction and endpoint refinement. Preserve explicit
++  domain coverage, negative-tail shortcuts and retry after exhaustion.
++
+ - Add allocation-free fixed-point and qualified IEEE square roots with tight
+   endpoints and explicit domain coverage. Validate maximal-scale overflow,
+   subnormal inputs and independence from native rounding/FTZ/DAZ modes.
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index fa1b2c4e7..12e808098 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -83,3 +83,8 @@ required-features = ["rational", "dyadic"]
+ name = "primitive_root_cost"
+ path = "conformance/primitive_root_cost.rs"
+ required-features = ["fixed", "float-enclosure"]
++
++[[example]]
++name = "exp_cost"
++path = "conformance/exp_cost.rs"
++required-features = ["rational", "dyadic"]
+diff --git a/crates/hyperinterval/PERFORMANCE.md b/crates/hyperinterval/PERFORMANCE.md
+index 7b56cde9e..98e387edb 100644
+--- a/crates/hyperinterval/PERFORMANCE.md
++++ b/crates/hyperinterval/PERFORMANCE.md
+@@ -228,3 +228,40 @@ combinations, and emitted code scans on Rust 1.88, 1.95 and stable, plus stable
+ fat LTO, find no native floating arithmetic/comparison in the selected root
+ and existing strict-float paths. This target/compiler evidence does not
+ qualify a different platform or replace the exact mathematical argument.
++
++## Budgeted exponential completion probe
++
++`conformance/exp_cost.rs` computes tight grid images of preconstructed exact
++inputs: point 1, narrow [1,1+2^-8], wide [-4,4], and negative [-16,-8]. The
++output includes both owned dyadic endpoints and Complete domain coverage;
++all refinement attempts remain charged to the same budget. Independent
++directed MPFR checks run before timing. Rust 1.99 release, x86_64 Linux,
++rational+dyadic features, 128 warmups and 20 samples of 128 images per case:
++
++| Backend / input | grid 2^-16 | grid 2^-64 | grid 2^-256 |
++| --- | ---: | ---: | ---: |
++| dyadic / point | 18646.520 | 36383.531 | 114201.234 |
++| dyadic / narrow | 38583.367 | 69556.871 | 213629.574 |
++| dyadic / wide | 64542.234 | 133154.922 | 452603.320 |
++| dyadic / negative | 19836.590 | 75867.113 | 220062.328 |
++| rational / point | 18753.453 | 36558.797 | 114525.246 |
++| rational / narrow | 35268.566 | 69941.078 | 215594.012 |
++| rational / wide | 64724.559 | 133569.125 | 453385.070 |
++| rational / negative | 20020.934 | 76152.012 | 219971.211 |
++
++Values are median ns/image; all 480 samples completed. Timed work includes
++budget creation, Taylor tails, range reconstruction, any endpoint refinement,
++output materialization and destruction. Inputs/oracles are excluded. Raw
++samples retain deterministic work units per image alongside elapsed time;
++compiler/hardware metadata, executable hash and whole-probe size are archived.
++The executable includes GMP/MPFR oracle code, so its size is not kernel size.
++These are finite host completion costs, not a speedup comparison to an
++unbudgeted point evaluator or evidence of a consumer/firmware migration.
++
++The ordinary corpus additionally completes values through ±1024, precision
++through -2048, rational coefficients beyond 1024 bits, tiny inputs, and
++extreme-scale negative tails under its declared size/work settings. Positive
++extreme scales and small budgets exercise typed refusal, not completion.
++Deterministic accounting is distinct from precision, actual heap bytes,
++wall-clock time and cancellation. A broad memory/cancellation contract and
++full consumer performance qualification remain open.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 780765310..3f9022e41 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -26,6 +26,14 @@ are excluded with `Partial` coverage; strictly negative nonempty inputs return
+ `EmptyDomain`. Empty inputs return empty with `Complete` coverage. Keep the
+ coverage receipt when consuming the result in later arithmetic.
+ 
++Rational and dyadic intervals also provide `exp(precision, &mut budget)` with
++tight outward dyadic endpoints. Its domain is complete for every input, with
++empty mapped to empty. Certified Taylor tails, directed range reconstruction
++and endpoint refinement share the same work/size budget. A failed attempt
++publishes no partial image; a new budget permits a fresh retry. This path
++provides deterministic work accounting, not cancellation or actual heap-byte
++limits.
++
+ Hyperinterval encloses. Hyperlattice carries set-valued linear structure.
+ Hyperlimit decides. Hypersolve certifies. Hyperdynamics evolves. Domain crates
+ assign meaning.
+diff --git a/crates/hyperinterval/conformance/exp_cost.rs b/crates/hyperinterval/conformance/exp_cost.rs
+new file mode 100644
+index 000000000..20a8b6b94
+--- /dev/null
++++ b/crates/hyperinterval/conformance/exp_cost.rs
+@@ -0,0 +1,59 @@
++//! Materialized tight exponential images, including all refinement work.
++use hyperinterval::{DyadicBudget, DyadicInterval, RationalInterval};
++use hyperreal::Rational;
++use std::{hint::black_box, time::Instant};
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/exp_oracle.rs"]
++mod oracle;
++fn main() {
++    println!("backend,case,precision,sample,elapsed_ns,completed_images,work_units_per_image");
++    for (case, a, b) in [
++        ("point", 256i64, 256i64),
++        ("narrow", 256, 257),
++        ("wide", -1024, 1024),
++        ("negative", -4096, -2048),
++    ] {
++        let dyadic = DyadicInterval::new(a.into(), b.into(), -8).unwrap();
++        let rational = RationalInterval::new(
++            Rational::fraction(a, 256).unwrap(),
++            Rational::fraction(b, 256).unwrap(),
++        )
++        .unwrap();
++        for precision in [-16, -64, -256] {
++            for backend in ["dyadic", "rational"] {
++                let work = || {
++                    let mut budget = DyadicBudget::new(16384, 1_000_000_000_000);
++                    let result = if backend == "dyadic" {
++                        black_box(&dyadic).exp(black_box(precision), &mut budget)
++                    } else {
++                        black_box(&rational).exp(black_box(precision), &mut budget)
++                    }
++                    .unwrap();
++                    (result, 1_000_000_000_000 - budget.remaining_work())
++                };
++                let (result, units) = work();
++                #[cfg(not(target_env = "msvc"))]
++                oracle::verify(
++                    &result.range,
++                    &oracle::q(&a, -8),
++                    &oracle::q(&b, -8),
++                    precision,
++                );
++                black_box(result);
++                for _ in 0..128 {
++                    black_box(work());
++                }
++                for sample in 0..20 {
++                    let start = Instant::now();
++                    for _ in 0..128 {
++                        black_box(work());
++                    }
++                    println!(
++                        "{backend},{case},{precision},{sample},{},128,{units}",
++                        start.elapsed().as_nanos()
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index de75544e1..56eb8acfd 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -78,3 +78,11 @@ path = "fuzz_targets/primitive_roots.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "exponential"
++path = "fuzz_targets/exponential.rs"
++required-features = ["rational"]
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs b/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs
+new file mode 100644
+index 000000000..43fc25414
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs
+@@ -0,0 +1,46 @@
++#![no_main]
++use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, RationalInterval};
++use hyperreal::Rational;
++use libfuzzer_sys::fuzz_target;
++use rug::Rational as Q;
++#[path = "../../tests/support/exp_oracle.rs"]
++mod oracle;
++
++fuzz_target!(|data: [i16; 4]| {
++    let [a, b, c, p] = data;
++    let (a, b) = (
++        i64::from(a.rem_euclid(17) - 8),
++        i64::from(b.rem_euclid(17) - 8),
++    );
++    let (a, b) = (a.min(b), a.max(b));
++    let denominator = 1 + u64::from(c.unsigned_abs() % 64);
++    let exponent = i32::from(c % 3);
++    let precision = -i32::from(p.unsigned_abs() % 73);
++    let budget = || DyadicBudget::new(4096, 100_000_000_000);
++    let dyadic = DyadicInterval::new(a.into(), b.into(), exponent).unwrap();
++    let rational = RationalInterval::new(
++        Rational::fraction(a, denominator).unwrap(),
++        Rational::fraction(b, denominator).unwrap(),
++    )
++    .unwrap();
++    for (image, lo, hi) in [
++        (
++            dyadic.exp(precision, &mut budget()).unwrap(),
++            oracle::q(&a, exponent),
++            oracle::q(&b, exponent),
++        ),
++        (
++            rational.exp(precision, &mut budget()).unwrap(),
++            Q::from((a, denominator)),
++            Q::from((b, denominator)),
++        ),
++    ] {
++        assert_eq!(image.domain, DomainCoverage::Complete);
++        oracle::verify(&image.range, &lo, &hi, precision);
++        let restored: DyadicInterval =
++            serde_json::from_slice(&serde_json::to_vec(&image.range).unwrap()).unwrap();
++        assert_eq!(restored, image.range);
++        let coarse = restored.regrid(precision + 4, &mut budget()).unwrap();
++        assert!(restored.subset_of(&coarse, &mut budget()).unwrap());
++    }
++});
+diff --git a/crates/hyperinterval/src/exponential.rs b/crates/hyperinterval/src/exponential.rs
+new file mode 100644
+index 000000000..7a8965bfb
+--- /dev/null
++++ b/crates/hyperinterval/src/exponential.rs
+@@ -0,0 +1,216 @@
++//! Budgeted interval evaluation; no unaccounted computable-graph evaluation.
++use crate::dyadic::scaled_quotient;
++use crate::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError, RangeEnclosure};
++use num_bigint::BigInt;
++use num_traits::{One, Signed, Zero};
++
++impl DyadicInterval {
++    /// Tight outward exponential image on the grid `2^precision`.
++    ///
++    /// The exponential is defined everywhere; empty maps to empty and domain
++    /// coverage is always `Complete`. Certified Taylor tails, directed squaring
++    /// and reciprocal arithmetic refine until each endpoint has adjacent grid
++    /// bounds. All stages share the caller's size/work budget. Exhaustion
++    /// publishes no partial result; there is no cache to poison a later retry.
++    /// These are deterministic accounting units, not CPU/heap-byte bounds or
++    /// cancellation support. See [`DyadicBudget`].
++    pub fn exp(
++        &self,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<RangeEnclosure<Self>, IntervalError> {
++        let Some((a, b, e)) = self.bounds() else {
++            return complete(Self::empty());
++        };
++        budget.reserve(1, 1, false)?;
++        let denominator = BigInt::one();
++        let lower = endpoint(a, &denominator, e, precision, budget)?;
++        if a == b {
++            return complete(lower);
++        }
++        let upper = endpoint(b, &denominator, e, precision, budget)?;
++        complete(outer_bounds(lower, upper, budget)?)
++    }
++}
++
++#[cfg(feature = "rational")]
++impl crate::RationalInterval {
++    /// Tight outward exponential image with dyadic spacing `2^precision`.
++    ///
++    /// Requires `rational` and `dyadic`. The complete exact rational source is
++    /// retained through argument bounds; it is not replaced by an adopted
++    /// rounded model. Directed refinement and all interval arithmetic share
++    /// the caller's budget. Empty maps to empty with `Complete` coverage.
++    pub fn exp(
++        &self,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<RangeEnclosure<DyadicInterval>, IntervalError> {
++        let Some((a, b)) = self.bounds() else {
++            return complete(DyadicInterval::empty());
++        };
++        let point = |x: &hyperreal::Rational, budget: &mut DyadicBudget| {
++            budget.reserve(x.numerator().bits().max(x.denominator().bits()), 2, false)?;
++            endpoint(
++                &BigInt::from_biguint(x.sign(), x.numerator().clone()),
++                &BigInt::from(x.denominator().clone()),
++                0,
++                precision,
++                budget,
++            )
++        };
++        let lower = point(a, budget)?;
++        if a == b {
++            return complete(lower);
++        }
++        complete(outer_bounds(lower, point(b, budget)?, budget)?)
++    }
++}
++
++// Select only the monotone image extrema before normalization/alignment.
++// The other half of either point enclosure need not occur in the region image
++// representation; retaining it can cause needless scale-sized allocations.
++fn outer_bounds(
++    lower: DyadicInterval,
++    upper: DyadicInterval,
++    budget: &mut DyadicBudget,
++) -> Result<DyadicInterval, IntervalError> {
++    let (a, _, e) = lower.bounds().expect("nonempty lower endpoint image");
++    let (_, b, f) = upper.bounds().expect("nonempty upper endpoint image");
++    budget.reserve(a.bits().max(b.bits()).max(1), 4, false)?;
++    if a.is_zero() {
++        // Zero needs no aligned mantissa, even at the minimum grid exponent.
++        return DyadicInterval::new(BigInt::zero(), b.clone(), f);
++    }
++    DyadicInterval::point(a.clone(), e)?.hull(&DyadicInterval::point(b.clone(), f)?, budget)
++}
++
++fn complete(range: DyadicInterval) -> Result<RangeEnclosure<DyadicInterval>, IntervalError> {
++    Ok(RangeEnclosure {
++        range,
++        domain: DomainCoverage::Complete,
++    })
++}
++
++// n*2^exponent/d is a single exact source; d is strictly positive.
++fn endpoint(
++    n: &BigInt,
++    d: &BigInt,
++    exponent: i32,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<DyadicInterval, IntervalError> {
++    budget.reserve(n.bits().max(d.bits()).max(1), 3, false)?;
++    let one = DyadicInterval::point(BigInt::one(), 0)?;
++    if n.is_zero() {
++        return if precision <= 0 {
++            Ok(one)
++        } else {
++            DyadicInterval::new(BigInt::zero(), BigInt::one(), precision)
++        };
++    }
++    let negative = n.is_negative();
++    let magnitude = n.abs();
++    // For p<=0 and x<=p, exp(x)<=exp(p)<=2^p. For p>=0 and
++    // x<0, exp(x)<1<=2^p. No magnitude-sized expansion is required.
++    if negative
++        && (precision >= 0
++            || at_least_integer(&magnitude, d, exponent, precision.unsigned_abs(), budget)?)
++    {
++        return DyadicInterval::new(BigInt::zero(), BigInt::one(), precision);
++    }
++    // n<2^N, d>=2^(D-1); division by 2^s puts the magnitude below 1/2.
++    let reduction = (i64::try_from(n.bits()).map_err(|_| IntervalError::Overflow)?
++        - i64::try_from(d.bits()).map_err(|_| IntervalError::Overflow)?
++        + i64::from(exponent)
++        + 2)
++    .max(0);
++    budget.reserve(1, reduction as u64, false)?;
++    let mut working = precision
++        .min(-4)
++        .checked_sub(12)
++        .ok_or(IntervalError::Overflow)?;
++    loop {
++        let shift = i64::from(exponent) - reduction - i64::from(working);
++        let (lo, hi) = if i128::from(magnitude.bits()) + i128::from(shift) < i128::from(d.bits()) {
++            // Positive value below one grid unit; avoid a huge denominator.
++            budget.reserve(1, 2, false)?;
++            (BigInt::zero(), BigInt::one())
++        } else {
++            scaled_quotient(&magnitude, d, shift, budget)?
++        };
++        let argument = DyadicInterval::new(lo, hi, working)?;
++        let mut value = small_exp(&argument, working, budget)?;
++        for _ in 0..reduction {
++            value = value.square(budget)?.regrid(working, budget)?;
++        }
++        if negative {
++            value = value.reciprocal(working, budget)?;
++        }
++        let rounded = value.regrid(precision, budget)?;
++        let (lo, hi, e) = rounded.bounds().expect("nonempty exponential");
++        budget.reserve(lo.bits().max(hi.bits()).saturating_add(1), 1, false)?;
++        let gap = hi - lo;
++        if gap.is_zero() || (gap.is_one() && e == precision) {
++            return Ok(rounded);
++        }
++        // All failed attempts remain charged to the same budget. Doubling the
++        // guard precision eventually separates nonzero rational exponentials
++        // from dyadic grid boundaries, subject to resource/storage limits.
++        working = working.checked_mul(2).ok_or(IntervalError::Overflow)?;
++    }
++}
++
++// Prove n*2^e/d >= threshold with bit lengths before aligned comparison.
++// This shortcut is distinct from ordinary quotient materialization: a huge
++// negative exponential can have a one-unit enclosure even at extreme e/p.
++fn at_least_integer(
++    n: &BigInt,
++    d: &BigInt,
++    e: i32,
++    threshold: u32,
++    budget: &mut DyadicBudget,
++) -> Result<bool, IntervalError> {
++    budget.reserve(d.bits().saturating_add(32), 1, true)?;
++    let right = d * threshold;
++    let left_bits = i128::from(n.bits()) + i128::from(e);
++    if left_bits != i128::from(right.bits()) {
++        return Ok(left_bits > i128::from(right.bits()));
++    }
++    budget.reserve(n.bits().max(right.bits()), 2, false)?;
++    Ok(if e >= 0 {
++        n << e as usize >= right
++    } else {
++        n >= &(right << e.unsigned_abs() as usize)
++    })
++}
++
++// 0<=x<=1/2. After S_n, the remaining positive Taylor tail is at most
++// 2*t_(n+1), since every subsequent term ratio is at most 1/2. Directed
++// arithmetic encloses every term and sum, including argument-grid uncertainty.
++fn small_exp(
++    argument: &DyadicInterval,
++    working: i32,
++    budget: &mut DyadicBudget,
++) -> Result<DyadicInterval, IntervalError> {
++    budget.reserve(2, 4, false)?;
++    let one = DyadicInterval::point(BigInt::one(), 0)?;
++    let two = DyadicInterval::point(BigInt::from(2), 0)?;
++    let zero = DyadicInterval::point(BigInt::zero(), 0)?;
++    let tolerance = DyadicInterval::new(BigInt::zero(), BigInt::one(), working)?;
++    let mut sum = one.clone();
++    let mut term = one;
++    let mut k = 1u64;
++    loop {
++        budget.reserve(u64::from(u64::BITS - k.leading_zeros()), 2, false)?;
++        let divisor = DyadicInterval::point(BigInt::from(k), 0)?;
++        term = term.mul(argument, budget)?.div(&divisor, working, budget)?;
++        if term.subset_of(&tolerance, budget)? {
++            return sum.add(&term.mul(&two, budget)?.hull(&zero, budget)?, budget);
++        }
++        sum = sum.add(&term, budget)?;
++        // Every iteration consumes more than one of at most u64::MAX work
++        // units, so work exhaustion precedes overflow of this index.
++        k += 1;
++    }
++}
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index c14f8b929..b524ee1a9 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -23,6 +23,8 @@
+ mod bounds;
+ #[cfg(feature = "dyadic")]
+ mod dyadic;
++#[cfg(feature = "dyadic")]
++mod exponential;
+ #[cfg(feature = "fixed")]
+ mod fixed;
+ #[cfg(feature = "fixed")]
+diff --git a/crates/hyperinterval/tests/exponential.rs b/crates/hyperinterval/tests/exponential.rs
+new file mode 100644
+index 000000000..a3c13eefc
+--- /dev/null
++++ b/crates/hyperinterval/tests/exponential.rs
+@@ -0,0 +1,232 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError};
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++#[test]
++fn exponential_empty_zero_and_negative_tail() {
++    for precision in [i32::MIN, -128, 0, 1, i32::MAX] {
++        let empty = DyadicInterval::empty()
++            .exp(precision, &mut DyadicBudget::new(0, 0))
++            .unwrap();
++        assert!(empty.range.is_empty());
++        assert_eq!(empty.domain, DomainCoverage::Complete);
++        assert_eq!(
++            d(0, 0, 0).exp(precision, &mut budget()).unwrap().range,
++            if precision <= 0 {
++                d(1, 1, 0)
++            } else {
++                d(0, 1, precision)
++            }
++        );
++        assert_eq!(
++            d(-1, -1, i32::MAX)
++                .exp(precision, &mut budget())
++                .unwrap()
++                .range,
++            d(0, 1, precision)
++        );
++    }
++    assert_eq!(
++        d(-3, -3, -1).exp(-1, &mut budget()).unwrap().range,
++        d(0, 1, -1)
++    );
++    assert_eq!(
++        d(-1, -1, -1).exp(-1, &mut budget()).unwrap().range,
++        d(1, 2, -1)
++    );
++    assert_eq!(d(1, 1, 0).exp(0, &mut budget()).unwrap().range, d(2, 3, 0));
++    assert_eq!(
++        d(-1, -1, 0).exp(-3, &mut budget()).unwrap().range,
++        d(2, 3, -3)
++    );
++    assert_eq!(
++        d(1, 1, 0).exp(-32, &mut DyadicBudget::new(64, 0)),
++        Err(IntervalError::WorkExhausted)
++    );
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/exp_oracle.rs"]
++mod oracle;
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn dyadic_exp_matches_independent_directed_bounds() {
++    for exponent in [-8, -1, 0, 3] {
++        for a in -12..=12 {
++            for b in [a, a + 1, 12].into_iter().filter(|b| *b >= a) {
++                for precision in [-64, -16, -1, 0, 8] {
++                    let result = d(a, b, exponent).exp(precision, &mut budget()).unwrap();
++                    assert_eq!(result.domain, DomainCoverage::Complete);
++                    oracle::verify(
++                        &result.range,
++                        &oracle::q(&a, exponent),
++                        &oracle::q(&b, exponent),
++                        precision,
++                    );
++                }
++            }
++        }
++    }
++    for (a, e, p) in [
++        (1, -1074, -128),
++        (-1, -1074, -128),
++        (1, 10, -64),
++        (-1, 10, -2048),
++        (1, 0, -1024),
++    ] {
++        let result = d(a, a, e).exp(p, &mut budget()).unwrap();
++        oracle::verify(&result.range, &oracle::q(&a, e), &oracle::q(&a, e), p);
++    }
++    // Tiny but nonzero source values still select the correct side of one;
++    // their enormous denominator need never be materialized.
++    assert_eq!(
++        d(1, 1, i32::MIN).exp(-8, &mut budget()).unwrap().range,
++        d(256, 257, -8)
++    );
++    assert_eq!(
++        d(-1, -1, i32::MIN).exp(-8, &mut budget()).unwrap().range,
++        d(255, 256, -8)
++    );
++}
++
++#[cfg(all(feature = "rational", not(target_env = "msvc")))]
++#[test]
++fn rational_exp_preserves_exact_source_and_matches_mpfr() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    use rug::Rational as Q;
++    for denominator in [1u64, 3, 7, 65537] {
++        for a in -8..=8 {
++            let b = a + 3;
++            let x = I::new(
++                R::fraction(a, denominator).unwrap(),
++                R::fraction(b, denominator).unwrap(),
++            )
++            .unwrap();
++            for precision in [-128, -32, 0, 8] {
++                let result = x.exp(precision, &mut budget()).unwrap();
++                oracle::verify(
++                    &result.range,
++                    &Q::from((a, denominator)),
++                    &Q::from((b, denominator)),
++                    precision,
++                );
++            }
++        }
++    }
++    let huge = rug::Integer::from(1) << 1024u32;
++    for source in [
++        Q::from((huge.clone() + 1, huge.clone())),
++        Q::from((1, huge.clone() + 1)),
++        Q::from((-1, huge)),
++    ] {
++        let x = I::point(source.to_string().parse::<R>().unwrap());
++        let result = x.exp(-128, &mut budget()).unwrap();
++        oracle::verify(&result.range, &source, &source, -128);
++        assert_eq!(
++            x.exp(-128, &mut DyadicBudget::new(64, 1_000_000)),
++            Err(IntervalError::SizeExhausted)
++        );
++        assert_eq!(x.exp(-128, &mut budget()).unwrap(), result);
++    }
++    for source in ["0", "1/3", "-1/3"] {
++        let x = I::point(source.parse::<R>().unwrap());
++        let result = x.exp(-128, &mut budget()).unwrap();
++        let q = source.parse::<Q>().unwrap();
++        oracle::verify(&result.range, &q, &q, -128);
++    }
++    assert!(
++        I::empty()
++            .exp(i32::MIN, &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .range
++            .is_empty()
++    );
++}
++
++#[test]
++fn resource_refusal_retry_and_successive_operations() {
++    let x = d(-1, 1, 0);
++    assert_eq!(
++        x.exp(-64, &mut DyadicBudget::new(16, 1_000_000)),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        x.exp(-64, &mut DyadicBudget::new(1024, 10)),
++        Err(IntervalError::WorkExhausted)
++    );
++    // A completed first endpoint must not be published when the second fails.
++    assert_eq!(
++        d(0, 1, 0).exp(-32, &mut DyadicBudget::new(1, 1000)),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        d(1, 1, 0).exp(i32::MIN, &mut budget()),
++        Err(IntervalError::Overflow)
++    );
++    let first = x.exp(-64, &mut budget()).unwrap();
++    assert_eq!(first, x.exp(-64, &mut budget()).unwrap());
++    let coarse = x.exp(-16, &mut budget()).unwrap();
++    assert!(first.range.subset_of(&coarse.range, &mut budget()).unwrap());
++    let next = first.range.exp(-16, &mut budget()).unwrap();
++    assert!(!next.range.is_empty());
++    let positive = d(1, 1, 0).exp(-64, &mut budget()).unwrap().range;
++    let negative = d(-1, -1, 0).exp(-64, &mut budget()).unwrap().range;
++    assert!(
++        positive
++            .mul(&negative, &mut budget())
++            .unwrap()
++            .contains_point(&1.into(), 0, &mut budget())
++            .unwrap()
++    );
++    assert_eq!(
++        d(1, 1, i32::MAX).exp(0, &mut DyadicBudget::new(256, 1_000_000_000_000)),
++        Err(IntervalError::SizeExhausted)
++    );
++    #[cfg(feature = "serde")]
++    {
++        let bytes = serde_json::to_vec(&first.range).unwrap();
++        let restored: DyadicInterval = serde_json::from_slice(&bytes).unwrap();
++        assert_eq!(restored, first.range);
++        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
++        assert_eq!(restored.exp(-16, &mut budget()).unwrap(), next);
++    }
++}
++
++#[test]
++fn interval_assembly_selects_only_extreme_endpoint_bounds() {
++    assert_eq!(
++        d(-2, -1, i32::MAX)
++            .exp(i32::MIN, &mut budget())
++            .unwrap()
++            .range,
++        d(0, 1, i32::MIN)
++    );
++
++    assert_eq!(
++        d(-1, 0, i32::MAX)
++            .exp(i32::MIN, &mut budget())
++            .unwrap()
++            .range,
++        d(0, 1, 0)
++    );
++    #[cfg(feature = "rational")]
++    {
++        use hyperinterval::RationalInterval as I;
++        use hyperreal::Rational as R;
++        let a = R::from_bigint(-(num_bigint::BigInt::from(1) << 1024usize));
++        assert_eq!(
++            I::new(a, R::zero())
++                .unwrap()
++                .exp(i32::MIN, &mut budget())
++                .unwrap()
++                .range,
++            d(0, 1, 0)
++        );
++    }
++}
+diff --git a/crates/hyperinterval/tests/support/dyadic_oracle.rs b/crates/hyperinterval/tests/support/dyadic_oracle.rs
+new file mode 100644
+index 000000000..8e57a8ba1
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/dyadic_oracle.rs
+@@ -0,0 +1,12 @@
++//! Exact value transfer to independent GMP without floating conversion.
++use rug::{Integer, Rational as Q};
++
++pub fn q(mantissa: &impl core::fmt::Display, exponent: i32) -> Q {
++    let mut value = Q::from(mantissa.to_string().parse::<Integer>().unwrap());
++    if exponent >= 0 {
++        value <<= exponent as u32;
++    } else {
++        value >>= exponent.unsigned_abs();
++    }
++    value
++}
+diff --git a/crates/hyperinterval/tests/support/exp_oracle.rs b/crates/hyperinterval/tests/support/exp_oracle.rs
+new file mode 100644
+index 000000000..4f172ca9f
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/exp_oracle.rs
+@@ -0,0 +1,35 @@
++//! Independent directed MPFR exponential and exact GMP grid conversion.
++use hyperinterval::DyadicInterval;
++use rug::{Float, Rational, float::Round};
++#[path = "dyadic_oracle.rs"]
++mod dyadic_oracle;
++pub use dyadic_oracle::q;
++
++pub fn verify(result: &DyadicInterval, a: &Rational, b: &Rational, precision: i32) {
++    let (mut lower, _) = Float::with_val_round(4096, a, Round::Down);
++    let (mut upper, _) = Float::with_val_round(4096, b, Round::Up);
++    lower.exp_round(Round::Down);
++    upper.exp_round(Round::Up);
++    let mut lo = lower.to_rational().unwrap();
++    let mut hi = upper.to_rational().unwrap();
++    if precision >= 0 {
++        lo >>= precision as u32;
++        hi >>= precision as u32;
++    } else {
++        lo <<= precision.unsigned_abs();
++        hi <<= precision.unsigned_abs();
++    }
++    let expected_lower = q(lo.floor().numer(), precision);
++    let expected_upper = q(hi.ceil().numer(), precision);
++    let (actual_lower, actual_upper, e) = result.bounds().unwrap();
++    assert_eq!(
++        q(actual_lower, e),
++        expected_lower,
++        "lower exp({a}), p={precision}"
++    );
++    assert_eq!(
++        q(actual_upper, e),
++        expected_upper,
++        "upper exp({b}), p={precision}"
++    );
++}
+diff --git a/crates/hyperinterval/tests/support/sqrt_oracle.rs b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+index d4b146c1e..b58592083 100644
+--- a/crates/hyperinterval/tests/support/sqrt_oracle.rs
++++ b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+@@ -1,16 +1,10 @@
+ //! Independent exact grid tightness and directed MPFR square-root oracle.
+ use hyperinterval::DyadicInterval;
+-use rug::{Float, Integer, Rational as Q, float::Round};
++use rug::{Float, Rational as Q, float::Round};
+ 
+-pub fn q(mantissa: &impl core::fmt::Display, exponent: i32) -> Q {
+-    let mut value = Q::from(mantissa.to_string().parse::<Integer>().unwrap());
+-    if exponent >= 0 {
+-        value <<= exponent as u32;
+-    } else {
+-        value >>= exponent.unsigned_abs();
+-    }
+-    value
+-}
++#[path = "dyadic_oracle.rs"]
++mod dyadic_oracle;
++pub use dyadic_oracle::q;
+ 
+ // Certify containment AND the impossibility of moving either grid endpoint
+ // inward. These exact GMP inequalities do not reuse the implementation's
