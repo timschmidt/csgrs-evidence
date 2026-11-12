@@ -1,0 +1,1341 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index 529a2e61a..50b81c260 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -131,7 +131,7 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
+-          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots" "$RUNNER_TEMP/interval-exponential" "$RUNNER_TEMP/interval-logarithm" "$RUNNER_TEMP/interval-arctangent" "$RUNNER_TEMP/interval-trigonometry" "$RUNNER_TEMP/interval-split-division" "$RUNNER_TEMP/interval-fractional-power"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots" "$RUNNER_TEMP/interval-exponential" "$RUNNER_TEMP/interval-logarithm" "$RUNNER_TEMP/interval-arctangent" "$RUNNER_TEMP/interval-trigonometry" "$RUNNER_TEMP/interval-split-division" "$RUNNER_TEMP/interval-fractional-power" "$RUNNER_TEMP/interval-tangent"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+@@ -146,3 +146,4 @@ jobs:
+           cargo +nightly fuzz run trigonometry --features rational "$RUNNER_TEMP/interval-trigonometry" -- -runs=10000 -max_len=8 -max_total_time=30 -seed=20261121
+           cargo +nightly fuzz run split_division "$RUNNER_TEMP/interval-split-division" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261122
+           cargo +nightly fuzz run fractional_power "$RUNNER_TEMP/interval-fractional-power" -- -runs=10000 -max_len=12 -max_total_time=30 -seed=20261123
++          cargo +nightly fuzz run tangent --features rational "$RUNNER_TEMP/interval-tangent" -- -runs=10000 -max_len=8 -max_total_time=120 -seed=20261124
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 45f22056c..7f7c1f108 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -1429,6 +1429,93 @@ Tangent/pole functions, remaining
+ Phase 5 qualifications, broader consumer migrations, allocation/cancellation,
+ coordinated release and the earlier incomplete plan phases remain open.
+ 
++## Tangent and cotangent admission (2026-11-12)
++
++Owner: Hyperinterval scalar image layer, P1/P3/P5/P6/P19; baseline `0ef6cc8ec`.
++The missing tan/cot witness is reproduced before implementation in
++`/tmp/interval-refactor/tangent/missing-witness.log`. The input domain is
++connected rational, dyadic and extended dyadic source intervals. Every finite
++rational tangent endpoint is defined; cotangent excludes zero and its irrational
++nonzero poles. A zero-only cotangent source returns EmptyDomain, empty sources
++return empty/Complete, and any excluded pole gives Partial coverage. The image
++is a normalized IntervalSet2 of closed extended dyadic components, rounded
++outward on the requested grid. A full branch or nonempty unbounded source gives
++the entire line/Partial, proved from source topology rather than uncertainty.
++
++Reuse certified half-pi phase reduction, Taylor bounds and extrema detection;
++keep existing sine/cosine call order and accounting unchanged. Prove monotonic
++branch extrema and pole incidence before assembling finite intervals or rays.
++Never infer a whole-range success from a denominator enclosure containing zero:
++refine or exhaust the shared deterministic size/work budget. Exact cotangent
++endpoint poles require one-sided limits and domain qualification. No rounded
++source conversion supplies the authoritative phase. Independent directed MPFR
++point bounds and GMP pole indexing, near-pole sources, huge/tiny arguments,
++partial/repeated operations, fresh-process replay and budget refusal/retry are
++acceptance gates. Actual heap-byte limits, cancellation, wider consumer migration
++and coordinated release remain open.
++
++The implementation shares the existing reducer, alternating Taylor bounds and
++extremum scan. Sine extrema mark tangent poles; cosine extrema mark cotangent
++poles. Nonzero rational endpoints cannot equal nonzero rational multiples of pi.
++Cotangent's exact zero endpoint is excluded from the interior scan and supplied
++as a one-sided infinite limit. Two interior poles, or an interior pole plus an
++endpoint pole, prove a full branch. With no pole, monotonicity selects finite
++extrema; with one interior pole, it selects two rays. Tangent increases and
++cotangent decreases on each branch. Normalization merges only touching or
++overlapping represented enclosures, including gaps closed by outward rounding.
++
++Endpoint evaluation selects the denominator first from certified sine/cosine
++residual enclosures. If zero cannot yet be excluded, refinement continues. The
++original rational source remains authoritative at every attempt. Signed quotient
++bounds must reach adjacent requested-grid endpoints before publication; no
++rounded-source pole decision or exhausted partial result escapes. Full-line
++unbounded-source results need no numerical allocation or budget work.
++
++The source audit in shared-trig-body-check.json proves the old trigonometry
++module is identical after removing only crate visibility, whitespace and one
++optional signature comma. Existing call order/accounting and Hyperreal dispatch
++remain unchanged; no numerical-body refactor was performed. Shared test helpers
++now supply MPFR pi bounds and exact GMP phase indices to both trig corpora.
++
++The final 29-command feature/release/lint/docs/security/portable-build matrix
++passes. It includes the existing sine/cosine corpus, four unchanged Hypersolve
++value/dispatch witnesses, primitive dependency closure, no-feature strict Clippy,
++ARM/WASM no_std builds and repository-wide Zizmor. Two initial Clippy failures
++on the same parity spelling are retained with pre-lint source; the repair keeps
++condition order. One additional adapter test was then added and passed focused
++strict Clippy and the complete instrumented suite. The final unique count is
++148 unit/integration tests plus 12 doctests, recorded by test-list.log; the three
++fresh-process child executions are not additional unique tests. No push occurred.
++
++The independent oracle combines directed MPFR endpoint bounds with GMP branch
++indices, a different closed-form calculation from the production residue scan.
++Its ordinary dyadic corpus has 504 function/source/grid combinations, plus
++explicit pole-crossing cases. Rational near-pole fixtures include points and
++intervals within 2^-128 of periodic boundaries, and huge phases through 2^512.
++Tiny cases include both functions at 2^-1074 with grids 2^-64 and 2^-1074.
++A near-pole point exhausts small work budgets without being mislabeled a pole;
++a larger retry returns the same Complete finite enclosure. Output undergoes
++fresh-process replay, another pole operation, arctangent and exponential use.
++Initial ASan fuzzing completed 10,000 cases in 55 seconds; final-source fuzzing
++completed 10,000 in 61 seconds, seed 20261124, within the published 120-second cap.
++
++Final Rust 1.95 production coverage is 4121/4208 lines (97.93%) and 8190/8772
++regions (93.37%); all 16 new-module functions execute. No branch denominator is
++available. Tests, probes, Hyperreal, dependencies and test-only IEEE code are
++excluded. LLVM's initial extra diagnostic run aborted; the failure/backtrace is
++retained. Running diagnostics with one merge thread succeeded and its report
++table matched the successful ordinary report. All nine profile mismatches are
++excluded Rug OptRational::parts. Final profiles are fresh and separate from the
++earlier adapter-incomplete run; single-thread reporting changes no exclusions.
++
++All 1560 cost samples completed, across rational/dyadic functions and extended
++entire-line inputs, three grids and six finite source shapes. PERFORMANCE.md
++records medians, deterministic work and the expensive subnormal cotangent case;
++raw samples retain compiler/host metadata, executable hash and whole-probe size.
++No allocation/cancellation, embedded-cycle or speedup claim is made.
++Source and archive registration are pending. Phase 5 qualification gaps and all
++remaining plan phases require their own completion evidence.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 58681c4a4..bc5871876 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,12 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add rational, dyadic and extended dyadic tangent/cotangent images with
++  certified interior and endpoint poles, one-sided limits, split components
++  and explicit domain coverage. Reuse the existing trigonometric proof helpers.
++- Exercise near-pole refinement, subnormal-scale inputs, canonical replay and
++  subsequent pole/atan/exponential operations with shared budget accounting.
++
+ - Add budgeted rational, dyadic and extended dyadic rational powers with
+   arbitrary-size exponent components, reduced real-branch semantics, exact
+   integer root witnesses, compact perfect roots and split pole images.
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index 0305af02c..317c620da 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -113,3 +113,8 @@ required-features = ["dyadic"]
+ name = "fractional_power_cost"
+ path = "conformance/fractional_power_cost.rs"
+ required-features = ["dyadic"]
++
++[[example]]
++name = "tangent_cost"
++path = "conformance/tangent_cost.rs"
++required-features = ["dyadic", "rational"]
+diff --git a/crates/hyperinterval/PERFORMANCE.md b/crates/hyperinterval/PERFORMANCE.md
+index 494d74036..4e3820d62 100644
+--- a/crates/hyperinterval/PERFORMANCE.md
++++ b/crates/hyperinterval/PERFORMANCE.md
+@@ -479,3 +479,58 @@ speedup comparisons. The archived executable includes GMP/MPFR oracle code,
+ so whole-probe size is not production-kernel size. Actual allocation/heap-byte,
+ cancellation, rational-backend timing and downstream consumer qualification
+ remain open. Source/work reservations do not establish those claims.
++
++
++## Tangent and cotangent completion probe
++
++`conformance/tangent_cost.rs` evaluates rational and dyadic point 1, narrow
++[1,257/256], pole-sensitive [1,2], wide [-4,4], huge 2^128 and tiny 2^-1074
++sources, plus the extended entire line. The [1,2] case crosses a tangent pole
++and stays within one cotangent branch. Independent directed MPFR point bounds
++and exact GMP pole indexing run before timing. Rust 1.99 release, x86_64 Linux,
++dyadic+rational with no default features:
++
++| Backend / function / case | grid 2^-16 | grid 2^-64 | grid 2^-256 |
++| --- | ---: | ---: | ---: |
++| dyadic / tan / point | 60158.875 | 112760.594 | 369536.562 |
++| dyadic / tan / narrow | 93677.594 | 176096.219 | 541577.000 |
++| dyadic / tan / pole | 90750.688 | 196303.438 | 612686.688 |
++| dyadic / tan / wide | 154.625 | 154.125 | 154.438 |
++| dyadic / tan / huge | 295284.031 | 383250.156 | 821884.406 |
++| dyadic / tan / tiny | 30974.781 | 60508.219 | 214659.500 |
++| dyadic / cot / point | 58076.969 | 112557.531 | 368712.656 |
++| dyadic / cot / narrow | 93402.375 | 176021.156 | 538127.000 |
++| dyadic / cot / pole | 90946.000 | 195939.406 | 608159.125 |
++| dyadic / cot / wide | 154.438 | 155.031 | 154.344 |
++| dyadic / cot / huge | 295125.438 | 382224.750 | 821193.156 |
++| dyadic / cot / tiny | 34548372.438 | 57426317.531 | 39388858.375 |
++| rational / tan / point | 58283.438 | 112676.406 | 368997.188 |
++| rational / tan / narrow | 94043.562 | 176234.281 | 541215.188 |
++| rational / tan / pole | 90898.250 | 195982.438 | 610121.188 |
++| rational / tan / wide | 257.875 | 256.562 | 257.375 |
++| rational / tan / huge | 294786.562 | 382600.031 | 820607.219 |
++| rational / tan / tiny | 31151.125 | 60540.000 | 214032.844 |
++| rational / cot / point | 58222.000 | 112481.250 | 367486.031 |
++| rational / cot / narrow | 93797.969 | 176370.562 | 537880.656 |
++| rational / cot / pole | 91055.188 | 195886.562 | 606496.750 |
++| rational / cot / wide | 257.969 | 259.094 | 257.500 |
++| rational / cot / huge | 295563.656 | 381423.125 | 819743.562 |
++| rational / cot / tiny | 34490514.812 | 57398168.469 | 39366275.656 |
++| extended / tan / entire | 17.000 | 17.000 | 17.000 |
++| extended / cot / entire | 17.219 | 17.219 | 17.250 |
++
++Values are median ns/image. All 1560 samples complete: 20 samples of 16 calls
++following 16 warmups for each backend/function/source/precision group. Timed work
++includes fresh 32768-bit/10^13-unit budgets, phase and pole proofs, refinement,
++full normalized image/receipt materialization and destruction. Source construction
++and independent oracle work are excluded. Actual deterministic work units remain
++in every raw row; metadata records compiler, host, executable hash and size.
++The executable links GMP/MPFR, so whole-probe size is not production-kernel size.
++
++Tiny cotangent is a stress case: its large image lies very close to a grid
++boundary, requiring substantially finer internal bounds than the requested
++output precision. That cost is reported separately from ordinary point and
++interval completion. Wide/unbounded sources prove complete branch coverage;
++no undecided denominator is counted as whole-range success. These are costs
++for new capabilities, not speedup claims. Actual allocation/heap-byte bounds,
++cancellation, embedded cycles and full downstream qualification remain open.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 7ad741173..05a74bc90 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -62,6 +62,15 @@ outward grid enclosure of the whole function range; narrow inputs with huge phas
+ budget to resolve those phases. The original exact endpoints remain the source
+ through refinement. No native floating transcendental supplies a certificate.
+ 
++Rational, dyadic and extended dyadic `tan`/`cot` return closed split images with
++certified pole incidence and domain coverage. Tangent on [1,2] retains two rays;
++cotangent on [0,1] retains its one-sided unbounded image. Zero-only cotangent
++returns EmptyDomain. Empty sources succeed with Complete coverage, while any
++excluded pole gives Partial coverage. A full branch or unbounded connected
++source produces the entire line. Coarse outward rounding can merge split
++components. An unresolved numerical denominator triggers refinement or typed
++exhaustion; it never establishes a pole or whole-range result.
++
+ Rational, dyadic and extended dyadic `pow_rational(&numerator, &denominator,
+ precision, &mut budget)` accepts arbitrary-size integer exponent components.
+ It reduces the exponent before selecting its real domain: odd denominators
+diff --git a/crates/hyperinterval/conformance/tangent_cost.rs b/crates/hyperinterval/conformance/tangent_cost.rs
+new file mode 100644
+index 000000000..0baebf219
+--- /dev/null
++++ b/crates/hyperinterval/conformance/tangent_cost.rs
+@@ -0,0 +1,105 @@
++//! Completed tangent/cotangent images by width, scale, precision and backend.
++use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval};
++use std::{hint::black_box, time::Instant};
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/tangent_oracle.rs"]
++mod oracle;
++fn main() {
++    println!("backend,case,precision,sample,elapsed_ns,completed_images,work_units_per_image");
++    for (case, a, b, e) in [
++        ("point", 1i64, 1i64, 0),
++        ("narrow", 256, 257, -8),
++        ("pole", 1, 2, 0),
++        ("wide", -4, 4, 0),
++        ("huge", 1, 1, 128),
++        ("tiny", 1, 1, -1074),
++    ] {
++        let dyadic = DyadicInterval::new(a.into(), b.into(), e).unwrap();
++        let rational = dyadic
++            .to_rational(&mut DyadicBudget::new(32768, 10_000_000_000_000))
++            .unwrap();
++        for precision in [-16, -64, -256] {
++            for cotangent in [false, true] {
++                for backend in ["dyadic", "rational"] {
++                    let work = || {
++                        let mut budget = DyadicBudget::new(32768, 10_000_000_000_000);
++                        let image = match (backend, cotangent) {
++                            ("dyadic", false) => {
++                                black_box(&dyadic).tan(black_box(precision), &mut budget)
++                            }
++                            ("dyadic", true) => {
++                                black_box(&dyadic).cot(black_box(precision), &mut budget)
++                            }
++                            (_, false) => {
++                                black_box(&rational).tan(black_box(precision), &mut budget)
++                            }
++                            (_, true) => {
++                                black_box(&rational).cot(black_box(precision), &mut budget)
++                            }
++                        }
++                        .unwrap();
++                        (image, 10_000_000_000_000 - budget.remaining_work())
++                    };
++                    let (image, units) = work();
++                    #[cfg(not(target_env = "msvc"))]
++                    oracle::verify(
++                        Ok(image.clone()),
++                        &Some((
++                            oracle::End::Value(oracle::q(&a, e)),
++                            oracle::End::Value(oracle::q(&b, e)),
++                        )),
++                        precision,
++                        cotangent,
++                    );
++                    black_box(image);
++                    for _ in 0..16 {
++                        black_box(work());
++                    }
++                    let function = if cotangent { "cot" } else { "tan" };
++                    for sample in 0..20 {
++                        let start = Instant::now();
++                        for _ in 0..16 {
++                            black_box(work());
++                        }
++                        println!(
++                            "{backend},{function}_{case},{precision},{sample},{},16,{units}",
++                            start.elapsed().as_nanos()
++                        );
++                    }
++                }
++            }
++        }
++    }
++    for precision in [-16, -64, -256] {
++        for cotangent in [false, true] {
++            let source = ExtendedInterval::<DyadicInterval>::entire();
++            let work = || {
++                let mut budget = DyadicBudget::new(32768, 10_000_000_000_000);
++                let image = if cotangent {
++                    black_box(&source).cot(black_box(precision), &mut budget)
++                } else {
++                    black_box(&source).tan(black_box(precision), &mut budget)
++                }
++                .unwrap();
++                (image, 10_000_000_000_000 - budget.remaining_work())
++            };
++            let (image, units) = work();
++            assert_eq!(image.range.components(), &[ExtendedInterval::entire()]);
++            black_box(image);
++            for _ in 0..16 {
++                black_box(work());
++            }
++            let function = if cotangent { "cot" } else { "tan" };
++            for sample in 0..20 {
++                let start = Instant::now();
++                for _ in 0..16 {
++                    black_box(work());
++                }
++                println!(
++                    "extended,{function}_entire,{precision},{sample},{},16,{units}",
++                    start.elapsed().as_nanos()
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 52ae9fd4b..37c4d3ba2 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -124,3 +124,11 @@ path = "fuzz_targets/fractional_power.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "tangent"
++path = "fuzz_targets/tangent.rs"
++required-features = ["rational"]
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs b/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs
+new file mode 100644
+index 000000000..758b95d07
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs
+@@ -0,0 +1,72 @@
++#![no_main]
++use hyperinterval::{
++    DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalSet2,
++    RationalInterval,
++};
++use hyperreal::Rational;
++use libfuzzer_sys::fuzz_target;
++use rug::Rational as Q;
++#[path = "../../tests/support/tangent_oracle.rs"]
++mod oracle;
++fuzz_target!(|data: [i16; 4]| {
++    let [a, b, c, p] = data;
++    let a = i64::from(a.rem_euclid(17) - 8);
++    let b = i64::from(b.rem_euclid(17) - 8);
++    let (a, b) = (a.min(b), a.max(b));
++    let e = i32::from(c % 5);
++    let den = 1 + u64::from(c.unsigned_abs() % 64);
++    let p = 2 - i32::from(p.unsigned_abs() % 35);
++    let budget = || DyadicBudget::new(8192, 1_000_000_000_000);
++    let dyadic = DyadicInterval::new(a.into(), b.into(), e).unwrap();
++    let rational = RationalInterval::new(
++        Rational::fraction(a, den).unwrap(),
++        Rational::fraction(b, den).unwrap(),
++    )
++    .unwrap();
++    for (result, lo, hi, cot) in [
++        (
++            dyadic.tan(p, &mut budget()),
++            oracle::q(&a, e),
++            oracle::q(&b, e),
++            false,
++        ),
++        (
++            dyadic.cot(p, &mut budget()),
++            oracle::q(&a, e),
++            oracle::q(&b, e),
++            true,
++        ),
++        (
++            rational.tan(p, &mut budget()),
++            Q::from((a, den)),
++            Q::from((b, den)),
++            false,
++        ),
++        (
++            rational.cot(p, &mut budget()),
++            Q::from((a, den)),
++            Q::from((b, den)),
++            true,
++        ),
++    ] {
++        oracle::verify(
++            result.clone(),
++            &Some((oracle::End::Value(lo), oracle::End::Value(hi))),
++            p,
++            cot,
++        );
++        if let Ok(image) = result {
++            let bytes = serde_json::to_vec(&image.range).unwrap();
++            let restored: IntervalSet2<DyadicInterval> = serde_json::from_slice(&bytes).unwrap();
++            assert_eq!(restored, image.range);
++            for component in restored.components() {
++                let atan = component.atan(-16, &mut budget()).unwrap();
++                assert_eq!(atan.domain, DomainCoverage::Complete);
++                assert!(!atan.range.is_empty());
++            }
++        }
++    }
++    let entire = E::<DyadicInterval>::entire().tan(p, &mut budget()).unwrap();
++    assert_eq!(entire.range.components(), &[E::entire()]);
++    assert_eq!(entire.domain, DomainCoverage::Partial);
++});
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 78a67fa5c..b6a0555dd 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -59,6 +59,8 @@ mod split;
+ mod sqrt;
+ mod state;
+ #[cfg(feature = "dyadic")]
++mod tangent;
++#[cfg(feature = "dyadic")]
+ mod trigonometry;
+ pub use extended::{ExtendedInterval, ExtendedIntervalView, FiniteRealInterval};
+ pub use split::IntervalSet2;
+diff --git a/crates/hyperinterval/src/tangent.rs b/crates/hyperinterval/src/tangent.rs
+new file mode 100644
+index 000000000..bad93dcb6
+--- /dev/null
++++ b/crates/hyperinterval/src/tangent.rs
+@@ -0,0 +1,325 @@
++//! Pole incidence and monotone branches reuse certified trigonometric bounds.
++use crate::trigonometry::{Function, Reduced, Source, extrema, reduce, series, wide};
++use crate::{
++    DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval, ExtendedIntervalView as View,
++    IntervalError, IntervalSet2, RangeEnclosure,
++};
++use num_bigint::BigInt;
++use num_traits::{One, Zero};
++type Extended = ExtendedInterval<DyadicInterval>;
++type Image = RangeEnclosure<IntervalSet2<DyadicInterval>>;
++#[derive(Clone, Copy)]
++enum PoleFunction {
++    Tan,
++    Cot,
++}
++impl PoleFunction {
++    fn cot(self) -> bool {
++        matches!(self, Self::Cot)
++    }
++}
++impl DyadicInterval {
++    /// Tight closed tangent enclosure on the requested grid, retaining split
++    /// images around poles. Empty maps to empty/Complete; excluded poles report
++    /// Partial. Certified phase selection distinguishes no pole, one pole and
++    /// full-branch coverage. An unresolved numerical denominator causes further
++    /// refinement or typed exhaustion, never a whole-range fallback.
++    /// All nested work uses the caller's DyadicBudget; its exclusions apply.
++    pub fn tan(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        self.pole_trig(PoleFunction::Tan, precision, budget)
++    }
++    /// Tight closed cotangent enclosure. Zero-only input returns EmptyDomain;
++    /// endpoint/interior poles use one-sided limits and Partial coverage.
++    /// Other semantics and resource accounting match [`Self::tan`].
++    pub fn cot(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        self.pole_trig(PoleFunction::Cot, precision, budget)
++    }
++    fn pole_trig(
++        &self,
++        function: PoleFunction,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Image, IntervalError> {
++        let Some((a, b, e)) = self.bounds() else {
++            return image(IntervalSet2::empty(), DomainCoverage::Complete);
++        };
++        if function.cot() && a.is_zero() && b.is_zero() {
++            return Err(IntervalError::EmptyDomain);
++        }
++        budget.reserve(1, 1, false)?;
++        let one = BigInt::one();
++        range(
++            Source { n: a, d: &one, e },
++            Source { n: b, d: &one, e },
++            function,
++            precision,
++            budget,
++        )
++    }
++}
++#[cfg(feature = "rational")]
++impl crate::RationalInterval {
++    /// Tangent of the exact rational source, with certified pole incidence,
++    /// outward dyadic components and domain coverage. Requires rational+dyadic.
++    pub fn tan(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        self.pole_trig(PoleFunction::Tan, precision, budget)
++    }
++    /// Cotangent of the exact rational source, including the exact zero pole.
++    /// See [`DyadicInterval::cot`] for limits and shared-budget semantics.
++    pub fn cot(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        self.pole_trig(PoleFunction::Cot, precision, budget)
++    }
++    fn pole_trig(
++        &self,
++        function: PoleFunction,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Image, IntervalError> {
++        let Some((a, b)) = self.bounds() else {
++            return image(IntervalSet2::empty(), DomainCoverage::Complete);
++        };
++        if function.cot() && a.is_zero() && b.is_zero() {
++            return Err(IntervalError::EmptyDomain);
++        }
++        budget.reserve(
++            a.numerator()
++                .bits()
++                .max(a.denominator().bits())
++                .max(b.numerator().bits())
++                .max(b.denominator().bits()),
++            4,
++            false,
++        )?;
++        let (an, ad, bn, bd) = (
++            BigInt::from_biguint(a.sign(), a.numerator().clone()),
++            BigInt::from(a.denominator().clone()),
++            BigInt::from_biguint(b.sign(), b.numerator().clone()),
++            BigInt::from(b.denominator().clone()),
++        );
++        range(
++            Source {
++                n: &an,
++                d: &ad,
++                e: 0,
++            },
++            Source {
++                n: &bn,
++                d: &bd,
++                e: 0,
++            },
++            function,
++            precision,
++            budget,
++        )
++    }
++}
++impl Extended {
++    /// Tangent including unbounded connected sources: each contains full
++    /// branches and poles, so its image is the entire line with Partial coverage.
++    pub fn tan(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        match self.view() {
++            View::Empty => image(IntervalSet2::empty(), DomainCoverage::Complete),
++            View::Finite(x) => x.tan(precision, budget),
++            _ => whole(),
++        }
++    }
++    /// Cotangent with unbounded-source and pole semantics as in [`Self::tan`].
++    /// Preserve earlier domain receipts when consuming this local result.
++    pub fn cot(&self, precision: i32, budget: &mut DyadicBudget) -> Result<Image, IntervalError> {
++        match self.view() {
++            View::Empty => image(IntervalSet2::empty(), DomainCoverage::Complete),
++            View::Finite(x) => x.cot(precision, budget),
++            _ => whole(),
++        }
++    }
++}
++fn image(
++    range: IntervalSet2<DyadicInterval>,
++    domain: DomainCoverage,
++) -> Result<Image, IntervalError> {
++    Ok(RangeEnclosure { range, domain })
++}
++fn whole() -> Result<Image, IntervalError> {
++    image(
++        IntervalSet2::from_interval(Extended::entire()),
++        DomainCoverage::Partial,
++    )
++}
++fn range(
++    a: Source<'_>,
++    b: Source<'_>,
++    function: PoleFunction,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Image, IntervalError> {
++    if wide(a, b, budget)? {
++        return whole();
++    }
++    if a.n.is_zero() && b.n.is_zero() {
++        // Cotangent's exact zero pole was validated at ingress.
++        return image(
++            IntervalSet2::from_interval(Extended::from_finite(DyadicInterval::point(0.into(), 0)?)),
++            DomainCoverage::Complete,
++        );
++    }
++    let left_pole = function.cot() && a.n.is_zero();
++    let right_pole = function.cot() && b.n.is_zero();
++    let size = |x: Source<'_>| {
++        (i128::from(x.n.bits()) - i128::from(x.d.bits()) + i128::from(x.e) + 1).max(0)
++    };
++    let magnitude = size(a).max(size(b));
++    let initial = i128::from(precision.min(-4)) - 16 - magnitude;
++    budget.reserve(
++        u64::try_from(magnitude - initial + 4).map_err(|_| IntervalError::SizeExhausted)?,
++        1,
++        false,
++    )?;
++    let mut working = i32::try_from(initial).map_err(|_| IntervalError::Overflow)?;
++    loop {
++        budget.reserve(2, 1, false)?;
++        let half_pi = crate::arctangent::quarter_pi(working, budget)?
++            .mul(&DyadicInterval::point(2.into(), 0)?, budget)?;
++        if let Some(left) = reduce(a, &half_pi, working, budget)? {
++            if a.n == b.n && a.d == b.d {
++                if let Some(value) = evaluate(left, function, precision, working, budget)? {
++                    return image(
++                        IntervalSet2::from_interval(Extended::from_finite(value)),
++                        DomainCoverage::Complete,
++                    );
++                }
++            } else if let Some(right) = reduce(b, &half_pi, working, budget)? {
++                // Extrema of sine locate tangent poles; extrema of cosine
++                // locate cotangent poles. Exclude an exact right-end zero
++                // from interior incidence; it is handled by a one-sided limit.
++                budget.reserve(1, 1, false)?;
++                let before_zero = BigInt::from(-1);
++                let (first, second) = extrema(
++                    &left.index,
++                    if right_pole {
++                        &before_zero
++                    } else {
++                        &right.index
++                    },
++                    if function.cot() {
++                        Function::Cos
++                    } else {
++                        Function::Sin
++                    },
++                    budget,
++                )?;
++                let interior = first || second;
++                if (first && second) || (interior && (left_pole || right_pole)) {
++                    return whole();
++                }
++                let left = if left_pole {
++                    None
++                } else {
++                    evaluate(left, function, precision, working, budget)?
++                };
++                let right = if right_pole {
++                    None
++                } else {
++                    evaluate(right, function, precision, working, budget)?
++                };
++                if (left_pole || left.is_some()) && (right_pole || right.is_some()) {
++                    return assemble(left, right, function, interior, budget);
++                }
++            }
++        }
++        working = working.checked_mul(2).ok_or(IntervalError::Overflow)?;
++    }
++}
++fn endpoint(
++    x: &DyadicInterval,
++    lower: bool,
++    budget: &mut DyadicBudget,
++) -> Result<DyadicInterval, IntervalError> {
++    let (a, b, e) = x.bounds().expect("nonempty point enclosure");
++    let n = if lower { a } else { b };
++    budget.reserve(n.bits().max(1), 1, false)?;
++    DyadicInterval::point(n.clone(), e)
++}
++fn assemble(
++    left: Option<DyadicInterval>,
++    right: Option<DyadicInterval>,
++    function: PoleFunction,
++    interior: bool,
++    budget: &mut DyadicBudget,
++) -> Result<Image, IntervalError> {
++    // Cotangent decreases on each branch; tangent increases.
++    let (lower, upper) = if function.cot() {
++        (right, left)
++    } else {
++        (left, right)
++    };
++    match (lower, upper) {
++        (Some(lower), Some(upper)) if !interior => {
++            let (a, _, e) = lower.bounds().expect("nonempty image");
++            let (_, b, f) = upper.bounds().expect("nonempty image");
++            image(
++                IntervalSet2::from_interval(crate::extended_dyadic::closed_bounds(
++                    a, e, b, f, budget,
++                )?),
++                DomainCoverage::Complete,
++            )
++        }
++        (Some(lower), Some(upper)) => image(
++            IntervalSet2::new(
++                Extended::above(endpoint(&lower, true, budget)?)?,
++                Extended::below(endpoint(&upper, false, budget)?)?,
++                budget,
++            )?,
++            DomainCoverage::Partial,
++        ),
++        (Some(lower), None) => image(
++            IntervalSet2::from_interval(Extended::above(endpoint(&lower, true, budget)?)?),
++            DomainCoverage::Partial,
++        ),
++        (None, Some(upper)) => image(
++            IntervalSet2::from_interval(Extended::below(endpoint(&upper, false, budget)?)?),
++            DomainCoverage::Partial,
++        ),
++        (None, None) => unreachable!("zero-only cotangent was rejected at ingress"),
++    }
++}
++fn evaluate(
++    source: Reduced,
++    function: PoleFunction,
++    precision: i32,
++    working: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Option<DyadicInterval>, IntervalError> {
++    if source.zero {
++        return Ok(Some(DyadicInterval::point(0.into(), 0)?));
++    }
++    let (a, b, _) = source
++        .argument
++        .bounds()
++        .expect("certified residual enclosure");
++    budget.reserve(a.bits().max(b.bits()).max(1), 2, false)?;
++    let unit = DyadicInterval::new(0.into(), 1.into(), 0)?;
++    let denominator_cosine = source.quadrant.is_multiple_of(2) != function.cot();
++    let denominator = series(source.argument.clone(), denominator_cosine, working, budget)?
++        .intersection(&unit, budget)?;
++    if denominator.signs().contains_zero() {
++        return Ok(None);
++    }
++    let numerator = series(source.argument, !denominator_cosine, working, budget)?
++        .intersection(&unit, budget)?;
++    let value = numerator.div(&denominator, precision, budget)?;
++    let value = if (source.quadrant % 2 == 1) ^ source.negative {
++        value.neg(budget)?
++    } else {
++        value
++    };
++    let (a, b, e) = value
++        .bounds()
++        .expect("positive divisor and nonempty numerator");
++    budget.reserve(a.bits().max(b.bits()).saturating_add(1), 1, false)?;
++    let gap = b - a;
++    Ok(if gap.is_zero() || (gap.is_one() && e == precision) {
++        Some(value)
++    } else {
++        None
++    })
++}
+diff --git a/crates/hyperinterval/src/trigonometry.rs b/crates/hyperinterval/src/trigonometry.rs
+index 33283835f..fcc4b22ad 100644
+--- a/crates/hyperinterval/src/trigonometry.rs
++++ b/crates/hyperinterval/src/trigonometry.rs
+@@ -9,22 +9,22 @@ use num_integer::Integer;
+ use num_traits::{One, Signed, ToPrimitive, Zero};
+ type Image = RangeEnclosure<DyadicInterval>;
+ #[derive(Clone, Copy)]
+-enum Function {
++pub(crate) enum Function {
+     Sin,
+     Cos,
+ }
+ #[derive(Clone, Copy)]
+-struct Source<'a> {
+-    n: &'a BigInt,
+-    d: &'a BigInt,
+-    e: i32,
++pub(crate) struct Source<'a> {
++    pub(crate) n: &'a BigInt,
++    pub(crate) d: &'a BigInt,
++    pub(crate) e: i32,
+ }
+-struct Reduced {
+-    index: BigInt,
+-    quadrant: u8,
+-    negative: bool,
+-    zero: bool,
+-    argument: DyadicInterval,
++pub(crate) struct Reduced {
++    pub(crate) index: BigInt,
++    pub(crate) quadrant: u8,
++    pub(crate) negative: bool,
++    pub(crate) zero: bool,
++    pub(crate) argument: DyadicInterval,
+ }
+ 
+ impl DyadicInterval {
+@@ -145,7 +145,11 @@ fn whole(precision: i32, budget: &mut DyadicBudget) -> Result<DyadicInterval, In
+ }
+ // Both public source families share an exponent. Width >=8 proves a complete
+ // period since 2*pi<8, even when resolving either endpoint phase is expensive.
+-fn wide(a: Source<'_>, b: Source<'_>, budget: &mut DyadicBudget) -> Result<bool, IntervalError> {
++pub(crate) fn wide(
++    a: Source<'_>,
++    b: Source<'_>,
++    budget: &mut DyadicBudget,
++) -> Result<bool, IntervalError> {
+     if a.d == b.d {
+         budget.reserve(a.n.bits().max(b.n.bits()).saturating_add(1), 1, false)?;
+         return Ok(!crate::dyadic_order::compare(&(b.n - a.n), a.e, a.d, 3, budget)?.is_lt());
+@@ -228,7 +232,7 @@ fn range(
+         working = working.checked_mul(2).ok_or(IntervalError::Overflow)?;
+     }
+ }
+-fn reduce(
++pub(crate) fn reduce(
+     source: Source<'_>,
+     half_pi: &DyadicInterval,
+     working: i32,
+@@ -286,7 +290,7 @@ fn reduce(
+         argument: residual,
+     }))
+ }
+-fn extrema(
++pub(crate) fn extrema(
+     a: &BigInt,
+     b: &BigInt,
+     function: Function,
+@@ -362,7 +366,7 @@ fn evaluate(
+ }
+ // Residuals lie in [0,pi/2] subset [0,2]. Beyond the initial cosine term,
+ // alternating factorial terms decrease. The signed next term bounds the tail.
+-fn series(
++pub(crate) fn series(
+     argument: DyadicInterval,
+     cosine: bool,
+     working: i32,
+diff --git a/crates/hyperinterval/tests/support/phase_oracle.rs b/crates/hyperinterval/tests/support/phase_oracle.rs
+new file mode 100644
+index 000000000..1da865ded
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/phase_oracle.rs
+@@ -0,0 +1,16 @@
++//! Directed MPFR pi bounds and independent exact GMP phase selection.
++use rug::{
++    Float, Integer, Rational,
++    float::{Constant, Round},
++};
++pub fn half_pi() -> (Rational, Rational) {
++    let (a, _) = Float::with_val_round(4096, Constant::Pi, Round::Down);
++    let (b, _) = Float::with_val_round(4096, Constant::Pi, Round::Up);
++    (a.to_rational().unwrap() / 2, b.to_rational().unwrap() / 2)
++}
++pub fn index(x: &Rational, pi: &(Rational, Rational)) -> Integer {
++    let a = (x.clone() / &pi.0).floor().numer().clone();
++    let b = (x.clone() / &pi.1).floor().numer().clone();
++    assert_eq!(a, b, "independent phase oracle needs more precision");
++    a
++}
+diff --git a/crates/hyperinterval/tests/support/tangent_oracle.rs b/crates/hyperinterval/tests/support/tangent_oracle.rs
+new file mode 100644
+index 000000000..2828d76bf
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/tangent_oracle.rs
+@@ -0,0 +1,111 @@
++//! MPFR monotone point bounds plus GMP branch indices and one-sided limits.
++use hyperinterval::{DomainCoverage, DyadicInterval, IntervalError, IntervalSet2, RangeEnclosure};
++use rug::{Float, Integer, Rational, float::Round};
++#[path = "set_oracle.rs"]
++mod set_oracle;
++pub use set_oracle::{End, Source, actual, q};
++#[path = "phase_oracle.rs"]
++mod phase_oracle;
++pub use phase_oracle::half_pi;
++// Each branch is bounded by consecutive poles. This closed-form floor
++// calculation is independent of production's extremum-residue scan.
++fn branch(x: &Rational, cot: bool, pi: &(Rational, Rational)) -> Integer {
++    let half_index = phase_oracle::index(x, pi);
++    let shifted = if cot { half_index } else { half_index + 1 };
++    (Rational::from(shifted) / 2i32).floor().numer().clone()
++}
++fn point(
++    x: &Rational,
++    cot: bool,
++    precision: i32,
++    pi: &(Rational, Rational),
++) -> (Rational, Rational) {
++    if x == &0 {
++        assert!(!cot);
++        return (0.into(), 0.into());
++    }
++    let (mut lo, _) = Float::with_val_round(4096, x, Round::Down);
++    let (mut hi, _) = Float::with_val_round(4096, x, Round::Up);
++    let expected = branch(x, cot, pi);
++    assert_eq!(branch(&lo.to_rational().unwrap(), cot, pi), expected);
++    assert_eq!(branch(&hi.to_rational().unwrap(), cot, pi), expected);
++    if cot {
++        (lo, hi) = (hi, lo);
++        lo.cot_round(Round::Down);
++        hi.cot_round(Round::Up);
++    } else {
++        lo.tan_round(Round::Down);
++        hi.tan_round(Round::Up);
++    }
++    set_oracle::bounds(
++        lo.to_rational().unwrap(),
++        hi.to_rational().unwrap(),
++        precision,
++    )
++}
++pub fn expected(
++    source: &Source,
++    precision: i32,
++    cot: bool,
++) -> Result<(Vec<(End, End)>, DomainCoverage), IntervalError> {
++    use End::{Minus as M, Plus as P, Value as V};
++    let Some((a, b)) = source else {
++        return Ok((vec![], DomainCoverage::Complete));
++    };
++    let (V(a), V(b)) = (a, b) else {
++        return Ok((vec![(M, P)], DomainCoverage::Partial));
++    };
++    if cot && a == &0 && b == &0 {
++        return Err(IntervalError::EmptyDomain);
++    }
++    let pi = half_pi();
++    let endpoint_left = cot && a == &0;
++    let endpoint_right = cot && b == &0;
++    let count = branch(b, cot, &pi) - branch(a, cot, &pi) - i32::from(endpoint_right);
++    if count >= 2 || (count >= 1 && (endpoint_left || endpoint_right)) {
++        return Ok((vec![(M, P)], DomainCoverage::Partial));
++    }
++    let x = if endpoint_left {
++        None
++    } else {
++        Some(point(a, cot, precision, &pi))
++    };
++    let y = if endpoint_right {
++        None
++    } else {
++        Some(point(b, cot, precision, &pi))
++    };
++    let (lo, hi) = if cot { (y, x) } else { (x, y) };
++    let mut parts = match (lo, hi) {
++        (Some((lo, _)), Some((_, hi))) if count == 0 => {
++            return Ok((vec![(V(lo), V(hi))], DomainCoverage::Complete));
++        }
++        (Some((lo, _)), Some((_, hi))) => vec![(M, V(hi)), (V(lo), P)],
++        (Some((lo, _)), None) => vec![(V(lo), P)],
++        (None, Some((_, hi))) => vec![(M, V(hi))],
++        (None, None) => unreachable!(),
++    };
++    if parts.len() == 2 && parts[0].1 >= parts[1].0 {
++        parts = vec![(M, P)];
++    }
++    Ok((parts, DomainCoverage::Partial))
++}
++pub fn verify(
++    result: Result<RangeEnclosure<IntervalSet2<DyadicInterval>>, IntervalError>,
++    source: &Source,
++    precision: i32,
++    cot: bool,
++) {
++    match expected(source, precision, cot) {
++        Err(e) => assert_eq!(result, Err(e)),
++        Ok((parts, domain)) => {
++            let result = result.unwrap();
++            assert_eq!(result.domain, domain, "{source:?},cot={cot}");
++            assert_eq!(
++                actual(&result.range),
++                parts,
++                "{source:?},p={precision},cot={cot}"
++            );
++        }
++    }
++}
+diff --git a/crates/hyperinterval/tests/support/trig_oracle.rs b/crates/hyperinterval/tests/support/trig_oracle.rs
+index 3773b74c9..dfaa35fa5 100644
+--- a/crates/hyperinterval/tests/support/trig_oracle.rs
++++ b/crates/hyperinterval/tests/support/trig_oracle.rs
+@@ -1,12 +1,13 @@
+ //! MPFR point bounds plus the global Lipschitz bound and exact GMP extrema.
+ use hyperinterval::DyadicInterval;
+-use rug::{
+-    Float, Integer, Rational,
+-    float::{Constant, Round},
+-};
++use rug::{Float, Rational, float::Round};
+ #[path = "grid_oracle.rs"]
+ mod grid_oracle;
+ pub use grid_oracle::q;
++#[path = "phase_oracle.rs"]
++mod phase_oracle;
++pub use phase_oracle::half_pi;
++use phase_oracle::index;
+ fn point(x: &Rational, cosine: bool) -> (Rational, Rational) {
+     let f = Float::with_val(4096, x);
+     let error = (x.clone() - f.to_rational().unwrap()).abs();
+@@ -24,17 +25,6 @@ fn point(x: &Rational, cosine: bool) -> (Rational, Rational) {
+         hi.to_rational().unwrap() + error,
+     )
+ }
+-pub fn half_pi() -> (Rational, Rational) {
+-    let (a, _) = Float::with_val_round(4096, Constant::Pi, Round::Down);
+-    let (b, _) = Float::with_val_round(4096, Constant::Pi, Round::Up);
+-    (a.to_rational().unwrap() / 2, b.to_rational().unwrap() / 2)
+-}
+-fn index(x: &Rational, pi: &(Rational, Rational)) -> Integer {
+-    let a = (x.clone() / &pi.0).floor().numer().clone();
+-    let b = (x.clone() / &pi.1).floor().numer().clone();
+-    assert_eq!(a, b, "independent phase oracle needs more precision");
+-    a
+-}
+ pub fn verify(result: &DyadicInterval, a: &Rational, b: &Rational, precision: i32, cosine: bool) {
+     let (a_lo, a_hi) = point(a, cosine);
+     let (b_lo, b_hi) = point(b, cosine);
+diff --git a/crates/hyperinterval/tests/tangent.rs b/crates/hyperinterval/tests/tangent.rs
+new file mode 100644
+index 000000000..54b68abb9
+--- /dev/null
++++ b/crates/hyperinterval/tests/tangent.rs
+@@ -0,0 +1,300 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::ExtendedInterval as E;
++#[cfg(feature = "serde")]
++use hyperinterval::IntervalSet2;
++use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError};
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(32768, 10_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++#[test]
++fn pole_images_and_exact_endpoint_pole() {
++    let x = DyadicInterval::new(1.into(), 2.into(), 0).unwrap();
++    let image = x
++        .tan(-64, &mut DyadicBudget::new(32768, 10_000_000_000_000))
++        .unwrap();
++    assert_eq!(image.domain, DomainCoverage::Partial);
++    assert_eq!(image.range.components().len(), 2);
++    assert_eq!(
++        DyadicInterval::point(0.into(), 0)
++            .unwrap()
++            .cot(-64, &mut DyadicBudget::new(0, 0)),
++        Err(IntervalError::EmptyDomain)
++    );
++}
++
++#[test]
++fn exact_zero_empty_endpoint_limits_and_whole_branches() {
++    for cot in [false, true] {
++        let empty = E::<DyadicInterval>::empty();
++        let mut no_work = DyadicBudget::new(0, 0);
++        let result = if cot {
++            empty.cot(i32::MIN, &mut no_work)
++        } else {
++            empty.tan(i32::MIN, &mut no_work)
++        }
++        .unwrap();
++        assert!(result.range.is_empty());
++        assert_eq!(result.domain, DomainCoverage::Complete);
++        for source in [
++            E::entire(),
++            E::below(d(1, 1, 0)).unwrap(),
++            E::above(d(-1, -1, 0)).unwrap(),
++        ] {
++            let result = if cot {
++                source.cot(0, &mut no_work)
++            } else {
++                source.tan(0, &mut no_work)
++            }
++            .unwrap();
++            assert_eq!(result.range.components(), &[E::entire()]);
++            assert_eq!(result.domain, DomainCoverage::Partial);
++        }
++        for source in [d(-8, 8, 0), d(0, 4, 0), d(-4, 0, 0)] {
++            let result = if cot {
++                source.cot(-64, &mut budget())
++            } else {
++                source.tan(-64, &mut budget())
++            }
++            .unwrap();
++            assert_eq!(result.range.components(), &[E::entire()]);
++            assert_eq!(result.domain, DomainCoverage::Partial);
++        }
++    }
++    let zero = d(0, 0, 0).tan(i32::MIN, &mut budget()).unwrap();
++    assert_eq!(zero.range.components(), &[E::from_finite(d(0, 0, 0))]);
++    assert_eq!(zero.domain, DomainCoverage::Complete);
++    let right = d(0, 1, 0).cot(-64, &mut budget()).unwrap();
++    let left = d(-1, 0, 0).cot(-64, &mut budget()).unwrap();
++    assert_eq!(right.domain, DomainCoverage::Partial);
++    assert_eq!(left.domain, DomainCoverage::Partial);
++    assert_eq!(right.range.neg(&mut budget()).unwrap(), left.range);
++    assert!(matches!(
++        right.range.components()[0].view(),
++        hyperinterval::ExtendedIntervalView::Above(_)
++    ));
++}
++
++#[cfg(feature = "rational")]
++#[test]
++fn finite_and_empty_adapters_preserve_domain_errors_and_receipts() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    let empty = I::empty();
++    let mut no_work = DyadicBudget::new(0, 0);
++    for result in [
++        empty.tan(i32::MIN, &mut no_work),
++        empty.cot(i32::MIN, &mut no_work),
++    ] {
++        let result = result.unwrap();
++        assert!(result.range.is_empty());
++        assert_eq!(result.domain, DomainCoverage::Complete);
++    }
++    let zero = I::point(R::new(0));
++    assert_eq!(zero.cot(-64, &mut no_work), Err(IntervalError::EmptyDomain));
++    assert_eq!(
++        zero.tan(-64, &mut budget()).unwrap().range.components(),
++        &[E::from_finite(d(0, 0, 0))]
++    );
++    assert_eq!(
++        E::from_finite(d(0, 0, 0)).cot(-64, &mut no_work),
++        Err(IntervalError::EmptyDomain)
++    );
++    let finite = d(1, 2, 0);
++    let extended = E::from_finite(finite.clone());
++    assert_eq!(
++        extended.tan(-64, &mut budget()).unwrap(),
++        finite.tan(-64, &mut budget()).unwrap()
++    );
++    assert_eq!(
++        extended.cot(-64, &mut budget()).unwrap(),
++        finite.cot(-64, &mut budget()).unwrap()
++    );
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/tangent_oracle.rs"]
++mod oracle;
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn periodic_poles_and_monotone_ranges_match_mpfr() {
++    use oracle::End::Value as V;
++    for e in [-8, -1, 2] {
++        for a in -3..=3 {
++            for b in a..=3 {
++                for p in [-64, 0, 4] {
++                    let source = d(a, b, e);
++                    let exact = Some((V(oracle::q(&a, e)), V(oracle::q(&b, e))));
++                    oracle::verify(source.tan(p, &mut budget()), &exact, p, false);
++                    oracle::verify(source.cot(p, &mut budget()), &exact, p, true);
++                }
++            }
++        }
++    }
++    for (a, b) in [(1, 2), (-2, -1), (-1, 1), (3, 4), (-4, -3), (0, 1), (-1, 0)] {
++        let exact = Some((V(a.into()), V(b.into())));
++        oracle::verify(d(a, b, 0).tan(-128, &mut budget()), &exact, -128, false);
++        oracle::verify(d(a, b, 0).cot(-128, &mut budget()), &exact, -128, true);
++    }
++}
++
++#[cfg(all(feature = "rational", not(target_env = "msvc")))]
++#[test]
++fn exact_rational_sources_near_poles_and_huge_phases() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    use oracle::End::Value as V;
++    use rug::{Integer, Rational as Q};
++    let verify = |a: Q, b: Q, p| {
++        let x = I::new(
++            a.to_string().parse::<R>().unwrap(),
++            b.to_string().parse::<R>().unwrap(),
++        )
++        .unwrap();
++        let exact = Some((V(a), V(b)));
++        oracle::verify(x.tan(p, &mut budget()), &exact, p, false);
++        oracle::verify(x.cot(p, &mut budget()), &exact, p, true);
++    };
++    for denominator in [3, 7, 65537] {
++        for a in -3..=3 {
++            verify(
++                Q::from((a, denominator)),
++                Q::from((a + 2, denominator + 1)),
++                -64,
++            );
++        }
++    }
++    let (pi, _) = oracle::half_pi();
++    let scale = Integer::from(1) << 128u32;
++    for k in [-5i32, -4, -1, 0, 1, 4, 5] {
++        let at = (pi.clone() * k * &scale).floor().numer().clone();
++        let a = Q::from((at.clone() - 1, scale.clone()));
++        let b = Q::from((at + 2, scale.clone()));
++        verify(a.clone(), a.clone(), -64);
++        verify(b.clone(), b.clone(), -64);
++        verify(a, b, -64);
++    }
++    for e in [128u32, 512] {
++        let huge = Q::from(Integer::from(1) << e);
++        verify(huge.clone(), huge.clone(), -64);
++        verify(huge.clone(), huge + Q::from((1, 1024)), -64);
++    }
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn tiny_and_large_sources_refuse_then_retry_without_false_poles() {
++    use oracle::End::Value as V;
++    for (a, e, p) in [
++        (1, -1074, -64),
++        (1, -1074, -1074),
++        (-1, -1074, -64),
++        (1, -512, -64),
++        (1, 128, -64),
++        (1, 0, -256),
++    ] {
++        let source = d(a, a, e);
++        let exact = Some((V(oracle::q(&a, e)), V(oracle::q(&a, e))));
++        oracle::verify(source.tan(p, &mut budget()), &exact, p, false);
++        oracle::verify(source.cot(p, &mut budget()), &exact, p, true);
++    }
++    let source = d(1, 2, 0);
++    assert_eq!(
++        source.tan(-64, &mut DyadicBudget::new(32768, 1)),
++        Err(IntervalError::WorkExhausted)
++    );
++    assert_eq!(
++        d(1, 1, 512).cot(-64, &mut DyadicBudget::new(64, u64::MAX)),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        d(1, 1, i32::MAX).tan(-64, &mut budget()),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        d(1, 1, i32::MIN)
++            .tan(-64, &mut budget())
++            .unwrap()
++            .range
++            .components(),
++        &[E::from_finite(d(0, 1, -64))]
++    );
++    let completed = source.tan(-64, &mut budget()).unwrap();
++    assert_eq!(completed.domain, DomainCoverage::Partial);
++    assert_eq!(completed.range.components().len(), 2);
++    assert_eq!(source.tan(-64, &mut budget()).unwrap(), completed);
++    let exp = completed.range.exp(-32, &mut budget()).unwrap();
++    assert_eq!(exp.domain, DomainCoverage::Complete);
++    assert_eq!(exp.range.components().len(), 2);
++}
++
++#[cfg(all(feature = "rational", not(target_env = "msvc")))]
++#[test]
++fn near_pole_uncertainty_is_not_a_proved_pole_and_rounding_can_close_gaps() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    use rug::{Integer, Rational as Q};
++    let (pi, _) = oracle::half_pi();
++    let scale = Integer::from(1) << 128u32;
++    let n = (pi * &scale).floor().numer().clone();
++    let q = Q::from((n, scale));
++    let source = I::point(q.to_string().parse::<R>().unwrap());
++    let completed = source.tan(-64, &mut budget()).unwrap();
++    assert_eq!(completed.domain, DomainCoverage::Complete);
++    assert_eq!(completed.range.components().len(), 1);
++    assert!(completed.range.components()[0].as_finite().is_some());
++    for work in [10000, 1_000_000, 100_000_000] {
++        match source.tan(-64, &mut DyadicBudget::new(32768, work)) {
++            Ok(result) => assert_eq!(result, completed),
++            Err(error) => assert_eq!(error, IntervalError::WorkExhausted),
++        }
++    }
++    assert_eq!(source.tan(-64, &mut budget()).unwrap(), completed);
++    for (source, cot) in [(d(1, 2, 0), false), (d(-1, 1, 0), true)] {
++        let fine = if cot {
++            source.cot(-64, &mut budget())
++        } else {
++            source.tan(-64, &mut budget())
++        }
++        .unwrap();
++        let coarse = if cot {
++            source.cot(4, &mut budget())
++        } else {
++            source.tan(4, &mut budget())
++        }
++        .unwrap();
++        assert_eq!(fine.range.components().len(), 2);
++        assert_eq!(coarse.range.components(), &[E::entire()]);
++        assert_eq!(coarse.domain, DomainCoverage::Partial);
++    }
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn replay_then_another_pole_operation_in_fresh_process() {
++    const ENV: &str = "HYPERINTERVAL_TANGENT_REPLAY";
++    if let Ok(bytes) = std::env::var(ENV) {
++        let set: IntervalSet2<DyadicInterval> = serde_json::from_str(&bytes).unwrap();
++        assert_eq!(serde_json::to_string(&set).unwrap(), bytes);
++        assert!(!set.contains_point(&0.into(), 0, &mut budget()).unwrap());
++        for component in set.components() {
++            let further = component.cot(-32, &mut budget()).unwrap();
++            assert_eq!(further.range.components(), &[E::entire()]);
++            assert_eq!(further.domain, DomainCoverage::Partial);
++        }
++        return;
++    }
++    let original = d(1, 2, 0).tan(-64, &mut budget()).unwrap();
++    assert_eq!(original.domain, DomainCoverage::Partial);
++    assert!(
++        std::process::Command::new(std::env::current_exe().unwrap())
++            .arg("--exact")
++            .arg("replay_then_another_pole_operation_in_fresh_process")
++            .env(ENV, serde_json::to_string(&original.range).unwrap())
++            .status()
++            .unwrap()
++            .success()
++    );
++}
