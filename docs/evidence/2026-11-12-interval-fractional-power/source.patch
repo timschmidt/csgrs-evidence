@@ -1,0 +1,1457 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index 607b27bf1..529a2e61a 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -131,7 +131,7 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
+-          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots" "$RUNNER_TEMP/interval-exponential" "$RUNNER_TEMP/interval-logarithm" "$RUNNER_TEMP/interval-arctangent" "$RUNNER_TEMP/interval-trigonometry" "$RUNNER_TEMP/interval-split-division"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots" "$RUNNER_TEMP/interval-exponential" "$RUNNER_TEMP/interval-logarithm" "$RUNNER_TEMP/interval-arctangent" "$RUNNER_TEMP/interval-trigonometry" "$RUNNER_TEMP/interval-split-division" "$RUNNER_TEMP/interval-fractional-power"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+@@ -145,3 +145,4 @@ jobs:
+           cargo +nightly fuzz run arctangent --features rational "$RUNNER_TEMP/interval-arctangent" -- -runs=10000 -max_len=8 -max_total_time=30 -seed=20261120
+           cargo +nightly fuzz run trigonometry --features rational "$RUNNER_TEMP/interval-trigonometry" -- -runs=10000 -max_len=8 -max_total_time=30 -seed=20261121
+           cargo +nightly fuzz run split_division "$RUNNER_TEMP/interval-split-division" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261122
++          cargo +nightly fuzz run fractional_power "$RUNNER_TEMP/interval-fractional-power" -- -runs=10000 -max_len=12 -max_total_time=30 -seed=20261123
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index a8f2e9cd8..1313ae5a6 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -1350,6 +1350,80 @@ Rational powers themselves, additional
+ split operations/backends, general union closure, actual heap-byte bounds,
+ cancellation, consumer migrations and release qualification remain open.
+ 
++## Rational exponent admission (2026-11-12)
++
++Owner: Hyperinterval scalar image layer, P1/P3/P5/P6/P19, baseline `593d5c95e`.
++The missing `pow_rational` acceptance witness is reproduced in
++`/tmp/interval-refactor/fractional-power/missing-witness.log` before implementation.
++The domain is connected rational, dyadic and extended dyadic source intervals
++and an arbitrary-size integer numerator/denominator exponent. The denominator
++must be nonzero even for an empty source. Normalize its sign and common factors
++before determining the real branch: odd reduced denominators admit negative
++sources; even denominators admit nonnegative sources. Negative powers exclude
++zero and retain disconnected images. The zero exponent maps every real source
++member, including zero, to one, consistently with existing integer powers.
++Empty maps to empty; no defined member returns EmptyDomain; excluded members
++produce Partial. The output is a normalized closed IntervalSet2 on the requested
++dyadic grid; infinity denotes a limit, and closure may include unattained zero.
++
++Use exact integer root/power relations and monotonicity of each sign branch.
++Retain perfect rational roots before expanding a fine requested grid. Share
++normalization, exact quotient rounding, extended bounds and work accounting
++with existing owners; do not introduce a rounded reciprocal intermediate.
++Small-budget refusal/retry, independent GMP/MPFR expectations, extreme scales,
++replay, and consumption by subsequent supported operations are acceptance gates.
++DyadicBudget's deterministic size/work accounting applies across nested calls;
++actual heap bytes, cancellation and consumer migration are not established by
++this new entry point.
++
++The shared implementation now serves all three adapters. It strips binary
++factors, preserves perfect rational roots before powering, and applies signed
++powers to the exact source fraction before grid rounding/root isolation.
++For nonnegative z, floor(root_q(z)) = floor(root_q(floor(z))); bisection keeps
++lo^q <= floor(z) < hi^q and an exact power comparison distinguishes equality.
++The upper grid bound increments exactly when either relation is nonintegral.
++Reduced numerator parity and denominator parity select admitted sign branches;
++negative exponents reverse magnitude order. Split normalization acts only after
++outward bounds are certified. No approximate scalar or rounded reciprocal is
++used. Hyperreal's existing perfect_nth_root is an unbudgeted u32-degree helper;
++this arbitrary-degree no_std dyadic implementation does not change its dispatch
++or add a Hyperreal dependency. The primitive power helper and its accounting
++also remain unchanged.
++
++Independent GMP tests cover 23 connected source states, 11 numerators, nine
++denominators (including zero and negative), and four grids: 9108 combinations.
++An additional 80 point cases use directed MPFR, with an exact GMP relation for
++singletons that a rounded intermediate MPFR root can straddle. Rational tests
++include perfect roots, partial domains, fine grids and 1024-bit near-one ratios.
++Extreme exponents/scales exercise compact results, explicit reservation
++exhaustion and retry. Fresh-process replay consumes split output in another
++power; further exponentials retain operation-local and inherited coverage.
++
++The initial constant-one shortcut ignored coarse grids. The failing regression
++and pre-fix source are retained in zero-grid-failure.log and pre-zero-grid.rs;
++the final zero-exponent image rounds outward on the requested grid. Early
++oracle compile/lint failures and an initial module-order formatting failure
++remain in the record. These are distinct from successful geometric outcomes.
++The final 29-command feature/release/lint/docs/security/portable-build matrix
++passes, including 140 unique unit/integration tests and 12 doctests. The two
++fresh-process child executions are not double-counted; test-list.log records
++the unique count. Four unchanged Hypersolve value/dispatch witnesses, strict
++Clippy on supported compiler/feature combinations, primitive dependency closure,
++ARM/WASM no_std builds and repository Zizmor checks pass. No push was attempted.
++
++Final Rust 1.95 coverage: 3878/3959 production lines (97.95%), 7709/8259 regions
++(93.34%), all 12 new-module functions executed. No branch denominator is reported.
++Tests, probes, Hyperreal, dependencies and test-only IEEE code are excluded;
++eight profile mismatches are diagnosed as excluded Rug OptRational::parts.
++Initial and final profiles remain separate. ASan fuzzing completes the published
++10,000-case campaign; raw logs/corpus are retained. All 540 completed cost
++samples, compiler/host metadata, executable hash and size are retained;
++PERFORMANCE.md records medians and methodological limits.
++
++Source and archive registration are pending. Tangent/pole functions, remaining
++Phase 5 qualifications, broader consumer migrations, allocation/cancellation,
++coordinated release and the earlier incomplete plan phases remain open.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 521dd16d0..58681c4a4 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,12 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add budgeted rational, dyadic and extended dyadic rational powers with
++  arbitrary-size exponent components, reduced real-branch semantics, exact
++  integer root witnesses, compact perfect roots and split pole images.
++- Exercise rational-power output through canonical replay and further powers
++  and exponentials; preserve local and inherited domain qualifications.
++
+ - Add normalized IntervalSet2 carriers and extended dyadic division/reciprocal
+   with split pole images, explicit domain coverage and canonical replay.
+ - Preserve exact dyadic quotient bounds before grid expansion, with budgeted
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index aa46e5d19..0305af02c 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -108,3 +108,8 @@ required-features = ["rational", "dyadic"]
+ name = "division_cost"
+ path = "conformance/division_cost.rs"
+ required-features = ["dyadic"]
++
++[[example]]
++name = "fractional_power_cost"
++path = "conformance/fractional_power_cost.rs"
++required-features = ["dyadic"]
+diff --git a/crates/hyperinterval/PERFORMANCE.md b/crates/hyperinterval/PERFORMANCE.md
+index e6197c8a2..494d74036 100644
+--- a/crates/hyperinterval/PERFORMANCE.md
++++ b/crates/hyperinterval/PERFORMANCE.md
+@@ -441,3 +441,41 @@ the minimum output-grid exponent, while genuinely fine nondyadic results must
+ pay their coefficient growth. These are new-capability costs, not speedups
+ against the finite strict API, which intentionally has a different pole contract.
+ Full memory/cancellation, consumer and firmware qualification remain open.
++
++
++## Rational exponent completion probe
++
++`conformance/fractional_power_cost.rs` measures full normalized images and
++local domain receipts. Cases are 2^(1/3), [2,3]^(3/5), [-8,-1]^(2/3),
++[-3,5]^(-1/3), [-3,5]^(-3/2), [8,27]^(1/3), (2^512)^(1/3),
++(2^-512)^(1/3), and the entire line raised to -1/3. Exact GMP power/root/grid
++expectations run before timing, with an additional directed MPFR point check.
++Rust 1.99 release, x86_64 Linux, dyadic only with no default features:
++
++| Case | grid 2^-16 | grid 2^-64 | grid 2^-256 |
++| --- | ---: | ---: | ---: |
++| point | 12368.426 | 48927.836 | 222718.707 |
++| narrow | 17094.371 | 58084.070 | 274537.297 |
++| negative | 2205.164 | 2198.148 | 2197.098 |
++| split | 10379.039 | 57336.215 | 210931.961 |
++| partial | 4751.941 | 17984.922 | 61941.824 |
++| perfect | 2904.707 | 2894.859 | 2841.676 |
++| huge | 126160.676 | 166265.855 | 375193.273 |
++| tiny | 1916.641 | 1914.168 | 55832.668 |
++| entire | 609.613 | 609.582 | 609.684 |
++
++Values are median ns/image. All 540 samples complete: three precisions, nine
++cases, 20 samples of 128 calls after 32 warmups per group. Timed work includes
++exponent normalization, root relations, arithmetic and work reservations,
++component normalization, owned output/receipt and destruction; input construction
++and the independent oracles are excluded. Each call starts a fresh 32768-bit,
++10^13-work-unit budget. Raw rows retain actual deterministic work units.
++
++Perfect rational roots avoid output-grid expansion; a nonperfect root uses
++integer bisection with exact power comparisons. Huge and fine-grid cases pay
++for their larger integer relations. Bounds and root witnesses are recomputed
++per call; no warm cache is assumed. These are costs for a new operation, not
++speedup comparisons. The archived executable includes GMP/MPFR oracle code,
++so whole-probe size is not production-kernel size. Actual allocation/heap-byte,
++cancellation, rational-backend timing and downstream consumer qualification
++remain open. Source/work reservations do not establish those claims.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 5762101ca..7ad741173 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -62,6 +62,16 @@ outward grid enclosure of the whole function range; narrow inputs with huge phas
+ budget to resolve those phases. The original exact endpoints remain the source
+ through refinement. No native floating transcendental supplies a certificate.
+ 
++Rational, dyadic and extended dyadic `pow_rational(&numerator, &denominator,
++precision, &mut budget)` accepts arbitrary-size integer exponent components.
++It reduces the exponent before selecting its real domain: odd denominators
++admit negative bases, even denominators exclude them, and negative powers
++exclude zero. A zero exponent uses the constant-one convention, including at
++zero, with outward grid rounding. A zero denominator is invalid even for empty
++sources. Exact integer relations certify each bound; perfect rational roots
++remain compact. Split results retain poles and Partial domain receipts. Large
++degrees or fine grids can exhaust the declared size/work budget.
++
+ `IntervalSet2<I>` retains up to two normalized closed components without a
+ separate union allocation. Dyadic construction and replay validate order and
+ separation; queries preserve real gaps. Extended dyadic `div` and `reciprocal`
+diff --git a/crates/hyperinterval/conformance/fractional_power_cost.rs b/crates/hyperinterval/conformance/fractional_power_cost.rs
+new file mode 100644
+index 000000000..70c78c5e3
+--- /dev/null
++++ b/crates/hyperinterval/conformance/fractional_power_cost.rs
+@@ -0,0 +1,68 @@
++//! Completed rational-power images, including exact roots and pole branches.
++#[cfg(not(target_env = "msvc"))]
++use hyperinterval::IntervalSet2;
++use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval as E};
++use num_bigint::BigInt;
++use std::{hint::black_box, time::Instant};
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/power_oracle.rs"]
++mod oracle;
++fn d(a: i64, b: i64, e: i32) -> E<DyadicInterval> {
++    E::from_finite(DyadicInterval::new(a.into(), b.into(), e).unwrap())
++}
++fn main() {
++    println!("backend,case,precision,sample,elapsed_ns,completed_images,work_units_per_image");
++    for (case, source, n, q) in [
++        ("point", d(2, 2, 0), 1, 3),
++        ("narrow", d(2, 3, 0), 3, 5),
++        ("negative", d(-8, -1, 0), 2, 3),
++        ("split", d(-3, 5, 0), -1, 3),
++        ("partial", d(-3, 5, 0), -3, 2),
++        ("perfect", d(8, 27, 0), 1, 3),
++        ("huge", d(1, 1, 512), 1, 3),
++        ("tiny", d(1, 1, -512), 1, 3),
++        ("entire", E::entire(), -1, 3),
++    ] {
++        let numerator: BigInt = n.into();
++        let denominator: BigInt = q.into();
++        for precision in [-16, -64, -256] {
++            let work = || {
++                let mut budget = DyadicBudget::new(32768, 10_000_000_000_000);
++                let result = black_box(&source)
++                    .pow_rational(
++                        black_box(&numerator),
++                        black_box(&denominator),
++                        black_box(precision),
++                        &mut budget,
++                    )
++                    .unwrap();
++                (result, 10_000_000_000_000 - budget.remaining_work())
++            };
++            let (result, units) = work();
++            #[cfg(not(target_env = "msvc"))]
++            {
++                let exact = oracle::actual(&IntervalSet2::from_interval(source.clone()))
++                    .into_iter()
++                    .next();
++                oracle::verify(Ok(result.clone()), &exact, n, q, precision);
++                if case == "point" {
++                    oracle::mpfr_point(&result.range, &2.into(), n, q as u32);
++                }
++            }
++            black_box(result);
++            for _ in 0..32 {
++                black_box(work());
++            }
++            for sample in 0..20 {
++                let start = Instant::now();
++                for _ in 0..128 {
++                    black_box(work());
++                }
++                println!(
++                    "dyadic,{case},{precision},{sample},{},128,{units}",
++                    start.elapsed().as_nanos()
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 64f72f561..52ae9fd4b 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -117,3 +117,10 @@ path = "fuzz_targets/split_division.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "fractional_power"
++path = "fuzz_targets/fractional_power.rs"
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs b/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs
+new file mode 100644
+index 000000000..b37a4313f
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs
+@@ -0,0 +1,56 @@
++#![no_main]
++use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalSet2};
++use libfuzzer_sys::fuzz_target;
++#[path = "../../tests/support/power_oracle.rs"]
++mod oracle;
++fn source(a: i64, b: i64, e: i32, kind: u16) -> (E<DyadicInterval>, oracle::Source) {
++    use oracle::End::{Minus as M, Plus as P, Value as V};
++    let point = |n: i64| DyadicInterval::point(n.into(), e).unwrap();
++    match kind % 5 {
++        0 => (
++            E::from_finite(DyadicInterval::new(a.into(), b.into(), e).unwrap()),
++            Some((V(oracle::q(&a, e)), V(oracle::q(&b, e)))),
++        ),
++        1 => (E::above(point(a)).unwrap(), Some((V(oracle::q(&a, e)), P))),
++        2 => (E::below(point(b)).unwrap(), Some((M, V(oracle::q(&b, e))))),
++        3 => (E::entire(), Some((M, P))),
++        _ => (E::empty(), None),
++    }
++}
++fuzz_target!(|data: [i16; 6]| {
++    let [a, b, e, n, q, p] = data;
++    let (a, b) = (
++        i64::from(a.rem_euclid(17) - 8),
++        i64::from(b.rem_euclid(17) - 8),
++    );
++    let (source, exact) = source(a.min(b), a.max(b), i32::from(e % 5), e.unsigned_abs());
++    let (n, q) = (i32::from(n % 6), i32::from(q % 7));
++    let p = 4 - i32::from(p.unsigned_abs() % 37);
++    let budget = || DyadicBudget::new(8192, 1_000_000_000_000);
++    let result = source.pow_rational(&n.into(), &q.into(), p, &mut budget());
++    oracle::verify(result.clone(), &exact, n, q, p);
++    if let Ok(image) = result {
++        let bytes = serde_json::to_vec(&image.range).unwrap();
++        let restored: IntervalSet2<DyadicInterval> = serde_json::from_slice(&bytes).unwrap();
++        assert_eq!(restored, image.range);
++        assert_eq!(
++            restored
++                .neg(&mut budget())
++                .unwrap()
++                .neg(&mut budget())
++                .unwrap(),
++            restored
++        );
++        if let Some((oracle::End::Value(a), oracle::End::Value(b))) = exact
++            && a == b
++            && a != 0
++            && q > 0
++            && n != 0
++        {
++            // Compare an independent directed MPFR point on admitted raw branches.
++            if a > 0 || q % 2 == 1 {
++                oracle::mpfr_point(&restored, &a, n, q as u32);
++            }
++        }
++    }
++});
+diff --git a/crates/hyperinterval/src/fractional_power.rs b/crates/hyperinterval/src/fractional_power.rs
+new file mode 100644
+index 000000000..1448577f1
+--- /dev/null
++++ b/crates/hyperinterval/src/fractional_power.rs
+@@ -0,0 +1,423 @@
++//! Real rational powers from exact integer relations and sign monotonicity.
++use crate::{
++    DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval, ExtendedIntervalView as View,
++    IntervalError, IntervalSet2, RangeEnclosure, SignSet,
++};
++use num_bigint::{BigInt, BigUint};
++use num_integer::Integer;
++use num_traits::{One, Pow, Signed, ToPrimitive, Zero};
++type Extended = ExtendedInterval<DyadicInterval>;
++type Image = RangeEnclosure<IntervalSet2<DyadicInterval>>;
++
++// Endpoints borrow the authoritative source. No preliminary dyadic conversion.
++#[derive(Clone, Copy)]
++enum End<'a> {
++    Infinity,
++    Finite(&'a BigInt, &'a BigInt, i32),
++}
++struct Power {
++    numerator: BigUint,
++    denominator: BigUint,
++    negative: bool,
++}
++impl Power {
++    fn new(n: &BigInt, d: &BigInt, budget: &mut DyadicBudget) -> Result<Self, IntervalError> {
++        let bits = n.bits().max(d.bits()).max(1);
++        budget.reserve(bits, bits.saturating_mul(2).saturating_add(5), true)?;
++        let gcd = n.magnitude().gcd(d.magnitude());
++        Ok(Self {
++            numerator: n.magnitude() / &gcd,
++            denominator: d.magnitude() / gcd,
++            negative: n.is_negative() != d.is_negative(),
++        })
++    }
++}
++impl DyadicInterval {
++    /// Tight closed outward image of the real power `x^(numerator/denominator)`.
++    ///
++    /// Both exponent integers may have arbitrary finite size. A zero denominator
++    /// returns ContainsZero, including for empty sources. The exponent is reduced
++    /// before branch selection. Odd denominators admit negative bases; even ones
++    /// exclude them. Negative exponents exclude zero. Excluded source members
++    /// report Partial, and no defined member returns EmptyDomain. Empty returns
++    /// empty/Complete; exponent zero maps all real members, including zero, to one.
++    ///
++    /// Outputs retain up to two closed components around a pole. Infinity is a
++    /// limit; closure may include unattained zero. Integer relations certify the
++    /// requested grid bounds. All arithmetic shares the supplied deterministic
++    /// size/work budget; see DyadicBudget for its units and exclusions.
++    pub fn pow_rational(
++        &self,
++        numerator: &BigInt,
++        denominator: &BigInt,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Image, IntervalError> {
++        if let Some(result) = trivial(self.signs(), numerator, denominator, precision, budget)? {
++            return Ok(result);
++        }
++        let (a, b, e) = self.bounds().expect("nonempty source");
++        budget.reserve(1, 1, false)?;
++        let one = BigInt::one();
++        image(
++            End::Finite(a, &one, e),
++            End::Finite(b, &one, e),
++            self.signs(),
++            &Power::new(numerator, denominator, budget)?,
++            precision,
++            budget,
++        )
++    }
++}
++impl Extended {
++    /// Real rational power with the same domain and grid contract as
++    /// [`DyadicInterval::pow_rational`], including infinite-end limits.
++    pub fn pow_rational(
++        &self,
++        numerator: &BigInt,
++        denominator: &BigInt,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Image, IntervalError> {
++        if let Some(result) = trivial(self.signs(), numerator, denominator, precision, budget)? {
++            return Ok(result);
++        }
++        budget.reserve(1, 1, false)?;
++        let one = BigInt::one();
++        let (a, b) = match self.view() {
++            View::Empty => unreachable!("handled by trivial"),
++            View::Entire => (End::Infinity, End::Infinity),
++            View::Finite(x) => {
++                let (a, b, e) = x.bounds().expect("nonempty source");
++                (End::Finite(a, &one, e), End::Finite(b, &one, e))
++            }
++            View::Below(x) => {
++                let (b, _, e) = x.bounds().expect("singleton bound");
++                (End::Infinity, End::Finite(b, &one, e))
++            }
++            View::Above(x) => {
++                let (a, _, e) = x.bounds().expect("singleton bound");
++                (End::Finite(a, &one, e), End::Infinity)
++            }
++        };
++        image(
++            a,
++            b,
++            self.signs(),
++            &Power::new(numerator, denominator, budget)?,
++            precision,
++            budget,
++        )
++    }
++}
++#[cfg(feature = "rational")]
++impl crate::RationalInterval {
++    /// Real rational power retaining exact rational endpoints through root
++    /// isolation. Requires rational+dyadic; see [`DyadicInterval::pow_rational`]
++    /// for branch, pole, empty, domain-coverage and shared-budget semantics.
++    pub fn pow_rational(
++        &self,
++        numerator: &BigInt,
++        denominator: &BigInt,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Image, IntervalError> {
++        if let Some(result) = trivial(self.signs(), numerator, denominator, precision, budget)? {
++            return Ok(result);
++        }
++        let (a, b) = self.bounds().expect("nonempty source");
++        let convert = |x: &hyperreal::Rational, budget: &mut DyadicBudget| {
++            budget.reserve(x.numerator().bits().max(x.denominator().bits()), 2, false)?;
++            Ok::<_, IntervalError>((
++                BigInt::from(x.numerator().clone()),
++                BigInt::from(x.denominator().clone()),
++            ))
++        };
++        let (an, ad) = convert(a, budget)?;
++        let (bn, bd) = convert(b, budget)?;
++        image(
++            End::Finite(&an, &ad, 0),
++            End::Finite(&bn, &bd, 0),
++            self.signs(),
++            &Power::new(numerator, denominator, budget)?,
++            precision,
++            budget,
++        )
++    }
++}
++fn trivial(
++    signs: SignSet,
++    n: &BigInt,
++    d: &BigInt,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Option<Image>, IntervalError> {
++    if d.is_zero() {
++        return Err(IntervalError::ContainsZero);
++    }
++    if signs == SignSet::Empty {
++        return Ok(Some(RangeEnclosure {
++            range: IntervalSet2::empty(),
++            domain: DomainCoverage::Complete,
++        }));
++    }
++    if n.is_zero() {
++        budget.reserve(1, 1, false)?;
++        return Ok(Some(RangeEnclosure {
++            range: IntervalSet2::from_interval(Extended::from_finite(if precision > 0 {
++                DyadicInterval::new(BigInt::zero(), BigInt::one(), precision)?
++            } else {
++                DyadicInterval::point(BigInt::one(), 0)?
++            })),
++            domain: DomainCoverage::Complete,
++        }));
++    }
++    Ok(None)
++}
++fn image(
++    a: End<'_>,
++    b: End<'_>,
++    signs: SignSet,
++    power: &Power,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Image, IntervalError> {
++    let admit_negative = power.denominator.is_odd() && signs.contains_negative();
++    let admit_positive = signs.contains_positive();
++    let admit_zero = !power.negative && signs.contains_zero();
++    if !admit_negative && !admit_positive && !admit_zero {
++        return Err(IntervalError::EmptyDomain);
++    }
++    let domain = if (signs.contains_negative() && !admit_negative)
++        || (signs.contains_zero() && !admit_zero)
++    {
++        DomainCoverage::Partial
++    } else {
++        DomainCoverage::Complete
++    };
++    budget.reserve(1, 1, false)?;
++    let zero = BigInt::zero();
++    let one = BigInt::one();
++    let z = End::Finite(&zero, &one, 0);
++    let negative = if admit_negative {
++        let range = magnitude(
++            if signs.contains_zero() { z } else { b },
++            a,
++            power,
++            precision,
++            budget,
++        )?;
++        if power.numerator.is_odd() {
++            range.neg(budget)?
++        } else {
++            range
++        }
++    } else {
++        Extended::empty()
++    };
++    let positive = if admit_positive {
++        magnitude(
++            if signs.contains_zero() { z } else { a },
++            b,
++            power,
++            precision,
++            budget,
++        )?
++    } else if admit_zero {
++        Extended::from_finite(DyadicInterval::point(zero, 0)?)
++    } else {
++        Extended::empty()
++    };
++    Ok(RangeEnclosure {
++        range: IntervalSet2::new(negative, positive, budget)?,
++        domain,
++    })
++}
++// On either sign half-line, absolute source endpoints are nonnegative and
++// ordered. Negative powers reverse magnitude order; odd numerators reflect it.
++fn magnitude(
++    a: End<'_>,
++    b: End<'_>,
++    power: &Power,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Extended, IntervalError> {
++    let (a, b) = if power.negative { (b, a) } else { (a, b) };
++    let lower = endpoint(a, power, precision, budget)?.expect("lower magnitude bound is finite");
++    let upper = endpoint(b, power, precision, budget)?;
++    let (lo, _, e) = lower.bounds().expect("nonempty point image");
++    match upper {
++        None => {
++            budget.reserve(lo.bits().max(1), 1, false)?;
++            Extended::above(DyadicInterval::point(lo.clone(), e)?)
++        }
++        Some(upper) => {
++            let (_, hi, f) = upper.bounds().expect("nonempty point image");
++            crate::extended_dyadic::closed_bounds(lo, e, hi, f, budget)
++        }
++    }
++}
++// None denotes positive infinity, not an omitted result.
++fn endpoint(
++    x: End<'_>,
++    power: &Power,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<Option<DyadicInterval>, IntervalError> {
++    match x {
++        End::Infinity if !power.negative => Ok(None),
++        End::Infinity => Ok(Some(DyadicInterval::point(BigInt::zero(), 0)?)),
++        End::Finite(n, _, _) if n.is_zero() && power.negative => Ok(None),
++        End::Finite(n, _, _) if n.is_zero() => Ok(Some(DyadicInterval::point(BigInt::zero(), 0)?)),
++        End::Finite(n, d, e) => point(n, d, e, power, precision, budget).map(Some),
++    }
++}
++fn point(
++    n: &BigInt,
++    d: &BigInt,
++    e: i32,
++    power: &Power,
++    precision: i32,
++    budget: &mut DyadicBudget,
++) -> Result<DyadicInterval, IntervalError> {
++    let nt = n.trailing_zeros().expect("nonzero numerator");
++    let dt = d.trailing_zeros().expect("positive denominator");
++    budget.reserve(n.bits().max(d.bits()).max(65), 4, false)?;
++    let n = n.abs() >> usize::try_from(nt).map_err(|_| IntervalError::Overflow)?;
++    let d = d >> usize::try_from(dt).map_err(|_| IntervalError::Overflow)?;
++    let scale = BigInt::from(e) + BigInt::from(nt) - BigInt::from(dt);
++    let (nr, ne) = root(&n, &power.denominator, budget)?;
++    let (dr, de) = root(&d, &power.denominator, budget)?;
++    budget.reserve(
++        scale.bits().max(power.denominator.bits()).saturating_add(1),
++        4,
++        true,
++    )?;
++    let degree = BigInt::from(power.denominator.clone());
++    let (root_scale, remainder) = scale.div_rem(&degree);
++    let exact_root = ne && de && remainder.is_zero();
++    let (n, d, scale) = if exact_root {
++        (nr, dr, root_scale)
++    } else {
++        (n, d, scale)
++    };
++    let n = integer_power(&n, &power.numerator, budget)?;
++    let d = integer_power(&d, &power.numerator, budget)?;
++    budget.reserve(
++        scale
++            .bits()
++            .saturating_add(power.numerator.bits())
++            .saturating_add(1),
++        3,
++        true,
++    )?;
++    let scale = scale * BigInt::from(power.numerator.clone());
++    let (n, d, scale) = if power.negative {
++        (d, n, -scale)
++    } else {
++        (n, d, scale)
++    };
++    if exact_root
++        && d.is_one()
++        && let Some(e) = scale.to_i32()
++        && precision <= e
++    {
++        return DyadicInterval::point(n, e);
++    }
++    budget.reserve(
++        scale
++            .bits()
++            .max(power.denominator.bits().saturating_add(32))
++            .saturating_add(2),
++        4,
++        true,
++    )?;
++    let shift = if exact_root {
++        scale - precision
++    } else {
++        scale - degree * precision
++    };
++    // If strictly smaller than one grid unit, no exponent-sized denominator is needed.
++    if &shift + BigInt::from(n.bits()) < BigInt::from(d.bits()) {
++        budget.reserve(1, 2, false)?;
++        return DyadicInterval::new(BigInt::zero(), BigInt::one(), precision);
++    }
++    // Check the declared size reservation even when the shared quotient's
++    // signed scale cannot represent this request. Overflow remains distinct.
++    let shift = match shift.to_i64() {
++        Some(shift) => shift,
++        None => {
++            if shift.abs() + BigInt::from(n.bits().max(d.bits())) > BigInt::from(budget.max_bits())
++            {
++                return Err(IntervalError::SizeExhausted);
++            }
++            return Err(IntervalError::Overflow);
++        }
++    };
++    let (floor, ceil) = crate::dyadic::scaled_quotient(&n, &d, shift, budget)?;
++    if exact_root {
++        return DyadicInterval::new(floor, ceil, precision);
++    }
++    let (lower, exact) = root(&floor, &power.denominator, budget)?;
++    budget.reserve(lower.bits().saturating_add(1), 2, false)?;
++    let upper = if exact && floor == ceil {
++        lower.clone()
++    } else {
++        &lower + 1
++    };
++    DyadicInterval::new(lower, upper, precision)
++}
++// Exact nonnegative integer power, with arbitrary finite exponent. Bounds are
++// reserved before the backend call, including binary exponentiation stages.
++fn integer_power(
++    x: &BigInt,
++    p: &BigUint,
++    budget: &mut DyadicBudget,
++) -> Result<BigInt, IntervalError> {
++    if x.bits() <= 1 || p.is_one() {
++        budget.reserve(x.bits().max(1), 1, false)?;
++        return Ok(x.clone());
++    }
++    let bits = x
++        .bits()
++        .checked_mul(p.to_u64().ok_or(IntervalError::SizeExhausted)?)
++        .ok_or(IntervalError::SizeExhausted)?;
++    budget.reserve(bits, p.bits().saturating_mul(2), true)?;
++    Ok(Pow::pow(x, p))
++}
++// floor(q-th root(x)) and an exactness witness. Bisection maintains
++// lo^q <= x < hi^q. Degree comparisons avoid materializing enormous powers
++// when the root is one. Every iteration consumes the shared work budget.
++fn root(
++    x: &BigInt,
++    q: &BigUint,
++    budget: &mut DyadicBudget,
++) -> Result<(BigInt, bool), IntervalError> {
++    budget.reserve(x.bits().max(q.bits()).max(1), 2, false)?;
++    if x.bits() <= 1 || q.is_one() {
++        return Ok((x.clone(), true));
++    }
++    let degree = q.to_u64().unwrap_or(u64::MAX);
++    if degree >= x.bits() {
++        return Ok((BigInt::one(), false));
++    }
++    let bits = x.bits();
++    let shift = (bits - 1) / degree;
++    budget.reserve(shift.saturating_add(2), 4, false)?;
++    let mut lo = BigInt::one() << usize::try_from(shift).map_err(|_| IntervalError::Overflow)?;
++    let mut hi = &lo << 1usize;
++    loop {
++        budget.reserve(hi.bits().saturating_add(1), 4, false)?;
++        if &hi - &lo == BigInt::one() {
++            break;
++        }
++        let mid = (&lo + &hi) >> 1usize;
++        if integer_power(&mid, q, budget)? <= *x {
++            lo = mid;
++        } else {
++            hi = mid;
++        }
++    }
++    let exact = integer_power(&lo, q, budget)? == *x;
++    Ok((lo, exact))
++}
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 816875606..78a67fa5c 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -38,6 +38,8 @@ mod fixed;
+ mod fixed_arithmetic;
+ #[cfg(feature = "float-enclosure")]
+ mod float;
++#[cfg(feature = "dyadic")]
++mod fractional_power;
+ #[cfg(any(feature = "float-proposal", feature = "float-enclosure"))]
+ mod ieee;
+ #[cfg(feature = "integer")]
+diff --git a/crates/hyperinterval/tests/fractional_power.rs b/crates/hyperinterval/tests/fractional_power.rs
+new file mode 100644
+index 000000000..dfe556053
+--- /dev/null
++++ b/crates/hyperinterval/tests/fractional_power.rs
+@@ -0,0 +1,375 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::{
++    DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalError,
++    IntervalSet2,
++};
++use num_bigint::BigInt;
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(32768, 10_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++#[test]
++fn cube_root_of_eight_is_exact() {
++    let x = DyadicInterval::point(8.into(), 0).unwrap();
++    let result = x
++        .pow_rational(
++            &1.into(),
++            &3.into(),
++            -64,
++            &mut DyadicBudget::new(4096, 1_000_000_000),
++        )
++        .unwrap();
++    assert_eq!(
++        result.range.components()[0].as_finite(),
++        Some(&DyadicInterval::point(2.into(), 0).unwrap())
++    );
++}
++
++#[test]
++fn zero_exponent_obeys_the_requested_coarse_grid() {
++    let result = d(-3, 5, 0)
++        .pow_rational(&0.into(), &7.into(), 4, &mut budget())
++        .unwrap();
++    assert_eq!(result.range.components(), &[E::from_finite(d(0, 1, 4))]);
++}
++
++#[test]
++fn reduced_exponents_domains_poles_and_limits() {
++    let split = d(-8, 8, 0)
++        .pow_rational(&(-1).into(), &3.into(), -32, &mut budget())
++        .unwrap();
++    assert_eq!(split.domain, DomainCoverage::Partial);
++    assert_eq!(
++        split.range,
++        IntervalSet2::new(
++            E::below(d(-1, -1, -1)).unwrap(),
++            E::above(d(1, 1, -1)).unwrap(),
++            &mut budget()
++        )
++        .unwrap()
++    );
++    for (n, q) in [(2, 6), (-2, -6), (3, 9), (5, 15)] {
++        let result = d(-8, 27, 0)
++            .pow_rational(&n.into(), &q.into(), -32, &mut budget())
++            .unwrap();
++        assert_eq!(result.domain, DomainCoverage::Complete);
++        assert_eq!(result.range.components(), &[E::from_finite(d(-2, 3, 0))]);
++    }
++    for (n, q) in [(1, 2), (2, 4), (-1, -2)] {
++        let result = d(-8, 4, 0)
++            .pow_rational(&n.into(), &q.into(), -32, &mut budget())
++            .unwrap();
++        assert_eq!(result.domain, DomainCoverage::Partial);
++        assert_eq!(result.range.components(), &[E::from_finite(d(0, 2, 0))]);
++        assert_eq!(
++            d(-8, -1, 0).pow_rational(&n.into(), &q.into(), 0, &mut budget()),
++            Err(IntervalError::EmptyDomain)
++        );
++    }
++    assert_eq!(
++        d(-8, 27, 0)
++            .pow_rational(&2.into(), &3.into(), -32, &mut budget())
++            .unwrap()
++            .range
++            .components(),
++        &[E::from_finite(d(0, 9, 0))]
++    );
++    assert_eq!(
++        d(0, 0, 0).pow_rational(&(-1).into(), &3.into(), 0, &mut budget()),
++        Err(IntervalError::EmptyDomain)
++    );
++    assert!(
++        DyadicInterval::empty()
++            .pow_rational(&1.into(), &3.into(), i32::MIN, &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .range
++            .is_empty()
++    );
++    assert_eq!(
++        DyadicInterval::empty().pow_rational(&0.into(), &0.into(), 0, &mut DyadicBudget::new(0, 0)),
++        Err(IntervalError::ContainsZero)
++    );
++    assert_eq!(
++        d(0, 0, 0)
++            .pow_rational(&0.into(), &7.into(), i32::MIN, &mut budget())
++            .unwrap()
++            .range
++            .components(),
++        &[E::from_finite(d(1, 1, 0))]
++    );
++    let entire = E::<DyadicInterval>::entire()
++        .pow_rational(&(-2).into(), &3.into(), -32, &mut budget())
++        .unwrap();
++    assert_eq!(entire.domain, DomainCoverage::Partial);
++    assert_eq!(entire.range.components(), &[E::above(d(0, 0, 0)).unwrap()]);
++}
++
++#[test]
++fn compact_exact_roots_extreme_scales_and_arbitrary_exponents() {
++    for e in [i32::MIN, -1074, 0, i32::MAX - 1] {
++        let source = d(1, 1, e);
++        let result = source
++            .pow_rational(&1.into(), &2.into(), i32::MIN, &mut budget())
++            .unwrap();
++        assert_eq!(result.range.components(), &[E::from_finite(d(1, 1, e / 2))]);
++    }
++    let huge: BigInt = BigInt::from(1) << 512usize;
++    for n in [huge.clone(), &huge + 1, -&huge - 1] {
++        let result = d(1, 1, 0)
++            .pow_rational(&n, &(&huge + 3), i32::MIN, &mut budget())
++            .unwrap();
++        assert_eq!(result.range.components(), &[E::from_finite(d(1, 1, 0))]);
++    }
++    let result = d(2, 2, 0)
++        .pow_rational(&1.into(), &(&huge + 1), 0, &mut budget())
++        .unwrap();
++    assert_eq!(result.range.components(), &[E::from_finite(d(1, 2, 0))]);
++    let result = d(1, 1, i32::MIN)
++        .pow_rational(&3.into(), &1.into(), -64, &mut budget())
++        .unwrap();
++    assert_eq!(result.range.components(), &[E::from_finite(d(0, 1, -64))]);
++    let result = d(1, 1, i32::MIN)
++        .pow_rational(&(-1).into(), &1.into(), i32::MAX, &mut budget())
++        .unwrap();
++    assert_eq!(
++        result.range.components(),
++        &[E::from_finite(d(2, 2, i32::MAX))]
++    );
++}
++
++#[test]
++fn shared_work_refusal_retry_and_continued_operations() {
++    let source = d(-3, 5, 0);
++    let completed = source
++        .pow_rational(&(-3).into(), &5.into(), -64, &mut budget())
++        .unwrap();
++    assert_eq!(
++        source.pow_rational(
++            &(-3).into(),
++            &5.into(),
++            -64,
++            &mut DyadicBudget::new(32768, 100)
++        ),
++        Err(IntervalError::WorkExhausted)
++    );
++    assert_eq!(
++        source.pow_rational(
++            &(-3).into(),
++            &5.into(),
++            -64,
++            &mut DyadicBudget::new(128, u64::MAX)
++        ),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        source
++            .pow_rational(&(-3).into(), &5.into(), -64, &mut budget())
++            .unwrap(),
++        completed
++    );
++    let exp = completed.range.exp(-32, &mut budget()).unwrap();
++    assert_eq!(exp.domain, DomainCoverage::Complete);
++    assert_eq!(completed.domain, DomainCoverage::Partial);
++    assert_eq!(exp.range.components().len(), 2);
++    for piece in completed.range.components() {
++        let square = piece
++            .pow_rational(&2.into(), &1.into(), -32, &mut budget())
++            .unwrap();
++        assert_eq!(square.domain, DomainCoverage::Complete);
++        assert!(!square.range.signs().contains_negative());
++    }
++}
++
++#[test]
++fn extreme_requests_exhaust_declared_reservations() {
++    let huge: BigInt = BigInt::from(1) << 512usize;
++    for (n, q, p) in [
++        (BigInt::from(1), &huge + 1, -1),
++        (&huge + 1, BigInt::from(1), -64),
++    ] {
++        assert_eq!(
++            d(2, 2, 0).pow_rational(&n, &q, p, &mut budget()),
++            Err(IntervalError::SizeExhausted)
++        );
++    }
++    assert_eq!(
++        d(3, 3, 0).pow_rational(&1.into(), &3.into(), i32::MIN, &mut budget()),
++        Err(IntervalError::SizeExhausted)
++    );
++    let reduced = d(-8, 27, 0)
++        .pow_rational(&huge, &(&huge * 3), -64, &mut budget())
++        .unwrap();
++    assert_eq!(reduced.range.components(), &[E::from_finite(d(-2, 3, 0))]);
++    let coarse = d(3, 3, i32::MAX)
++        .pow_rational(&1.into(), &3.into(), i32::MAX, &mut budget())
++        .unwrap();
++    assert_eq!(
++        coarse.range.components(),
++        &[E::from_finite(d(0, 1, i32::MAX))]
++    );
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/power_oracle.rs"]
++mod oracle;
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn independent_gmp_roots_domains_and_mpfr_point_bounds() {
++    use oracle::End::{Minus as M, Plus as P, Value as V};
++    let mut cases = vec![(E::empty(), None), (E::entire(), Some((M, P)))];
++    for n in [-8, -1, 0, 1, 8] {
++        cases.push((E::below(d(n, n, 0)).unwrap(), Some((M, V(n.into())))));
++        cases.push((E::above(d(n, n, 0)).unwrap(), Some((V(n.into()), P))));
++        cases.push((E::from_finite(d(n, n, 0)), Some((V(n.into()), V(n.into())))));
++    }
++    for (a, b) in [(-8, -1), (-8, 0), (-8, 27), (-1, 8), (0, 8), (1, 8)] {
++        cases.push((E::from_finite(d(a, b, 0)), Some((V(a.into()), V(b.into())))));
++    }
++    for (x, qx) in cases {
++        for n in -5..=5 {
++            for den in [-6, -3, 0, 1, 2, 3, 4, 5, 6] {
++                for p in [-64, -8, 0, 4] {
++                    oracle::verify(
++                        x.pow_rational(&n.into(), &den.into(), p, &mut budget()),
++                        &qx,
++                        n,
++                        den,
++                        p,
++                    );
++                }
++            }
++        }
++    }
++    for e in [-1074, -8, 0, 8, 512] {
++        for a in [-7, -2, 2, 7] {
++            for (n, den) in [(-3, 5), (-2, 3), (1, 3), (3, 5)] {
++                let x = d(a, a, e);
++                let q = oracle::q(&a, e);
++                let result = x
++                    .pow_rational(&n.into(), &den.into(), -64, &mut budget())
++                    .unwrap();
++                oracle::verify(
++                    Ok(result.clone()),
++                    &Some((V(q.clone()), V(q.clone()))),
++                    n,
++                    den,
++                    -64,
++                );
++                oracle::mpfr_point(&result.range, &q, n, den as u32);
++            }
++        }
++    }
++}
++
++#[cfg(all(feature = "rational", not(target_env = "msvc")))]
++#[test]
++fn rational_endpoints_retain_exact_source_and_perfect_roots() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    use oracle::End::Value as V;
++    use rug::Rational as Q;
++    for denominator in [1, 3, 7, 65537] {
++        for a in [-9, -1, 0, 1, 9] {
++            for (n, q) in [(-3, 5), (-1, 3), (1, 2), (2, 3), (3, 2)] {
++                let x = I::new(
++                    R::fraction(a, denominator).unwrap(),
++                    R::fraction(a + 5, denominator).unwrap(),
++                )
++                .unwrap();
++                for p in [-128, -8, 4] {
++                    oracle::verify(
++                        x.pow_rational(&n.into(), &q.into(), p, &mut budget()),
++                        &Some((
++                            V(Q::from((a, denominator))),
++                            V(Q::from((a + 5, denominator))),
++                        )),
++                        n,
++                        q,
++                        p,
++                    );
++                }
++            }
++        }
++    }
++    let x = I::point(R::fraction(8, 27).unwrap());
++    let result = x
++        .pow_rational(&1.into(), &3.into(), -64, &mut budget())
++        .unwrap();
++    oracle::verify(
++        Ok(result),
++        &Some((V(Q::from((8, 27))), V(Q::from((8, 27))))),
++        1,
++        3,
++        -64,
++    );
++    let x = I::point(R::fraction(27, 8).unwrap());
++    assert_eq!(
++        x.pow_rational(&1.into(), &3.into(), i32::MIN, &mut budget())
++            .unwrap()
++            .range
++            .components(),
++        &[E::from_finite(d(3, 3, -1))]
++    );
++    let large = rug::Integer::from(1) << 1024u32;
++    for (a, b) in [
++        (large.clone() + 1, large.clone() - 1),
++        (large.clone() - 1, large + 1),
++    ] {
++        let q = Q::from((a, b));
++        let x = I::point(q.to_string().parse::<R>().unwrap());
++        let image = x
++            .pow_rational(&1.into(), &7.into(), -64, &mut budget())
++            .unwrap();
++        oracle::verify(Ok(image.clone()), &Some((V(q.clone()), V(q))), 1, 7, -64);
++        assert_eq!(
++            x.pow_rational(
++                &1.into(),
++                &7.into(),
++                -64,
++                &mut DyadicBudget::new(32768, 10000)
++            ),
++            Err(IntervalError::WorkExhausted)
++        );
++        assert_eq!(
++            x.pow_rational(&1.into(), &7.into(), -64, &mut budget())
++                .unwrap(),
++            image
++        );
++    }
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn exact_replay_then_further_power_in_fresh_process() {
++    const ENV: &str = "HYPERINTERVAL_POWER_REPLAY";
++    if let Ok(bytes) = std::env::var(ENV) {
++        let set: IntervalSet2<DyadicInterval> = serde_json::from_str(&bytes).unwrap();
++        assert_eq!(serde_json::to_string(&set).unwrap(), bytes);
++        assert!(!set.contains_point(&0.into(), 0, &mut budget()).unwrap());
++        for piece in set.components() {
++            let result = piece
++                .pow_rational(&(-3).into(), &1.into(), -32, &mut budget())
++                .unwrap();
++            assert_eq!(result.domain, DomainCoverage::Complete);
++            assert_eq!(result.range.components().len(), 1);
++            assert!(result.range.components()[0].as_finite().is_some());
++        }
++        return;
++    }
++    let image = d(-8, 8, 0)
++        .pow_rational(&(-1).into(), &3.into(), -64, &mut budget())
++        .unwrap();
++    assert_eq!(image.domain, DomainCoverage::Partial);
++    let bytes = serde_json::to_string(&image.range).unwrap();
++    assert!(
++        std::process::Command::new(std::env::current_exe().unwrap())
++            .arg("--exact")
++            .arg("exact_replay_then_further_power_in_fresh_process")
++            .env(ENV, bytes)
++            .status()
++            .unwrap()
++            .success()
++    );
++}
+diff --git a/crates/hyperinterval/tests/support/division_oracle.rs b/crates/hyperinterval/tests/support/division_oracle.rs
+index 30145b146..76aadb861 100644
+--- a/crates/hyperinterval/tests/support/division_oracle.rs
++++ b/crates/hyperinterval/tests/support/division_oracle.rs
+@@ -1,19 +1,11 @@
+ //! Independent four-corner/limit image of each denominator sign component.
+-use hyperinterval::{
+-    DomainCoverage, DyadicInterval, ExtendedIntervalView as View, IntervalError, IntervalSet2,
+-    RangeEnclosure,
+-};
+-use rug::Rational;
+-#[path = "grid_oracle.rs"]
+-mod grid_oracle;
+-pub use grid_oracle::q;
+-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+-pub enum End {
+-    Minus,
+-    Value(Rational),
+-    Plus,
+-}
+-pub type Source = Option<(End, End)>;
++use hyperinterval::{DomainCoverage, DyadicInterval, IntervalError, IntervalSet2, RangeEnclosure};
++#[path = "set_oracle.rs"]
++mod set_oracle;
++pub use set_oracle::{End, Source, actual};
++// Fuzz and cost consumers also construct exact scaled source values.
++#[allow(unused_imports)]
++pub use set_oracle::q;
+ fn zero() -> End {
+     End::Value(0.into())
+ }
+@@ -62,10 +54,10 @@ fn image(a: &(End, End), b: &(End, End), branch: i32, precision: i32) -> (End, E
+     let mut lo = values.first().unwrap().clone();
+     let mut hi = values.last().unwrap().clone();
+     if let End::Value(x) = lo {
+-        lo = End::Value(grid_oracle::bounds(x.clone(), x, precision).0);
++        lo = End::Value(set_oracle::bounds(x.clone(), x, precision).0);
+     }
+     if let End::Value(x) = hi {
+-        hi = End::Value(grid_oracle::bounds(x.clone(), x, precision).1);
++        hi = End::Value(set_oracle::bounds(x.clone(), x, precision).1);
+     }
+     (lo, hi)
+ }
+@@ -110,27 +102,6 @@ pub fn expected(
+     };
+     Ok((images, coverage))
+ }
+-pub fn actual(set: &IntervalSet2<DyadicInterval>) -> Vec<(End, End)> {
+-    set.components()
+-        .iter()
+-        .map(|x| match x.view() {
+-            View::Empty => panic!("empty component"),
+-            View::Entire => (End::Minus, End::Plus),
+-            View::Finite(x) => {
+-                let (a, b, e) = x.bounds().unwrap();
+-                (End::Value(q(a, e)), End::Value(q(b, e)))
+-            }
+-            View::Below(x) => {
+-                let (_, b, e) = x.bounds().unwrap();
+-                (End::Minus, End::Value(q(b, e)))
+-            }
+-            View::Above(x) => {
+-                let (a, _, e) = x.bounds().unwrap();
+-                (End::Value(q(a, e)), End::Plus)
+-            }
+-        })
+-        .collect()
+-}
+ pub fn verify(
+     result: Result<RangeEnclosure<IntervalSet2<DyadicInterval>>, IntervalError>,
+     a: &Source,
+diff --git a/crates/hyperinterval/tests/support/power_oracle.rs b/crates/hyperinterval/tests/support/power_oracle.rs
+new file mode 100644
+index 000000000..338916b66
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/power_oracle.rs
+@@ -0,0 +1,165 @@
++//! Independent GMP power/root/grid expectations over monotone sign pieces.
++use hyperinterval::{DomainCoverage, DyadicInterval, IntervalError, IntervalSet2, RangeEnclosure};
++use rug::{Rational, ops::Pow};
++#[path = "set_oracle.rs"]
++mod set_oracle;
++pub use set_oracle::{End, Source, actual, q};
++fn zero() -> End {
++    End::Value(0.into())
++}
++fn finite(x: &Rational, n: i32, d: u32, precision: i32) -> (End, End) {
++    let mut value = x.clone().abs().pow(n.unsigned_abs());
++    if n < 0 {
++        value.recip_mut();
++    }
++    let shift = -i64::from(precision) * i64::from(d);
++    if shift >= 0 {
++        value <<= shift as u32;
++    } else {
++        value >>= shift.unsigned_abs() as u32;
++    }
++    let integral = value.clone().floor().numer().clone();
++    let root = integral.root(d);
++    let exact = root.clone().pow(d) == value;
++    let ceil = if exact {
++        root.clone()
++    } else {
++        root.clone() + 1
++    };
++    let (a, b) = if x < &0 && n.unsigned_abs() % 2 == 1 {
++        (-ceil, -root)
++    } else {
++        (root, ceil)
++    };
++    (End::Value(q(&a, precision)), End::Value(q(&b, precision)))
++}
++fn limit(x: &End, side: i32, n: i32, d: u32, precision: i32) -> (End, End) {
++    let infinite = || {
++        if side < 0 && n.unsigned_abs() % 2 == 1 {
++            End::Minus
++        } else {
++            End::Plus
++        }
++    };
++    match x {
++        End::Value(x) if x != &0 => finite(x, n, d, precision),
++        End::Value(_) if n > 0 => (zero(), zero()),
++        End::Value(_) => (infinite(), infinite()),
++        _ if n < 0 => (zero(), zero()),
++        _ => (infinite(), infinite()),
++    }
++}
++pub fn expected(
++    source: &Source,
++    n: i32,
++    d: i32,
++    precision: i32,
++) -> Result<(Vec<(End, End)>, DomainCoverage), IntervalError> {
++    if d == 0 {
++        return Err(IntervalError::ContainsZero);
++    }
++    let Some((a, b)) = source else {
++        return Ok((vec![], DomainCoverage::Complete));
++    };
++    if n == 0 {
++        let (a, b) = set_oracle::bounds(1.into(), 1.into(), precision);
++        return Ok((
++            vec![(End::Value(a), End::Value(b))],
++            DomainCoverage::Complete,
++        ));
++    }
++    let exponent = Rational::from((n, d));
++    let n = exponent.numer().to_i32().unwrap();
++    let d = exponent.denom().to_u32().unwrap();
++    let has_zero = a <= &zero() && b >= &zero();
++    let partial = (a < &zero() && d % 2 == 0) || (has_zero && n < 0);
++    let mut pieces = vec![];
++    if a < &zero() && d % 2 == 1 {
++        let x = limit(a, -1, n, d, precision);
++        let y = limit(&b.clone().min(zero()), -1, n, d, precision);
++        pieces.push((x.0.min(y.0), x.1.max(y.1)));
++    }
++    if b > &zero() {
++        let x = limit(&a.clone().max(zero()), 1, n, d, precision);
++        let y = limit(b, 1, n, d, precision);
++        pieces.push((x.0.min(y.0), x.1.max(y.1)));
++    }
++    if has_zero && n > 0 {
++        pieces.push((zero(), zero()));
++    }
++    if pieces.is_empty() {
++        return Err(IntervalError::EmptyDomain);
++    }
++    pieces.sort();
++    let mut merged: Vec<(End, End)> = vec![];
++    for (a, b) in pieces {
++        if let Some(last) = merged.last_mut()
++            && last.1 >= a
++        {
++            last.1 = last.1.clone().max(b);
++        } else {
++            merged.push((a, b));
++        }
++    }
++    Ok((
++        merged,
++        if partial {
++            DomainCoverage::Partial
++        } else {
++            DomainCoverage::Complete
++        },
++    ))
++}
++pub fn verify(
++    result: Result<RangeEnclosure<IntervalSet2<DyadicInterval>>, IntervalError>,
++    source: &Source,
++    n: i32,
++    d: i32,
++    precision: i32,
++) {
++    match expected(source, n, d, precision) {
++        Err(e) => assert_eq!(result, Err(e)),
++        Ok((parts, coverage)) => {
++            let result = result.unwrap();
++            assert_eq!(result.domain, coverage, "{source:?} ^ {n}/{d}");
++            assert_eq!(
++                actual(&result.range),
++                parts,
++                "{source:?} ^ {n}/{d} grid={precision}"
++            );
++        }
++    }
++}
++// Additional directed MPFR oracle for non-grid point values; exact grid cases
++// are independently resolved by the GMP integer relation above.
++pub fn mpfr_point(result: &IntervalSet2<DyadicInterval>, source: &Rational, n: i32, d: u32) {
++    use rug::{Float, float::Round};
++    let mut lo = Float::with_val_round(4096, source.clone().abs(), Round::Down).0;
++    let mut hi = Float::with_val_round(4096, source.clone().abs(), Round::Up).0;
++    lo.root_round(d, Round::Down);
++    hi.root_round(d, Round::Up);
++    use rug::ops::PowAssignRound;
++    lo.pow_assign_round(n.unsigned_abs(), Round::Down);
++    hi.pow_assign_round(n.unsigned_abs(), Round::Up);
++    if n < 0 {
++        (lo, hi) = (hi, lo);
++        lo.recip_round(Round::Down);
++        hi.recip_round(Round::Up);
++    }
++    if source < &0 && n.unsigned_abs() % 2 == 1 {
++        (lo, hi) = (-hi, -lo);
++    }
++    let parts = actual(result);
++    assert_eq!(parts.len(), 1);
++    let (End::Value(a), End::Value(b)) = &parts[0] else {
++        panic!("finite point image")
++    };
++    let (lo, hi) = (lo.to_rational().unwrap(), hi.to_rational().unwrap());
++    if a == b {
++        // A rounded intermediate root can straddle an exact final power.
++        // GMP separately proves the singleton relation; MPFR must contain it.
++        assert!(&lo <= a && a <= &hi);
++    } else {
++        assert!(a <= &lo && b >= &hi);
++    }
++}
+diff --git a/crates/hyperinterval/tests/support/set_oracle.rs b/crates/hyperinterval/tests/support/set_oracle.rs
+new file mode 100644
+index 000000000..f3e9750e6
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/set_oracle.rs
+@@ -0,0 +1,34 @@
++//! Shared exact view of closed split images for independent test oracles.
++use hyperinterval::{DyadicInterval, ExtendedIntervalView as View, IntervalSet2};
++use rug::Rational;
++#[path = "grid_oracle.rs"]
++mod grid_oracle;
++pub use grid_oracle::{bounds, q};
++#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
++pub enum End {
++    Minus,
++    Value(Rational),
++    Plus,
++}
++pub type Source = Option<(End, End)>;
++pub fn actual(set: &IntervalSet2<DyadicInterval>) -> Vec<(End, End)> {
++    set.components()
++        .iter()
++        .map(|x| match x.view() {
++            View::Empty => panic!("empty component"),
++            View::Entire => (End::Minus, End::Plus),
++            View::Finite(x) => {
++                let (a, b, e) = x.bounds().unwrap();
++                (End::Value(q(a, e)), End::Value(q(b, e)))
++            }
++            View::Below(x) => {
++                let (_, b, e) = x.bounds().unwrap();
++                (End::Minus, End::Value(q(b, e)))
++            }
++            View::Above(x) => {
++                let (a, _, e) = x.bounds().unwrap();
++                (End::Value(q(a, e)), End::Plus)
++            }
++        })
++        .collect()
++}
