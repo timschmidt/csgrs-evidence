@@ -1,0 +1,609 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 5b4d4a48d..4e44e2a15 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -2077,6 +2077,81 @@ and verified before registration; all previous archive rows remain unchanged. Ph
+ midpoint/radius forms, contraction/Jacobian/Krawczyk helpers, specialized consumer
+ kernels and further qualification. No phase or full-plan completion is claimed.
+ 
++## Validation admission: MPFR oracle thread-cache lifecycle
++
++The preceding goal turn made progress: exact widths and evidence were committed.
++Current baseline is `1b62459197944b4ebd3356054a560d1e0af97f07`; all managed
++repositories are clean. States and new command logs are staged under
++`/tmp/interval-refactor/mpfr-cleanup`. No nested owning AGENTS instructions.
++The broader scalar ASan failure from the width checkpoint is being reproduced
++on this revision before any test code changes.
++
++Owner: Hyperinterval's independent MPFR test oracles; shared lifecycle authority
++already exists in `hyperreal/tests/support/mpfr.rs`. Properties P5–P6/P20 and
++plan §§14.4–14.5 require cleanup and executable sanitizer evidence. Domain:
++Rug/MPFR oracle use on non-MSVC test threads, normal return and unwinding,
++including concurrent threads and repeated registration. Reuse that existing
++thread-local cleanup helper once per oracle executable, registering it before
++each entry that starts MPFR work. Preserve cached work until thread exit; free
++only Local caches, never shared caches used by other running threads. No copied
++cache lifecycle implementation, unsafe code, suppression or disabled leak check.
++
++Acceptance failure reproduced: the current arctangent process reports 1,576 bytes leaked
++from MPFR thread caches; a lifecycle regression must exercise normal and panic
++exit and confirm that exact oracle outputs remain valid. Audit all Float call
++sites in the owner tests, retain original precision, rounding, calculations,
++assertions and oracle independence. Production source/manifests/dependency graph
++must remain identical. These support modules are also used by cost probes and
++fuzz targets. Each affected consumer root must import the same existing helper;
++oracle entry points register that owner. This avoids duplicate thread-local
++cleanup owners when an executable includes several oracle modules. Validate feature isolation, MSRV, ordinary tests/lints,
++ASan across both owner packages, and output/dispatch consumers. This test-only
++cleanup does not establish any new geometric or arithmetic capability, speedup,
++full-plan coverage, hosted CI or firmware qualification.
++
++## MPFR oracle lifecycle: local qualification
++
++Reproduced the width checkpoint's leak on `1b624591`: all five arctangent tests
++pass, then ASan exits 1 with 1,576 bytes leaked in three MPFR cache allocations.
++Reused `hyperreal/tests/support/mpfr.rs` at the roots of affected integration
++tests, cost probes and fuzz executables. Every MPFR oracle entry registers its
++single executable-local thread-cache owner before use. No production algorithm,
++manifest, dependency, precision, rounding mode or oracle assertion changed.
++Normal thread exit and unwinding release Local caches; shared caches are not
++cleared while other threads may be active. A new eight-worker regression tests
++repeated registration, normal/panic exit, exact oracle equality and returned
++rational values consumed after their producing threads have exited.
++
++The final full scalar/lattice ASan run passes 206 parent-suite tests across 36
++executables (154 Hyperinterval, 52 lattice), including fresh-process replay,
++with `ASAN_OPTIONS=detect_leaks=1`. This closes the reproducible MPFR lifecycle
++blocker reported above; it does not rewrite that adverse historical evidence.
++All 37 selected commands pass: Rust 1.88/1.95/stable feature isolation,
++all-target tests, doctests, Clippy/docs with warnings denied, optimized owner
++tests, full lattice tests, five main-facade tests, four unchanged Hypersolve
++migration/dispatch tests, primitive/rational fuzz checks, fuzz Clippy/format and
++workspace format. Rust 1.88 uses portable features; Hyperreal retains MSRV 1.95.
++
++All fuzz targets build with the address sanitizer. Nine affected targets each
++complete 128 executions from 32 deterministic valid-length seeds, with leak
++detection, ten-second input timeout, 2,048 MiB RSS cap and 180-second external
++process limit. These are bounded smoke tests, not exhaustive fuzz qualification.
++Raw inputs/corpora, commands, outputs and binary digests are retained.
++
++Two integration attempts failed and remain in the record: initial test-root
++wiring omitted cost/fuzz consumers, and per-oracle helper imports produced
++Clippy duplicate-module errors when several oracles shared an executable.
++The final one-owner-per-executable wiring fixes both without suppressions.
++Source preservation verifies 39 implementation/manifest/shared-helper files
++byte-identical and every original line of 37 changed oracle/consumer files
++retained in order. Production cost closures and predicate order remain intact;
++no performance or binary-size improvement is claimed. No new coverage report
++replaces the preceding width report's documented external Rug profile warning.
++Hosted OS checks, full pre-push workflows, full coverage/fuzz, firmware HIL and
++remaining arithmetic/resource/Phase 6/full-plan work remain open. No push.
++
++Source/evidence registration pending for the MPFR lifecycle checkpoint.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/conformance/atan_cost.rs b/crates/hyperinterval/conformance/atan_cost.rs
+index f17da94b6..f5297c74a 100644
+--- a/crates/hyperinterval/conformance/atan_cost.rs
++++ b/crates/hyperinterval/conformance/atan_cost.rs
+@@ -1,4 +1,7 @@
+ //! Completed finite and unbounded arctangent enclosures.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval};
+ use std::{hint::black_box, time::Instant};
+ #[cfg(not(target_env = "msvc"))]
+diff --git a/crates/hyperinterval/conformance/exp_cost.rs b/crates/hyperinterval/conformance/exp_cost.rs
+index 20a8b6b94..e9db40e34 100644
+--- a/crates/hyperinterval/conformance/exp_cost.rs
++++ b/crates/hyperinterval/conformance/exp_cost.rs
+@@ -1,4 +1,7 @@
+ //! Materialized tight exponential images, including all refinement work.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, RationalInterval};
+ use hyperreal::Rational;
+ use std::{hint::black_box, time::Instant};
+diff --git a/crates/hyperinterval/conformance/fractional_power_cost.rs b/crates/hyperinterval/conformance/fractional_power_cost.rs
+index 70c78c5e3..0414e8d23 100644
+--- a/crates/hyperinterval/conformance/fractional_power_cost.rs
++++ b/crates/hyperinterval/conformance/fractional_power_cost.rs
+@@ -1,5 +1,8 @@
+ //! Completed rational-power images, including exact roots and pole branches.
+ #[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
++#[cfg(not(target_env = "msvc"))]
+ use hyperinterval::IntervalSet2;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval as E};
+ use num_bigint::BigInt;
+diff --git a/crates/hyperinterval/conformance/log_cost.rs b/crates/hyperinterval/conformance/log_cost.rs
+index 01fbe2555..b326b0376 100644
+--- a/crates/hyperinterval/conformance/log_cost.rs
++++ b/crates/hyperinterval/conformance/log_cost.rs
+@@ -1,4 +1,7 @@
+ //! Completed finite and lower-unbounded logarithm enclosures.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval, RationalInterval};
+ use hyperreal::Rational;
+ use num_bigint::{BigInt, BigUint};
+diff --git a/crates/hyperinterval/conformance/primitive_root_cost.rs b/crates/hyperinterval/conformance/primitive_root_cost.rs
+index 4a609bdba..991a0a56a 100644
+--- a/crates/hyperinterval/conformance/primitive_root_cost.rs
++++ b/crates/hyperinterval/conformance/primitive_root_cost.rs
+@@ -1,4 +1,7 @@
+ //! Owned primitive square-root outputs across widths and endpoint lattices.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{F32Enclosure, F64Enclosure, FixedInterval};
+ use std::{hint::black_box, time::Instant};
+ #[cfg(not(target_env = "msvc"))]
+diff --git a/crates/hyperinterval/conformance/sqrt_cost.rs b/crates/hyperinterval/conformance/sqrt_cost.rs
+index 5de5f6163..7dc61e6b0 100644
+--- a/crates/hyperinterval/conformance/sqrt_cost.rs
++++ b/crates/hyperinterval/conformance/sqrt_cost.rs
+@@ -1,4 +1,7 @@
+ //! Materialized square-root enclosures by requested grid and source width.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, RationalInterval};
+ use hyperreal::Rational;
+ use std::{hint::black_box, time::Instant};
+diff --git a/crates/hyperinterval/conformance/tangent_cost.rs b/crates/hyperinterval/conformance/tangent_cost.rs
+index 0baebf219..cf0fd7f6a 100644
+--- a/crates/hyperinterval/conformance/tangent_cost.rs
++++ b/crates/hyperinterval/conformance/tangent_cost.rs
+@@ -1,4 +1,7 @@
+ //! Completed tangent/cotangent images by width, scale, precision and backend.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval};
+ use std::{hint::black_box, time::Instant};
+ #[cfg(not(target_env = "msvc"))]
+diff --git a/crates/hyperinterval/conformance/trig_cost.rs b/crates/hyperinterval/conformance/trig_cost.rs
+index 060631acf..c41641637 100644
+--- a/crates/hyperinterval/conformance/trig_cost.rs
++++ b/crates/hyperinterval/conformance/trig_cost.rs
+@@ -1,4 +1,7 @@
+ //! Completed periodic images by width, scale, precision and source backend.
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval};
+ use std::{hint::black_box, time::Instant};
+ #[cfg(not(target_env = "msvc"))]
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/arctangent.rs b/crates/hyperinterval/fuzz/fuzz_targets/arctangent.rs
+index 725516449..db77ddac0 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/arctangent.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/arctangent.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval, RationalInterval,
+ };
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs b/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs
+index 43fc25414..8455ba394 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/exponential.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, RationalInterval};
+ use hyperreal::Rational;
+ use libfuzzer_sys::fuzz_target;
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs b/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs
+index b37a4313f..6c448b3dd 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/fractional_power.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalSet2};
+ use libfuzzer_sys::fuzz_target;
+ #[path = "../../tests/support/power_oracle.rs"]
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/logarithm.rs b/crates/hyperinterval/fuzz/fuzz_targets/logarithm.rs
+index b6a298edb..8a09c6003 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/logarithm.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/logarithm.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval, IntervalError, RationalInterval,
+ };
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs b/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs
+index e65d5be9a..81d2df16e 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DomainCoverage, F32Enclosure, F64Enclosure, FixedInterval, IntervalError};
+ use libfuzzer_sys::fuzz_target;
+ #[path = "../../tests/support/fixed_sqrt_oracle.rs"]
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs b/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs
+index dac3b6d26..da42f2b3d 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, IntervalError, RationalInterval,
+ };
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/strict_float.rs b/crates/hyperinterval/fuzz/fuzz_targets/strict_float.rs
+index 77dad7a05..638a95f1b 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/strict_float.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/strict_float.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{F32Enclosure, F64Enclosure, IntervalError};
+ use libfuzzer_sys::fuzz_target;
+ use rug::Rational;
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs b/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs
+index 758b95d07..b9973146e 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/tangent.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalSet2,
+     RationalInterval,
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/trigonometry.rs b/crates/hyperinterval/fuzz/fuzz_targets/trigonometry.rs
+index 3c92b9950..589a8fd9f 100644
+--- a/crates/hyperinterval/fuzz/fuzz_targets/trigonometry.rs
++++ b/crates/hyperinterval/fuzz/fuzz_targets/trigonometry.rs
+@@ -1,4 +1,6 @@
+ #![no_main]
++#[path = "../../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval, RationalInterval,
+ };
+diff --git a/crates/hyperinterval/tests/arctangent.rs b/crates/hyperinterval/tests/arctangent.rs
+index f29587aca..7ad3cf365 100644
+--- a/crates/hyperinterval/tests/arctangent.rs
++++ b/crates/hyperinterval/tests/arctangent.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval};
+ #[test]
+ fn atan_zero_empty_and_domain() {
+diff --git a/crates/hyperinterval/tests/exponential.rs b/crates/hyperinterval/tests/exponential.rs
+index a3c13eefc..6f9f2f2b4 100644
+--- a/crates/hyperinterval/tests/exponential.rs
++++ b/crates/hyperinterval/tests/exponential.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError};
+ fn budget() -> DyadicBudget {
+     DyadicBudget::new(16384, 1_000_000_000_000)
+diff --git a/crates/hyperinterval/tests/float.rs b/crates/hyperinterval/tests/float.rs
+index d00bfc543..7786493de 100644
+--- a/crates/hyperinterval/tests/float.rs
++++ b/crates/hyperinterval/tests/float.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "float-enclosure")]
++#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ #[cfg(target_arch = "x86_64")]
+ use hyperinterval::SignSet;
+ use hyperinterval::{F32Enclosure, F64Enclosure, IntervalError};
+diff --git a/crates/hyperinterval/tests/fractional_power.rs b/crates/hyperinterval/tests/fractional_power.rs
+index dfe556053..36dee434c 100644
+--- a/crates/hyperinterval/tests/fractional_power.rs
++++ b/crates/hyperinterval/tests/fractional_power.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedInterval as E, IntervalError,
+     IntervalSet2,
+diff --git a/crates/hyperinterval/tests/logarithm.rs b/crates/hyperinterval/tests/logarithm.rs
+index 10cea41c7..872fb43e9 100644
+--- a/crates/hyperinterval/tests/logarithm.rs
++++ b/crates/hyperinterval/tests/logarithm.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{
+     DomainCoverage, DyadicBudget, DyadicInterval, ExtendedIntervalView, IntervalError,
+ };
+diff --git a/crates/hyperinterval/tests/mpfr_cache_lifecycle.rs b/crates/hyperinterval/tests/mpfr_cache_lifecycle.rs
+new file mode 100644
+index 000000000..88bec4c83
+--- /dev/null
++++ b/crates/hyperinterval/tests/mpfr_cache_lifecycle.rs
+@@ -0,0 +1,51 @@
++#![cfg(not(target_env = "msvc"))]
++
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
++
++use rug::{Float, Rational, float::Constant};
++use std::{sync::Arc, sync::Barrier, thread};
++
++// Under LeakSanitizer this process fails if an oracle thread leaves its MPFR
++// caches behind. Exercise both exits and repeated registration while other
++// threads still use their own caches; no global cache clearing is permitted.
++#[test]
++fn mpfr_oracle_caches_release_on_normal_and_unwinding_thread_exit() {
++    let barrier = Arc::new(Barrier::new(8));
++    let threads: Vec<_> = (0..8)
++        .map(|index| {
++            let barrier = Arc::clone(&barrier);
++            thread::spawn(move || {
++                mpfr_cache::cleanup_on_thread_exit();
++                let pi = Float::with_val(512, Constant::Pi);
++                mpfr_cache::cleanup_on_thread_exit();
++                barrier.wait();
++                assert!(pi > 3 && pi < 4);
++                if index % 2 != 0 {
++                    panic!("intentional oracle unwind");
++                }
++                let mut atan = Float::with_val(512, 1);
++                atan.atan_mut();
++                let quarter_pi = pi / 4;
++                assert_eq!(atan, quarter_pi);
++                atan.to_rational().unwrap()
++            })
++        })
++        .collect();
++    for (index, child) in threads.into_iter().enumerate() {
++        match child.join() {
++            Ok(value) => {
++                assert_eq!(index % 2, 0);
++                assert!(value > Rational::from((3, 4)));
++                assert!(value < Rational::from((4, 5)));
++            }
++            Err(payload) => {
++                assert_eq!(index % 2, 1);
++                assert_eq!(
++                    payload.downcast_ref::<&str>(),
++                    Some(&"intentional oracle unwind")
++                );
++            }
++        }
++    }
++}
+diff --git a/crates/hyperinterval/tests/primitive_roots.rs b/crates/hyperinterval/tests/primitive_roots.rs
+index c95fda0ec..ea7c3423e 100644
+--- a/crates/hyperinterval/tests/primitive_roots.rs
++++ b/crates/hyperinterval/tests/primitive_roots.rs
+@@ -1,4 +1,11 @@
+ #![cfg(any(feature = "fixed", feature = "float-enclosure"))]
++#[cfg(all(
++    feature = "float-enclosure",
++    not(target_env = "msvc"),
++    target_arch = "x86_64"
++))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ #[cfg(any(feature = "fixed", target_arch = "x86_64"))]
+ use hyperinterval::{DomainCoverage, IntervalError};
+ 
+diff --git a/crates/hyperinterval/tests/real_bridge.rs b/crates/hyperinterval/tests/real_bridge.rs
+index 0ec27f18c..3cb8707d0 100644
+--- a/crates/hyperinterval/tests/real_bridge.rs
++++ b/crates/hyperinterval/tests/real_bridge.rs
+@@ -1,5 +1,9 @@
+ #![cfg(feature = "real-ball")]
+ 
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
++
+ use hyperinterval::{
+     BallRelation, DyadicBudget, DyadicInterval, IntervalError, RationalInterval, RealBall,
+ };
+@@ -110,6 +114,7 @@ mod mpfr {
+ 
+     #[test]
+     fn real_bridges_enclose_independently_directed_mpfr_bounds() {
++        crate::mpfr_cache::cleanup_on_thread_exit();
+         let (pi_lo, _) = Float::with_val_round(512, Constant::Pi, Round::Down);
+         let (pi_hi, _) = Float::with_val_round(512, Constant::Pi, Round::Up);
+         let mut sqrt_lo = Float::with_val(512, 2);
+diff --git a/crates/hyperinterval/tests/square_roots.rs b/crates/hyperinterval/tests/square_roots.rs
+index 509b44b49..a952fc02f 100644
+--- a/crates/hyperinterval/tests/square_roots.rs
++++ b/crates/hyperinterval/tests/square_roots.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError};
+ 
+ fn budget() -> DyadicBudget {
+diff --git a/crates/hyperinterval/tests/support/atan_oracle.rs b/crates/hyperinterval/tests/support/atan_oracle.rs
+index 3abc6bff9..f161aa8e7 100644
+--- a/crates/hyperinterval/tests/support/atan_oracle.rs
++++ b/crates/hyperinterval/tests/support/atan_oracle.rs
+@@ -14,6 +14,7 @@ pub fn finite(result: &DyadicInterval, lower: Rational, upper: Rational, precisi
+     assert_eq!(q(b, e), hi);
+ }
+ pub fn verify(result: &DyadicInterval, a: &Rational, b: &Rational, precision: i32) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (mut lo, _) = Float::with_val_round(4096, a, Round::Down);
+     let (mut hi, _) = Float::with_val_round(4096, b, Round::Up);
+     lo.atan_round(Round::Down);
+@@ -26,6 +27,7 @@ pub fn verify(result: &DyadicInterval, a: &Rational, b: &Rational, precision: i3
+     );
+ }
+ pub fn half_pi() -> (Rational, Rational) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (lo, _) = Float::with_val_round(4096, Constant::Pi, Round::Down);
+     let (hi, _) = Float::with_val_round(4096, Constant::Pi, Round::Up);
+     (lo.to_rational().unwrap() / 2, hi.to_rational().unwrap() / 2)
+diff --git a/crates/hyperinterval/tests/support/exp_oracle.rs b/crates/hyperinterval/tests/support/exp_oracle.rs
+index 778a129df..fb9afe386 100644
+--- a/crates/hyperinterval/tests/support/exp_oracle.rs
++++ b/crates/hyperinterval/tests/support/exp_oracle.rs
+@@ -6,6 +6,7 @@ mod grid_oracle;
+ pub use grid_oracle::q;
+ 
+ pub fn verify(result: &DyadicInterval, a: &Rational, b: &Rational, precision: i32) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (mut lower, _) = Float::with_val_round(4096, a, Round::Down);
+     let (mut upper, _) = Float::with_val_round(4096, b, Round::Up);
+     lower.exp_round(Round::Down);
+diff --git a/crates/hyperinterval/tests/support/float_oracle.rs b/crates/hyperinterval/tests/support/float_oracle.rs
+index db0d43e98..817aa6c1e 100644
+--- a/crates/hyperinterval/tests/support/float_oracle.rs
++++ b/crates/hyperinterval/tests/support/float_oracle.rs
+@@ -7,6 +7,7 @@ use rug::{Float, Rational, float::Round};
+ macro_rules! oracle {
+     ($name:ident, $bits:ty, $convert:ident) => {
+         pub fn $name(value: &Rational) -> Result<($bits, $bits), IntervalError> {
++            crate::mpfr_cache::cleanup_on_thread_exit();
+             let (lo, _) = Float::with_val_round(128, value, Round::Down);
+             let (hi, _) = Float::with_val_round(128, value, Round::Up);
+             let (lo, hi) = (lo.$convert(Round::Down), hi.$convert(Round::Up));
+diff --git a/crates/hyperinterval/tests/support/log_oracle.rs b/crates/hyperinterval/tests/support/log_oracle.rs
+index 18fea6475..bad5d8873 100644
+--- a/crates/hyperinterval/tests/support/log_oracle.rs
++++ b/crates/hyperinterval/tests/support/log_oracle.rs
+@@ -10,6 +10,7 @@ pub fn verify(
+     b: &Rational,
+     precision: i32,
+ ) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (mut upper, _) = Float::with_val_round(4096, b, Round::Up);
+     upper.ln_round(Round::Up);
+     if a <= &0 {
+@@ -44,6 +45,7 @@ fn finite(
+     assert_eq!(q(b, e), hi);
+ }
+ pub fn log_two_multiple(result: &ExtendedInterval<DyadicInterval>, k: i64, precision: i32) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let mut lo = Float::with_val(4096, 2);
+     let mut hi = lo.clone();
+     lo.ln_round(Round::Down);
+diff --git a/crates/hyperinterval/tests/support/phase_oracle.rs b/crates/hyperinterval/tests/support/phase_oracle.rs
+index 1da865ded..48d71f6ef 100644
+--- a/crates/hyperinterval/tests/support/phase_oracle.rs
++++ b/crates/hyperinterval/tests/support/phase_oracle.rs
+@@ -4,6 +4,7 @@ use rug::{
+     float::{Constant, Round},
+ };
+ pub fn half_pi() -> (Rational, Rational) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (a, _) = Float::with_val_round(4096, Constant::Pi, Round::Down);
+     let (b, _) = Float::with_val_round(4096, Constant::Pi, Round::Up);
+     (a.to_rational().unwrap() / 2, b.to_rational().unwrap() / 2)
+diff --git a/crates/hyperinterval/tests/support/power_oracle.rs b/crates/hyperinterval/tests/support/power_oracle.rs
+index 338916b66..a63603a95 100644
+--- a/crates/hyperinterval/tests/support/power_oracle.rs
++++ b/crates/hyperinterval/tests/support/power_oracle.rs
+@@ -134,6 +134,7 @@ pub fn verify(
+ // are independently resolved by the GMP integer relation above.
+ pub fn mpfr_point(result: &IntervalSet2<DyadicInterval>, source: &Rational, n: i32, d: u32) {
+     use rug::{Float, float::Round};
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let mut lo = Float::with_val_round(4096, source.clone().abs(), Round::Down).0;
+     let mut hi = Float::with_val_round(4096, source.clone().abs(), Round::Up).0;
+     lo.root_round(d, Round::Down);
+diff --git a/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs b/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs
+index 2c10167f6..e7b407de7 100644
+--- a/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs
++++ b/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs
+@@ -10,6 +10,7 @@ macro_rules! ieee_root {
+             }
+             // Ingress is exact at 128 bits. Same-direction nested rounding
+             // retains the tight target floor/ceiling after the MPFR root.
++            crate::mpfr_cache::cleanup_on_thread_exit();
+             let mut lower = Float::with_val(128, value);
+             let mut upper = lower.clone();
+             lower.sqrt_round(Round::Down);
+diff --git a/crates/hyperinterval/tests/support/sqrt_oracle.rs b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+index b58592083..5ff92e836 100644
+--- a/crates/hyperinterval/tests/support/sqrt_oracle.rs
++++ b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+@@ -25,6 +25,7 @@ pub fn verify(result: &DyadicInterval, a: Q, b: Q, precision: i32) {
+     assert!((&hi / &step).complete().is_integer());
+     // 4096 bits is greater than every exact input and chosen grid in this
+     // corpus; perfect grid squares are represented exactly by MPFR.
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (mut down, _) = Float::with_val_round(4096, &a, Round::Down);
+     let (mut up, _) = Float::with_val_round(4096, &b, Round::Up);
+     down.sqrt_round(Round::Down);
+diff --git a/crates/hyperinterval/tests/support/tangent_oracle.rs b/crates/hyperinterval/tests/support/tangent_oracle.rs
+index 2828d76bf..c1a81c410 100644
+--- a/crates/hyperinterval/tests/support/tangent_oracle.rs
++++ b/crates/hyperinterval/tests/support/tangent_oracle.rs
+@@ -24,6 +24,7 @@ fn point(
+         assert!(!cot);
+         return (0.into(), 0.into());
+     }
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let (mut lo, _) = Float::with_val_round(4096, x, Round::Down);
+     let (mut hi, _) = Float::with_val_round(4096, x, Round::Up);
+     let expected = branch(x, cot, pi);
+diff --git a/crates/hyperinterval/tests/support/trig_oracle.rs b/crates/hyperinterval/tests/support/trig_oracle.rs
+index dfaa35fa5..deac0d5a4 100644
+--- a/crates/hyperinterval/tests/support/trig_oracle.rs
++++ b/crates/hyperinterval/tests/support/trig_oracle.rs
+@@ -9,6 +9,7 @@ mod phase_oracle;
+ pub use phase_oracle::half_pi;
+ use phase_oracle::index;
+ fn point(x: &Rational, cosine: bool) -> (Rational, Rational) {
++    crate::mpfr_cache::cleanup_on_thread_exit();
+     let f = Float::with_val(4096, x);
+     let error = (x.clone() - f.to_rational().unwrap()).abs();
+     let mut lo = f.clone();
+diff --git a/crates/hyperinterval/tests/tangent.rs b/crates/hyperinterval/tests/tangent.rs
+index 54b68abb9..628e14b74 100644
+--- a/crates/hyperinterval/tests/tangent.rs
++++ b/crates/hyperinterval/tests/tangent.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::ExtendedInterval as E;
+ #[cfg(feature = "serde")]
+ use hyperinterval::IntervalSet2;
+diff --git a/crates/hyperinterval/tests/trigonometry.rs b/crates/hyperinterval/tests/trigonometry.rs
+index 0068bf031..7aeac1cfb 100644
+--- a/crates/hyperinterval/tests/trigonometry.rs
++++ b/crates/hyperinterval/tests/trigonometry.rs
+@@ -1,4 +1,7 @@
+ #![cfg(feature = "dyadic")]
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
+ use hyperinterval::{DyadicBudget, DyadicInterval};
+ fn budget() -> DyadicBudget {
+     DyadicBudget::new(32768, 10_000_000_000_000)
