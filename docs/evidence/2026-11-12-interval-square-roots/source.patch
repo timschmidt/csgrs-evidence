@@ -1,0 +1,875 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index ce8f02dc7..e7b669bcb 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -130,10 +130,11 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
+-          mkdir -p "$RUNNER_TEMP/interval-rational-powers"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run primitive_proposals "$RUNNER_TEMP/interval-proposals" -- -runs=100000 -max_len=32 -max_total_time=30 -seed=20261113
+           cargo +nightly fuzz run strict_float "$RUNNER_TEMP/interval-strict-float" -- -runs=100000 -max_len=24 -max_total_time=30 -seed=20261114
+           cargo +nightly fuzz run rational_powers --features rational "$RUNNER_TEMP/interval-rational-powers" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261115
++          cargo +nightly fuzz run square_roots --features rational "$RUNNER_TEMP/interval-square-roots" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261116
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index f322e0b49..95d918a4d 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -46,7 +46,7 @@ No existing arithmetic or predicate dispatch has been changed.
+ | 2 integer/fixed | local correctness/cost probes passed | firmware cycles/HIL and coordinated baseline gaps remain |
+ | 3 rational/dyadic/ball | carriers and local acceptance implemented | solver kernel migration, full coverage and consumer cost gates |
+ | 4 proposals/float | proposal wrappers and strict integer IEEE core implemented; local x86_64 qualification passed | full surface/coverage, further targets and shipped consumers |
+-| 5 elementary functions | abs/min/max and rational signed powers implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
++| 5 elementary functions | abs/min/max, rational signed powers and rational/dyadic square roots implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
+ | 6 lattice | not started | component oracles and allocation/cost evidence |
+ | 7 solver | qualification started; production migration rejected | satisfy size/performance gates with unchanged statuses, certificates and dispatch |
+ | 8 interface | not started | unchanged canonical bytes and profiles |
+@@ -807,6 +807,74 @@ at `/tmp/interval-refactor/rational-powers`. Remaining signed-power surfaces,
+ square root and subsequent elementary functions, consumer migrations, full
+ coverage and release qualification are still required.
+ 
++## Square-root admission (2026-11-12)
++
++Owner: Hyperinterval, P1/P3/P5/P6 and P19. Target revision before edits:
++`79fa33f6f`. The missing `sqrt` witness was reproduced as a compile failure.
++Domain: finite rational or dyadic closed real intervals, canonical empty,
++all signed i32 output-grid exponents, principal nonnegative root. Rational
++inputs need rational+dyadic features. Output is a `RangeEnclosure` of a dyadic
++interval, with Complete coverage for nonnegative/empty sources, Partial when
++negative source members are excluded, and EmptyDomain for a strictly negative
++nonempty input. No existing consumer dispatch or scalar kernel was changed.
++
++For positive n/d after exact binary scaling, let q=floor(n/d). Then
++floor(sqrt(n/d))=floor(sqrt(q)); the upper endpoint is the same exactly when
++n/d is integral and q is a square, otherwise it is one grid unit higher.
++Monotonicity on the clipped nonnegative domain selects endpoint images. The
++shared existing scaled-quotient helper and num-bigint integer square root
++supply these operations. No rounded source interval substitutes for the input.
++Num-bigint may use a float proposal for a Newton seed when its std feature is
++unified; integer iteration establishes the result. That proposal is not an
++accepted endpoint certificate.
++
++Reservations precede operand cloning/scaling and root extraction. Root stages
++charge `(quotient_bits+2)^2 * (2*bit_length(quotient_bits+2)+4)` deterministic
++work units, in addition to existing linear ingress and scaled-division costs.
++This is the existing accounting contract, not a CPU-cycle, peak-byte or
++cancellation guarantee. Domain checks and caller-owned input construction are
++outside that accounting. Exhaustion publishes no partial interval, and fresh
++budgets permit retry. Zero and empty avoid scale-sized allocations; nonzero
++extreme grids can exhaust the declared size limit.
++
++Final qualification in `/tmp/interval-refactor/square-roots` passes all 26
++commands: 90 all-feature unit/integration tests and 11 doctests; the affected
++Rust 1.88/1.95/stable feature/release/strict-lint matrix; docs, formatting,
++fuzz checks, whole-repository zizmor and retention budget; unchanged solver
++value/dispatch witnesses; primitive dependency closure; and ARM/WASM no_std
++compilation. The first matrix exposed an unused rational-only test import in
++a dyadic-only build; feature-gating that import preserves every assertion.
++Initial compile diagnostics and all matrix results are retained. No hosted
++Windows/macOS or release-distribution completion is inferred.
++
++The first ASan campaign completed 100,000 cases in 28 seconds. After reserving
++the dyadic denominator constant explicitly, the final-source campaign completed
++92,929 cases in 31 seconds at its 30-second wall-time stopping condition, with
++no failure (seed 20261116, 10-byte cap). Both corpora and logs are retained;
++the final run is not reported as 100,000. Each generated case checks rational
++and dyadic tightness, domain coverage, serialization and further root/square
++composition using a shared independent oracle.
++
++Rust 1.95 instrumentation reports 2,186/2,230 production lines (98.03%) and
++4,123/4,289 regions (96.13%), excluding dependencies, tests and probes. No
++branch denominator is reported. Report/export and diagnostic dump succeeded;
++both mismatches identify excluded Rug OptRational::parts records, not a
++Hyperinterval function. Full coverage remains open.
++
++All 640 cost samples complete on Rust 1.99 x86_64 Linux: four input widths,
++four grid exponents and both backends, each with 1,024 warmups followed by
++20 samples of 1,024 owned outputs. Inputs and independent GMP/MPFR checks are
++outside the timed loop; budget creation and output destruction are inside.
++The full median table is in the crate performance ledger. No comparative
++speedup, allocation-byte, firmware or consumer claim follows.
++Independent exact GMP adjacent-grid inequalities and directed MPFR bounds cover
++small rational/dyadic domains, large/near-square coefficients, subnormal-sized
++values, partial domains, full exponent tags, resource refusal/retry, refinement,
++validated serialization, repeated roots/powers and reciprocal composition.
++The separate `2026-11-12-interval-square-roots` evidence record is pending
++registration. Remaining elementary functions, primitive square-root backends, consumer
++migrations, full coverage and release qualification remain open.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index c12fc3490..e526e6518 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add budgeted rational/dyadic square-root enclosures with tight grid bounds,
++  explicit partial-domain coverage and typed empty-domain failures. Exact
++  integer arithmetic establishes direction; generated bounds remain dyadic
++  arithmetic and validated replay operands.
++
+ - Add exact signed-integer powers for rational intervals, preserving empty,
+   zero-domain, parity and monotonicity semantics. Retain scalar-kernel errors
+   and their source, including Hyperreal's existing eager-power growth refusal.
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index 03b2f3167..ab7464901 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -73,3 +73,8 @@ required-features = ["integer", "fixed", "rational", "dyadic", "float-enclosure"
+ name = "float_cost"
+ path = "conformance/float_cost.rs"
+ required-features = ["float-enclosure"]
++
++[[example]]
++name = "sqrt_cost"
++path = "conformance/sqrt_cost.rs"
++required-features = ["rational", "dyadic"]
+diff --git a/crates/hyperinterval/PERFORMANCE.md b/crates/hyperinterval/PERFORMANCE.md
+index 31e9a87a5..4f85faa4b 100644
+--- a/crates/hyperinterval/PERFORMANCE.md
++++ b/crates/hyperinterval/PERFORMANCE.md
+@@ -155,3 +155,40 @@ Hyperreal by this adapter. The compiled host layouts are 1 byte for IntervalErro
+ promises. The complete probe executable has 666,956 text, 210,984 data and 1,818
+ BSS bytes, including runtime and scalar dependencies. Raw evidence is linked
+ from the root progress record.
++
++## Square-root completion probe
++
++`conformance/sqrt_cost.rs` materializes owned dyadic enclosures and coverage
++receipts from preconstructed rational/dyadic inputs. The four inputs are the
++singleton 2, narrow [2, 2+2^-16], wide [0,16], and partial-domain [-1,4].
++Independent GMP tightness inequalities and directed MPFR bounds run before
++timing. Rust 1.99 release on x86_64 Linux, rational+dyadic features, 1,024
++warmups and 20 samples of 1,024 completed images per case/grid/backend:
++
++| Backend / input | grid 2^-16 | grid 2^-64 | grid 2^-256 | grid 2^-1024 |
++| --- | ---: | ---: | ---: | ---: |
++| dyadic / point | 505.123 | 1178.072 | 2804.901 | 8326.062 |
++| dyadic / narrow | 713.662 | 2263.782 | 5425.439 | 16532.276 |
++| dyadic / wide | 367.915 | 683.699 | 923.493 | 2588.463 |
++| dyadic / partial | 368.306 | 680.600 | 929.400 | 2606.833 |
++| rational / point | 459.582 | 1219.851 | 2906.726 | 8366.091 |
++| rational / narrow | 899.005 | 2681.588 | 5937.013 | 17435.620 |
++| rational / wide | 397.708 | 735.685 | 975.101 | 2686.746 |
++| rational / partial | 396.959 | 736.199 | 1004.698 | 2719.616 |
++
++Values are median ns/image. Timed work includes a fresh deterministic budget,
++owned output construction and destruction. Source parsing and oracle work are
++excluded. All 640 samples complete with exact directed output bounds and an
++explicit domain receipt. Raw samples, compiler/hardware metadata, executable
++hash and whole-probe size are retained in the square-root evidence record.
++The executable also includes the independent GMP/MPFR oracle; its size is not
++a production-kernel size estimate. These are finite host completion costs,
++not a consumer speedup, no-regression or firmware timing claim. Input width
++alone does not determine cost: exact zero and perfect-square endpoints can
++be cheaper than narrower nonsquare intervals.
++
++Root extraction reserves quadratic accounting stages logarithmic in the
++scaled quotient bit length, plus existing scaling/division and rational
++cloning reservations. These are deterministic work/size units, not CPU cycles
++or peak retained/temporary bytes. Allocation accounting, cancellation, full
++coverage and consumer qualification remain separate work.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 12629db1b..e969bdb44 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -13,6 +13,13 @@ retains zero when its input crosses zero; a signed primitive minimum that
+ cannot be reflected returns Overflow. Dyadic methods use the existing shared
+ size/work budget. These total real functions do not clip their input domain.
+ 
++Rational and dyadic intervals provide `sqrt(precision, &mut budget)`, returning
++`RangeEnclosure<DyadicInterval>` with tight outward endpoints on the grid
++`2^precision`. Rational inputs require both features. Negative source points
++are excluded with `Partial` coverage; strictly negative nonempty inputs return
++`EmptyDomain`. Empty inputs return empty with `Complete` coverage. Keep the
++coverage receipt when consuming the result in later arithmetic.
++
+ Hyperinterval encloses. Hyperlattice carries set-valued linear structure.
+ Hyperlimit decides. Hypersolve certifies. Hyperdynamics evolves. Domain crates
+ assign meaning.
+diff --git a/crates/hyperinterval/conformance/sqrt_cost.rs b/crates/hyperinterval/conformance/sqrt_cost.rs
+new file mode 100644
+index 000000000..5de5f6163
+--- /dev/null
++++ b/crates/hyperinterval/conformance/sqrt_cost.rs
+@@ -0,0 +1,60 @@
++//! Materialized square-root enclosures by requested grid and source width.
++use hyperinterval::{DyadicBudget, DyadicInterval, RationalInterval};
++use hyperreal::Rational;
++use std::{hint::black_box, time::Instant};
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/sqrt_oracle.rs"]
++mod sqrt_oracle;
++
++fn main() {
++    println!("backend,case,precision,sample,elapsed_ns,completed_images");
++    for (name, a, b) in [
++        ("point", 131072i64, 131072i64),
++        ("narrow", 131072, 131073),
++        ("wide", 0, 1048576),
++        ("partial", -65536, 262144),
++    ] {
++        let dyadic = DyadicInterval::new(a.into(), b.into(), -16).unwrap();
++        let rational = RationalInterval::new(
++            Rational::fraction(a, 65536).unwrap(),
++            Rational::fraction(b, 65536).unwrap(),
++        )
++        .unwrap();
++        for precision in [-16, -64, -256, -1024] {
++            for backend in ["dyadic", "rational"] {
++                let work = || {
++                    let mut budget = DyadicBudget::new(8192, 10_000_000_000);
++                    if backend == "dyadic" {
++                        black_box(&dyadic)
++                            .sqrt(black_box(precision), &mut budget)
++                            .unwrap()
++                    } else {
++                        black_box(&rational)
++                            .sqrt(black_box(precision), &mut budget)
++                            .unwrap()
++                    }
++                };
++                #[cfg(not(target_env = "msvc"))]
++                sqrt_oracle::verify(
++                    &work().range,
++                    rug::Rational::from((a.max(0), 65536)),
++                    rug::Rational::from((b, 65536)),
++                    precision,
++                );
++                for _ in 0..1024 {
++                    black_box(work());
++                }
++                for sample in 0..20 {
++                    let start = Instant::now();
++                    for _ in 0..1024 {
++                        black_box(work());
++                    }
++                    println!(
++                        "{backend},{name},{precision},{sample},{},1024",
++                        start.elapsed().as_nanos()
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 3e1100fc5..85d9cfa92 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -63,3 +63,11 @@ path = "fuzz_targets/strict_float.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "square_roots"
++path = "fuzz_targets/square_roots.rs"
++required-features = ["rational"]
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs b/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs
+new file mode 100644
+index 000000000..dac3b6d26
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/square_roots.rs
+@@ -0,0 +1,58 @@
++#![no_main]
++use hyperinterval::{
++    DomainCoverage, DyadicBudget, DyadicInterval, IntervalError, RationalInterval,
++};
++use hyperreal::Rational;
++use libfuzzer_sys::fuzz_target;
++use rug::Rational as Q;
++#[path = "../../tests/support/sqrt_oracle.rs"]
++mod sqrt_oracle;
++use sqrt_oracle::{q, verify};
++
++fuzz_target!(|data: [i16; 5]| {
++    let [a, b, e, p, denominator] = data;
++    let (a, b) = (i64::from(a.min(b)), i64::from(a.max(b)));
++    let exponent = i32::from(e % 1024);
++    let precision = i32::from(p % 128);
++    let denominator = u64::from(denominator.unsigned_abs()) + 1;
++    let budget = || DyadicBudget::new(4096, 1_000_000_000);
++    let dyadic = DyadicInterval::new(a.into(), b.into(), exponent).unwrap();
++    let rational = RationalInterval::new(
++        Rational::fraction(a, denominator).unwrap(),
++        Rational::fraction(b, denominator).unwrap(),
++    )
++    .unwrap();
++    for (result, lower, upper) in [
++        (
++            dyadic.sqrt(precision, &mut budget()),
++            q(&a.max(0), exponent),
++            q(&b, exponent),
++        ),
++        (
++            rational.sqrt(precision, &mut budget()),
++            Q::from((a.max(0), denominator)),
++            Q::from((b, denominator)),
++        ),
++    ] {
++        if b < 0 {
++            assert_eq!(result, Err(IntervalError::EmptyDomain));
++            continue;
++        }
++        let result = result.unwrap();
++        assert_eq!(
++            result.domain,
++            if a < 0 {
++                DomainCoverage::Partial
++            } else {
++                DomainCoverage::Complete
++            }
++        );
++        verify(&result.range, lower, upper, precision);
++        let restored: DyadicInterval =
++            serde_json::from_slice(&serde_json::to_vec(&result.range).unwrap()).unwrap();
++        assert_eq!(restored, result.range);
++        let root = restored.sqrt(precision - 16, &mut budget()).unwrap().range;
++        let squared = root.square(&mut budget()).unwrap();
++        assert!(restored.subset_of(&squared, &mut budget()).unwrap());
++    }
++});
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 8fc18c2f5..677b4c061 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -1,5 +1,5 @@
+ use crate::bounds::Bounds;
+-use crate::{IntervalError, SignSet};
++use crate::{DomainCoverage, IntervalError, RangeEnclosure, SignSet};
+ use num_bigint::BigInt;
+ use num_integer::Integer;
+ use num_traits::{One, Zero};
+@@ -8,6 +8,8 @@ use num_traits::{One, Zero};
+ ///
+ /// Each stage reserves an upper bound `n` on its input/output magnitude bits.
+ /// Linear stages cost `n` units; product/division stages cost `n*n` units.
++/// Square-root extraction reserves `2 * bit_length(n) + 4` quadratic stages,
++/// with `n` the scaled quotient bit length plus two.
+ /// The formulas deliberately overestimate small or cancelling results. A size
+ /// limit bounds each reservation; a work limit bounds their cumulative cost.
+ /// Both limits are checked before the corresponding allocation/arithmetic.
+@@ -75,6 +77,49 @@ pub struct DyadicInterval {
+ }
+ 
+ impl DyadicInterval {
++    /// Encloses the principal square root on the grid `2^precision`.
++    ///
++    /// The endpoints are the tight outward grid bounds. Negative source points
++    /// are excluded with `Partial` coverage; a strictly negative nonempty input
++    /// returns `EmptyDomain`. Empty maps to empty with `Complete` coverage.
++    /// Exact integer division, square root and a square check establish
++    /// the directed bounds. Reservations precede scaling, root extraction and verification;
++    /// see [`DyadicBudget`] for the accounting units and exclusions.
++    pub fn sqrt(
++        &self,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<RangeEnclosure<Self>, IntervalError> {
++        let Some((a, b, exponent)) = self.bounds() else {
++            return Ok(RangeEnclosure {
++                range: Self::empty(),
++                domain: DomainCoverage::Complete,
++            });
++        };
++        let zero = BigInt::zero();
++        if b < &zero {
++            return Err(IntervalError::EmptyDomain);
++        }
++        let domain = if a < &zero {
++            DomainCoverage::Partial
++        } else {
++            DomainCoverage::Complete
++        };
++        let shift = i64::from(exponent) - 2 * i64::from(precision);
++        budget.reserve(1, 1, false)?;
++        let denominator = BigInt::one();
++        let (lower, lower_ceil) = scaled_sqrt(a.max(&zero), &denominator, shift, budget)?;
++        let upper = if a == b {
++            lower_ceil
++        } else {
++            scaled_sqrt(b, &denominator, shift, budget)?.1
++        };
++        Ok(RangeEnclosure {
++            range: Self::new(lower, upper, precision)?,
++            domain,
++        })
++    }
++
+     /// Validates order and normalizes caller-owned mantissas without growing them.
+     /// This ingress operation has no work budget; input parsing limits belong to
+     /// the caller. Arithmetic methods require a separate explicit budget.
+@@ -653,6 +698,36 @@ fn endpoint_power(
+     Ok(value.pow(exponent))
+ }
+ 
++// For n >= 0 and d > 0, floor(sqrt(n/d * 2^shift)) equals
++// floor(sqrt(floor(n/d * 2^shift))). The upper endpoint equals this floor
++// exactly when the quotient is integral and its floor is a perfect square.
++// Domain checks belong to the public entry points.
++fn scaled_sqrt(
++    n: &BigInt,
++    d: &BigInt,
++    shift: i64,
++    budget: &mut DyadicBudget,
++) -> Result<(BigInt, BigInt), IntervalError> {
++    if n.is_zero() {
++        budget.reserve(1, 1, false)?;
++        return Ok((BigInt::zero(), BigInt::zero()));
++    }
++    let (floor, ceil) = scaled_quotient(n, d, shift, budget)?;
++    let bits = floor.bits().saturating_add(2);
++    // Charge the integer root backend logarithmically many quadratic stages,
++    // plus its exact square check, increment, and owned output. These are
++    // deterministic accounting units, not a bound on backend CPU instructions.
++    let stages = 2 * u64::from(u64::BITS - bits.leading_zeros()) + 4;
++    budget.reserve(bits, stages, true)?;
++    let lower = floor.sqrt();
++    let upper = if floor == ceil && &lower * &lower == floor {
++        lower.clone()
++    } else {
++        &lower + 1
++    };
++    Ok((lower, upper))
++}
++
+ // Exact floor/ceiling of (numerator / denominator) * 2^shift.
+ // Guard bit growth before constructing either scaled operand.
+ pub(crate) fn scaled_quotient(
+@@ -691,6 +766,62 @@ mod bridge {
+     use num_traits::One;
+ 
+     impl RationalInterval {
++        /// Tight outward grid enclosure of the principal square root.
++        ///
++        /// Requires the `dyadic` feature. Output spacing is `2^precision`.
++        /// Negative source points are excluded with `Partial` coverage; a
++        /// strictly negative nonempty input returns `EmptyDomain`. Empty maps
++        /// to empty with `Complete` coverage. Scaling, integer division and
++        /// root extraction use the caller's shared [`DyadicBudget`]. No rounded
++        /// rational input or intermediate interval is substituted for the source.
++        pub fn sqrt(
++            &self,
++            precision: i32,
++            budget: &mut DyadicBudget,
++        ) -> Result<RangeEnclosure<DyadicInterval>, IntervalError> {
++            let Some((a, b)) = self.bounds() else {
++                return Ok(RangeEnclosure {
++                    range: DyadicInterval::empty(),
++                    domain: DomainCoverage::Complete,
++                });
++            };
++            if b.is_negative() {
++                return Err(IntervalError::EmptyDomain);
++            }
++            let domain = if a.is_negative() {
++                DomainCoverage::Partial
++            } else {
++                DomainCoverage::Complete
++            };
++            let endpoint = |value: &Rational, budget: &mut DyadicBudget| {
++                if value.is_negative() || value.is_zero() {
++                    budget.reserve(1, 1, false)?;
++                    return Ok((BigInt::zero(), BigInt::zero()));
++                }
++                budget.reserve(
++                    value.numerator().bits().max(value.denominator().bits()),
++                    2,
++                    false,
++                )?;
++                scaled_sqrt(
++                    &BigInt::from(value.numerator().clone()),
++                    &BigInt::from(value.denominator().clone()),
++                    -2 * i64::from(precision),
++                    budget,
++                )
++            };
++            let (lower, lower_ceil) = endpoint(a, budget)?;
++            let upper = if a == b {
++                lower_ceil
++            } else {
++                endpoint(b, budget)?.1
++            };
++            Ok(RangeEnclosure {
++                range: DyadicInterval::new(lower, upper, precision)?,
++                domain,
++            })
++        }
++
+         /// Outward enclosure with grid spacing `2^precision` and explicit
+         /// conversion accounting. This does not call a floating-point backend.
+         pub fn to_dyadic(
+diff --git a/crates/hyperinterval/tests/square_roots.rs b/crates/hyperinterval/tests/square_roots.rs
+new file mode 100644
+index 000000000..509b44b49
+--- /dev/null
++++ b/crates/hyperinterval/tests/square_roots.rs
+@@ -0,0 +1,309 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::{DomainCoverage, DyadicBudget, DyadicInterval, IntervalError};
++
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(16384, 100_000_000_000)
++}
++fn d(a: i64, b: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), exponent).unwrap()
++}
++
++#[test]
++fn square_root_reports_domain_and_preserves_empty() {
++    for precision in [i32::MIN, -128, 0, 32, i32::MAX] {
++        let empty = DyadicInterval::empty()
++            .sqrt(precision, &mut DyadicBudget::new(0, 0))
++            .unwrap();
++        assert!(empty.range.is_empty());
++        assert_eq!(empty.domain, DomainCoverage::Complete);
++        assert_eq!(
++            d(-4, -1, 0).sqrt(precision, &mut budget()),
++            Err(IntervalError::EmptyDomain)
++        );
++        assert_eq!(
++            d(-4, 0, 0).sqrt(precision, &mut budget()).unwrap().range,
++            d(0, 0, 0)
++        );
++    }
++    for (input, expected, domain) in [
++        (d(-1, 4, 0), d(0, 2, 0), DomainCoverage::Partial),
++        (d(0, 4, 0), d(0, 2, 0), DomainCoverage::Complete),
++        (d(1, 9, 0), d(1, 3, 0), DomainCoverage::Complete),
++        (d(2, 2, 0), d(362, 363, -8), DomainCoverage::Complete),
++    ] {
++        let result = input.sqrt(-8, &mut budget()).unwrap();
++        assert_eq!(result.range, expected);
++        assert_eq!(result.domain, domain);
++    }
++}
++
++#[test]
++fn budgets_refuse_before_growth_and_allow_independent_retry() {
++    let x = d(2, 3, 0);
++    for precision in [i32::MIN, i32::MAX] {
++        let mut work = DyadicBudget::new(64, 100_000);
++        assert_eq!(
++            x.sqrt(precision, &mut work),
++            Err(IntervalError::SizeExhausted)
++        );
++        assert_eq!(work.remaining_work(), 99_999);
++    }
++    assert_eq!(
++        x.sqrt(-32, &mut DyadicBudget::new(1024, 0)),
++        Err(IntervalError::WorkExhausted)
++    );
++    // The division stage fits, but the root-extraction reservation does not.
++    assert_eq!(
++        d(2, 2, 0).sqrt(0, &mut DyadicBudget::new(3, 1000)),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        d(2, 2, 0).sqrt(0, &mut DyadicBudget::new(4, 37)),
++        Err(IntervalError::WorkExhausted)
++    );
++    let result = x.sqrt(-32, &mut budget()).unwrap();
++    assert!(
++        x.subset_of(&result.range.square(&mut budget()).unwrap(), &mut budget())
++            .unwrap()
++    );
++    // Shared accounting: first attempt completes, then no budget for another.
++    let mut measured = budget();
++    x.sqrt(-32, &mut measured).unwrap();
++    let used = budget().remaining_work() - measured.remaining_work();
++    let mut shared = DyadicBudget::new(16384, used);
++    assert_eq!(x.sqrt(-32, &mut shared).unwrap(), result);
++    assert_eq!(shared.remaining_work(), 0);
++    assert_eq!(x.sqrt(-32, &mut shared), Err(IntervalError::WorkExhausted));
++    assert_eq!(x.sqrt(-32, &mut budget()).unwrap(), result);
++    // Full input exponent range; choose a nearby output grid so no giant
++    // integer is materialized merely to accommodate the scale tag.
++    assert_eq!(
++        d(1, 1, i32::MIN)
++            .sqrt(i32::MIN / 2, &mut budget())
++            .unwrap()
++            .range,
++        d(1, 1, i32::MIN / 2)
++    );
++    assert_eq!(
++        d(1, 1, i32::MAX)
++            .sqrt(i32::MAX / 2, &mut budget())
++            .unwrap()
++            .range,
++        d(1, 2, i32::MAX / 2)
++    );
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn replay_refinement_and_further_operations_preserve_enclosures() {
++    let source = d(1, 7, -3);
++    let coarse = source.sqrt(-8, &mut budget()).unwrap();
++    let fine = source.sqrt(-64, &mut budget()).unwrap();
++    assert!(fine.range.subset_of(&coarse.range, &mut budget()).unwrap());
++    let bytes = serde_json::to_vec(&fine.range).unwrap();
++    let restored: DyadicInterval = serde_json::from_slice(&bytes).unwrap();
++    assert_eq!(restored, fine.range);
++    assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
++    let fourth_root = restored.sqrt(-96, &mut budget()).unwrap().range;
++    let fourth_power = fourth_root.checked_pow(4, &mut budget()).unwrap();
++    assert!(source.subset_of(&fourth_power, &mut budget()).unwrap());
++    let inverse = restored.reciprocal(-96, &mut budget()).unwrap();
++    let product = restored.mul(&inverse, &mut budget()).unwrap();
++    assert!(product.contains_point(&1.into(), 0, &mut budget()).unwrap());
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/sqrt_oracle.rs"]
++mod sqrt_oracle;
++
++#[cfg(not(target_env = "msvc"))]
++mod independent {
++    use super::sqrt_oracle::{q, verify};
++    use super::*;
++    #[cfg(feature = "rational")]
++    use rug::{Integer, Rational as Q};
++
++    #[test]
++    fn dyadic_roots_are_tight_on_small_large_and_near_square_inputs() {
++        for a in -8..=16 {
++            for b in a..=16 {
++                for exponent in [-15, -1, 0, 1, 15] {
++                    for precision in [-32, -1, 0, 16] {
++                        let x = d(a, b, exponent);
++                        let result = x.sqrt(precision, &mut budget());
++                        if b < 0 {
++                            assert_eq!(result, Err(IntervalError::EmptyDomain));
++                            continue;
++                        }
++                        let result = result.unwrap();
++                        assert_eq!(
++                            result.domain,
++                            if a < 0 {
++                                DomainCoverage::Partial
++                            } else {
++                                DomainCoverage::Complete
++                            }
++                        );
++                        verify(
++                            &result.range,
++                            q(&a.max(0), exponent),
++                            q(&b, exponent),
++                            precision,
++                        );
++                    }
++                }
++            }
++        }
++        for bits in [64usize, 127, 513, 1024] {
++            let square = num_bigint::BigInt::from(1) << (2 * bits);
++            for delta in [-1i32, 0, 1] {
++                let input = &square + delta;
++                for exponent in [-2000, -1074, 0, 2000] {
++                    let x = DyadicInterval::point(input.clone(), exponent).unwrap();
++                    for precision in [exponent / 2 - 32, exponent / 2, exponent / 2 + 32] {
++                        let result = x.sqrt(precision, &mut budget()).unwrap();
++                        let source = q(&input, exponent);
++                        verify(&result.range, source.clone(), source, precision);
++                    }
++                }
++            }
++        }
++    }
++
++    #[cfg(feature = "rational")]
++    #[test]
++    fn rational_roots_are_tight_without_rounding_the_source_first() {
++        use hyperinterval::RationalInterval;
++        use hyperreal::Rational;
++        for precision in [i32::MIN, -32, 0, i32::MAX] {
++            assert!(
++                RationalInterval::empty()
++                    .sqrt(precision, &mut DyadicBudget::new(0, 0))
++                    .unwrap()
++                    .range
++                    .is_empty()
++            );
++            assert_eq!(
++                RationalInterval::point((-1).into()).sqrt(precision, &mut budget()),
++                Err(IntervalError::EmptyDomain)
++            );
++            let zero = RationalInterval::new((-1).into(), 0.into())
++                .unwrap()
++                .sqrt(precision, &mut budget())
++                .unwrap();
++            assert_eq!(zero.range, d(0, 0, 0));
++            assert_eq!(zero.domain, DomainCoverage::Partial);
++        }
++        for denominator in [1u64, 3, 7, 23, 65537] {
++            for a in -4..=12 {
++                for b in a.max(0)..=12 {
++                    let x = RationalInterval::new(
++                        Rational::fraction(a, denominator).unwrap(),
++                        Rational::fraction(b, denominator).unwrap(),
++                    )
++                    .unwrap();
++                    for precision in [-48, -3, 0, 8] {
++                        let result = x.sqrt(precision, &mut budget()).unwrap();
++                        assert_eq!(
++                            result.domain,
++                            if a < 0 {
++                                DomainCoverage::Partial
++                            } else {
++                                DomainCoverage::Complete
++                            }
++                        );
++                        verify(
++                            &result.range,
++                            Q::from((a.max(0), denominator)),
++                            Q::from((b, denominator)),
++                            precision,
++                        );
++                    }
++                }
++            }
++        }
++        // Huge denominators and rational values immediately around a perfect
++        // square exercise exactness decisions that a rounded source could lose.
++        let large = Integer::from(1) << 1024u32;
++        for source in [
++            Q::from((Integer::from(1), large.clone() + 1)),
++            Q::from((large.clone() - 1, large.clone())),
++            Q::from((large.clone() + 1, large)),
++        ] {
++            let x = RationalInterval::point(source.to_string().parse::<Rational>().unwrap());
++            for precision in [-600, -32, 0] {
++                let result = x.sqrt(precision, &mut budget()).unwrap();
++                verify(&result.range, source.clone(), source.clone(), precision);
++            }
++        }
++        let huge = (Integer::from(1) << 1024u32) + 1;
++        let source = Q::from((huge, Integer::from(7)));
++        let exact = source.to_string().parse::<Rational>().unwrap();
++        let x = RationalInterval::point(exact);
++        let root = x.sqrt(-128, &mut budget()).unwrap();
++        verify(&root.range, source.clone(), source, -128);
++        assert_eq!(
++            x.sqrt(-128, &mut DyadicBudget::new(64, 1000)),
++            Err(IntervalError::SizeExhausted)
++        );
++        assert_eq!(
++            x.sqrt(-128, &mut DyadicBudget::new(16384, 0)),
++            Err(IntervalError::WorkExhausted)
++        );
++        assert_eq!(x.sqrt(-128, &mut budget()).unwrap(), root);
++    }
++}
++
++#[cfg(feature = "rational")]
++#[test]
++fn rational_domain_and_second_endpoint_failure_are_portable() {
++    use hyperinterval::RationalInterval as I;
++    use hyperreal::Rational as R;
++    assert_eq!(
++        I::empty()
++            .sqrt(0, &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .domain,
++        DomainCoverage::Complete
++    );
++    for (a, b, domain, expected) in [
++        (-1, 4, DomainCoverage::Partial, d(0, 2, 0)),
++        (0, 4, DomainCoverage::Complete, d(0, 2, 0)),
++        (1, 9, DomainCoverage::Complete, d(1, 3, 0)),
++        (-1, 0, DomainCoverage::Partial, d(0, 0, 0)),
++    ] {
++        let x = I::new(a.into(), b.into()).unwrap();
++        let result = x.sqrt(-32, &mut budget()).unwrap();
++        assert_eq!(result.range, expected);
++        assert_eq!(result.domain, domain);
++    }
++    let x = I::new(R::zero(), R::from(2)).unwrap();
++    // Zero lower endpoint succeeds; no incomplete result is returned when
++    // the nonzero upper endpoint cannot reserve its materialization.
++    assert_eq!(
++        x.sqrt(-32, &mut DyadicBudget::new(64, 1)),
++        Err(IntervalError::WorkExhausted)
++    );
++    let retry = x.sqrt(-32, &mut budget()).unwrap();
++    assert!(
++        x.subset_of(
++            &retry
++                .range
++                .square(&mut budget())
++                .unwrap()
++                .to_rational(&mut budget())
++                .unwrap()
++        )
++    );
++    assert_eq!(
++        I::point(R::fraction(9, 16).unwrap())
++            .sqrt(-2, &mut budget())
++            .unwrap()
++            .range,
++        d(3, 3, -2)
++    );
++    assert_eq!(
++        I::point(R::from(-2)).sqrt(0, &mut budget()),
++        Err(IntervalError::EmptyDomain)
++    );
++}
+diff --git a/crates/hyperinterval/tests/support/sqrt_oracle.rs b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+new file mode 100644
+index 000000000..d4b146c1e
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/sqrt_oracle.rs
+@@ -0,0 +1,41 @@
++//! Independent exact grid tightness and directed MPFR square-root oracle.
++use hyperinterval::DyadicInterval;
++use rug::{Float, Integer, Rational as Q, float::Round};
++
++pub fn q(mantissa: &impl core::fmt::Display, exponent: i32) -> Q {
++    let mut value = Q::from(mantissa.to_string().parse::<Integer>().unwrap());
++    if exponent >= 0 {
++        value <<= exponent as u32;
++    } else {
++        value >>= exponent.unsigned_abs();
++    }
++    value
++}
++
++// Certify containment AND the impossibility of moving either grid endpoint
++// inward. These exact GMP inequalities do not reuse the implementation's
++// division/root algorithm. Directed MPFR separately checks point bounds.
++pub fn verify(result: &DyadicInterval, a: Q, b: Q, precision: i32) {
++    let (lo, hi, exponent) = result.bounds().unwrap();
++    let lo = q(lo, exponent);
++    let hi = q(hi, exponent);
++    let step = q(&1, precision);
++    assert!(lo >= 0 && hi >= 0);
++    assert!(lo.clone().square() <= a);
++    assert!(hi.clone().square() >= b);
++    assert!((lo.clone() + &step).square() > a);
++    if hi > 0 {
++        assert!((hi.clone() - &step).square() < b);
++    }
++    assert!((&lo / &step).complete().is_integer());
++    assert!((&hi / &step).complete().is_integer());
++    // 4096 bits is greater than every exact input and chosen grid in this
++    // corpus; perfect grid squares are represented exactly by MPFR.
++    let (mut down, _) = Float::with_val_round(4096, &a, Round::Down);
++    let (mut up, _) = Float::with_val_round(4096, &b, Round::Up);
++    down.sqrt_round(Round::Down);
++    up.sqrt_round(Round::Up);
++    assert!(lo <= down.to_rational().unwrap());
++    assert!(hi >= up.to_rational().unwrap());
++}
++use rug::Complete;
