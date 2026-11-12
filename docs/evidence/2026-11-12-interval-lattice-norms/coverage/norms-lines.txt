@@ -1,0 +1,210 @@
+    1|       |use crate::{
+    2|       |    IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector, array_result,
+    3|       |};
+    4|       |use hyperinterval::IntervalError;
+    5|       |
+    6|       |// No scalar formulas live here: each absolute image, sum, maximum and difference
+    7|       |// delegates to Hyperinterval through the narrow backend adapter.
+    8|  61.0k|fn sum_abs<'a, I: IntervalArithmetic + 'a>(
+    9|  61.0k|    values: impl Iterator<Item = &'a I>,
+   10|  61.0k|    context: &mut I::Context,
+   11|  61.0k|) -> Result<I, IntervalError> {
+   12|  61.0k|    let mut sum = I::zero()?;
+   13|  77.6k|    for value in values {
+   14|  77.6k|        let absolute = value.abs(context)?;
+   15|  77.6k|        sum = sum.add(&absolute, context)?;
+   16|       |    }
+   17|  60.9k|    Ok(sum)
+   18|  61.0k|}
+   19|       |
+   20|  47.4k|fn include_max<I: IntervalArithmetic>(
+   21|  47.4k|    maximum: &mut Option<I>,
+   22|  47.4k|    next: I,
+   23|  47.4k|    context: &mut I::Context,
+   24|  47.4k|) -> Result<(), IntervalError> {
+   25|  47.4k|    *maximum = Some(match maximum {
+   26|  23.3k|        None => next,
+   27|  24.1k|        Some(previous) => previous.max_image(&next, context)?,
+   28|       |    });
+   29|  47.4k|    Ok(())
+   30|  47.4k|}
+   31|       |
+   32|       |impl<I: IntervalArithmetic, const N: usize> IntervalVector<I, N> {
+   33|       |    /// Encloses `{ sum_i |x_i| : x in self }`, including its minimum.
+   34|       |    ///
+   35|       |    /// Scalar absolute images are added in coordinate order with one shared
+   36|       |    /// context. Rational/dyadic success gives the exact range; primitive rounding
+   37|       |    /// can widen it and overflow is typed. Empty has empty image; the unique
+   38|       |    /// zero-dimensional vector has norm zero. No midpoint or point is selected.
+   39|       |    ///
+   40|       |    /// ```
+   41|       |    /// # #[cfg(feature = "fixed")] {
+   42|       |    /// use hyperlattice_interval::{IntervalVector, hyperinterval::FixedInterval};
+   43|       |    /// type I = FixedInterval<i32, 0>;
+   44|       |    /// let vector = IntervalVector::new([I::new(-2, 1).unwrap(), I::new(3, 4).unwrap()]).unwrap();
+   45|       |    /// assert_eq!(vector.norm_one(&mut ()).unwrap(), I::new(3, 6).unwrap());
+   46|       |    /// # }
+   47|       |    /// ```
+   48|    782|    pub fn norm_one(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+   49|    782|        match self.lanes() {
+   50|      6|            None => Ok(I::empty()?),
+   51|    776|            Some(lanes) => Ok(sum_abs(lanes.iter(), context)?),
+   52|       |        }
+   53|    782|    }
+   54|       |
+   55|       |    /// Encloses `{ max_i |x_i| : x in self }`, including interior minima.
+   56|       |    /// Empty has empty image; dimension zero has norm zero. The scalar context
+   57|       |    /// covers every absolute image and maximum in increasing coordinate order.
+   58|  8.27k|    pub fn norm_infinity(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+   59|  8.27k|        let Some(lanes) = self.lanes() else {
+   60|      6|            return Ok(I::empty()?);
+   61|       |        };
+   62|  8.26k|        let mut maximum = None;
+   63|  17.2k|        for lane in lanes {
+   64|  17.2k|            let absolute = lane.abs(context)?;
+   65|  17.2k|            include_max(&mut maximum, absolute, context)?;
+   66|       |        }
+   67|  8.26k|        Ok(match maximum {
+   68|  8.25k|            Some(value) => value,
+   69|      6|            None => I::zero()?,
+   70|       |        })
+   71|  8.27k|    }
+   72|       |}
+   73|       |
+   74|       |impl<I: IntervalArithmetic, const R: usize, const C: usize> IntervalMatrix<I, R, C> {
+   75|       |    /// Encloses the induced one-norm range: maximum absolute column sum.
+   76|       |    ///
+   77|       |    /// The matrix set is Cartesian, so each column's extrema can be attained
+   78|       |    /// independently. Rational/dyadic success gives the exact range. Primitive
+   79|       |    /// sums round outward or fail with typed overflow. Empty has empty image;
+   80|       |    /// a nonempty matrix set with either dimension zero has norm zero.
+   81|  3.79k|    pub fn norm_one(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+   82|  3.79k|        let Some(rows) = self.rows() else {
+   83|      7|            return Ok(I::empty()?);
+   84|       |        };
+   85|  3.79k|        let mut maximum = None;
+   86|  7.56k|        for column in 0..C {
+   87|  15.1k|            let sum = sum_abs(rows.iter().map(|row| &row[column]), context)?;
+   88|  7.56k|            include_max(&mut maximum, sum, context)?;
+   89|       |        }
+   90|  3.78k|        Ok(match maximum {
+   91|  3.77k|            Some(value) => value,
+   92|     12|            None => I::zero()?,
+   93|       |        })
+   94|  3.79k|    }
+   95|       |
+   96|       |    /// Encloses the induced infinity-norm range: maximum absolute row sum.
+   97|       |    /// Rows and their entries are processed in increasing order. One context
+   98|       |    /// covers all operations, including maximum reduction; failures leave the
+   99|       |    /// source reusable. Empty and zero-dimension behavior matches `norm_one`.
+  100|  3.78k|    pub fn norm_infinity(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+  101|  3.78k|        let Some(rows) = self.rows() else {
+  102|      6|            return Ok(I::empty()?);
+  103|       |        };
+  104|  3.78k|        let mut maximum = None;
+  105|  7.56k|        for row in rows {
+  106|  7.56k|            let sum = sum_abs(row.iter(), context)?;
+  107|  7.55k|            include_max(&mut maximum, sum, context)?;
+  108|       |        }
+  109|  3.78k|        Ok(match maximum {
+  110|  3.77k|            Some(value) => value,
+  111|      6|            None => I::zero()?,
+  112|       |        })
+  113|  3.78k|    }
+  114|       |}
+  115|       |
+  116|       |impl<I: IntervalArithmetic, const N: usize> IntervalMatrix<I, N, N> {
+  117|       |    /// Encloses the logarithmic one-norm (matrix measure) range:
+  118|       |    /// `max_j (a_jj + sum_{i != j} |a_ij|)`. The diagonal retains its sign.
+  119|       |    ///
+  120|       |    /// For positive dimension, rational/dyadic success gives the exact range;
+  121|       |    /// primitive arithmetic may widen it or overflow. Empty input gives empty.
+  122|       |    /// For the nonempty 0×0 matrix, `lim_{h->0+} (norm(I+hA)-1)/h` is negative
+  123|       |    /// infinity under the zero-dimensional induced-norm convention. This finite
+  124|       |    /// scalar API reports [`IntervalError::UnboundedImage`] rather than zero.
+  125|       |    ///
+  126|       |    /// This is numerical evidence, not a solver uniqueness/contraction status.
+  127|  3.77k|    pub fn measure_one(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+  128|  3.77k|        self.measure::<true>(context)
+  129|  3.77k|    }
+  130|       |
+  131|       |    /// Encloses the logarithmic infinity-norm range:
+  132|       |    /// `max_i (a_ii + sum_{j != i} |a_ij|)`. Negative measures are retained.
+  133|       |    /// Shares the empty/zero-dimension and resource contract of `measure_one`.
+  134|  3.78k|    pub fn measure_infinity(&self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
+  135|  3.78k|        self.measure::<false>(context)
+  136|  3.78k|    }
+  137|       |
+  138|       |    /// Per-row ranges of `|a_ii| - sum_{j != i} |a_ij|`.
+  139|       |    ///
+  140|       |    /// Strictly positive lower bounds supply diagonal-dominance evidence;
+  141|       |    /// a range containing zero is not a strict proof. No decision status is
+  142|       |    /// synthesized here. Empty input yields an empty vector; a nonempty 0×0
+  143|       |    /// matrix yields the unit vector product. Scalar failures propagate.
+  144|  7.52k|    pub fn row_dominance_margins(
+  145|  7.52k|        &self,
+  146|  7.52k|        context: &mut I::Context,
+  147|  7.52k|    ) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
+  148|  7.52k|        self.dominance_margins::<false>(context)
+  149|  7.52k|    }
+  150|       |
+  151|       |    /// Per-column ranges of `|a_jj| - sum_{i != j} |a_ij|`, with the same
+  152|       |    /// evidence and resource contract as `row_dominance_margins`.
+  153|  7.51k|    pub fn column_dominance_margins(
+  154|  7.51k|        &self,
+  155|  7.51k|        context: &mut I::Context,
+  156|  7.51k|    ) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
+  157|  7.51k|        self.dominance_margins::<true>(context)
+  158|  7.51k|    }
+  159|       |
+  160|  45.1k|    fn off_diagonal_sum<const COLUMN: bool>(
+  161|  45.1k|        rows: &[[I; N]; N],
+  162|  45.1k|        line: usize,
+  163|  45.1k|        context: &mut I::Context,
+  164|  45.1k|    ) -> Result<I, IntervalError> {
+  165|  45.1k|        sum_abs(
+  166|  90.2k|            (0..N).filter(|&index| index != line).map(|index| {
+  167|  45.1k|                if COLUMN {
+  168|  22.5k|                    &rows[index][line]
+  169|       |                } else {
+  170|  22.5k|                    &rows[line][index]
+  171|       |                }
+  172|  45.1k|            }),
+  173|  45.1k|            context,
+  174|       |        )
+  175|  45.1k|    }
+  176|       |
+  177|  7.55k|    fn measure<const COLUMN: bool>(
+  178|  7.55k|        &self,
+  179|  7.55k|        context: &mut I::Context,
+  180|  7.55k|    ) -> Result<I, IntervalLatticeError> {
+  181|  7.55k|        let Some(rows) = self.rows() else {
+  182|     12|            return Ok(I::empty()?);
+  183|       |        };
+  184|  7.54k|        if N == 0 {
+  185|     12|            return Err(IntervalError::UnboundedImage.into());
+  186|  7.53k|        }
+  187|  7.53k|        let mut maximum = None;
+  188|  15.0k|        for line in 0..N {
+  189|  15.0k|            let sum = Self::off_diagonal_sum::<COLUMN>(rows, line, context)?;
+  190|  15.0k|            let measure = rows[line][line].add(&sum, context)?;
+  191|  15.0k|            include_max(&mut maximum, measure, context)?;
+  192|       |        }
+  193|  7.53k|        Ok(maximum.expect("positive dimension has at least one line"))
+  194|  7.55k|    }
+  195|       |
+  196|  15.0k|    fn dominance_margins<const COLUMN: bool>(
+  197|  15.0k|        &self,
+  198|  15.0k|        context: &mut I::Context,
+  199|  15.0k|    ) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
+  200|  15.0k|        match self.rows() {
+  201|     12|            None => IntervalVector::empty(),
+  202|  30.0k|            Some(rows) => IntervalVector::new(array_result(|line| {
+  203|  30.0k|                let sum = Self::off_diagonal_sum::<COLUMN>(rows, line, context)?;
+  204|  30.0k|                let diagonal = rows[line][line].abs(context)?;
+  205|  30.0k|                diagonal.sub(&sum, context)
+  206|  30.0k|            })?),
+  207|       |        }
+  208|  15.0k|    }
+  209|       |}
+
