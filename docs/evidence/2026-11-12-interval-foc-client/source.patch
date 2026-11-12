@@ -1,0 +1,1268 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 1a1599470..caf91f8e2 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -47,10 +47,10 @@ No existing arithmetic or predicate dispatch has been changed.
+ | 3 rational/dyadic/ball | carriers and local acceptance implemented | solver kernel migration, full coverage and consumer cost gates |
+ | 4 proposals/float | proposal wrappers and strict integer IEEE core implemented; local x86_64 qualification passed | full surface/coverage, further targets and shipped consumers |
+ | 5 elementary functions | abs/min/max, integer powers, square roots, exp/log/atan/sin/cos, split division, rational powers and tan/cot implemented on documented backends | final function/backend coverage, resource and consumer qualification |
+-| 6 lattice | Cartesian/affine carriers, widths, derived midpoint/radius, norms/measures/dominance and contraction evidence implemented | independent center/radius forms, Jacobian carriers, specialization and full consumer/performance gates |
++| 6 lattice | Cartesian/affine carriers, widths, derived midpoint/radius, norm/contraction evidence and FOC/Krawczyk clients implemented | independent center/radius forms, Jacobian carriers, specialization and full consumer/performance gates |
+ | 7 solver | qualification started; production migration rejected | satisfy size/performance gates with unchanged statuses, certificates and dispatch |
+ | 8 interface | not started | unchanged canonical bytes and profiles |
+-| 9 firmware | not started | exact differential, no_alloc, HIL/cycles/stack/size |
++| 9 firmware | FOC conformance client qualified; production migration not started | fixed transform performance/size regression, clock migration, HIL/cycles/stack/size |
+ | 10 predicate filters | not started | proof/cost/trace admission |
+ | 11 path dynamics | not started | domain-neutral extraction and exact field equivalence |
+ | 12 ODE/reachability | not started | certified tubes, bounded refinement, analytic oracles |
+@@ -2348,6 +2348,100 @@ center/radius forms, Jacobian carriers, specialized kernels, the full consumer/
+ resource/performance gates and later phases remain open. No phase completion
+ or push is claimed.
+ 
++## Phase 6 admission: maintained Alumina FOC client
++
++Baseline CSGRS `a4560f1c9209396bc4409d0dc5d5f2fe92db2225`, firmware
++`bdee397d0b80841f16bf17e7bcd029b4feb2c212`. Initial state records all four
++managed repositories clean, their branches, heads and absent upstreams.
++Owner: standalone Hyperlattice interval conformance client; Alumina retains
++wrappers, rotation validation, balance policy and FocError semantics. P1, P5,
++P6, P18–P20, P31–P33. Missing acceptance: Phase 6's maintained Clarke/Park
++conformance and benchmark client. Existing fixed conversion, wide i64 storage,
++checked scalar operations and matrix products were found and reused. No scalar
++kernel or domain validator was copied into production. Raw staging:
++`/tmp/interval-refactor/foc-client`.
++
++The pre-edit witness reproduced two mismatches in naive substitutions. For
++alpha=MIN, beta=0 and sine=-1/cosine=0, native Park rejects an intermediate
++MIN*-1 while a signed dense matrix succeeds. For phases (1,0,-1), pre-rounded
++2/3 and -1/3 coefficients widen the alpha output by one ulp on both sides while
++native Clarke returns exact one. Both original witnesses remain deterministic
++tests. The new client retains rounded product order, subtraction boundaries and
++widened Clarke numerators until division/scaling. The public result/error types
++remain Alumina's, and every arithmetic operation delegates to the shared layer.
++
++## Phase 6 FOC client: correctness and cost qualification
++
++Implemented the unpublished `conformance/alumina-foc` standalone package with
++its own lockfile, no_std library, independent integer oracles, paired native/
++shared cost and footprint binaries, and an allocator-free Wasm consumer.
++The package uses four local dependencies and does not change any production
++dependency graph. The exact domain is valid nonempty Q2.30 input intervals,
++public validated Rotation values and all signed zero-sequence tolerances.
++Constant-size loops and i128 intermediates preserve the original typed range
++and balance failures. No implicit midpoint, floating demotion, policy or proof
++status is introduced. The wide Clarke linear numerators have magnitude below
++2^34 and fit i64; their fixed products and scaled divisions fit i128.
++
++The endpoint and seeded transform corpus checks 399,950 full outcomes: 95,848
++successful transforms, 26,366 Range outcomes and 277,736 balance rejections.
++Every result and typed error agrees with firmware; successful outputs also
++contain independently enumerated exact integer corners. The scalar corpus
++checks 12,025 interval pairs for products and divisions, both native i32 storage
++and shared narrow/widened paths, against exact rational extrema. Seed: 20261112.
++Tests preserve radical-constant enclosure inequalities, full i32 endpoints,
++continuous admitted rotations, balance rejection priority, original hard cases,
++and 64 successful five-transform chains with each intermediate compared.
++The allocation counter covers complete workloads and representative error paths;
++all measured native/shared paths allocate zero.
++
++All 24 final commands pass, including Rust 1.88/stable debug/release tests,
++Clippy with -D warnings, docs with warnings denied, ARM/Wasm checks and Clippy,
++both package format checks plus workspace formatting, the fixed-only companion
++suite (23 tests/doctests), and all 83 original FOC tests. Initial and final
++checks are retained; final repeat follows added allocation-error cases. ASan
++with leak detection passes all seven client tests. Source coverage for the
++client library and samples is 172/174 lines (98.85%), 382/401 regions (95.26%)
++and 17/17 functions; dependencies/tests/probe binaries are outside that report.
++No complete coverage, new fuzz campaign, hosted-OS or HIL claim.
++
++The actual no-allocator Wasm module has no imports and passes 1,660 completed
++transform calls across a 165-fixture period plus 405 full-range Park checks
++(335 successes, 70 typed overflows). A separate Python exact-integer oracle
++checks every output digest and expected overflow, in addition to native/shared
++full-value assertions inside Wasm. The one-million-fuel cap was not reached;
++maximum observed fuel is 28,172. Artifact: 43,086 bytes, SHA-256
++`67c36ef145e556a2b7930f747c7b560bcbea273b58d3cb9c5ef6726f5bf94c5e`.
++No firmware cycle, stack or additional float-target qualification is implied.
++
++Matched completed-work cost: 200 samples per compiler, five actions, two
++implementations, twenty samples per action/implementation, 512 completed calls
++per sample after 64 warmups. Inputs are prebuilt; timing includes full output
++materialization and digest work. All outputs/checksums match and allocations are
++zero. Rust 1.88 shared/native median ratios are 3.31 Clarke, 0.71 Park, 0.71
++inverse Park, 0.69 inverse Clarke, and 1.65 chain. Stable ratios are 4.26, 1.11,
++1.09, 1.09 and 3.14 respectively. These are unpinned shared-host probes, not
++universal speed claims. Raw samples, compiler/host metadata, executable digests
++and section sizes are retained. Matching footprint probes grow by 5,752 bytes
++on 1.88 and 9,928 bytes on stable; five runtime seeds yield identical checksums
++across both implementations and compilers. Final footprint probes were rebuilt
++after formatting the shared include file; timing binaries remain byte-identical.
++Production/shared-support preservation verifies 172
++byte-identical files, and the firmware checkout remains unchanged.
++
++| Candidate | Decision | Evidence |
++| --- | --- | --- |
++| Maintained shared FOC conformance/cost client | kept | required Phase 6 consumer, independent exact expectations, failures and measured costs |
++| Naive signed Park matrix | rejected | MIN*-1 intermediate failure changes |
++| Pre-rounded Clarke coefficient matrix | rejected | exact point output widens by two ulps |
++| Blanket production adoption of current shared transforms | rejected | Clarke/chain time and matched probe size regress on both measured compilers |
++
++Source/evidence registration pending for this checkpoint. Performance-specialized
++fixed kernels are still needed before firmware migration; the conformance client
++is evidence infrastructure, not an adopted optimization. Jacobian carriers,
++independent authored center/radius, remaining specializations and later phases
++stay open. No phase completion, full pre-push run or push is claimed.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 13ff7ef5d..a1d12fdb6 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -74,3 +74,9 @@ still establish Jacobian validity, self-mapping and solver decisions. Empty
+ inputs stay empty. Nonempty queries require representable scalar one, except
+ zero-dimensional identity subtraction; fixed i32/F31 and i64/F63 therefore
+ report typed overflow. Scalar operations share the caller's context.
++
++The standalone [Alumina FOC client](conformance/alumina-foc/README.md) exercises
++Clarke/Park transforms through the shared fixed kernels, retaining Alumina's
++rounding boundaries and typed errors. It includes independent exact corner
++checks, transform chains and matched cost probes against the firmware routines.
++Build it with its own manifest and the sibling `alumina-firmware` checkout.
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.lock b/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.lock
+new file mode 100644
+index 000000000..ce570f4b5
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.lock
+@@ -0,0 +1,33 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "alumina-foc"
++version = "0.1.0"
++dependencies = [
++ "alumina-protocol",
++]
++
++[[package]]
++name = "alumina-protocol"
++version = "0.1.0"
++
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
++[[package]]
++name = "interval-foc-conformance"
++version = "0.0.0"
++dependencies = [
++ "alumina-foc",
++ "hyperlattice-interval",
++]
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml b/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml
+new file mode 100644
+index 000000000..f47782f3b
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml
+@@ -0,0 +1,25 @@
++[package]
++name = "interval-foc-conformance"
++version = "0.0.0"
++edition = "2024"
++rust-version = "1.88"
++license = "MIT OR Apache-2.0"
++publish = false
++
++[workspace]
++
++[dependencies]
++hyperlattice-interval = { path = "../..", default-features = false, features = ["fixed"] }
++alumina-foc = { path = "../../../../../alumina-firmware/crates/alumina-foc" }
++
++[[bin]]
++name = "cost"
++path = "src/bin/cost.rs"
++
++[[bin]]
++name = "native-probe"
++path = "src/bin/native_probe.rs"
++
++[[bin]]
++name = "shared-probe"
++path = "src/bin/shared_probe.rs"
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/README.md b/crates/hyperlattice-interval/conformance/alumina-foc/README.md
+new file mode 100644
+index 000000000..3653e4c81
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/README.md
+@@ -0,0 +1,39 @@
++# Alumina FOC interval conformance client
++
++This standalone, unpublished client compares Hyperinterval fixed arithmetic and
++Hyperlattice matrix products with Alumina's current Clarke/Park transforms. It
++uses the public Alumina wrappers, validated rotations and error types. It does
++not replace firmware code or supply a second geometry or scalar kernel.
++
++Place `csgrs` and `alumina-firmware` next to each other. From the CSGRS root:
++
++```sh
++cargo +1.88.0 test --locked --manifest-path crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml -- --nocapture
++cargo +1.88.0 clippy --locked --manifest-path crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml --all-targets -- -D warnings
++cargo +1.88.0 run --locked --release --manifest-path crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml --bin cost
++cargo +1.88.0 check --locked --manifest-path crates/hyperlattice-interval/conformance/alumina-foc/Cargo.toml --lib --target thumbv7em-none-eabihf
++cargo +1.88.0 build --locked --release --manifest-path crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.toml --target wasm32-unknown-unknown
++```
++
++The production dependency graph of Hyperinterval/Hyperlattice is unchanged. This
++client has its own lockfile and only four dependency packages, all local: Alumina
++FOC/protocol and Hyperinterval/Hyperlattice interval algebra. The library and Wasm
++consumer are `no_std` and need no allocator; tests and native probes use `std`.
++
++`clarke` keeps wide Q30 numerators until division/scaling, including differences
++that exceed i32 but have representable outputs. Park and its inverse retain the
++current sequence of rounded products and sums/differences. For example, the
++current Park implementation can reject an intermediate `MIN * -1` even when the
++mathematical final result fits. A signed matrix rewrite must not silently change
++that failure contract. Separately rounding the Clarke coefficients `2/3` and
++`-1/3` changes exact output endpoints. Both cases are maintained regressions.
++
++The corpus compares full outputs and typed failures, then checks successful
++outputs against independent exact integer corner expectations. It covers full
++i32 endpoints, zero-crossing intervals, valid uncertain rotations, balance
++rejection, seeded intervals, widened products/divisions and repeated transforms.
++The cost probe first verifies equal completed results, then reports timing,
++allocation and checksums for both implementations. `native-probe` and
++`shared-probe` run identical workload bodies for executable-size comparison.
++These probes do not establish firmware cycle, stack, HIL or performance gates.
++Measurements and adoption decisions belong in the main progress/evidence ledger.
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/cost.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/cost.rs
+new file mode 100644
+index 000000000..ad73673c5
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/cost.rs
+@@ -0,0 +1,47 @@
++use alumina_foc::FocError;
++use interval_foc_conformance::samples::{self, ACTIONS, Action, Output, Sample};
++use std::{hint::black_box, time::Instant};
++#[path = "../../../allocations.rs"]
++mod allocations;
++
++fn main() {
++    let inputs = core::array::from_fn::<_, 64, _>(|i| samples::sample(i as u32));
++    for action in ACTIONS {
++        for &input in &inputs {
++            assert_eq!(
++                samples::shared(action, input).unwrap(),
++                samples::native(action, input).unwrap()
++            );
++        }
++    }
++    println!(
++        "implementation,action,sample,completed_operations,elapsed_ns,allocation_calls,allocated_bytes,checksum"
++    );
++    type Provider = fn(Action, Sample) -> Result<Output, FocError>;
++    for action in ACTIONS {
++        for (name, provider) in [
++            ("native", samples::native as Provider),
++            ("shared", samples::shared as Provider),
++        ] {
++            for &input in &inputs {
++                black_box(provider(black_box(action), black_box(input)).unwrap());
++            }
++            for sample in 0..20 {
++                let mut hash = 0xcbf29ce484222325;
++                let start = Instant::now();
++                let (_, calls, bytes) = allocations::measure(|| {
++                    for _ in 0..8 {
++                        for &input in &inputs {
++                            hash =
++                                black_box(provider(black_box(action), black_box(input)).unwrap())
++                                    .digest(hash);
++                        }
++                    }
++                });
++                let elapsed = start.elapsed().as_nanos();
++                assert_eq!((calls, bytes), (0, 0));
++                println!("{name},{action:?},{sample},512,{elapsed},{calls},{bytes},{hash:016x}");
++            }
++        }
++    }
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/native_probe.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/native_probe.rs
+new file mode 100644
+index 000000000..b953a1ce0
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/native_probe.rs
+@@ -0,0 +1,2 @@
++use interval_foc_conformance::samples::native as provider;
++include!("probe_body.inc");
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/probe_body.inc b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/probe_body.inc
+new file mode 100644
+index 000000000..c1b556514
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/probe_body.inc
+@@ -0,0 +1,19 @@
++fn main() {
++    use interval_foc_conformance::samples::{ACTIONS, sample};
++    let seed = std::env::args()
++        .nth(1)
++        .map(|s| s.parse::<u32>().unwrap())
++        .unwrap_or(0);
++    let mut hash = 0xcbf29ce484222325;
++    for index in 0..64 {
++        for action in ACTIONS {
++            hash = provider(
++                std::hint::black_box(action),
++                std::hint::black_box(sample(seed.wrapping_add(index))),
++            )
++            .unwrap()
++            .digest(hash);
++        }
++    }
++    println!("{hash:016x}");
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/shared_probe.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/shared_probe.rs
+new file mode 100644
+index 000000000..e153ac90b
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/bin/shared_probe.rs
+@@ -0,0 +1,2 @@
++use interval_foc_conformance::samples::shared as provider;
++include!("probe_body.inc");
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs
+new file mode 100644
+index 000000000..4421d3d2f
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/lib.rs
+@@ -0,0 +1,150 @@
++//! Conformance client for shared fixed arithmetic, preserving Alumina semantics.
++//!
++//! This is an independently built, unpublished client, not a firmware migration.
++//! Domain wrappers, rotation validation and errors remain owned by Alumina.
++//! The functions intentionally preserve each current rounding/failure boundary.
++#![no_std]
++#![forbid(unsafe_code)]
++#![deny(missing_docs)]
++
++pub mod samples;
++
++use alumina_foc::{AlphaBeta, DqInterval, FocError, Phase3, Q30, Q30Interval, Rotation};
++use hyperlattice_interval::hyperinterval::{FixedInterval, IntervalError};
++use hyperlattice_interval::{IntervalLatticeError, IntervalMatrix, IntervalVector};
++
++type Fixed = FixedInterval<i32, 30>;
++type Wide = FixedInterval<i64, 30>;
++const SCALE: i64 = 1 << 30;
++
++fn input(value: Q30Interval) -> Fixed {
++    Fixed::new(value.lower().bits(), value.upper().bits()).expect("validated Q30 bounds")
++}
++
++fn output(value: Fixed) -> Q30Interval {
++    let (lo, hi) = value
++        .bounds()
++        .expect("operations on nonempty finite inputs");
++    Q30Interval::new(Q30::from_bits(lo), Q30::from_bits(hi)).expect("checked fixed bounds")
++}
++
++fn scalar_error(error: IntervalError) -> FocError {
++    match error {
++        IntervalError::Overflow => FocError::Range,
++        // This client uses only fixed F30 operations on validated nonempty
++        // inputs, with constant nonzero divisors. Other errors are unreachable.
++        _ => unreachable!("validated fixed transform: {error}"),
++    }
++}
++
++fn lattice_error(error: IntervalLatticeError) -> FocError {
++    match error {
++        IntervalLatticeError::Scalar(error) => scalar_error(error),
++        _ => unreachable!("statically dimensioned matrix product: {error}"),
++    }
++}
++
++fn narrow(value: Wide) -> Result<Q30Interval, FocError> {
++    value.convert::<i32>().map(output).map_err(scalar_error)
++}
++
++fn sum_products(a: Fixed, b: Fixed, c: Fixed, d: Fixed) -> Result<Fixed, FocError> {
++    // The zero accumulator is exact and adds no rounding/overflow boundary.
++    let matrix = IntervalMatrix::new([[a, c]]).expect("valid scalar family");
++    let vector = IntervalVector::new([b, d]).expect("valid scalar family");
++    let result = matrix.mul_vector(&vector, &mut ()).map_err(lattice_error)?;
++    Ok(result.into_lanes().expect("nonempty product")[0])
++}
++
++fn difference_products(a: Fixed, b: Fixed, c: Fixed, d: Fixed) -> Result<Fixed, FocError> {
++    // Negating a coefficient and using a dense product changes intermediate
++    // overflow, e.g. MIN * -1 followed by subtraction. Preserve both products.
++    let first = a.checked_mul(&b).map_err(scalar_error)?;
++    let second = c.checked_mul(&d).map_err(scalar_error)?;
++    first.checked_sub(&second).map_err(scalar_error)
++}
++
++/// Clarke transform with the same balance policy, rounding and errors as Alumina.
++/// Widened Q30 storage retains the integer numerator before division by three.
++pub fn clarke(phases: Phase3, maximum_zero_sequence: Q30) -> Result<AlphaBeta, FocError> {
++    if maximum_zero_sequence.bits() < 0 {
++        return Err(FocError::UnbalancedPhases);
++    }
++    let a = input(phases.a).convert::<i64>().map_err(scalar_error)?;
++    let b = input(phases.b).convert::<i64>().map_err(scalar_error)?;
++    let c = input(phases.c).convert::<i64>().map_err(scalar_error)?;
++    let residual = a
++        .checked_add(&b)
++        .map_err(scalar_error)?
++        .checked_add(&c)
++        .map_err(scalar_error)?;
++    let (lo, hi) = residual.bounds().expect("nonempty residual");
++    if lo.unsigned_abs().max(hi.unsigned_abs()) > maximum_zero_sequence.bits() as u64 {
++        return Err(FocError::UnbalancedPhases);
++    }
++    // All i32 source values and these integer linear combinations fit i64.
++    let coefficient = |n| Wide::point(n * SCALE).expect("small constant");
++    let matrix = IntervalMatrix::new([[coefficient(2), coefficient(-1), coefficient(-1)]])
++        .expect("valid scalar family");
++    let vector = IntervalVector::new([a, b, c]).expect("valid scalar family");
++    let numerator = matrix.mul_vector(&vector, &mut ()).map_err(lattice_error)?;
++    let numerator = numerator.into_lanes().expect("nonempty numerator")[0];
++    let alpha = narrow(
++        numerator
++            .checked_div(&coefficient(3))
++            .map_err(scalar_error)?,
++    )?;
++    let difference = b.checked_sub(&c).map_err(scalar_error)?;
++    let scale = input(alumina_foc::INV_SQRT_3)
++        .convert::<i64>()
++        .map_err(scalar_error)?;
++    let beta = narrow(difference.checked_mul(&scale).map_err(scalar_error)?)?;
++    Ok(AlphaBeta { alpha, beta })
++}
++
++/// Inverse Clarke transform, retaining multiplication then negation boundaries.
++pub fn inverse_clarke(value: AlphaBeta) -> Result<Phase3, FocError> {
++    let negative_half = input(Q30Interval::HALF)
++        .checked_mul(&input(value.alpha))
++        .map_err(scalar_error)?
++        .checked_neg()
++        .map_err(scalar_error)?;
++    let beta = input(alumina_foc::SQRT_3_OVER_2)
++        .checked_mul(&input(value.beta))
++        .map_err(scalar_error)?;
++    let b = negative_half.checked_add(&beta).map_err(scalar_error)?;
++    let c = negative_half.checked_sub(&beta).map_err(scalar_error)?;
++    Ok(Phase3 {
++        a: value.alpha,
++        b: output(b),
++        c: output(c),
++    })
++}
++
++/// Park transform using validated rotation evidence and staged fixed operations.
++pub fn park(value: AlphaBeta, rotation: Rotation) -> Result<DqInterval, FocError> {
++    let alpha = input(value.alpha);
++    let beta = input(value.beta);
++    let sine = input(rotation.sine());
++    let cosine = input(rotation.cosine());
++    let d = sum_products(alpha, cosine, beta, sine)?;
++    let q = difference_products(beta, cosine, alpha, sine)?;
++    Ok(DqInterval {
++        d: output(d),
++        q: output(q),
++    })
++}
++
++/// Inverse Park transform with the same intermediate failures as Alumina.
++pub fn inverse_park(value: DqInterval, rotation: Rotation) -> Result<AlphaBeta, FocError> {
++    let d = input(value.d);
++    let q = input(value.q);
++    let sine = input(rotation.sine());
++    let cosine = input(rotation.cosine());
++    let alpha = difference_products(d, cosine, q, sine)?;
++    let beta = sum_products(d, sine, q, cosine)?;
++    Ok(AlphaBeta {
++        alpha: output(alpha),
++        beta: output(beta),
++    })
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/src/samples.rs b/crates/hyperlattice-interval/conformance/alumina-foc/src/samples.rs
+new file mode 100644
+index 000000000..221854925
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/src/samples.rs
+@@ -0,0 +1,152 @@
++//! Deterministic, completed-work fixtures shared by tests and cost/size probes.
++use alumina_foc::{AlphaBeta, DqInterval, FocError, Phase3, Q30, Q30Interval, Rotation};
++
++/// One balanced phase source, two frame sources and validated rotation.
++#[derive(Clone, Copy)]
++pub struct Sample {
++    /// Phase inputs with a zero-sequence range of [-3,3] lattice units.
++    pub phases: Phase3,
++    /// Stationary-frame input.
++    pub stationary: AlphaBeta,
++    /// Rotating-frame input.
++    pub rotating: DqInterval,
++    /// Validated angle evidence.
++    pub rotation: Rotation,
++}
++
++/// The admitted zero-sequence tolerance for the sample phases.
++pub const BALANCE: Q30 = Q30::from_bits(3);
++
++/// Generates one of 64 small, nontrivial successful transform/chain workloads.
++pub fn sample(index: u32) -> Sample {
++    let n = (index % 33) as i32 - 16;
++    let unit = 1 << 24;
++    let interval =
++        |center| Q30Interval::new(Q30::from_bits(center - 1), Q30::from_bits(center + 1)).unwrap();
++    let a = n * unit;
++    let b = -(n / 2) * unit;
++    let phases = Phase3 {
++        a: interval(a),
++        b: interval(b),
++        c: interval(-a - b),
++    };
++    let stationary = AlphaBeta {
++        alpha: interval(a),
++        beta: interval((16 - n.abs()) * unit),
++    };
++    let rotating = DqInterval {
++        d: interval(a),
++        q: interval((n + 8) * unit / 2),
++    };
++    let (sine, cosine) = match index % 5 {
++        0 => (Q30Interval::ZERO, Q30Interval::ONE),
++        1 => (Q30Interval::ONE, Q30Interval::ZERO),
++        2 => (Q30Interval::point(Q30::NEG_ONE), Q30Interval::ZERO),
++        3 => (Q30Interval::ZERO, Q30Interval::point(Q30::NEG_ONE)),
++        _ => (
++            Q30Interval::from_ratio(3, 5).unwrap(),
++            Q30Interval::from_ratio(4, 5).unwrap(),
++        ),
++    };
++    let rotation = Rotation::new(sine, cosine, Q30::from_bits(16)).unwrap();
++    Sample {
++        phases,
++        stationary,
++        rotating,
++        rotation,
++    }
++}
++
++/// Named completed workload, identical for both implementations.
++#[derive(Clone, Copy, Debug)]
++pub enum Action {
++    /// Forward Clarke.
++    Clarke,
++    /// Forward Park.
++    Park,
++    /// Inverse Park.
++    InversePark,
++    /// Inverse Clarke.
++    InverseClarke,
++    /// Clarke, Park, inverse Park, inverse Clarke, and Clarke again.
++    Chain,
++}
++
++/// All actions in deterministic reporting order.
++pub const ACTIONS: [Action; 5] = [
++    Action::Clarke,
++    Action::Park,
++    Action::InversePark,
++    Action::InverseClarke,
++    Action::Chain,
++];
++
++/// Complete output retaining the domain wrapper.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Output {
++    /// Stationary frame.
++    Stationary(AlphaBeta),
++    /// Rotating frame.
++    Rotating(DqInterval),
++    /// Three phases.
++    Phases(Phase3),
++}
++
++impl Output {
++    /// Deterministic digest of every endpoint and the output tag; equality tests
++    /// compare the original outputs separately, not just this checksum.
++    pub fn digest(self, mut hash: u64) -> u64 {
++        let (tag, lanes) = match self {
++            Self::Stationary(v) => (1, [v.alpha, v.beta, Q30Interval::ZERO]),
++            Self::Rotating(v) => (2, [v.d, v.q, Q30Interval::ZERO]),
++            Self::Phases(v) => (3, [v.a, v.b, v.c]),
++        };
++        for byte in core::iter::once(tag).chain(
++            lanes
++                .into_iter()
++                .flat_map(|v| [v.lower().bits(), v.upper().bits()])
++                .flat_map(i32::to_le_bytes),
++        ) {
++            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
++        }
++        hash
++    }
++}
++
++// The macro shares only the identical composition client, not any arithmetic.
++macro_rules! provider {
++    ($name:ident, $ops:ident, $doc:literal) => {
++        #[doc = $doc]
++        pub fn $name(action: Action, sample: Sample) -> Result<Output, FocError> {
++            match action {
++                Action::Clarke => $ops::clarke(sample.phases, BALANCE).map(Output::Stationary),
++                Action::Park => {
++                    $ops::park(sample.stationary, sample.rotation).map(Output::Rotating)
++                }
++                Action::InversePark => {
++                    $ops::inverse_park(sample.rotating, sample.rotation).map(Output::Stationary)
++                }
++                Action::InverseClarke => {
++                    $ops::inverse_clarke(sample.stationary).map(Output::Phases)
++                }
++                Action::Chain => {
++                    let a = $ops::clarke(sample.phases, BALANCE)?;
++                    let dq = $ops::park(a, sample.rotation)?;
++                    let b = $ops::inverse_park(dq, sample.rotation)?;
++                    let phases = $ops::inverse_clarke(b)?;
++                    $ops::clarke(phases, Q30::from_bits(1 << 20)).map(Output::Stationary)
++                }
++            }
++        }
++    };
++}
++provider!(
++    native,
++    alumina_foc,
++    "Runs the current firmware implementation."
++);
++provider!(
++    shared,
++    crate,
++    "Runs the shared-kernel conformance implementation."
++);
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/tests/no_alloc.rs b/crates/hyperlattice-interval/conformance/alumina-foc/tests/no_alloc.rs
+new file mode 100644
+index 000000000..9ce93c660
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/tests/no_alloc.rs
+@@ -0,0 +1,75 @@
++use interval_foc_conformance::samples::{self, ACTIONS};
++#[path = "../../allocations.rs"]
++mod allocations;
++
++#[test]
++fn both_complete_transform_clients_allocate_nothing() {
++    let ((native, shared), calls, bytes) = allocations::measure(|| {
++        use alumina_foc::{
++            AlphaBeta, DqInterval, FocError, Phase3, Q30, Q30Interval as Q, Rotation,
++        };
++        use interval_foc_conformance as kernel;
++        let minimum = Q::point(Q30::from_bits(i32::MIN));
++        let maximum = Q::point(Q30::from_bits(i32::MAX));
++        let rotation = Rotation::new(Q::point(Q30::NEG_ONE), Q::ZERO, Q30::ZERO).unwrap();
++        let value = AlphaBeta {
++            alpha: minimum,
++            beta: Q::ZERO,
++        };
++        assert_eq!(kernel::park(value, rotation), Err(FocError::Range));
++        assert_eq!(
++            kernel::park(value, rotation),
++            alumina_foc::park(value, rotation)
++        );
++        let value = DqInterval {
++            d: Q::ZERO,
++            q: minimum,
++        };
++        assert_eq!(kernel::inverse_park(value, rotation), Err(FocError::Range));
++        assert_eq!(
++            kernel::inverse_park(value, rotation),
++            alumina_foc::inverse_park(value, rotation)
++        );
++        let value = AlphaBeta {
++            alpha: minimum,
++            beta: maximum,
++        };
++        assert_eq!(kernel::inverse_clarke(value), Err(FocError::Range));
++        assert_eq!(
++            kernel::inverse_clarke(value),
++            alumina_foc::inverse_clarke(value)
++        );
++        let value = Phase3 {
++            a: Q::ZERO,
++            b: maximum,
++            c: minimum,
++        };
++        assert_eq!(
++            kernel::clarke(value, Q30::from_bits(1)),
++            Err(FocError::Range)
++        );
++        assert_eq!(
++            kernel::clarke(value, Q30::from_bits(1)),
++            alumina_foc::clarke(value, Q30::from_bits(1))
++        );
++        assert_eq!(
++            kernel::clarke(value, Q30::from_bits(-1)),
++            Err(FocError::UnbalancedPhases)
++        );
++        let mut native = 0xcbf29ce484222325;
++        let mut shared = native;
++        for index in 0..64 {
++            for action in ACTIONS {
++                let input = samples::sample(index);
++                let a = samples::native(action, input).unwrap();
++                let b = samples::shared(action, input).unwrap();
++                assert_eq!(a, b);
++                native = a.digest(native);
++                shared = b.digest(shared);
++            }
++        }
++        (native, shared)
++    });
++    assert_eq!(native, shared);
++    assert_eq!((calls, bytes), (0, 0));
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/tests/transforms.rs b/crates/hyperlattice-interval/conformance/alumina-foc/tests/transforms.rs
+new file mode 100644
+index 000000000..12100e952
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/tests/transforms.rs
+@@ -0,0 +1,410 @@
++use alumina_foc::{AlphaBeta, DqInterval, FocError, Phase3, Q30, Q30Interval as Q, Rotation};
++use interval_foc_conformance as shared;
++const SCALE: i128 = 1 << 30;
++
++fn q(a: i32, b: i32) -> Q {
++    Q::new(Q30::from_bits(a), Q30::from_bits(b)).unwrap()
++}
++
++fn endpoints(value: Q) -> [i128; 2] {
++    [value.lower().bits().into(), value.upper().bits().into()]
++}
++
++fn encloses(value: Q, numerator: i128, denominator: i128) {
++    let [lo, hi] = endpoints(value);
++    assert!(
++        lo * denominator <= numerator && numerator <= hi * denominator,
++        "{value:?} misses {numerator}/{denominator} lattice units"
++    );
++}
++
++// Enumerate every corner of the original multi-affine expressions in exact
++// integers, before any Q30 rounding. This oracle does not call either kernel.
++fn park_oracle(value: AlphaBeta, r: Rotation, output: DqInterval) {
++    for a in endpoints(value.alpha) {
++        for b in endpoints(value.beta) {
++            for s in endpoints(r.sine()) {
++                for c in endpoints(r.cosine()) {
++                    encloses(output.d, a * c + b * s, SCALE);
++                    encloses(output.q, b * c - a * s, SCALE);
++                }
++            }
++        }
++    }
++}
++
++fn inverse_park_oracle(value: DqInterval, r: Rotation, output: AlphaBeta) {
++    for d in endpoints(value.d) {
++        for q in endpoints(value.q) {
++            for s in endpoints(r.sine()) {
++                for c in endpoints(r.cosine()) {
++                    encloses(output.alpha, d * c - q * s, SCALE);
++                    encloses(output.beta, d * s + q * c, SCALE);
++                }
++            }
++        }
++    }
++}
++
++fn clarke_oracle(value: Phase3, output: AlphaBeta) {
++    for a in endpoints(value.a) {
++        for b in endpoints(value.b) {
++            for c in endpoints(value.c) {
++                encloses(output.alpha, 2 * a - b - c, 3);
++                for k in endpoints(alumina_foc::INV_SQRT_3) {
++                    encloses(output.beta, (b - c) * k, SCALE);
++                }
++            }
++        }
++    }
++}
++
++fn inverse_clarke_oracle(value: AlphaBeta, output: Phase3) {
++    assert_eq!(output.a, value.alpha);
++    for a in endpoints(value.alpha) {
++        for b in endpoints(value.beta) {
++            for k in endpoints(alumina_foc::SQRT_3_OVER_2) {
++                encloses(output.b, -a * SCALE + 2 * b * k, 2 * SCALE);
++                encloses(output.c, -a * SCALE - 2 * b * k, 2 * SCALE);
++            }
++        }
++    }
++}
++
++fn intervals() -> Vec<Q> {
++    let endpoints = [
++        i32::MIN,
++        i32::MIN + 1,
++        -(1 << 30),
++        -1,
++        0,
++        1,
++        1 << 30,
++        (1 << 30) + 1,
++        i32::MAX,
++    ];
++    endpoints
++        .iter()
++        .enumerate()
++        .flat_map(|(i, &a)| endpoints[i..].iter().map(move |&b| q(a, b)))
++        .collect()
++}
++
++fn rotations() -> Vec<Rotation> {
++    let mut result: Vec<_> = (0..5)
++        .map(|i| shared::samples::sample(i).rotation)
++        .collect();
++    // Continuous rotation families, admitted by the existing norm contract.
++    for interval in [q(-(1 << 30), 0), q(0, 1 << 30), q(-(1 << 30), 1 << 30)] {
++        result.push(Rotation::new(interval, Q::ZERO, Q30::ONE).unwrap());
++        result.push(Rotation::new(Q::ZERO, interval, Q30::ONE).unwrap());
++    }
++    result
++}
++
++#[derive(Default, Debug)]
++struct Outcomes {
++    success: usize,
++    range: usize,
++    unbalanced: usize,
++}
++impl Outcomes {
++    fn check<T: std::fmt::Debug + PartialEq>(
++        &mut self,
++        actual: Result<T, FocError>,
++        expected: Result<T, FocError>,
++    ) -> Option<T> {
++        assert_eq!(actual, expected);
++        match actual {
++            Ok(value) => {
++                self.success += 1;
++                Some(value)
++            }
++            Err(FocError::Range) => {
++                self.range += 1;
++                None
++            }
++            Err(FocError::UnbalancedPhases) => {
++                self.unbalanced += 1;
++                None
++            }
++            Err(error) => panic!("unexpected {error:?}"),
++        }
++    }
++}
++
++#[test]
++fn full_endpoint_transform_matrix_matches_outputs_errors_and_exact_corners() {
++    let intervals = intervals();
++    let mut park = Outcomes::default();
++    let mut inverse = Outcomes::default();
++    let mut inverse_clarke = Outcomes::default();
++    for &a in &intervals {
++        for &b in &intervals {
++            let value = AlphaBeta { alpha: a, beta: b };
++            if let Some(output) = inverse_clarke.check(
++                shared::inverse_clarke(value),
++                alumina_foc::inverse_clarke(value),
++            ) {
++                inverse_clarke_oracle(value, output);
++            }
++            for r in rotations() {
++                if let Some(output) =
++                    park.check(shared::park(value, r), alumina_foc::park(value, r))
++                {
++                    park_oracle(value, r, output);
++                }
++                let value = DqInterval { d: a, q: b };
++                if let Some(output) = inverse.check(
++                    shared::inverse_park(value, r),
++                    alumina_foc::inverse_park(value, r),
++                ) {
++                    inverse_park_oracle(value, r, output);
++                }
++            }
++        }
++    }
++    assert!(park.success > 0 && park.range > 0 && inverse.success > 0 && inverse.range > 0);
++    assert!(inverse_clarke.success > 0 && inverse_clarke.range > 0);
++    println!("park={park:?}; inverse_park={inverse:?}; inverse_clarke={inverse_clarke:?}");
++}
++
++#[test]
++fn clarke_full_endpoint_matrix_preserves_balance_priority_and_widening() {
++    let intervals = intervals();
++    let mut stats = Outcomes::default();
++    for &a in &intervals {
++        for &b in &intervals {
++            for &c in &intervals {
++                let value = Phase3 { a, b, c };
++                for bound in [Q30::from_bits(-1), Q30::ZERO, Q30::from_bits(i32::MAX)] {
++                    if let Some(output) = stats.check(
++                        shared::clarke(value, bound),
++                        alumina_foc::clarke(value, bound),
++                    ) {
++                        clarke_oracle(value, output);
++                    }
++                }
++            }
++        }
++    }
++    assert!(stats.success > 0 && stats.range > 0 && stats.unbalanced > 0);
++    println!("clarke={stats:?}");
++}
++
++#[test]
++fn original_hard_cases_preclude_dense_or_prerounded_rewrites() {
++    use hyperlattice_interval::{IntervalMatrix, IntervalVector, hyperinterval::FixedInterval};
++    type I = FixedInterval<i32, 30>;
++    let p = |x| I::point(x).unwrap();
++    let r = Rotation::new(Q::point(Q30::NEG_ONE), Q::ZERO, Q30::ZERO).unwrap();
++    let value = AlphaBeta {
++        alpha: q(i32::MIN, i32::MIN),
++        beta: Q::ZERO,
++    };
++    assert_eq!(shared::park(value, r), Err(FocError::Range));
++    assert_eq!(alumina_foc::park(value, r), Err(FocError::Range));
++    let dense = IntervalMatrix::new([[p(0), p(-(1 << 30))], [p(1 << 30), p(0)]])
++        .unwrap()
++        .mul_vector(&IntervalVector::new([p(i32::MIN), p(0)]).unwrap(), &mut ())
++        .unwrap();
++    assert_eq!(dense.lanes().unwrap(), &[p(0), p(i32::MIN)]);
++    let phases = Phase3 {
++        a: Q::ONE,
++        b: Q::ZERO,
++        c: Q::point(Q30::NEG_ONE),
++    };
++    let actual = shared::clarke(phases, Q30::ZERO).unwrap();
++    assert_eq!(actual.alpha, Q::ONE);
++    let dense = IntervalMatrix::new([[
++        I::from_ratio(2, 3).unwrap(),
++        I::from_ratio(-1, 3).unwrap(),
++        I::from_ratio(-1, 3).unwrap(),
++    ]])
++    .unwrap()
++    .mul_vector(
++        &IntervalVector::new([p(1 << 30), p(0), p(-(1 << 30))]).unwrap(),
++        &mut (),
++    )
++    .unwrap();
++    assert_eq!(
++        dense.lanes().unwrap()[0].bounds(),
++        Some(((1 << 30) - 1, (1 << 30) + 1))
++    );
++    // b-c exceeds i32 while the scaled beta is representable.
++    let phases = Phase3 {
++        a: Q::ZERO,
++        b: q(5 << 28, 5 << 28),
++        c: q(-(5 << 28), -(5 << 28)),
++    };
++    let actual = shared::clarke(phases, Q30::ZERO).unwrap();
++    assert_eq!(actual, alumina_foc::clarke(phases, Q30::ZERO).unwrap());
++    assert_eq!(actual.beta, q(1_549_812_827, 1_549_812_830));
++    clarke_oracle(phases, actual);
++    // Validate the authored radical enclosures independently in integers.
++    let [lo, hi] = endpoints(alumina_foc::INV_SQRT_3);
++    assert!(3 * lo * lo < SCALE * SCALE && 3 * hi * hi > SCALE * SCALE);
++    let [lo, hi] = endpoints(alumina_foc::SQRT_3_OVER_2);
++    assert!(4 * lo * lo < 3 * SCALE * SCALE && 4 * hi * hi > 3 * SCALE * SCALE);
++}
++
++#[test]
++fn completed_chains_keep_each_intermediate_and_contain_source() {
++    for index in 0..64 {
++        let sample = shared::samples::sample(index);
++        let a = shared::clarke(sample.phases, shared::samples::BALANCE).unwrap();
++        assert_eq!(
++            a,
++            alumina_foc::clarke(sample.phases, shared::samples::BALANCE).unwrap()
++        );
++        let dq = shared::park(a, sample.rotation).unwrap();
++        assert_eq!(dq, alumina_foc::park(a, sample.rotation).unwrap());
++        let b = shared::inverse_park(dq, sample.rotation).unwrap();
++        assert_eq!(b, alumina_foc::inverse_park(dq, sample.rotation).unwrap());
++        let phases = shared::inverse_clarke(b).unwrap();
++        assert_eq!(phases, alumina_foc::inverse_clarke(b).unwrap());
++        let again = shared::clarke(phases, Q30::from_bits(1 << 20)).unwrap();
++        assert_eq!(
++            again,
++            alumina_foc::clarke(phases, Q30::from_bits(1 << 20)).unwrap()
++        );
++        for (source, returned) in [
++            (sample.phases.a, phases.a),
++            (sample.phases.b, phases.b),
++            (sample.phases.c, phases.c),
++        ] {
++            assert!(
++                returned.lower().bits() <= source.lower().bits()
++                    && returned.upper().bits() >= source.upper().bits()
++            );
++        }
++    }
++}
++
++fn generated(state: &mut u64) -> Q {
++    let mut next = || {
++        *state ^= *state << 13;
++        *state ^= *state >> 7;
++        *state ^= *state << 17;
++        *state as i32
++    };
++    let a = next();
++    let b = next();
++    q(a.min(b), a.max(b))
++}
++
++#[test]
++fn seeded_full_width_intervals_match_native_and_exact_corners() {
++    let mut state = 20_261_112_u64;
++    let rotations = rotations();
++    let mut stats = Outcomes::default();
++    for index in 0..20_000 {
++        let a = generated(&mut state);
++        let b = generated(&mut state);
++        let c = generated(&mut state);
++        let r = rotations[index % rotations.len()];
++        let value = AlphaBeta { alpha: a, beta: b };
++        if let Some(out) = stats.check(shared::park(value, r), alumina_foc::park(value, r)) {
++            park_oracle(value, r, out);
++        }
++        let dq = DqInterval { d: a, q: b };
++        if let Some(out) = stats.check(
++            shared::inverse_park(dq, r),
++            alumina_foc::inverse_park(dq, r),
++        ) {
++            inverse_park_oracle(dq, r, out);
++        }
++        if let Some(out) = stats.check(
++            shared::inverse_clarke(value),
++            alumina_foc::inverse_clarke(value),
++        ) {
++            inverse_clarke_oracle(value, out);
++        }
++        let phases = Phase3 { a, b, c };
++        let bound = Q30::from_bits(i32::MAX);
++        if let Some(out) = stats.check(
++            shared::clarke(phases, bound),
++            alumina_foc::clarke(phases, bound),
++        ) {
++            clarke_oracle(phases, out);
++        }
++    }
++    assert!(stats.success > 0 && stats.range > 0 && stats.unbalanced > 0);
++    println!("seed=20261112; random_transforms={stats:?}");
++}
++
++#[test]
++fn primitive_and_widened_products_divisions_match_exact_rational_corners() {
++    use hyperlattice_interval::hyperinterval::{FixedInterval, IntervalError};
++    type I = FixedInterval<i32, 30>;
++    fn fixed_result(result: Result<I, IntervalError>) -> Result<Q, FocError> {
++        match result {
++            Ok(i) => {
++                let (a, b) = i.bounds().unwrap();
++                Ok(q(a, b))
++            }
++            Err(IntervalError::Overflow) => Err(FocError::Range),
++            Err(IntervalError::ContainsZero) => Err(FocError::DivideByZero),
++            Err(e) => panic!("unexpected {e:?}"),
++        }
++    }
++    fn rounded(lo: (i128, i128), hi: (i128, i128)) -> Result<Q, FocError> {
++        let lower = lo.0.div_euclid(lo.1);
++        let upper = hi.0.div_euclid(hi.1) + i128::from(hi.0.rem_euclid(hi.1) != 0);
++        Ok(q(
++            i32::try_from(lower).map_err(|_| FocError::Range)?,
++            i32::try_from(upper).map_err(|_| FocError::Range)?,
++        ))
++    }
++    fn check(a: Q, b: Q) {
++        let i = I::new(a.lower().bits(), a.upper().bits()).unwrap();
++        let j = I::new(b.lower().bits(), b.upper().bits()).unwrap();
++        let wide_i = i.convert::<i64>().unwrap();
++        let wide_j = j.convert::<i64>().unwrap();
++        let products: Vec<_> = endpoints(a)
++            .into_iter()
++            .flat_map(|x| endpoints(b).map(|y| x * y))
++            .collect();
++        let exact = rounded(
++            (*products.iter().min().unwrap(), SCALE),
++            (*products.iter().max().unwrap(), SCALE),
++        );
++        assert_eq!(fixed_result(i.checked_mul(&j)), exact);
++        assert_eq!(a.checked_mul(b), exact);
++        assert_eq!(
++            fixed_result(wide_i.checked_mul(&wide_j).and_then(|v| v.convert::<i32>())),
++            exact
++        );
++        let exact = if b.contains(Q30::ZERO) {
++            Err(FocError::DivideByZero)
++        } else {
++            let mut quotients: Vec<_> = endpoints(a)
++                .into_iter()
++                .flat_map(|x| endpoints(b).map(move |y| (x * SCALE * y.signum(), y.abs())))
++                .collect();
++            quotients.sort_by(|a, b| (a.0 * b.1).cmp(&(b.0 * a.1)));
++            rounded(quotients[0], quotients[3])
++        };
++        assert_eq!(fixed_result(i.checked_div(&j)), exact);
++        assert_eq!(a.checked_div(b), exact);
++        assert_eq!(
++            fixed_result(wide_i.checked_div(&wide_j).and_then(|v| v.convert::<i32>())),
++            exact
++        );
++    }
++    let values = intervals();
++    for &a in &values {
++        for &b in &values {
++            check(a, b);
++        }
++    }
++    let mut state = 20_261_112_u64;
++    for _ in 0..10_000 {
++        let a = generated(&mut state);
++        let b = generated(&mut state);
++        check(a, b);
++    }
++    println!(
++        "primitive_pairs=12025; operations=product,division; narrow_and_wide=true; seed=20261112"
++    );
++}
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.lock b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.lock
+new file mode 100644
+index 000000000..801a2c207
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.lock
+@@ -0,0 +1,41 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "alumina-foc"
++version = "0.1.0"
++dependencies = [
++ "alumina-protocol",
++]
++
++[[package]]
++name = "alumina-protocol"
++version = "0.1.0"
++
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
++[[package]]
++name = "interval-foc-conformance"
++version = "0.0.0"
++dependencies = [
++ "alumina-foc",
++ "hyperlattice-interval",
++]
++
++[[package]]
++name = "interval-foc-wasm-consumer"
++version = "0.0.0"
++dependencies = [
++ "alumina-foc",
++ "interval-foc-conformance",
++]
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.toml b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.toml
+new file mode 100644
+index 000000000..57995d33d
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/Cargo.toml
+@@ -0,0 +1,19 @@
++[package]
++name = "interval-foc-wasm-consumer"
++version = "0.0.0"
++edition = "2024"
++rust-version = "1.88"
++publish = false
++
++[workspace]
++
++[lib]
++path = "lib.rs"
++crate-type = ["cdylib"]
++
++[dependencies]
++interval-foc-conformance = { path = ".." }
++alumina-foc = { path = "../../../../../../alumina-firmware/crates/alumina-foc" }
++
++[profile.release]
++panic = "abort"
+diff --git a/crates/hyperlattice-interval/conformance/alumina-foc/wasm/lib.rs b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/lib.rs
+new file mode 100644
+index 000000000..8e6d9e283
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/alumina-foc/wasm/lib.rs
+@@ -0,0 +1,38 @@
++//! Allocator-free Wasm consumer exercising both implementations at runtime.
++#![no_std]
++use alumina_foc::{AlphaBeta, FocError, Q30, Q30Interval};
++use interval_foc_conformance::{self as shared, samples};
++
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
++    loop {
++        core::hint::spin_loop();
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn conformance_probe(index: u32, action: u32) -> u64 {
++    let sample = samples::sample(index);
++    let action = samples::ACTIONS[action as usize % samples::ACTIONS.len()];
++    let native = samples::native(action, sample).unwrap();
++    let shared = samples::shared(action, sample).unwrap();
++    assert_eq!(shared, native);
++    shared.digest(0xcbf29ce484222325)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn range_probe(alpha: i32, beta: i32, rotation: u32) -> i32 {
++    let value = AlphaBeta {
++        alpha: Q30Interval::point(Q30::from_bits(alpha)),
++        beta: Q30Interval::point(Q30::from_bits(beta)),
++    };
++    let r = samples::sample(rotation % 5).rotation;
++    let native = alumina_foc::park(value, r);
++    let shared = shared::park(value, r);
++    assert_eq!(shared, native);
++    match shared {
++        Ok(_) => 0,
++        Err(FocError::Range) => 1,
++        Err(_) => panic!("unexpected error"),
++    }
++}
