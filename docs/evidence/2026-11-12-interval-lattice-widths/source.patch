@@ -1,0 +1,1467 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index e82ff3b28..66a950bc5 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -1960,6 +1960,118 @@ No phase is complete and no push was attempted. Source commit:
+ `6f9d27889d8f0115360e0f052fc31d645d932e0b85ef63b2b3d22c86a85e1a2e`. The committed record was regenerated
+ and verified before registration; all prior archive rows are preserved.
+ 
++## Phase 6 admission: exact box widths and widest-axis selection
++
++Previous goal turn made progress: norms/measures/margins and evidence committed.
++Revalidated source `6768c26ae0f995973834e50be761e1fe2969c242`, with all four
++managed repositories clean on interval-refactor. Exact states and raw evidence
++are staged at `/tmp/interval-refactor/lattice-widths`. No nested owning AGENTS
++instructions. Reuse search found fixed width_ulps, rational/dyadic exact width,
++the shared integer IEEE decoder and budgeted dyadic_order::compare. No box
++width/widest-axis API exists, and strict float endpoints cannot represent every
++exact width. Full fixed signed-range widths also exceed signed endpoint storage.
++
++Owners: Hyperinterval exact scalar measurements/order; Hyperlattice coordinate
++selection. Properties P1–P6, P8–P11, P17–P20, P25–P27, P35–P39; plan §5.2.
++Domain: every admitted finite Cartesian box, including empty/unit products,
++singletons, full endpoint ranges and arbitrary exact rational/dyadic data.
++Fixed widths use a scale-tagged u64 numerator. Float widths retain their checked
++endpoint difference, with mathematical value ordering independent of defining
++interval position. Compare two widths by the exact signed sum b+c-a-d using
++bounded integer limbs and the existing IEEE decoder; no native float decisions,
++rounded width comparison, allocation or new scalar kernel in an adapter.
++Rational/dyadic width values remain exact singleton intervals; dyadic point
++comparison reuses existing budgeted ordering without expanding irrelevant gaps.
++
++Box widths return None for empty and Some([]) for the zero-dimensional unit;
++widest-axis returns None for either case. Nonempty positive dimension selects
++the lowest-index maximum, including index zero when every width is zero.
++Every dyadic construction/comparison uses one caller context and failure yields
++no partial selection. Primitive work/storage is dimension/encoding bounded and
++allocation-free. Float ingress keeps its existing target qualification. Exact
++widths remain usable when optional projection into endpoint storage overflows.
++Replay validates definitions/scales, not cached flags; equality of width values
++is separate from byte identity of different defining float intervals.
++
++Missing witnesses: full-range fixed widths, float overflow/subnormal/tiny width
++differences and exact ties invisible to rounded subtraction, independent exact
++integer/Rug comparisons, mixed exponent dyadic selection and budget retry,
++empty/unit/singleton/tie behavior, output-as-input and fresh-process replay,
++primitive no-allocation and portable builds. Existing arithmetic and predicate
++order must remain unchanged. Width facts supply scheduling evidence; no solver
++status or implicit midpoint is introduced. General cancellation/rational heap
++bounds and the remaining Phase 6/full-plan requirements stay open.
++
++## Phase 6 exact widths: local qualification
++
++Implemented exact coordinate widths and deterministic widest-axis selection for
++all six backends. `FixedWidth<F>` retains an unsigned numerator and binary scale;
++`F32Width`/`F64Width` retain defining endpoints and compare mathematical distances
++with bounded integer sums. Explicit projection can widen or overflow without
++losing the exact width. Rational/dyadic widths are singleton intervals. Dyadic
++singleton comparison shares the existing order kernel and caller budget.
++`IntervalVector::widths` and `widest_axis` preserve empty/unit distinctions and
++lowest-index ties. No solver status, midpoint, native float subtraction or
++replacement of the retained source is introduced. Float nonempty ingress remains
++qualified only on x86_64; this work does not qualify another float target.
++
++Acceptance: 3,375 independently expected boxes per backend; 12,025 GMP rational
++width comparisons per IEEE format; full fixed ranges, translated equal widths,
++rounded-projection ties, projection overflow, subnormals, invalid replay,
++shared dyadic work/size failures and retry, extreme exponent gaps, fresh-process
++save/reload and further consumption. All 16 x86 rounding/FTZ/DAZ combinations
++pass, including optimized builds on Rust 1.88, 1.95 and stable. The final lattice
++suite has 52 tests and four doctests; the scalar all-feature suite also passes.
++All 56 selected local/downstream commands pass: feature isolation, Clippy with
++warnings denied, docs, formatting, release tests, five main-facade tests, four
++existing Hypersolve migration/dispatch tests, packaging/dependency checks, and
++ARM/Wasm builds. This is not the complete pre-push workflow set. No push.
++
++Sanitizer evidence is deliberately scoped. Scalar width/float tests (24) and
++all lattice integration tests (52) pass ASan with leak detection. A broader
++scalar run stops after five successful arctangent tests with 1,576 leaked bytes
++in three MPFR cache allocations. The same failure reproduces on unchanged
++baseline `6768c26`; symbolized frames identify `mpfr_cache`, `mpfr_atan` and
++Rug's pi/atan oracle paths. Test-oracle cache cleanup remains open; the broad
++sanitizer run is not a pass. A cross-worktree shared-target stale artifact caused
++one focused compile failure; targeted package-cache cleanup and rebuild resolved
++it, with both records retained. The initial baseline attempt without an explicit
++sanitizer target also failed in proc-macro compilation; the explicit-target
++baseline reproduction is the controlling result.
++
++Instrumented owner coverage reports 5,230/5,331 lines (98.11%), 9,717/10,360
++regions (93.79%), and 650/652 functions. The new lattice widths file has 31/31
++lines and 49/50 regions. LLVM reports ten mismatches, all traced separately to
++the same external Rug `OptRational::parts` function (hash zero), which is outside
++the declared report denominator. Raw warnings and per-object diagnostics remain;
++this is owner coverage with a dependency warning, not a warning-free aggregate
++or 100% claim. Directed fuzz and broader qualification remain open.
++
++Completed-work cost probe: 160 samples across four backends and two queries,
++128 calls/sample after 64 warmups, dimension four. Fixed Q16 and strict f64
++allocate zero; measured rational small integers also allocate zero, which does
++not bound general rational data. Dyadic widths/selection use 6/7 allocation
++calls and 48/56 bytes per measured call. Inline source/width-array bytes are
++48/32 fixed, 96/64 f64, 72/64 rational, 288/288 dyadic; these are not peak stack
++or retained-heap measurements. No speedup or full legacy benchmark claim.
++The five-export no_std Wasm consumer has no imports/allocator and passes 2,051
++width calls over 256 effective inputs, alongside all previous probes, under a
++one-million-fuel per-call cap. It is 44,726 bytes, SHA-256
++`a2aa1b70e2a0528852146afd52d2aea03f97cbe55b96881ea7af7858d2c57324`.
++Its extra export changes the workload; the 5,134-byte increase is not a
++same-contract comparison. No firmware HIL or registry-release claim.
++
++Source preservation records show 47 existing implementation files byte-identical
++and every original function body/signature in the six edited implementation
++units retained, including the IEEE finite-ingress inline barrier. New paths are
++additive; existing dispatch order, Real APIs, geometry certainty and production
++consumers are unchanged. Full legacy geometry/performance/monomorphized-size
++qualification remains open rather than inferred from source identity.
++
++Source/evidence registration pending for this checkpoint. Phase 6 still needs
++midpoint/radius forms, contraction/Jacobian/Krawczyk helpers, specialized consumer
++kernels and further qualification. No phase or full-plan completion is claimed.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index bc5871876..53300bb9e 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add scale-tagged unsigned fixed widths and retained exact IEEE widths with
++  bounded integer value ordering, checked replay and explicit projection.
++- Expose budgeted dyadic singleton comparison using existing exact point order.
++
+ - Add rational, dyadic and extended dyadic tangent/cotangent images with
+   certified interior and endpoint poles, one-sided limits, split components
+   and explicit domain coverage. Reuse the existing trigonometric proof helpers.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 05a74bc90..11cac4f41 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -190,3 +190,10 @@ cargo run -p hyperinterval --example fixed_bounds --features fixed
+ See the [API proposal](../../docs/research/interval-api-design.md) and
+ [progress record](../../INTERVAL_REFACTOR_PROGRESS.md) for acceptance evidence
+ and the remaining implementation scope.
++
++Exact width measurements preserve values outside endpoint storage: `FixedWidth<F>`
++uses an unsigned numerator with a binary scale, and `F32Width`/`F64Width` retain
++checked endpoint differences. Float width ordering is exact integer arithmetic;
++`enclosure` is an explicit, fallible projection. Rational and dyadic intervals
++retain their exact width operations. `DyadicInterval::compare_singleton` shares
++caller-owned work/size accounting and rejects non-singleton operands.
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 677b4c061..8873cf371 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -205,6 +205,27 @@ impl DyadicInterval {
+         Self::point(mantissa.clone(), exponent)?.subset_of(self, budget)
+     }
+ 
++    /// Exact comparison of singleton values, sharing the caller's work/size
++    /// budget and avoiding alignment of irrelevant exponent gaps. With sufficient
++    /// budget, empty or nonsingleton operands return `NonSingletonEndpoint`.
++    pub fn compare_singleton(
++        &self,
++        other: &Self,
++        budget: &mut DyadicBudget,
++    ) -> Result<core::cmp::Ordering, IntervalError> {
++        let Some((a, b, e)) = self.bounds() else {
++            return Err(IntervalError::NonSingletonEndpoint);
++        };
++        let Some((c, d, f)) = other.bounds() else {
++            return Err(IntervalError::NonSingletonEndpoint);
++        };
++        budget.reserve(self.bits().max(other.bits()), 2, false)?;
++        if a != b || c != d {
++            return Err(IntervalError::NonSingletonEndpoint);
++        }
++        crate::dyadic_order::compare(a, e, c, f, budget)
++    }
++
+     /// Exact endpoint distance as a singleton interval; empty for empty input.
+     pub fn width(&self, budget: &mut DyadicBudget) -> Result<Self, IntervalError> {
+         self.measure(true, false, budget)
+diff --git a/crates/hyperinterval/src/fixed.rs b/crates/hyperinterval/src/fixed.rs
+index 05453f9dd..485243c8a 100644
+--- a/crates/hyperinterval/src/fixed.rs
++++ b/crates/hyperinterval/src/fixed.rs
+@@ -118,3 +118,48 @@ impl<'de, I: FixedEndpoint + serde::Deserialize<'de>, const FRAC: u32> serde::De
+         .map_err(serde::de::Error::custom)
+     }
+ }
++
++/// An exact nonnegative width `numerator / 2^FRAC`, including a full signed range.
++///
++/// Unlike a signed interval endpoint, this stores every u64 lattice distance.
++/// Equality and ordering compare mathematical values within the fixed scale.
++/// Serialization stores the numerator; the receiving type supplies the scale.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
++pub struct FixedWidth<const FRAC: u32> {
++    numerator: u64,
++}
++impl<const FRAC: u32> FixedWidth<FRAC> {
++    /// Constructs a width, requiring the shared fixed families' `FRAC < 64`.
++    pub fn new(numerator: u64) -> Result<Self, IntervalError> {
++        if FRAC >= 64 {
++            return Err(IntervalError::InvalidScale);
++        }
++        Ok(Self { numerator })
++    }
++    /// Exact distance in units of `2^-FRAC`, with no signed narrowing.
++    pub const fn numerator(&self) -> u64 {
++        self.numerator
++    }
++    /// Number of binary fractional places in this value's type.
++    pub const fn fraction_bits(&self) -> u32 {
++        FRAC
++    }
++    /// Exact singleton projection into the signed i64 fixed family, or typed
++    /// overflow. Failure leaves this exact unsigned width available for use.
++    pub fn to_interval(&self) -> Result<FixedInterval<i64, FRAC>, IntervalError> {
++        let numerator = i64::try_from(self.numerator).map_err(|_| IntervalError::Overflow)?;
++        FixedInterval::<i64, FRAC>::point(numerator)
++    }
++}
++#[cfg(feature = "serde")]
++impl<const F: u32> serde::Serialize for FixedWidth<F> {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.numerator.serialize(serializer)
++    }
++}
++#[cfg(feature = "serde")]
++impl<'de, const F: u32> serde::Deserialize<'de> for FixedWidth<F> {
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
++    }
++}
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index 20cab4b78..52628f944 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -76,6 +76,13 @@ macro_rules! arithmetic {
+                     .map(|(lower, upper)| (i128::from(upper) - i128::from(lower)) as u64)
+             }
+ 
++            /// Exact scale-tagged unsigned endpoint distance; empty has no width.
++            /// This includes widths larger than either signed endpoint can hold.
++            pub fn width(&self) -> Option<crate::FixedWidth<FRAC>> {
++                self.width_ulps()
++                    .map(|n| crate::FixedWidth::new(n).expect("source scale is valid"))
++            }
++
+             /// Changes scale with exact refinement or outward-rounded coarsening.
+             ///
+             /// No exact source point is lost. Refinement can overflow the
+diff --git a/crates/hyperinterval/src/float.rs b/crates/hyperinterval/src/float.rs
+index c8bf153d4..60b20a07d 100644
+--- a/crates/hyperinterval/src/float.rs
++++ b/crates/hyperinterval/src/float.rs
+@@ -12,7 +12,7 @@ fn qualify() -> Result<(), IntervalError> {
+ }
+ 
+ macro_rules! enclosure {
+-    ($name:ident, $endpoint:ident, $float:ty, $bits:ty, $format:ident) => {
++    ($name:ident, $endpoint:ident, $float:ty, $bits:ty, $format:ident, $width:ident, $limbs:literal) => {
+         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+         struct $endpoint($bits);
+ 
+@@ -54,6 +54,71 @@ let enclosure: F64Enclosure = proposal.into();
+             bounds: Option<Bounds<$endpoint>>,
+         }
+ 
++        /// Exact nonnegative endpoint distance of a checked finite interval.
++        ///
++        /// Retains the defining endpoints, including widths above the largest
++        /// finite float or between its grid points. `Ord`/`Eq` compare exact
++        /// width values by bounded integer arithmetic, independent of ambient
++        /// float state. Different definitions of equal widths can serialize
++        /// differently; serialization preserves the definition, not a canonical
++        /// mathematical-value encoding. No allocator or native float arithmetic.
++        #[derive(Clone, Copy, Debug)]
++        pub struct $width {
++            bounds: Bounds<$endpoint>,
++        }
++        impl $width {
++            /// Exact interval whose endpoint difference defines this width.
++            pub fn defining_interval(&self) -> $name {
++                $name {
++                    bounds: Some(self.bounds),
++                }
++            }
++            /// Explicit outward projection into the finite endpoint family.
++            /// Overflow is typed; the retained exact width remains unchanged.
++            pub fn enclosure(&self) -> Result<$name, IntervalError> {
++                let (a, b) = self.bounds.endpoints();
++                let (lo, hi) = $format.add(u64::from(b.0), $format.negate(u64::from(a.0)))?;
++                $name::from_bits(lo, hi)
++            }
++        }
++        impl Ord for $width {
++            fn cmp(&self, other: &Self) -> Ordering {
++                let (a, b) = self.bounds.endpoints();
++                let (c, d) = other.bounds.endpoints();
++                $format.compare_width::<$limbs>(
++                    u64::from(a.0),
++                    u64::from(b.0),
++                    u64::from(c.0),
++                    u64::from(d.0),
++                )
++            }
++        }
++        impl PartialOrd for $width {
++            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++                Some(self.cmp(other))
++            }
++        }
++        impl PartialEq for $width {
++            fn eq(&self, other: &Self) -> bool {
++                self.cmp(other) == Ordering::Equal
++            }
++        }
++        impl Eq for $width {}
++        #[cfg(feature = "serde")]
++        impl serde::Serialize for $width {
++            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++                self.defining_interval().serialize(serializer)
++            }
++        }
++        #[cfg(feature = "serde")]
++        impl<'de> serde::Deserialize<'de> for $width {
++            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++                $name::deserialize(deserializer)?
++                    .width()
++                    .ok_or_else(|| serde::de::Error::custom(IntervalError::EmptyDomain))
++            }
++        }
++
+         impl $name {
+             /// Whether the integer IEEE backend is qualified on this target.
+             /// This does not query or change ambient rounding state.
+@@ -120,6 +185,13 @@ let enclosure: F64Enclosure = proposal.into();
+                 })
+             }
+ 
++            /// Exact endpoint distance, retained without subtraction or rounding.
++            /// Empty has no width. Use the width's explicit `enclosure` method
++            /// only when a finite floating-point interval projection is wanted.
++            pub fn width(&self) -> Option<$width> {
++                self.bounds.map(|bounds| $width { bounds })
++            }
++
+             /// Exact lower endpoint, or None for empty.
+             pub fn lower(&self) -> Option<$float> {
+                 self.bounds().map(|v| v.0)
+@@ -479,5 +551,5 @@ let enclosure: F64Enclosure = proposal.into();
+     };
+ }
+ 
+-enclosure!(F32Enclosure, Binary32, f32, u32, BINARY32);
+-enclosure!(F64Enclosure, Binary64, f64, u64, BINARY64);
++enclosure!(F32Enclosure, Binary32, f32, u32, BINARY32, F32Width, 5);
++enclosure!(F64Enclosure, Binary64, f64, u64, BINARY64, F64Width, 33);
+diff --git a/crates/hyperinterval/src/ieee.rs b/crates/hyperinterval/src/ieee.rs
+index d174a6c3a..622645a16 100644
+--- a/crates/hyperinterval/src/ieee.rs
++++ b/crates/hyperinterval/src/ieee.rs
+@@ -119,6 +119,45 @@ impl Format {
+         )
+     }
+ 
++    // Compare (b-a) with (d-c) via b+c-a-d. Each finite endpoint is an
++    // integer on the format's minimum grid. Four binary64 magnitudes sum to
++    // fewer than 2^2100 grid units (33 u64 limbs); binary32 needs 279 bits
++    // (5 limbs). Keep positive/negative sums separately, then compare them.
++    // No rounding, floating-point operations or allocation is involved.
++    pub(crate) fn compare_width<const L: usize>(self, a: u64, b: u64, c: u64, d: u64) -> Ordering {
++        let mut positive = [0_u64; L];
++        let mut negative = [0_u64; L];
++        for (bits, subtract) in [(b, false), (c, false), (a, true), (d, true)] {
++            let value = self.decode(bits);
++            let sum = if value.negative ^ subtract {
++                &mut negative
++            } else {
++                &mut positive
++            };
++            let shift = (value.exponent - self.minimum()) as usize;
++            let word = shift / 64;
++            let shifted = value.magnitude << (shift % 64);
++            for (offset, piece) in [shifted as u64, (shifted >> 64) as u64]
++                .into_iter()
++                .enumerate()
++            {
++                if piece == 0 {
++                    continue;
++                }
++                let mut index = word + offset;
++                let (next, mut carry) = sum[index].overflowing_add(piece);
++                sum[index] = next;
++                while carry {
++                    index += 1;
++                    let (next, next_carry) = sum[index].overflowing_add(1);
++                    sum[index] = next;
++                    carry = next_carry;
++                }
++            }
++        }
++        positive.iter().rev().cmp(negative.iter().rev())
++    }
++
+     // A coefficient on an output grid; magnitude has at most F+2 bits,
+     // and any extra bit is the carry from rounding into the next binade.
+     fn encode(self, magnitude: u128, grid: i32) -> Result<u64, IntervalError> {
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index b6a0555dd..667b5daec 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -1,8 +1,9 @@
+ //! Scalar sets with explicit empty states, exact endpoints and checked ingress.
+ //!
+ //! Hyperinterval encloses; Hyperlimit decides; Hypersolve certifies. A set
+-//! containing zero is not evidence that an exact point equals zero. No carrier
+-//! implements scalar ordering or implicitly selects a midpoint.
++//! containing zero is not evidence that an exact point equals zero. Set carriers
++//! do not implement scalar ordering or implicitly select a midpoint. Exact width
++//! values have a separate measurement contract and mathematical value ordering.
+ //!
+ //! The default build is allocation-free `no_std`. `integer` enables discrete
+ //! integer sets; `fixed` enables closed real intervals on an exact binary
+@@ -68,7 +69,7 @@ pub use split::IntervalSet2;
+ #[cfg(feature = "dyadic")]
+ pub use dyadic::{DyadicBudget, DyadicInterval};
+ #[cfg(feature = "fixed")]
+-pub use fixed::{FixedEndpoint, FixedInterval};
++pub use fixed::{FixedEndpoint, FixedInterval, FixedWidth};
+ #[cfg(feature = "integer")]
+ pub use integer::{IntegerEndpoint, IntegerRange};
+ #[cfg(feature = "float-proposal")]
+@@ -80,4 +81,4 @@ pub use real_ball::{BallRelation, RealBall};
+ pub use state::{DomainCoverage, IntervalError, MidpointRounding, RangeEnclosure, SignSet};
+ 
+ #[cfg(feature = "float-enclosure")]
+-pub use float::{F32Enclosure, F64Enclosure};
++pub use float::{F32Enclosure, F32Width, F64Enclosure, F64Width};
+diff --git a/crates/hyperinterval/tests/float.rs b/crates/hyperinterval/tests/float.rs
+index c3fba8f26..d00bfc543 100644
+--- a/crates/hyperinterval/tests/float.rs
++++ b/crates/hyperinterval/tests/float.rs
+@@ -810,3 +810,45 @@ fn exact_bridges_preserve_ieee_values_and_generated_enclosures() {
+             .subset_of(&x.square().unwrap().to_rational())
+     );
+ }
++
++#[cfg(all(target_arch = "x86_64", not(target_env = "msvc")))]
++#[test]
++fn exact_widths_ignore_native_modes() {
++    const KEY: &str = "HYPERINTERVAL_WIDTH_MXCSR";
++    if let Ok(mode) = std::env::var(KEY) {
++        let mode = mode.parse().unwrap();
++        with_mxcsr(mode, || {
++            macro_rules! check {
++                ($i:ty,$f:ty) => {{
++                    let tiny = std::hint::black_box(<$f>::from_bits(1));
++                    let twice = std::hint::black_box(<$f>::from_bits(2));
++                    let one = std::hint::black_box(1.0 as $f);
++                    let a = <$i>::new(tiny, one).unwrap().width().unwrap();
++                    let b = <$i>::new(twice, one).unwrap().width().unwrap();
++                    assert!(a > b);
++                    assert_eq!(a.enclosure().unwrap(), b.enclosure().unwrap());
++                    let wide = <$i>::new(-<$f>::MAX, <$f>::MAX).unwrap().width().unwrap();
++                    assert!(wide > a);
++                    assert_eq!(wide.enclosure(), Err(IntervalError::Overflow));
++                }};
++            }
++            check!(F32Enclosure, f32);
++            check!(F64Enclosure, f64);
++        });
++        return;
++    }
++    for mode in 0..16 {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", "exact_widths_ignore_native_modes", "--nocapture"])
++            .env(KEY, mode.to_string())
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "mode={mode}: {} {}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        eprint!("{}", String::from_utf8_lossy(&output.stderr));
++    }
++}
+diff --git a/crates/hyperinterval/tests/widths.rs b/crates/hyperinterval/tests/widths.rs
+new file mode 100644
+index 000000000..e8f03929b
+--- /dev/null
++++ b/crates/hyperinterval/tests/widths.rs
+@@ -0,0 +1,225 @@
++#[cfg(feature = "fixed")]
++#[test]
++fn fixed_widths_preserve_unsigned_range_and_scale() {
++    use hyperinterval::{FixedInterval as I, FixedWidth, IntervalError};
++    let full = I::<i64, 63>::new(i64::MIN, i64::MAX)
++        .unwrap()
++        .width()
++        .unwrap();
++    assert_eq!(full.numerator(), u64::MAX);
++    assert_eq!(full.fraction_bits(), 63);
++    assert_eq!(full.to_interval(), Err(IntervalError::Overflow));
++    assert_eq!(
++        I::<i32, 31>::new(i32::MIN, i32::MAX)
++            .unwrap()
++            .width()
++            .unwrap()
++            .numerator(),
++        u64::from(u32::MAX)
++    );
++    for a in -32..=32 {
++        for b in a..=32 {
++            let x = I::<i32, 7>::new(a, b).unwrap();
++            let w = x.width().unwrap();
++            assert_eq!(w.numerator(), (b - a) as u64);
++            assert_eq!(
++                w.to_interval().unwrap(),
++                I::<i64, 7>::point((b - a).into()).unwrap()
++            );
++            assert_eq!(w, FixedWidth::new((b - a) as u64).unwrap());
++        }
++    }
++    assert!(I::<i64, 0>::empty().unwrap().width().is_none());
++    assert_eq!(FixedWidth::<64>::new(0), Err(IntervalError::InvalidScale));
++    #[cfg(feature = "serde")]
++    {
++        let text = serde_json::to_string(&full).unwrap();
++        assert_eq!(serde_json::from_str::<FixedWidth<63>>(&text).unwrap(), full);
++        for bad in ["-1", "null", "1.5", "18446744073709551616"] {
++            assert!(serde_json::from_str::<FixedWidth<0>>(bad).is_err());
++        }
++        assert!(serde_json::from_str::<FixedWidth<64>>("0").is_err());
++    }
++}
++
++#[cfg(all(feature = "float-enclosure", target_arch = "x86_64"))]
++macro_rules! float_cases {
++    ($test:ident,$i:ty,$w:ty,$f:ty,$bits:ty,$infinity:expr,$fraction:expr,$from:ident) => {
++        #[test]
++        fn $test() {
++            use core::cmp::Ordering;
++            use hyperinterval::IntervalError;
++            let width = |a, b| <$i>::new(a, b).unwrap().width().unwrap();
++            let tiny = <$f>::from_bits(1);
++            let full = width(-<$f>::MAX, <$f>::MAX);
++            assert!(full > width(0., <$f>::MAX));
++            assert_eq!(full.enclosure(), Err(IntervalError::Overflow));
++            let a = width(tiny, 1.);
++            let b = width(<$f>::from_bits(2), 1.);
++            assert_eq!(a.enclosure().unwrap(), b.enclosure().unwrap());
++            assert!(a > b);
++            assert_eq!(width(-1., 0.), width(0., 1.));
++            assert_eq!(
++                width(-1., 0.).partial_cmp(&width(0., 1.)),
++                Some(Ordering::Equal)
++            );
++            assert!(<$i>::empty().width().is_none());
++            assert_eq!(
++                width(-tiny, tiny).enclosure().unwrap(),
++                <$i>::point(<$f>::from_bits(2)).unwrap()
++            );
++            assert_eq!(core::mem::size_of::<$w>(), 2 * core::mem::size_of::<$f>());
++            #[cfg(feature = "serde")]
++            {
++                let text = serde_json::to_string(&full).unwrap();
++                let replay: $w = serde_json::from_str(&text).unwrap();
++                assert_eq!(replay, full);
++                assert_eq!(serde_json::to_string(&replay).unwrap(), text);
++                assert_eq!(replay.defining_interval(), full.defining_interval());
++                let a = width(-1., 0.);
++                let b = width(0., 1.);
++                assert_eq!(a, b);
++                assert_ne!(
++                    serde_json::to_string(&a).unwrap(),
++                    serde_json::to_string(&b).unwrap()
++                );
++                for bad in ["null", "[]", "[0]", "[0,0,0]"] {
++                    assert!(serde_json::from_str::<$w>(bad).is_err());
++                }
++                let nonfinite =
++                    serde_json::to_string(&[$infinity as $bits, $infinity as $bits]).unwrap();
++                assert!(serde_json::from_str::<$w>(&nonfinite).is_err());
++                let reversed = serde_json::to_string(&[(1.0 as $f).to_bits(), 0 as $bits]).unwrap();
++                assert!(serde_json::from_str::<$w>(&reversed).is_err());
++            }
++            #[cfg(not(target_env = "msvc"))]
++            {
++                use rug::Rational;
++                let mut state = 0x9e3779b97f4a7c15_u64;
++                let mut next = || {
++                    state ^= state << 13;
++                    state ^= state >> 7;
++                    state ^= state << 17;
++                    let mut bits = state as $bits;
++                    if bits & ($infinity as $bits) == ($infinity as $bits) {
++                        bits ^= 1 << $fraction;
++                    }
++                    <$f>::from_bits(bits)
++                };
++                for index in 0..10_000 {
++                    let mut points = [next(), next(), next(), next()];
++                    if points[0].total_cmp(&points[1]).is_gt() {
++                        points.swap(0, 1);
++                    }
++                    if points[2].total_cmp(&points[3]).is_gt() {
++                        points.swap(2, 3);
++                    }
++                    let [a, b, c, d] = points;
++                    let expected = (Rational::$from(b).unwrap() - Rational::$from(a).unwrap())
++                        .cmp(&(Rational::$from(d).unwrap() - Rational::$from(c).unwrap()));
++                    assert_eq!(
++                        width(a, b).cmp(&width(c, d)),
++                        expected,
++                        "seed=9e3779b97f4a7c15 index={index} points={points:?}"
++                    );
++                }
++                let edges = [
++                    -<$f>::MAX,
++                    -1.,
++                    -<$f>::MIN_POSITIVE,
++                    -tiny,
++                    0.,
++                    tiny,
++                    <$f>::MIN_POSITIVE,
++                    1.,
++                    <$f>::MAX,
++                ];
++                for (i, &a) in edges.iter().enumerate() {
++                    for &b in &edges[i..] {
++                        for (j, &c) in edges.iter().enumerate() {
++                            for &d in &edges[j..] {
++                                let expected = (Rational::$from(b).unwrap()
++                                    - Rational::$from(a).unwrap())
++                                .cmp(&(Rational::$from(d).unwrap() - Rational::$from(c).unwrap()));
++                                assert_eq!(width(a, b).cmp(&width(c, d)), expected);
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    };
++}
++#[cfg(all(feature = "float-enclosure", target_arch = "x86_64"))]
++float_cases!(
++    binary32_exact_width_order,
++    hyperinterval::F32Enclosure,
++    hyperinterval::F32Width,
++    f32,
++    u32,
++    0x7f80_0000_u32,
++    23,
++    from_f32
++);
++#[cfg(all(feature = "float-enclosure", target_arch = "x86_64"))]
++float_cases!(
++    binary64_exact_width_order,
++    hyperinterval::F64Enclosure,
++    hyperinterval::F64Width,
++    f64,
++    u64,
++    0x7ff0_0000_0000_0000_u64,
++    52,
++    from_f64
++);
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn singleton_order_shares_budget_and_does_not_expand_exponent_gaps() {
++    use core::cmp::Ordering;
++    use hyperinterval::{DyadicBudget, DyadicInterval as I, IntervalError};
++    let p = |m: i32, e| I::point(m.into(), e).unwrap();
++    assert_eq!(
++        p(1, i32::MAX)
++            .compare_singleton(&p(1, i32::MIN), &mut DyadicBudget::new(8, 100))
++            .unwrap(),
++        Ordering::Greater
++    );
++    assert_eq!(
++        p(-1, i32::MAX)
++            .compare_singleton(&p(-1, i32::MIN), &mut DyadicBudget::new(8, 100))
++            .unwrap(),
++        Ordering::Less
++    );
++    let a = p(3, 4);
++    let b = p(5, 3);
++    let mut budget = DyadicBudget::new(32, 1000);
++    assert_eq!(
++        a.compare_singleton(&b, &mut budget).unwrap(),
++        Ordering::Greater
++    );
++    let used = 1000 - budget.remaining_work();
++    assert_eq!(
++        a.compare_singleton(&b, &mut DyadicBudget::new(32, used - 1)),
++        Err(IntervalError::WorkExhausted)
++    );
++    assert_eq!(
++        a.compare_singleton(&b, &mut DyadicBudget::new(32, used))
++            .unwrap(),
++        Ordering::Greater
++    );
++    assert_eq!(
++        a.compare_singleton(&b, &mut DyadicBudget::new(1, 1000)),
++        Err(IntervalError::SizeExhausted)
++    );
++    for invalid in [I::empty(), I::new(0.into(), 1.into(), 0).unwrap()] {
++        assert_eq!(
++            invalid.compare_singleton(&a, &mut DyadicBudget::new(32, 1000)),
++            Err(IntervalError::NonSingletonEndpoint)
++        );
++        assert_eq!(
++            a.compare_singleton(&invalid, &mut DyadicBudget::new(32, 1000)),
++            Err(IntervalError::NonSingletonEndpoint)
++        );
++    }
++}
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index 089a038eb..cdb139bdd 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact box widths and deterministic widest-axis selection, preserving full
++  fixed-point distances and retained IEEE differences with shared dyadic budgets.
++
+ - Add vector/matrix one and infinity norm ranges, logarithmic matrix measures
+   and row/column diagonal-dominance margins using shared scalar accounting.
+ 
+diff --git a/crates/hyperlattice-interval/Cargo.toml b/crates/hyperlattice-interval/Cargo.toml
+index d727aecdf..dce09ef07 100644
+--- a/crates/hyperlattice-interval/Cargo.toml
++++ b/crates/hyperlattice-interval/Cargo.toml
+@@ -51,3 +51,8 @@ required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
+ name = "norm_cost"
+ path = "conformance/norm_cost.rs"
+ required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
++
++[[example]]
++name = "width_cost"
++path = "conformance/width_cost.rs"
++required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 41de30e4d..b4a0fe567 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -47,6 +47,11 @@ in inline storage. `push` reports typed capacity exhaustion without changing
+ the chain. Zero maps retain the source, and rectangular static images can
+ precede or follow a chain. Replay checks every map and the receiving capacity.
+ 
+-Midpoint/radius forms, widths, contraction helpers and measured specializations
++`widths` returns exact per-coordinate measurements, including full unsigned
++fixed widths and float widths that cannot fit a finite float. `widest_axis`
++compares exact widths and breaks ties by the lowest index. Empty boxes have no
++widths; the zero-dimensional unit has an empty width array and no axis.
++
++Midpoint/radius forms, contraction helpers and measured specializations
+ remain under development in Phase 6 of the
+ [implementation plan](../../docs/INTERVAL_REFACTOR_PLAN.md).
+diff --git a/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs b/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
+index 82888eedf..af4c7930b 100644
+--- a/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
++++ b/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
+@@ -116,3 +116,25 @@ pub extern "C" fn interval_norm_probe(input: i32) -> i32 {
+         + 17 * measure_infinity.0
+         + 19 * measure_infinity.1
+ }
++
++#[unsafe(no_mangle)]
++pub extern "C" fn interval_width_probe(input: i32) -> i32 {
++    type I = FixedInterval<i64, 63>;
++    let s = i64::from(input.clamp(0, 255));
++    let source = IntervalVector::new([
++        I::new(i64::MIN, i64::MAX - s).unwrap(),
++        I::new(-s, s).unwrap(),
++        I::new(i64::MIN + s, i64::MAX).unwrap(),
++        I::new(i64::MIN, i64::MAX).unwrap(),
++    ])
++    .unwrap();
++    let widths = source.widths(&mut ()).unwrap().unwrap();
++    assert_eq!(widths[0].numerator(), u64::MAX - s as u64);
++    assert_eq!(widths[1].numerator(), 2 * s as u64);
++    assert_eq!(widths[0], widths[2]);
++    assert_eq!(widths[3].numerator(), u64::MAX);
++    assert!(widths[3].to_interval().is_err());
++    let axis = source.widest_axis(&mut ()).unwrap().unwrap();
++    assert_eq!(axis, if s == 0 { 0 } else { 3 });
++    axis as i32 * 1000 + s as i32
++}
+diff --git a/crates/hyperlattice-interval/conformance/width_cost.rs b/crates/hyperlattice-interval/conformance/width_cost.rs
+new file mode 100644
+index 000000000..158224ee2
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/width_cost.rs
+@@ -0,0 +1,87 @@
++//! Completed exact box-width and selection queries; no rounded-width decisions.
++use hyperlattice_interval::hyperinterval::{
++    DyadicBudget, DyadicInterval, F64Enclosure, FixedInterval, RationalInterval,
++};
++use hyperlattice_interval::{IntervalArithmetic, IntervalVector};
++use std::{hint::black_box, time::Instant};
++mod allocations;
++fn family<I: IntervalArithmetic>(
++    name: &str,
++    scalar: impl Fn(i32, i32) -> I,
++    mut context: impl FnMut() -> I::Context,
++    primitive: bool,
++) {
++    let source =
++        IntervalVector::new([scalar(-3, 7), scalar(0, 20), scalar(0, 16), scalar(4, 4)]).unwrap();
++    assert_eq!(source.widest_axis(&mut context()).unwrap(), Some(1));
++    let widths = source.widths(&mut context()).unwrap().unwrap();
++    for (w, n) in widths.iter().zip([10, 20, 16, 0]) {
++        let expected = scalar(0, n).width(&mut context()).unwrap().unwrap();
++        assert_eq!(
++            I::compare_widths(w, &expected, &mut context()).unwrap(),
++            core::cmp::Ordering::Equal
++        );
++    }
++    eprintln!(
++        "{name},source_inline_bytes={},width_array_inline_bytes={}",
++        std::mem::size_of_val(&source),
++        std::mem::size_of_val(&widths)
++    );
++    for action in ["widths", "widest_axis"] {
++        let mut operation = || {
++            if action == "widths" {
++                black_box(black_box(&source).widths(&mut context()).unwrap());
++            } else {
++                assert_eq!(
++                    black_box(black_box(&source).widest_axis(&mut context()).unwrap()),
++                    Some(1)
++                );
++            }
++        };
++        for _ in 0..64 {
++            operation();
++        }
++        for sample in 0..20 {
++            let start = Instant::now();
++            let (_, calls, bytes) = allocations::measure(|| {
++                for _ in 0..128 {
++                    operation();
++                }
++            });
++            let elapsed = start.elapsed().as_nanos();
++            if primitive {
++                assert_eq!((calls, bytes), (0, 0));
++            }
++            println!("{name},{action},{sample},128,{elapsed},{calls},{bytes}");
++        }
++    }
++}
++fn main() {
++    println!(
++        "backend,action,sample,completed_operations,elapsed_ns,allocation_calls,allocated_bytes"
++    );
++    family(
++        "fixed_q16",
++        |a, b| FixedInterval::<i32, 16>::new(a << 16, b << 16).unwrap(),
++        || (),
++        true,
++    );
++    family(
++        "strict_f64",
++        |a, b| F64Enclosure::new(a.into(), b.into()).unwrap(),
++        || (),
++        true,
++    );
++    family(
++        "rational",
++        |a, b| RationalInterval::new(a.into(), b.into()).unwrap(),
++        || (),
++        false,
++    );
++    family(
++        "dyadic",
++        |a, b| DyadicInterval::new(a.into(), b.into(), 0).unwrap(),
++        || DyadicBudget::new(256, 1_000_000),
++        false,
++    );
++}
+diff --git a/crates/hyperlattice-interval/src/backend.rs b/crates/hyperlattice-interval/src/backend.rs
+index 9b97ca060..75f579d3f 100644
+--- a/crates/hyperlattice-interval/src/backend.rs
++++ b/crates/hyperlattice-interval/src/backend.rs
+@@ -11,6 +11,18 @@ mod sealed {
+ pub trait IntervalArithmetic: sealed::Sealed + FiniteRealInterval + Clone {
+     /// Caller-owned arithmetic state: `()` or a shared `DyadicBudget`.
+     type Context;
++    /// Exact width value: a scale-tagged unsigned fixed value, retained float
++    /// difference, or rational/dyadic singleton interval. Widths never round.
++    type Width;
++    /// Exact endpoint distance; `None` for empty. Scalar work shares the context.
++    fn width(&self, context: &mut Self::Context) -> Result<Option<Self::Width>, IntervalError>;
++    /// Exact order of width values. Interval-valued width backends require
++    /// singleton operands; this compares values, not interval set inclusion.
++    fn compare_widths(
++        a: &Self::Width,
++        b: &Self::Width,
++        context: &mut Self::Context,
++    ) -> Result<core::cmp::Ordering, IntervalError>;
+     /// Validates type-level constraints even for zero-dimensional products.
+     fn validate_family() -> Result<(), IntervalError> {
+         Self::empty().map(|_| ())
+@@ -77,6 +89,17 @@ macro_rules! fixed {
+         impl<const F: u32> sealed::Sealed for hyperinterval::FixedInterval<$ty, F> {}
+         impl<const F: u32> IntervalArithmetic for hyperinterval::FixedInterval<$ty, F> {
+             type Context = ();
++            type Width = hyperinterval::FixedWidth<F>;
++            fn width(&self, _: &mut ()) -> Result<Option<Self::Width>, IntervalError> {
++                Ok(Self::width(self))
++            }
++            fn compare_widths(
++                a: &Self::Width,
++                b: &Self::Width,
++                _: &mut (),
++            ) -> Result<core::cmp::Ordering, IntervalError> {
++                Ok(a.cmp(b))
++            }
+             fn empty() -> Result<Self, IntervalError> {
+                 Self::empty()
+             }
+@@ -112,6 +135,24 @@ impl sealed::Sealed for hyperinterval::RationalInterval {}
+ #[cfg(feature = "rational")]
+ impl IntervalArithmetic for hyperinterval::RationalInterval {
+     type Context = ();
++    type Width = Self;
++    fn width(&self, _: &mut ()) -> Result<Option<Self::Width>, IntervalError> {
++        Ok(Self::width(self).map(Self::point))
++    }
++    fn compare_widths(
++        a: &Self,
++        b: &Self,
++        _: &mut (),
++    ) -> Result<core::cmp::Ordering, IntervalError> {
++        if !a.is_singleton() || !b.is_singleton() {
++            return Err(IntervalError::NonSingletonEndpoint);
++        }
++        Ok(a.bounds()
++            .expect("singleton")
++            .0
++            .partial_cmp(b.bounds().expect("singleton").0)
++            .expect("rational order is total"))
++    }
+     fn empty() -> Result<Self, IntervalError> {
+         Ok(Self::empty())
+     }
+@@ -141,6 +182,21 @@ impl sealed::Sealed for hyperinterval::DyadicInterval {}
+ #[cfg(feature = "dyadic")]
+ impl IntervalArithmetic for hyperinterval::DyadicInterval {
+     type Context = hyperinterval::DyadicBudget;
++    type Width = Self;
++    fn width(&self, context: &mut Self::Context) -> Result<Option<Self>, IntervalError> {
++        if self.is_empty() {
++            Ok(None)
++        } else {
++            Self::width(self, context).map(Some)
++        }
++    }
++    fn compare_widths(
++        a: &Self,
++        b: &Self,
++        context: &mut Self::Context,
++    ) -> Result<core::cmp::Ordering, IntervalError> {
++        a.compare_singleton(b, context)
++    }
+     fn empty() -> Result<Self, IntervalError> {
+         Ok(Self::empty())
+     }
+@@ -186,10 +242,21 @@ impl IntervalArithmetic for hyperinterval::DyadicInterval {
+ 
+ #[cfg(feature = "float-enclosure")]
+ macro_rules! float {
+-    ($ty:ty) => {
++    ($ty:ty, $width:ty) => {
+         impl sealed::Sealed for $ty {}
+         impl IntervalArithmetic for $ty {
+             type Context = ();
++            type Width = $width;
++            fn width(&self, _: &mut ()) -> Result<Option<Self::Width>, IntervalError> {
++                Ok(Self::width(self))
++            }
++            fn compare_widths(
++                a: &Self::Width,
++                b: &Self::Width,
++                _: &mut (),
++            ) -> Result<core::cmp::Ordering, IntervalError> {
++                Ok(a.cmp(b))
++            }
+             fn empty() -> Result<Self, IntervalError> {
+                 Ok(Self::empty())
+             }
+@@ -216,6 +283,6 @@ macro_rules! float {
+     };
+ }
+ #[cfg(feature = "float-enclosure")]
+-float!(hyperinterval::F32Enclosure);
++float!(hyperinterval::F32Enclosure, hyperinterval::F32Width);
+ #[cfg(feature = "float-enclosure")]
+-float!(hyperinterval::F64Enclosure);
++float!(hyperinterval::F64Enclosure, hyperinterval::F64Width);
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+index b30fa5f97..c21df5968 100644
+--- a/crates/hyperlattice-interval/src/lib.rs
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -23,6 +23,7 @@ mod norms;
+ #[cfg(feature = "serde")]
+ mod serde;
+ mod vector;
++mod widths;
+ 
+ pub use affine::{AffineBox, AffineChain, AffineImage, AffineMap, AffineSource};
+ pub use backend::IntervalArithmetic;
+diff --git a/crates/hyperlattice-interval/src/widths.rs b/crates/hyperlattice-interval/src/widths.rs
+new file mode 100644
+index 000000000..6eab7f2cc
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/widths.rs
+@@ -0,0 +1,62 @@
++use crate::{IntervalArithmetic, IntervalLatticeError, IntervalVector, array_result};
++use core::cmp::Ordering;
++
++impl<I: IntervalArithmetic, const N: usize> IntervalVector<I, N> {
++    /// Exact coordinate widths, without narrowing to signed/float endpoints.
++    ///
++    /// Fixed widths retain their binary scale and full unsigned numerator;
++    /// float widths retain an exact endpoint difference. Rational/dyadic widths
++    /// are singleton intervals. Empty returns `None`, whereas the zero-dimensional
++    /// unit product returns `Some([])`. No rounded enclosure replaces a width.
++    /// The context covers all scalar work; failure returns no partial array.
++    ///
++    /// ```
++    /// # #[cfg(feature = "fixed")] {
++    /// use hyperlattice_interval::{IntervalVector, hyperinterval::FixedInterval};
++    /// type I = FixedInterval<i64, 63>;
++    /// let box_ = IntervalVector::new([I::new(i64::MIN, i64::MAX).unwrap(), I::point(0).unwrap()]).unwrap();
++    /// assert_eq!(box_.widths(&mut ()).unwrap().unwrap()[0].numerator(), u64::MAX);
++    /// assert_eq!(box_.widest_axis(&mut ()).unwrap(), Some(0));
++    /// # }
++    /// ```
++    pub fn widths(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<Option<[I::Width; N]>, IntervalLatticeError> {
++        match self.lanes() {
++            None => Ok(None),
++            Some(lanes) => Ok(Some(array_result(|index| {
++                lanes[index]
++                    .width(context)
++                    .map(|value| value.expect("nonempty coordinate"))
++            })?)),
++        }
++    }
++
++    /// Index of a maximum exact coordinate width, breaking ties by lowest index.
++    ///
++    /// Empty and zero-dimensional boxes return `None`. A nonempty box whose
++    /// widths are all zero selects index zero. Each width is constructed once;
++    /// only the current maximum is retained. All dyadic work shares the context.
++    /// Exhaustion publishes no provisional axis and does not mutate the source.
++    /// This schedules a coordinate; it does not certify a solver decision.
++    pub fn widest_axis(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<Option<usize>, IntervalLatticeError> {
++        let Some(lanes) = self.lanes() else {
++            return Ok(None);
++        };
++        let mut widest: Option<(usize, I::Width)> = None;
++        for (index, lane) in lanes.iter().enumerate() {
++            let width = lane.width(context)?.expect("nonempty coordinate");
++            if let Some((_, maximum)) = &widest
++                && I::compare_widths(&width, maximum, context)? != Ordering::Greater
++            {
++                continue;
++            }
++            widest = Some((index, width));
++        }
++        Ok(widest.map(|(index, _)| index))
++    }
++}
+diff --git a/crates/hyperlattice-interval/tests/no_alloc.rs b/crates/hyperlattice-interval/tests/no_alloc.rs
+index dbc61bd30..4e2777a43 100644
+--- a/crates/hyperlattice-interval/tests/no_alloc.rs
++++ b/crates/hyperlattice-interval/tests/no_alloc.rs
+@@ -75,6 +75,28 @@ fn primitive_construction_composition_and_errors_do_not_allocate() {
+             squared.column_dominance_margins(&mut ()).unwrap(),
+         );
+         std::hint::black_box((norms, margins));
++        let widths = x.widths(&mut ()).unwrap().unwrap();
++        assert_eq!(x.widest_axis(&mut ()).unwrap(), Some(0));
++        assert!(widths.iter().all(|w| w.numerator() == 2 << 16));
++        std::hint::black_box(widths);
++        #[cfg(feature = "float-enclosure")]
++        {
++            use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure};
++            let f = IntervalVector::new([
++                F64Enclosure::new(f64::from_bits(2), 1.).unwrap(),
++                F64Enclosure::new(f64::from_bits(1), 1.).unwrap(),
++            ])
++            .unwrap();
++            assert_eq!(f.widest_axis(&mut ()).unwrap(), Some(1));
++            std::hint::black_box(f.widths(&mut ()).unwrap());
++            let f = IntervalVector::new([
++                F32Enclosure::new(f32::from_bits(2), 1.).unwrap(),
++                F32Enclosure::new(f32::from_bits(1), 1.).unwrap(),
++            ])
++            .unwrap();
++            assert_eq!(f.widest_axis(&mut ()).unwrap(), Some(1));
++            std::hint::black_box(f.widths(&mut ()).unwrap());
++        }
+         (subset, interior)
+     });
+     assert!(subset && !interior);
+diff --git a/crates/hyperlattice-interval/tests/width_replay.rs b/crates/hyperlattice-interval/tests/width_replay.rs
+new file mode 100644
+index 000000000..141be4fcd
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/width_replay.rs
+@@ -0,0 +1,67 @@
++#![cfg(all(feature = "fixed", feature = "serde"))]
++use hyperlattice_interval::{
++    IntervalVector,
++    hyperinterval::{FixedInterval, FixedWidth},
++};
++type I = FixedInterval<i64, 63>;
++#[test]
++fn fresh_process_replay_preserves_exact_widths_and_selection() {
++    const KEY: &str = "HYPERLATTICE_WIDTH_REPLAY";
++    if let Ok(text) = std::env::var(KEY) {
++        let source: IntervalVector<I, 2> = serde_json::from_str(&text).unwrap();
++        assert_eq!(serde_json::to_string(&source).unwrap(), text);
++        assert_eq!(source.widest_axis(&mut ()).unwrap(), Some(1));
++        let widths = source.widths(&mut ()).unwrap().unwrap();
++        let text = serde_json::to_string(&widths).unwrap();
++        let replay: [FixedWidth<63>; 2] = serde_json::from_str(&text).unwrap();
++        assert_eq!(replay, widths);
++        assert_eq!(replay[1].numerator(), u64::MAX);
++        assert!(replay[1] > replay[0]);
++        assert!(replay[1].to_interval().is_err());
++        #[cfg(feature = "float-enclosure")]
++        {
++            use hyperlattice_interval::hyperinterval::{F64Enclosure as F, F64Width};
++            let text = std::env::var("HYPERLATTICE_FLOAT_WIDTH_REPLAY").unwrap();
++            let replay: IntervalVector<F, 2> = serde_json::from_str(&text).unwrap();
++            assert_eq!(replay.widest_axis(&mut ()).unwrap(), Some(1));
++            let text = serde_json::to_string(&replay.widths(&mut ()).unwrap().unwrap()).unwrap();
++            let widths: [F64Width; 2] = serde_json::from_str(&text).unwrap();
++            assert!(widths[1] > widths[0]);
++            assert_eq!(
++                widths[0].enclosure().unwrap(),
++                widths[1].enclosure().unwrap()
++            );
++        }
++        return;
++    }
++    let source =
++        IntervalVector::new([I::new(-1, 1).unwrap(), I::new(i64::MIN, i64::MAX).unwrap()]).unwrap();
++    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
++    command
++        .args([
++            "--exact",
++            "fresh_process_replay_preserves_exact_widths_and_selection",
++            "--nocapture",
++        ])
++        .env(KEY, serde_json::to_string(&source).unwrap());
++    #[cfg(feature = "float-enclosure")]
++    {
++        use hyperlattice_interval::hyperinterval::F64Enclosure as F;
++        let source = IntervalVector::new([
++            F::new(f64::from_bits(2), 1.).unwrap(),
++            F::new(f64::from_bits(1), 1.).unwrap(),
++        ])
++        .unwrap();
++        command.env(
++            "HYPERLATTICE_FLOAT_WIDTH_REPLAY",
++            serde_json::to_string(&source).unwrap(),
++        );
++    }
++    let output = command.output().unwrap();
++    assert!(
++        output.status.success(),
++        "{} {}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/widths.rs b/crates/hyperlattice-interval/tests/widths.rs
+new file mode 100644
+index 000000000..3ddcb5f0d
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/widths.rs
+@@ -0,0 +1,242 @@
++#![cfg(any(
++    feature = "fixed",
++    feature = "rational",
++    feature = "dyadic",
++    feature = "float-enclosure"
++))]
++use hyperlattice_interval::{IntervalArithmetic, IntervalVector};
++
++fn qualify<I: IntervalArithmetic>(
++    scalar: impl Fn(i32, i32) -> I,
++    check: impl Fn(&I::Width, i32),
++    mut context: impl FnMut() -> I::Context,
++) {
++    let intervals: Vec<_> = (-2..=2)
++        .flat_map(|a| (a..=2).map(move |b| (a, b)))
++        .collect();
++    assert_eq!(intervals.len(), 15);
++    for word in 0..3375 {
++        let mut digits = word;
++        let bounds = core::array::from_fn::<_, 3, _>(|_| {
++            let pair = intervals[digits % 15];
++            digits /= 15;
++            pair
++        });
++        let vector = IntervalVector::new(bounds.map(|(a, b)| scalar(a, b))).unwrap();
++        let widths = vector.widths(&mut context()).unwrap().unwrap();
++        let mut maximum = 0;
++        let mut index = 0;
++        for lane in 0..3 {
++            let expected = bounds[lane].1 - bounds[lane].0;
++            check(&widths[lane], expected);
++            if expected > maximum {
++                maximum = expected;
++                index = lane;
++            }
++        }
++        assert_eq!(vector.widest_axis(&mut context()).unwrap(), Some(index));
++    }
++    let empty = IntervalVector::<I, 3>::empty().unwrap();
++    assert!(empty.widths(&mut context()).unwrap().is_none());
++    assert_eq!(empty.widest_axis(&mut context()).unwrap(), None);
++    let unit = IntervalVector::<I, 0>::new([]).unwrap();
++    assert_eq!(unit.widths(&mut context()).unwrap().unwrap().len(), 0);
++    assert_eq!(unit.widest_axis(&mut context()).unwrap(), None);
++}
++#[cfg(feature = "fixed")]
++#[test]
++fn fixed_widths_and_ties() {
++    use hyperlattice_interval::hyperinterval::FixedInterval as I;
++    qualify(
++        |a, b| I::<i32, 4>::new(a * 16, b * 16).unwrap(),
++        |w, x| assert_eq!(w.numerator(), (x * 16) as u64),
++        || (),
++    );
++    qualify(
++        |a, b| I::<i64, 4>::new(i64::from(a) * 16, i64::from(b) * 16).unwrap(),
++        |w, x| assert_eq!(w.numerator(), (x * 16) as u64),
++        || (),
++    );
++}
++#[cfg(feature = "rational")]
++#[test]
++fn rational_widths_and_ties() {
++    use hyperlattice_interval::hyperinterval::RationalInterval as I;
++    qualify(
++        |a, b| I::new(a.into(), b.into()).unwrap(),
++        |w, x| assert_eq!(w, &I::point(x.into())),
++        || (),
++    );
++    let scalar = |a: &str, b: &str| I::new(a.parse().unwrap(), b.parse().unwrap()).unwrap();
++    let source = IntervalVector::new([
++        scalar("-1/3", "2/3"),
++        scalar("1/7", "8/7"),
++        scalar("-1/11", "12/11"),
++    ])
++    .unwrap();
++    assert_eq!(source.widest_axis(&mut ()).unwrap(), Some(2));
++    let widths = IntervalVector::new(source.widths(&mut ()).unwrap().unwrap()).unwrap();
++    assert_eq!(
++        widths.norm_one(&mut ()).unwrap(),
++        I::point("35/11".parse().unwrap())
++    );
++    for bad in [I::empty(), scalar("0", "1")] {
++        assert_eq!(
++            I::compare_widths(&bad, &I::point(0.into()), &mut ()),
++            Err(hyperlattice_interval::hyperinterval::IntervalError::NonSingletonEndpoint)
++        );
++        assert_eq!(
++            I::compare_widths(&I::point(0.into()), &bad, &mut ()),
++            Err(hyperlattice_interval::hyperinterval::IntervalError::NonSingletonEndpoint)
++        );
++    }
++}
++#[cfg(feature = "dyadic")]
++#[test]
++fn dyadic_widths_and_ties() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I};
++    qualify(
++        |a, b| I::new(a.into(), b.into(), 0).unwrap(),
++        |w, x| assert_eq!(w, &I::point(x.into(), 0).unwrap()),
++        || DyadicBudget::new(256, 1_000_000),
++    );
++}
++#[cfg(feature = "float-enclosure")]
++#[test]
++fn float_widths_and_ties() {
++    use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure};
++    qualify(
++        |a, b| F32Enclosure::new(a as f32, b as f32).unwrap(),
++        |w, x| {
++            assert_eq!(
++                w.enclosure().unwrap(),
++                F32Enclosure::point(x as f32).unwrap()
++            )
++        },
++        || (),
++    );
++    qualify(
++        |a, b| F64Enclosure::new(a.into(), b.into()).unwrap(),
++        |w, x| {
++            assert_eq!(
++                w.enclosure().unwrap(),
++                F64Enclosure::point(x.into()).unwrap()
++            )
++        },
++        || (),
++    );
++    macro_rules! case {
++        ($i:ty,$f:ty) => {{
++            let small = <$i>::new(<$f>::from_bits(2), 1.0).unwrap();
++            let large = <$i>::new(<$f>::from_bits(1), 1.0).unwrap();
++            assert_eq!(
++                small.width().unwrap().enclosure().unwrap(),
++                large.width().unwrap().enclosure().unwrap()
++            );
++            let source = IntervalVector::new([small, large]).unwrap();
++            assert_eq!(source.widest_axis(&mut ()).unwrap(), Some(1));
++            let source = IntervalVector::new([
++                <$i>::new(0., <$f>::MAX).unwrap(),
++                <$i>::new(-<$f>::MAX, <$f>::MAX).unwrap(),
++            ])
++            .unwrap();
++            assert_eq!(source.widest_axis(&mut ()).unwrap(), Some(1));
++            assert!(
++                source.widths(&mut ()).unwrap().unwrap()[1]
++                    .enclosure()
++                    .is_err()
++            );
++        }};
++    }
++    case!(F32Enclosure, f32);
++    case!(F64Enclosure, f64);
++}
++#[cfg(feature = "fixed")]
++#[test]
++fn full_range_widths_remain_ordered() {
++    use hyperlattice_interval::hyperinterval::FixedInterval;
++    type I = FixedInterval<i64, 63>;
++    let x =
++        IntervalVector::new([I::new(i64::MIN, i64::MAX).unwrap(), I::new(0, 1).unwrap()]).unwrap();
++    assert_eq!(x.widest_axis(&mut ()).unwrap(), Some(0));
++    let widths = x.widths(&mut ()).unwrap().unwrap();
++    assert_eq!(widths[0].numerator(), u64::MAX);
++    assert!(widths[0].to_interval().is_err());
++    let restricted = x
++        .intersection(
++            &IntervalVector::new([I::point(0).unwrap(), I::new(0, 1).unwrap()]).unwrap(),
++            &mut (),
++        )
++        .unwrap();
++    assert_eq!(restricted.widest_axis(&mut ()).unwrap(), Some(1));
++    assert_eq!(x.widest_axis(&mut ()).unwrap(), Some(0));
++}
++#[cfg(feature = "dyadic")]
++#[test]
++fn widths_and_selection_share_budget_and_retry() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I, IntervalError};
++    let source = IntervalVector::new([
++        I::new((-3).into(), 7.into(), 0).unwrap(),
++        I::new(0.into(), 5.into(), 2).unwrap(),
++        I::new(0.into(), 1.into(), 4).unwrap(),
++    ])
++    .unwrap();
++    let mut budget = DyadicBudget::new(64, 10_000);
++    assert_eq!(source.widest_axis(&mut budget).unwrap(), Some(1));
++    let used = 10_000 - budget.remaining_work();
++    assert_eq!(
++        source.widest_axis(&mut DyadicBudget::new(64, used - 1)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    let mut budget = DyadicBudget::new(64, used);
++    assert_eq!(source.widest_axis(&mut budget).unwrap(), Some(1));
++    assert_eq!(budget.remaining_work(), 0);
++    assert_eq!(
++        source.widths(&mut DyadicBudget::new(1, 10_000)),
++        Err(IntervalLatticeError::Scalar(IntervalError::SizeExhausted))
++    );
++    let mut budget = DyadicBudget::new(64, 10_000);
++    let widths = source.widths(&mut budget).unwrap().unwrap();
++    let used = 10_000 - budget.remaining_work();
++    assert_eq!(
++        source.widths(&mut DyadicBudget::new(64, used - 1)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    assert_eq!(
++        source.widths(&mut DyadicBudget::new(64, used)).unwrap(),
++        Some(widths.clone())
++    );
++    assert_eq!(
++        IntervalVector::new(widths)
++            .unwrap()
++            .norm_one(&mut budget)
++            .unwrap(),
++        I::point(46.into(), 0).unwrap()
++    );
++    let extreme = IntervalVector::new([
++        I::new(0.into(), 1.into(), i32::MIN).unwrap(),
++        I::new(0.into(), 1.into(), i32::MAX).unwrap(),
++    ])
++    .unwrap();
++    assert_eq!(
++        extreme
++            .widest_axis(&mut DyadicBudget::new(8, 1000))
++            .unwrap(),
++        Some(1)
++    );
++    assert!(
++        IntervalVector::<I, 3>::empty()
++            .unwrap()
++            .widths(&mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .is_none()
++    );
++    assert_eq!(
++        IntervalVector::<I, 0>::new([])
++            .unwrap()
++            .widest_axis(&mut DyadicBudget::new(0, 0))
++            .unwrap(),
++        None
++    );
++}
+diff --git a/crates/hyperlattice/tests/interval_surface.rs b/crates/hyperlattice/tests/interval_surface.rs
+index 7b1452728..c295b553f 100644
+--- a/crates/hyperlattice/tests/interval_surface.rs
++++ b/crates/hyperlattice/tests/interval_surface.rs
+@@ -80,3 +80,16 @@ fn interval_norm_and_measure_evidence_is_shared() {
+         interval(4, 6)
+     );
+ }
++
++#[test]
++fn exact_box_widths_survive_reduction_through_the_facade() {
++    let scalar =
++        |a: &str, b: &str| RationalInterval::new(a.parse().unwrap(), b.parse().unwrap()).unwrap();
++    let source = BoxN::new([scalar("-1/3", "2/3"), scalar("-1/11", "12/11")]).unwrap();
++    assert_eq!(source.widest_axis(&mut ()).unwrap(), Some(1));
++    let widths = IntervalVector::new(source.widths(&mut ()).unwrap().unwrap()).unwrap();
++    assert_eq!(
++        widths.norm_one(&mut ()).unwrap(),
++        RationalInterval::point("24/11".parse().unwrap())
++    );
++}
