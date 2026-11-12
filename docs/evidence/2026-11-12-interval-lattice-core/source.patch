@@ -1,0 +1,2236 @@
+diff --git a/.github/workflows/hyperlattice.yml b/.github/workflows/hyperlattice.yml
+index 89dcf46c3..95d7b9e15 100644
+--- a/.github/workflows/hyperlattice.yml
++++ b/.github/workflows/hyperlattice.yml
+@@ -5,6 +5,8 @@ on:
+     branches: ["**"]
+     paths:
+       - "crates/hyperlattice/**"
++      - "crates/hyperlattice-interval/**"
++      - "crates/hyperinterval/**"
+       - "crates/hyperreal/**"
+       - "Cargo.toml"
+       - "Cargo.lock"
+@@ -12,6 +14,8 @@ on:
+   pull_request:
+     paths:
+       - "crates/hyperlattice/**"
++      - "crates/hyperlattice-interval/**"
++      - "crates/hyperinterval/**"
+       - "crates/hyperreal/**"
+       - "Cargo.toml"
+       - "Cargo.lock"
+@@ -77,3 +81,49 @@ jobs:
+       - name: Check fuzz targets
+         if: matrix.backend.name == 'default'
+         run: cargo check --manifest-path fuzz/Cargo.toml --bins
++
++  interval-core:
++    name: Interval core (Rust ${{ matrix.rust }})
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        rust: ["1.88.0", stable]
++    env:
++      LATTICE_RUST: ${{ matrix.rust }}
++      LATTICE_FEATURES: ${{ matrix.rust == '1.88.0' && 'fixed,dyadic,float-enclosure,serde' || 'fixed,dyadic,rational,float-enclosure,serde' }}
++    defaults:
++      run:
++        working-directory: .
++    steps:
++      - name: Checkout
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++      - name: Install compiler and targets
++        run: rustup toolchain install "$LATTICE_RUST" --profile minimal --component clippy --component rustfmt --target thumbv7em-none-eabihf --target wasm32-unknown-unknown
++      - name: Check isolated features and composition
++        run: |
++          cargo +"$LATTICE_RUST" fmt -p hyperlattice-interval -- --check
++          rustfmt +"$LATTICE_RUST" --edition 2024 --check crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
++          for features in '' fixed dyadic float-enclosure serde fixed,serde dyadic,serde float-enclosure,serde; do
++            cargo +"$LATTICE_RUST" test --locked -p hyperlattice-interval --no-default-features --features "$features"
++          done
++          if [ "$LATTICE_RUST" != 1.88.0 ]; then
++            cargo +"$LATTICE_RUST" test --locked -p hyperlattice-interval --features rational,serde
++          fi
++          cargo +"$LATTICE_RUST" test --locked -p hyperlattice-interval --all-targets --features "$LATTICE_FEATURES"
++          cargo +"$LATTICE_RUST" clippy --locked -p hyperlattice-interval --all-targets --no-default-features -- -D warnings
++          cargo +"$LATTICE_RUST" clippy --locked -p hyperlattice-interval --all-targets --features "$LATTICE_FEATURES" -- -D warnings
++      - name: Check embedded dependency closure
++        run: |
++          cargo +"$LATTICE_RUST" tree --locked -p hyperlattice-interval --no-default-features --features fixed,float-enclosure --edges normal --prefix none > lattice-dependencies.txt
++          test "$(wc -l < lattice-dependencies.txt)" -eq 2
++          for target in thumbv7em-none-eabihf wasm32-unknown-unknown; do
++            cargo +"$LATTICE_RUST" check --locked -p hyperlattice-interval --target "$target" --no-default-features --features fixed,float-enclosure,serde
++            cargo +"$LATTICE_RUST" check --locked -p hyperlattice-interval --target "$target" --no-default-features --features dyadic,serde
++          done
++      - name: Build interval API documentation
++        env:
++          RUSTDOCFLAGS: -D warnings
++        run: cargo +"$LATTICE_RUST" doc --locked -p hyperlattice-interval --no-deps --features "$LATTICE_FEATURES"
+diff --git a/Cargo.lock b/Cargo.lock
+index 1e5cea68e..1d11b3e98 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2619,6 +2619,7 @@ version = "0.7.0"
+ dependencies = [
+  "arbitrary",
+  "criterion 0.7.0",
++ "hyperlattice-interval",
+  "hyperreal",
+  "proptest",
+  "rug",
+@@ -2627,6 +2628,15 @@ dependencies = [
+  "symbolica",
+ ]
+ 
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++ "serde",
++ "serde_json",
++]
++
+ [[package]]
+ name = "hyperlimit"
+ version = "0.5.0"
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index f565fb763..7088d4047 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -47,7 +47,7 @@ No existing arithmetic or predicate dispatch has been changed.
+ | 3 rational/dyadic/ball | carriers and local acceptance implemented | solver kernel migration, full coverage and consumer cost gates |
+ | 4 proposals/float | proposal wrappers and strict integer IEEE core implemented; local x86_64 qualification passed | full surface/coverage, further targets and shipped consumers |
+ | 5 elementary functions | abs/min/max, integer powers, square roots, exp/log/atan/sin/cos, split division, rational powers and tan/cot implemented on documented backends | final function/backend coverage, resource and consumer qualification |
+-| 6 lattice | not started | component oracles and allocation/cost evidence |
++| 6 lattice | Cartesian core implemented and locally qualified | exact affine correlation, width/midpoint/radius/norm/measure surface, specialization and full consumer/performance gates |
+ | 7 solver | qualification started; production migration rejected | satisfy size/performance gates with unchanged statuses, certificates and dispatch |
+ | 8 interface | not started | unchanged canonical bytes and profiles |
+ | 9 firmware | not started | exact differential, no_alloc, HIL/cycles/stack/size |
+@@ -1521,6 +1521,108 @@ The committed record was regenerated and independently verified before registrat
+ Phase 5 qualification gaps and all
+ remaining plan phases require their own completion evidence.
+ 
++## Phase 6 admission: Cartesian interval algebra and dependency boundary
++
++Before production edits, revision `a76acf1ac83c6532e72279ced05305dd29181e5d`
++reproduces absent `IntervalVector`/`IntervalMatrix` imports and fails Rust 1.88
++`cargo check -p hyperlattice --no-default-features --lib`: both Hyperlattice
++and its unconditional Hyperreal dependency require Rust 1.95. The normal
++no-default dependency tree includes Hyperreal and allocating numeric crates.
++Hypersolve and fuzz consumers already use Hyperlattice with defaults disabled;
++removing their existing Real API behind a new default feature would break them.
++This is the dependency evidence required by plan §2.3 to permit a production
++split. A Rust 1.88, no_std `hyperlattice-interval` companion will hold the single
++interval-linear implementation, re-exported additively from Hyperlattice. The
++legacy scalar/linear implementation and its feature behavior stay intact.
++
++Owner: Hyperlattice for Cartesian structure; Hyperinterval for all scalar
++arithmetic, set relations, and backend qualification. Relevant contracts:
++P1, P3, P6, P17–P20, P25, P26, P35–P39. Domain: fixed-size Cartesian products
++of validated finite real intervals (fixed i32/i64, rational, dyadic, qualified
++strict floats), including canonical empty and zero-dimensional unit products.
++An empty lane canonicalizes the entire product to empty. No scalar midpoint
++or point equality is inferred from an interval. Matrix/vector products and
++component hulls return explicit enclosures: their coordinates need not be
++independent in the source image. A coordinate affine enclosure does not satisfy
++the separate planned exact correlated affine-image carrier requirement.
++
++Missing acceptance witnesses: independent exact corner oracles for dot and
++matrix products, fixed outward rounding and overflow, empty/unit distinctions,
++serde validation for arbitrary const dimensions, consumed output chains,
++shared dyadic budget exhaustion and retry, primitive no-allocation/MSRV and
++embedded build, unchanged legacy tests/source/dispatch. Dyadic scalar work and
++size accounting must span every lane and nested product; it is not a wall-time,
++heap-byte or cancellation bound. Rational arithmetic remains explicitly
++unbounded. Primitive work is bounded by dimensions and fixed-width kernels;
++stack storage grows with dimensions. No partial numerical result is published
++on scalar failure. Explicit cloning/serialization are caller-owned work.
++
++Raw staging: `/tmp/interval-refactor/lattice-core`. The first legacy baseline
++was contaminated by a temporary compile-fail witness and is retained separately;
++it is not correctness evidence. The clean rerun on unchanged legacy source
++passed all 240 tests; the additive API run passed those 240 plus its new surface
++witness. Phase 6 remains open for its full advertised operation,
++measurement, solver/firmware consumer and exact-affine obligations.
++
++## Phase 6 Cartesian foundation: executed local qualification
++
++Implemented one sealed adapter to existing Hyperinterval scalar operations and
++inline `IntervalVector`, `IntervalMatrix`, and `BoxN` carriers. Construction,
++component relations, addition/subtraction, dot and matrix products, affine
++**enclosures**, transpose, projections, and arbitrary-dimension serde share the
++same authority through Hyperlattice's additive re-exports. No legacy numerical
++source or scalar kernel changed: a byte comparison covers 47 source files,
++subtracting only the new re-export block from Hyperlattice's lib.rs.
++
++The independent exact corner oracle exhausts 1,296 two-lane interval input
++combinations and 2,916 point-matrix/box combinations per scalar backend (i32,
++i64, rational, dyadic, strict f32 and strict f64). It checks dot, 1x1 and 2x2
++matrix products, affine enclosures, and subsequent products. Another 50,625
++fixed fractional cases check outward bounds against exact integer numerators.
++The 12 maintained tests also cover empty/unit products, invalid scales and
++indices, rounding/overflow, shared budgets and retry, owned-copy accounting,
++malformed replay, dimensions above 32, and allocation-free primitive chains.
++The final deterministic suite passes ASan with leak detection; this is not a
++claim of a directed fuzz campaign or universal proof.
++
++Final feature checks pass on Rust 1.88 and stable, plus the all-feature suite
++on 1.95; no-default and all-enabled Clippy, release tests, docs with warnings
++as errors, fmt and pedantic strict-collection zizmor pass. Hyperlattice's
++all-feature tests pass (241), its all-target Clippy and no-default API build
++pass, and all four Hypersolve interval migration differential/dispatch tests
++pass. ARM thumbv7em and wasm32 subsets check under both 1.88 and stable.
++Primitive normal dependency closure contains exactly the companion and
++Hyperinterval. A clean Rust 1.88 no_std Wasm cdylib links with no global
++allocator and no imports; Wasmtime 50.0.1 verifies 2,049 calls covering 513
++unique clamped inputs. Package listing includes the public source, licenses,
++README and runnable fixed example; registry publication is not established.
++
++Final owner-only instrumentation reports 472/483 executable lines (97.72%),
++605/639 regions (94.68%) and 101/101 functions. There is no measured branch
++denominator. Dependencies, tests, conformance and toolchain code are excluded;
++initial reports/profiles are preserved alongside the final report. The 100%
++coverage and full qualification targets remain open.
++
++A paired scalar-loop/control probe records 200 raw samples: 20 samples per
++path across five completed 2x2 product cases, each with 128 materialized and
++dropped outputs after 64 warmups. Both primitive cases allocate zero; rational
++and dyadic cases match their controls' allocation counts. Median Cartesian
++latencies are approximately 158 ns (fixed Q16), 1.86 us (strict f64), 1.57 us
++(small rational), 1.15 us (97-bit rational numerators), and 6.02 us (dyadic).
++Small/wide rational rows are slower than controls in this run; no speedup,
++firmware cycle, HIL, stack bound, or legacy Real benchmark claim is made.
++The probe ran on a shared host with concurrent validation, not an isolated
++performance machine. This additive capability is retained for its contract
++extension; it is not a behavior-preserving numerical refactor.
++
++Outstanding Phase 6 work includes exact correlated affine carriers, widths and
++widest axes, midpoint/radius forms, norms and matrix measures, contraction and
++Krawczyk helpers, measured specializations/facts and full consumer acceptance.
++Legacy Real benchmark/monomorphized-size and successive-operation comparisons
++remain part of the full phase gate. No solver or firmware production migration
++has occurred in this checkpoint. No phase or overall goal is complete, and no
++push was attempted. Source and immutable evidence registration: pending.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+new file mode 100644
+index 000000000..aabc4c2f9
+--- /dev/null
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -0,0 +1,8 @@
++# Changelog
++
++## 0.1.0 (unreleased)
++
++- Add Cartesian interval vectors, matrices and boxes with checked scalar
++  arithmetic, canonical empties, linear enclosures and validated serde.
++- Supply an allocation-free Rust 1.88 dependency path while preserving
++  Hyperlattice's existing Hyperreal API.
+diff --git a/crates/hyperlattice-interval/Cargo.toml b/crates/hyperlattice-interval/Cargo.toml
+new file mode 100644
+index 000000000..e331c7994
+--- /dev/null
++++ b/crates/hyperlattice-interval/Cargo.toml
+@@ -0,0 +1,38 @@
++[package]
++name = "hyperlattice-interval"
++version = "0.1.0"
++edition = "2024"
++rust-version = "1.88"
++description = "Fixed-size Cartesian interval algebra for Hyperlattice and no_std consumers"
++license = "MIT OR Apache-2.0"
++repository = "https://github.com/timschmidt/csgrs"
++readme = "README.md"
++include = ["/src/**", "/examples/**", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
++categories = ["mathematics", "no-std", "embedded"]
++
++[package.metadata.docs.rs]
++all-features = true
++
++[features]
++default = []
++fixed = ["hyperinterval/fixed"]
++dyadic = ["hyperinterval/dyadic"]
++rational = ["hyperinterval/rational"]
++float-enclosure = ["hyperinterval/float-enclosure"]
++serde = ["dep:serde", "hyperinterval/serde"]
++
++[dependencies]
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false }
++serde = { version = "1.0", default-features = false, optional = true }
++
++[dev-dependencies]
++serde_json = "1.0"
++
++[[example]]
++name = "fixed_affine"
++required-features = ["fixed"]
++
++[[example]]
++name = "linear_cost"
++path = "conformance/linear_cost.rs"
++required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
+diff --git a/crates/hyperlattice-interval/LICENSE-APACHE b/crates/hyperlattice-interval/LICENSE-APACHE
+new file mode 100644
+index 000000000..d64569567
+--- /dev/null
++++ b/crates/hyperlattice-interval/LICENSE-APACHE
+@@ -0,0 +1,202 @@
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/crates/hyperlattice-interval/LICENSE-MIT b/crates/hyperlattice-interval/LICENSE-MIT
+new file mode 100644
+index 000000000..d042a40ed
+--- /dev/null
++++ b/crates/hyperlattice-interval/LICENSE-MIT
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 Timothy Schmidt
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+new file mode 100644
+index 000000000..006c89d48
+--- /dev/null
++++ b/crates/hyperlattice-interval/README.md
+@@ -0,0 +1,37 @@
++# Hyperlattice interval algebra
++
++Fixed-size Cartesian interval vectors, matrices and boxes. Hyperinterval owns
++scalar arithmetic; this package owns Cartesian structure and linear products.
++Hyperlattice re-exports the same types for host consumers. This companion
++provides the Rust 1.88, allocation-free `no_std` dependency path for firmware.
++
++```rust
++use hyperlattice_interval::{IntervalMatrix, IntervalVector};
++use hyperlattice_interval::hyperinterval::FixedInterval;
++
++type I = FixedInterval<i32, 0>;
++let matrix = IntervalMatrix::new([[I::point(2)?, I::point(-1)?]])?;
++let vector = IntervalVector::new([I::new(1, 3)?, I::new(4, 5)?])?;
++let image = matrix.mul_vector(&vector, &mut ())?;
++assert_eq!(image.lanes().unwrap()[0].bounds(), Some((-3, 2)));
++# Ok::<(), hyperlattice_interval::IntervalLatticeError>(())
++```
++
++Build and test with `cargo test -p hyperlattice-interval --features fixed`.
++No scalar backend is enabled by default. `fixed` and `float-enclosure` require
++no allocator. `dyadic` uses allocation with explicit Hyperinterval work/size
++accounting. `rational` enables Hyperreal, std and its Rust 1.95 requirement.
++`serde` validates scalar endpoints, dimensions and fixed scales on replay.
++
++Implemented: canonical empty/unit products, component hull/intersection and
++inclusion, sums/differences, dot products, matrix products, affine enclosures,
++transpose and checked row/column projections. All loops have dimension bounds;
++inline storage and stack use grow with those dimensions. Scalar overflow and
++resource errors propagate; no partial result is returned. Rational operations,
++explicit clones and serialization have no total-work or heap bound.
++
++The outputs are Cartesian enclosures. They need not equal a correlated image;
++an affine enclosure does not retain the defining affine relation. Exact
++correlated affine carriers, midpoint/radius forms, norms, matrix measures and
++measured specializations remain under development in Phase 6 of the
++[implementation plan](../../docs/INTERVAL_REFACTOR_PLAN.md).
+diff --git a/crates/hyperlattice-interval/conformance/allocations.rs b/crates/hyperlattice-interval/conformance/allocations.rs
+new file mode 100644
+index 000000000..a645968d1
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/allocations.rs
+@@ -0,0 +1,44 @@
++//! Test/probe-only scoped allocation counter. Runs in a single-threaded scope.
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++struct Allocator;
++#[global_allocator]
++static ALLOCATOR: Allocator = Allocator;
++static ENABLED: AtomicBool = AtomicBool::new(false);
++static COUNT: AtomicUsize = AtomicUsize::new(0);
++static BYTES: AtomicUsize = AtomicUsize::new(0);
++
++fn record(bytes: usize) {
++    if ENABLED.load(Ordering::Relaxed) {
++        COUNT.fetch_add(1, Ordering::Relaxed);
++        BYTES.fetch_add(bytes, Ordering::Relaxed);
++    }
++}
++
++unsafe impl GlobalAlloc for Allocator {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        record(layout.size());
++        unsafe { System.alloc(layout) }
++    }
++    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
++        unsafe { System.dealloc(pointer, layout) }
++    }
++    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
++        record(size);
++        unsafe { System.realloc(pointer, layout, size) }
++    }
++}
++
++pub fn measure<T>(operation: impl FnOnce() -> T) -> (T, usize, usize) {
++    COUNT.store(0, Ordering::Relaxed);
++    BYTES.store(0, Ordering::Relaxed);
++    ENABLED.store(true, Ordering::Relaxed);
++    let output = operation();
++    ENABLED.store(false, Ordering::Relaxed);
++    (
++        output,
++        COUNT.load(Ordering::Relaxed),
++        BYTES.load(Ordering::Relaxed),
++    )
++}
+diff --git a/crates/hyperlattice-interval/conformance/linear_cost.rs b/crates/hyperlattice-interval/conformance/linear_cost.rs
+new file mode 100644
+index 000000000..663ee7174
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/linear_cost.rs
+@@ -0,0 +1,119 @@
++//! Completed 2x2 interval products, including materialized outputs and drops.
++//! The scalar-loop control is a cost comparison, not an independent oracle.
++use hyperlattice_interval::hyperinterval::{
++    DyadicBudget, DyadicInterval, F64Enclosure, FixedInterval, RationalInterval,
++};
++use hyperlattice_interval::{IntervalArithmetic, IntervalLatticeError, IntervalMatrix};
++use std::{hint::black_box, time::Instant};
++mod allocations;
++
++type M<I> = IntervalMatrix<I, 2, 2>;
++
++#[inline(never)]
++fn shared<I: IntervalArithmetic>(
++    a: &M<I>,
++    b: &M<I>,
++    context: &mut I::Context,
++) -> Result<M<I>, IntervalLatticeError> {
++    a.mul_matrix(b, context)
++}
++
++#[inline(never)]
++fn scalar_control<I: IntervalArithmetic>(
++    a: &M<I>,
++    b: &M<I>,
++    context: &mut I::Context,
++) -> Result<M<I>, IntervalLatticeError> {
++    let a = a.rows().unwrap();
++    let b = b.rows().unwrap();
++    let mut values = core::array::from_fn(|_| core::array::from_fn(|_| I::zero().unwrap()));
++    for r in 0..2 {
++        for c in 0..2 {
++            for (k, row) in b.iter().enumerate() {
++                let product = a[r][k].mul(&row[c], context)?;
++                values[r][c] = values[r][c].add(&product, context)?;
++            }
++        }
++    }
++    M::new(values)
++}
++
++fn run<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
++    name: &str,
++    a: M<I>,
++    b: M<I>,
++    mut context: impl FnMut() -> I::Context,
++    primitive: bool,
++) {
++    let expected = scalar_control(&a, &b, &mut context()).unwrap();
++    assert_eq!(shared(&a, &b, &mut context()).unwrap(), expected);
++    eprintln!("completed output {name}: {expected:?}");
++    type Operation<I> = fn(
++        &M<I>,
++        &M<I>,
++        &mut <I as IntervalArithmetic>::Context,
++    ) -> Result<M<I>, IntervalLatticeError>;
++    let paths: [(&str, Operation<I>); 2] = [
++        ("scalar_loop", scalar_control::<I>),
++        ("cartesian", shared::<I>),
++    ];
++    for (_, path) in paths {
++        for _ in 0..64 {
++            black_box(path(black_box(&a), black_box(&b), &mut context()).unwrap());
++        }
++    }
++    for sample in 0..20 {
++        for index in 0..2 {
++            let (path, operation) = paths[(index + sample) % 2];
++            let start = Instant::now();
++            let (_, allocations, bytes) = allocations::measure(|| {
++                for _ in 0..128 {
++                    black_box(operation(black_box(&a), black_box(&b), &mut context()).unwrap());
++                }
++            });
++            let elapsed = start.elapsed().as_nanos();
++            if primitive {
++                assert_eq!((allocations, bytes), (0, 0));
++            }
++            println!("{name},{sample},{path},128,{elapsed},{allocations},{bytes}");
++        }
++    }
++}
++
++fn main() {
++    println!("case,sample,path,completed_operations,elapsed_ns,allocation_calls,allocated_bytes");
++    let ranges = [[(1, 3), (-2, 1)], [(0, 2), (-4, -1)]];
++    let fixed = ranges
++        .map(|row| row.map(|(a, b)| FixedInterval::<i32, 16>::new(a << 14, b << 14).unwrap()));
++    let matrix = M::new(fixed).unwrap();
++    run("fixed_q16", matrix, matrix, || (), true);
++    let float = ranges.map(|row| {
++        row.map(|(a, b)| F64Enclosure::new(f64::from(a) / 4., f64::from(b) / 4.).unwrap())
++    });
++    let matrix = M::new(float).unwrap();
++    run("strict_f64", matrix, matrix, || (), true);
++    let rational =
++        ranges.map(|row| row.map(|(a, b)| RationalInterval::new(a.into(), b.into()).unwrap()));
++    let matrix = M::new(rational).unwrap();
++    run("small_rational", matrix.clone(), matrix, || (), false);
++    let wide = RationalInterval::new(
++        "12345678901234567890123456789/17".parse().unwrap(),
++        "98765432109876543210987654321/19".parse().unwrap(),
++    )
++    .unwrap();
++    let matrix = M::new(core::array::from_fn(|_| {
++        core::array::from_fn(|_| wide.clone())
++    }))
++    .unwrap();
++    run("wide_rational", matrix.clone(), matrix, || (), false);
++    let dyadic =
++        ranges.map(|row| row.map(|(a, b)| DyadicInterval::new(a.into(), b.into(), -2).unwrap()));
++    let matrix = M::new(dyadic).unwrap();
++    run(
++        "dyadic",
++        matrix.clone(),
++        matrix,
++        || DyadicBudget::new(256, 1_000_000),
++        false,
++    );
++}
+diff --git a/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs b/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
+new file mode 100644
+index 000000000..a78e8b6c8
+--- /dev/null
++++ b/crates/hyperlattice-interval/conformance/no_alloc_wasm.rs
+@@ -0,0 +1,25 @@
++//! Clean no_std cdylib consumer: linking succeeds without a global allocator.
++#![no_std]
++use hyperlattice_interval::hyperinterval::FixedInterval;
++use hyperlattice_interval::{IntervalMatrix, IntervalVector};
++
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
++    loop {
++        core::hint::spin_loop();
++    }
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn interval_affine_probe(input: i32) -> i32 {
++    type I = FixedInterval<i32, 0>;
++    let s = input.clamp(-256, 256);
++    let point = |x| I::point(x).unwrap();
++    let a = IntervalMatrix::new([[point(2), point(-1)], [point(1), point(1)]]).unwrap();
++    let x = IntervalVector::new([I::new(s, s + 1).unwrap(), I::new(-1, 2).unwrap()]).unwrap();
++    let b = IntervalVector::new([point(3), point(-4)]).unwrap();
++    let result = a.affine_enclosure(&x, &b, &mut ()).unwrap();
++    let [(lo0, hi0), (lo1, hi1)] = result.into_lanes().unwrap().map(|i| i.bounds().unwrap());
++    assert_eq!((lo0, hi0, lo1, hi1), (2 * s + 1, 2 * s + 6, s - 5, s - 1));
++    lo0 + 3 * hi0 + 5 * lo1 + 7 * hi1
++}
+diff --git a/crates/hyperlattice-interval/examples/fixed_affine.rs b/crates/hyperlattice-interval/examples/fixed_affine.rs
+new file mode 100644
+index 000000000..e84cb0bdc
+--- /dev/null
++++ b/crates/hyperlattice-interval/examples/fixed_affine.rs
+@@ -0,0 +1,12 @@
++use hyperlattice_interval::hyperinterval::FixedInterval;
++use hyperlattice_interval::{IntervalLatticeError, IntervalMatrix, IntervalVector};
++
++fn main() -> Result<(), IntervalLatticeError> {
++    type I = FixedInterval<i32, 0>;
++    let a = IntervalMatrix::new([[I::point(2)?, I::point(-1)?]])?;
++    let x = IntervalVector::new([I::new(1, 3)?, I::new(4, 5)?])?;
++    let b = IntervalVector::new([I::point(7)?])?;
++    let result = a.affine_enclosure(&x, &b, &mut ())?;
++    assert_eq!(result.lanes().unwrap()[0].bounds(), Some((4, 9)));
++    Ok(())
++}
+diff --git a/crates/hyperlattice-interval/src/backend.rs b/crates/hyperlattice-interval/src/backend.rs
+new file mode 100644
+index 000000000..a4a1f9bda
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/backend.rs
+@@ -0,0 +1,193 @@
++use hyperinterval::{FiniteRealInterval, IntervalError};
++
++mod sealed {
++    pub trait Sealed {}
++}
++
++/// Narrow sealed adapter to Hyperinterval's certified scalar operations.
++///
++/// No scalar algorithm lives here. Integer sets, proposal floats, and symbolic
++/// balls are deliberately not finite real-interval arithmetic backends.
++pub trait IntervalArithmetic: sealed::Sealed + FiniteRealInterval + Clone {
++    /// Caller-owned arithmetic state: `()` or a shared `DyadicBudget`.
++    type Context;
++    /// Validates type-level constraints even for zero-dimensional products.
++    fn validate_family() -> Result<(), IntervalError> {
++        Self::empty().map(|_| ())
++    }
++    /// Canonical empty scalar set, validating the backend family.
++    fn empty() -> Result<Self, IntervalError>;
++    /// Exact scalar zero, validating the backend family.
++    fn zero() -> Result<Self, IntervalError>;
++    /// Scalar sum enclosure.
++    fn add(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
++    /// Scalar difference enclosure.
++    fn sub(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
++    /// Scalar product enclosure.
++    fn mul(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
++    /// Smallest closed interval containing both inputs.
++    fn hull(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
++    /// Exact scalar intersection.
++    fn intersection(
++        &self,
++        other: &Self,
++        context: &mut Self::Context,
++    ) -> Result<Self, IntervalError>;
++    /// Exact inclusion in the other scalar set.
++    fn subset_of(&self, other: &Self, context: &mut Self::Context) -> Result<bool, IntervalError>;
++    /// Exact inclusion in the real interior of the other scalar set.
++    fn interior_subset_of(
++        &self,
++        other: &Self,
++        context: &mut Self::Context,
++    ) -> Result<bool, IntervalError>;
++    /// Owned copy with the backend's normal retention accounting.
++    fn copy(&self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        self.hull(&Self::empty()?, context)
++    }
++}
++
++// Only exactly matching pass-throughs share an adapter. Scalar failure and
++// budget-sensitive cases remain explicit below.
++#[cfg(any(feature = "fixed", feature = "rational", feature = "float-enclosure"))]
++macro_rules! unbudgeted_relations {
++    () => {
++        fn hull(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++            Ok(Self::hull(self, other))
++        }
++        fn intersection(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++            Ok(Self::intersection(self, other))
++        }
++        fn subset_of(&self, other: &Self, _: &mut ()) -> Result<bool, IntervalError> {
++            Ok(Self::subset_of(self, other))
++        }
++        fn interior_subset_of(&self, other: &Self, _: &mut ()) -> Result<bool, IntervalError> {
++            Ok(Self::interior_subset_of(self, other))
++        }
++    };
++}
++
++#[cfg(feature = "fixed")]
++macro_rules! fixed {
++    ($ty:ty) => {
++        impl<const F: u32> sealed::Sealed for hyperinterval::FixedInterval<$ty, F> {}
++        impl<const F: u32> IntervalArithmetic for hyperinterval::FixedInterval<$ty, F> {
++            type Context = ();
++            fn empty() -> Result<Self, IntervalError> {
++                Self::empty()
++            }
++            fn zero() -> Result<Self, IntervalError> {
++                Self::point(0)
++            }
++            fn add(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                self.checked_add(other)
++            }
++            fn sub(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                self.checked_sub(other)
++            }
++            fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                self.checked_mul(other)
++            }
++            unbudgeted_relations!();
++        }
++    };
++}
++#[cfg(feature = "fixed")]
++fixed!(i32);
++#[cfg(feature = "fixed")]
++fixed!(i64);
++
++#[cfg(feature = "rational")]
++impl sealed::Sealed for hyperinterval::RationalInterval {}
++#[cfg(feature = "rational")]
++impl IntervalArithmetic for hyperinterval::RationalInterval {
++    type Context = ();
++    fn empty() -> Result<Self, IntervalError> {
++        Ok(Self::empty())
++    }
++    fn zero() -> Result<Self, IntervalError> {
++        Ok(Self::point(0.into()))
++    }
++    fn add(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++        Ok(Self::add(self, other))
++    }
++    fn sub(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++        Ok(Self::sub(self, other))
++    }
++    fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++        Ok(Self::mul(self, other))
++    }
++    unbudgeted_relations!();
++}
++
++#[cfg(feature = "dyadic")]
++impl sealed::Sealed for hyperinterval::DyadicInterval {}
++#[cfg(feature = "dyadic")]
++impl IntervalArithmetic for hyperinterval::DyadicInterval {
++    type Context = hyperinterval::DyadicBudget;
++    fn empty() -> Result<Self, IntervalError> {
++        Ok(Self::empty())
++    }
++    fn zero() -> Result<Self, IntervalError> {
++        Self::point(0.into(), 0)
++    }
++    fn add(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        Self::add(self, other, context)
++    }
++    fn sub(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        Self::sub(self, other, context)
++    }
++    fn mul(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        Self::mul(self, other, context)
++    }
++    fn hull(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        Self::hull(self, other, context)
++    }
++    fn intersection(
++        &self,
++        other: &Self,
++        context: &mut Self::Context,
++    ) -> Result<Self, IntervalError> {
++        Self::intersection(self, other, context)
++    }
++    fn subset_of(&self, other: &Self, context: &mut Self::Context) -> Result<bool, IntervalError> {
++        Self::subset_of(self, other, context)
++    }
++    fn interior_subset_of(
++        &self,
++        other: &Self,
++        context: &mut Self::Context,
++    ) -> Result<bool, IntervalError> {
++        Self::interior_subset_of(self, other, context)
++    }
++}
++
++#[cfg(feature = "float-enclosure")]
++macro_rules! float {
++    ($ty:ty) => {
++        impl sealed::Sealed for $ty {}
++        impl IntervalArithmetic for $ty {
++            type Context = ();
++            fn empty() -> Result<Self, IntervalError> {
++                Ok(Self::empty())
++            }
++            fn zero() -> Result<Self, IntervalError> {
++                Self::point(0.0)
++            }
++            fn add(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                Self::add(self, other)
++            }
++            fn sub(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                Self::sub(self, other)
++            }
++            fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
++                Self::mul(self, other)
++            }
++            unbudgeted_relations!();
++        }
++    };
++}
++#[cfg(feature = "float-enclosure")]
++float!(hyperinterval::F32Enclosure);
++#[cfg(feature = "float-enclosure")]
++float!(hyperinterval::F64Enclosure);
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+new file mode 100644
+index 000000000..84a86f337
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -0,0 +1,94 @@
++//! Fixed-size Cartesian interval algebra, re-exported by Hyperlattice.
++//!
++//! Each carrier denotes a Cartesian product of scalar sets. Arithmetic returns
++//! an enclosure; repeated variables and shared input coordinates can introduce
++//! correlations that a Cartesian product does not retain. An affine enclosure
++//! is not the exact correlated affine image. No midpoint is selected implicitly.
++//!
++//! Scalar arithmetic and environment qualification belong to Hyperinterval.
++//! The primitive build is allocation-free `no_std`, with dimension-bounded
++//! loops and inline storage. Dyadic operations share one caller-owned budget
++//! across all lanes and nested products. Rational arithmetic has no internal
++//! work/heap bound. Explicit cloning and serialization are caller-owned work.
++#![no_std]
++#![forbid(unsafe_code)]
++#![deny(missing_docs)]
++
++mod backend;
++mod matrix;
++#[cfg(feature = "serde")]
++mod serde;
++mod vector;
++
++pub use backend::IntervalArithmetic;
++pub use hyperinterval;
++pub use matrix::IntervalMatrix;
++pub use vector::IntervalVector;
++
++/// An axis-aligned box, with the same Cartesian semantics as an interval vector.
++pub type BoxN<I, const N: usize> = IntervalVector<I, N>;
++
++/// Failure of an interval-linear operation. Empty sets are successful values.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[non_exhaustive]
++pub enum IntervalLatticeError {
++    /// The scalar backend rejected an operation; its typed cause is retained.
++    Scalar(hyperinterval::IntervalError),
++    /// A row or column index lies outside its declared dimension.
++    IndexOutOfBounds {
++        /// Requested zero-based index.
++        index: usize,
++        /// Number of rows or columns.
++        dimension: usize,
++    },
++}
++
++impl From<hyperinterval::IntervalError> for IntervalLatticeError {
++    fn from(value: hyperinterval::IntervalError) -> Self {
++        Self::Scalar(value)
++    }
++}
++
++impl core::fmt::Display for IntervalLatticeError {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        match self {
++            Self::Scalar(error) => write!(f, "interval arithmetic failed: {error}"),
++            Self::IndexOutOfBounds { index, dimension } => {
++                write!(f, "index {index} is outside dimension {dimension}")
++            }
++        }
++    }
++}
++
++impl core::error::Error for IntervalLatticeError {
++    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
++        match self {
++            Self::Scalar(error) => Some(error),
++            Self::IndexOutOfBounds { .. } => None,
++        }
++    }
++}
++
++// Stable Rust 1.88 has no array::try_from_fn. Initialized elements drop on
++// failure; only a fully constructed array is published. No unsafe or heap.
++fn array_result<T, E, const N: usize>(
++    mut f: impl FnMut(usize) -> Result<T, E>,
++) -> Result<[T; N], E> {
++    let mut elements = core::array::from_fn(|_| None);
++    for (index, slot) in elements.iter_mut().enumerate() {
++        *slot = Some(f(index)?);
++    }
++    Ok(elements.map(|slot| slot.expect("all slots initialized")))
++}
++
++fn dot<'a, I: IntervalArithmetic + 'a>(
++    terms: impl Iterator<Item = (&'a I, &'a I)>,
++    context: &mut I::Context,
++) -> Result<I, hyperinterval::IntervalError> {
++    let mut sum = I::zero()?;
++    for (a, b) in terms {
++        let product = a.mul(b, context)?;
++        sum = sum.add(&product, context)?;
++    }
++    Ok(sum)
++}
+diff --git a/crates/hyperlattice-interval/src/matrix.rs b/crates/hyperlattice-interval/src/matrix.rs
+new file mode 100644
+index 000000000..3d926d6c3
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/matrix.rs
+@@ -0,0 +1,246 @@
++use crate::{IntervalArithmetic, IntervalLatticeError, IntervalVector, array_result};
++
++/// Cartesian set of row-major `R` by `C` matrices, or the canonical empty set.
++/// All entries vary independently. Empty dimensions have a singleton unit
++/// product unless the explicit empty constructor is used.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct IntervalMatrix<I: IntervalArithmetic, const R: usize, const C: usize> {
++    pub(crate) rows: Option<[[I; C]; R]>,
++}
++
++impl<I: IntervalArithmetic, const R: usize, const C: usize> IntervalMatrix<I, R, C> {
++    /// Constructs from row-major scalar intervals; singleton entries lift a point
++    /// matrix. Any empty entry canonicalizes the whole matrix set to empty.
++    pub fn new(rows: [[I; C]; R]) -> Result<Self, IntervalLatticeError> {
++        I::validate_family()?;
++        Ok(Self {
++            rows: if rows.iter().flatten().any(I::is_empty) {
++                None
++            } else {
++                Some(rows)
++            },
++        })
++    }
++
++    /// Constructs the empty set after validating the scalar family.
++    pub fn empty() -> Result<Self, IntervalLatticeError> {
++        I::validate_family()?;
++        Ok(Self { rows: None })
++    }
++
++    /// Whether the matrix set is empty.
++    pub const fn is_empty(&self) -> bool {
++        self.rows.is_none()
++    }
++
++    /// Whether exactly one matrix is represented, including empty dimensions.
++    pub fn is_singleton(&self) -> bool {
++        self.rows
++            .as_ref()
++            .is_some_and(|rows| rows.iter().flatten().all(I::is_singleton))
++    }
++
++    /// Borrowed row-major entries, or `None` for empty. No scalar copies occur.
++    pub const fn rows(&self) -> Option<&[[I; C]; R]> {
++        self.rows.as_ref()
++    }
++
++    /// Transfers owned entries without copying scalar data.
++    pub fn into_rows(self) -> Option<[[I; C]; R]> {
++        self.rows
++    }
++
++    /// Smallest Cartesian matrix box containing both inputs.
++    pub fn hull(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        match (&self.rows, &other.rows) {
++            (None, None) => Self::empty(),
++            (Some(rows), None) | (None, Some(rows)) => Self::new(array_result(|r| {
++                array_result(|c| rows[r][c].copy(context))
++            })?),
++            (Some(a), Some(b)) => Self::new(array_result(|r| {
++                array_result(|c| a[r][c].hull(&b[r][c], context))
++            })?),
++        }
++    }
++
++    /// Exact Cartesian intersection, canonicalizing empty entries.
++    pub fn intersection(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::intersection)
++    }
++
++    /// Set inclusion. The empty set is included in every matrix set.
++    pub fn subset_of(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<bool, IntervalLatticeError> {
++        self.relation(other, context, I::subset_of)
++    }
++
++    /// Inclusion in the other's real interior (unit products are open).
++    pub fn interior_subset_of(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<bool, IntervalLatticeError> {
++        self.relation(other, context, I::interior_subset_of)
++    }
++
++    /// Entrywise sum enclosure.
++    pub fn add(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::add)
++    }
++
++    /// Entrywise difference enclosure, treating inputs independently.
++    pub fn sub(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::sub)
++    }
++
++    /// Matrix-vector product enclosure. Singleton coefficients or lanes support
++    /// point-matrix or point-vector products without a separate arithmetic path.
++    /// Rows are evaluated in order, each dot product from column zero upward.
++    pub fn mul_vector(
++        &self,
++        vector: &IntervalVector<I, C>,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, R>, IntervalLatticeError> {
++        match (&self.rows, vector.lanes()) {
++            (Some(a), Some(b)) => {
++                IntervalVector::new(array_result(|r| crate::dot(a[r].iter().zip(b), context))?)
++            }
++            _ => IntervalVector::empty(),
++        }
++    }
++
++    /// Matrix product enclosure. Entries are evaluated in row-major order and
++    /// each dot product in increasing shared index. No budget is reset per row.
++    pub fn mul_matrix<const K: usize>(
++        &self,
++        other: &IntervalMatrix<I, C, K>,
++        context: &mut I::Context,
++    ) -> Result<IntervalMatrix<I, R, K>, IntervalLatticeError> {
++        match (&self.rows, &other.rows) {
++            (Some(a), Some(b)) => IntervalMatrix::new(array_result(|r| {
++                array_result(|k| crate::dot((0..C).map(|c| (&a[r][c], &b[c][k])), context))
++            })?),
++            _ => IntervalMatrix::empty(),
++        }
++    }
++
++    /// Encloses `A*x+b`, with independent matrix, vector and translation sets.
++    /// Correlation between output coordinates is not retained. This does not
++    /// construct the exact correlated affine image of a box.
++    pub fn affine_enclosure(
++        &self,
++        vector: &IntervalVector<I, C>,
++        translation: &IntervalVector<I, R>,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, R>, IntervalLatticeError> {
++        // Empty translation makes the entire source domain empty; do not perform
++        // arithmetic that has no image (and could overflow).
++        if translation.is_empty() {
++            return IntervalVector::empty();
++        }
++        self.mul_vector(vector, context)?.add(translation, context)
++    }
++
++    /// Transposes with backend accounting for owned entry copies.
++    pub fn transpose(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<IntervalMatrix<I, C, R>, IntervalLatticeError> {
++        match &self.rows {
++            Some(rows) => IntervalMatrix::new(array_result(|c| {
++                array_result(|r| rows[r][c].copy(context))
++            })?),
++            None => IntervalMatrix::empty(),
++        }
++    }
++
++    /// Projects a row, copying with backend accounting. Invalid indices are
++    /// rejected even for empty input; projecting an empty set remains empty.
++    pub fn row(
++        &self,
++        index: usize,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, C>, IntervalLatticeError> {
++        if index >= R {
++            return Err(IntervalLatticeError::IndexOutOfBounds {
++                index,
++                dimension: R,
++            });
++        }
++        match &self.rows {
++            Some(rows) => IntervalVector::new(array_result(|c| rows[index][c].copy(context))?),
++            None => IntervalVector::empty(),
++        }
++    }
++
++    /// Projects a column with backend accounting and checked index.
++    pub fn column(
++        &self,
++        index: usize,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, R>, IntervalLatticeError> {
++        if index >= C {
++            return Err(IntervalLatticeError::IndexOutOfBounds {
++                index,
++                dimension: C,
++            });
++        }
++        match &self.rows {
++            Some(rows) => IntervalVector::new(array_result(|r| rows[r][index].copy(context))?),
++            None => IntervalVector::empty(),
++        }
++    }
++
++    fn zip(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++        mut op: impl FnMut(&I, &I, &mut I::Context) -> Result<I, hyperinterval::IntervalError>,
++    ) -> Result<Self, IntervalLatticeError> {
++        match (&self.rows, &other.rows) {
++            (Some(a), Some(b)) => Self::new(array_result(|r| {
++                array_result(|c| op(&a[r][c], &b[r][c], context))
++            })?),
++            _ => Self::empty(),
++        }
++    }
++
++    fn relation(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++        mut op: impl FnMut(&I, &I, &mut I::Context) -> Result<bool, hyperinterval::IntervalError>,
++    ) -> Result<bool, IntervalLatticeError> {
++        match (&self.rows, &other.rows) {
++            (None, _) => Ok(true),
++            (Some(_), None) => Ok(false),
++            (Some(a), Some(b)) => {
++                for (a, b) in a.iter().flatten().zip(b.iter().flatten()) {
++                    if !op(a, b, context)? {
++                        return Ok(false);
++                    }
++                }
++                Ok(true)
++            }
++        }
++    }
++}
+diff --git a/crates/hyperlattice-interval/src/serde.rs b/crates/hyperlattice-interval/src/serde.rs
+new file mode 100644
+index 000000000..9bd72f2b3
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/serde.rs
+@@ -0,0 +1,90 @@
++use crate::{IntervalArithmetic, IntervalMatrix, IntervalVector, array_result};
++use ::serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeTuple};
++
++// Serde's built-in arrays do not cover arbitrary const dimensions. This single
++// visitor preserves exact lengths without a Vec or a 32-lane restriction.
++struct Array<T, const N: usize>([T; N]);
++struct ArrayRef<'a, T, const N: usize>(&'a [T; N]);
++
++impl<T: Serialize, const N: usize> Serialize for ArrayRef<'_, T, N> {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        let mut tuple = serializer.serialize_tuple(N)?;
++        for item in self.0 {
++            tuple.serialize_element(item)?;
++        }
++        tuple.end()
++    }
++}
++
++impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for Array<T, N> {
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        struct Visitor<T, const N: usize>(core::marker::PhantomData<T>);
++        impl<'de, T: Deserialize<'de>, const N: usize> de::Visitor<'de> for Visitor<T, N> {
++            type Value = Array<T, N>;
++            fn expecting(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++                write!(formatter, "exactly {N} elements")
++            }
++            fn visit_seq<A: de::SeqAccess<'de>>(
++                self,
++                mut sequence: A,
++            ) -> Result<Self::Value, A::Error> {
++                let values = array_result(|index| {
++                    sequence
++                        .next_element()?
++                        .ok_or_else(|| de::Error::invalid_length(index, &self))
++                })?;
++                if sequence.next_element::<de::IgnoredAny>()?.is_some() {
++                    return Err(de::Error::invalid_length(N.saturating_add(1), &self));
++                }
++                Ok(Array(values))
++            }
++        }
++        deserializer.deserialize_tuple(N, Visitor(core::marker::PhantomData))
++    }
++}
++
++impl<I: IntervalArithmetic + Serialize, const N: usize> Serialize for IntervalVector<I, N> {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.lanes.as_ref().map(ArrayRef).serialize(serializer)
++    }
++}
++
++impl<'de, I: IntervalArithmetic + Deserialize<'de>, const N: usize> Deserialize<'de>
++    for IntervalVector<I, N>
++{
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let values = Option::<Array<I, N>>::deserialize(deserializer)?;
++        match values {
++            None => Self::empty(),
++            Some(values) => Self::new(values.0),
++        }
++        .map_err(de::Error::custom)
++    }
++}
++
++impl<I: IntervalArithmetic + Serialize, const R: usize, const C: usize> Serialize
++    for IntervalMatrix<I, R, C>
++{
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        match &self.rows {
++            None => serializer.serialize_none(),
++            Some(rows) => {
++                let refs: [_; R] = core::array::from_fn(|r| ArrayRef(&rows[r]));
++                serializer.serialize_some(&ArrayRef(&refs))
++            }
++        }
++    }
++}
++
++impl<'de, I: IntervalArithmetic + Deserialize<'de>, const R: usize, const C: usize> Deserialize<'de>
++    for IntervalMatrix<I, R, C>
++{
++    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let values = Option::<Array<Array<I, C>, R>>::deserialize(deserializer)?;
++        match values {
++            None => Self::empty(),
++            Some(values) => Self::new(values.0.map(|row| row.0)),
++        }
++        .map_err(de::Error::custom)
++    }
++}
+diff --git a/crates/hyperlattice-interval/src/vector.rs b/crates/hyperlattice-interval/src/vector.rs
+new file mode 100644
+index 000000000..314705892
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/vector.rs
+@@ -0,0 +1,157 @@
++use crate::{IntervalArithmetic, IntervalLatticeError, array_result};
++
++/// A Cartesian product of `N` finite real intervals, or the canonical empty set.
++///
++/// Any empty lane makes the whole product empty. With zero lanes, `new([])` is
++/// the singleton unit product, distinct from `empty()`. Coordinates are private
++/// and immutable; deserialization validates scalar values and canonicalizes.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct IntervalVector<I: IntervalArithmetic, const N: usize> {
++    pub(crate) lanes: Option<[I; N]>,
++}
++
++impl<I: IntervalArithmetic, const N: usize> IntervalVector<I, N> {
++    /// Constructs a product from validated scalar intervals (singletons lift points).
++    /// Type-level constraints are checked even when `N == 0`.
++    pub fn new(lanes: [I; N]) -> Result<Self, IntervalLatticeError> {
++        I::validate_family()?;
++        Ok(Self {
++            lanes: if lanes.iter().any(I::is_empty) {
++                None
++            } else {
++                Some(lanes)
++            },
++        })
++    }
++
++    /// Constructs the empty set after validating the scalar family.
++    pub fn empty() -> Result<Self, IntervalLatticeError> {
++        I::validate_family()?;
++        Ok(Self { lanes: None })
++    }
++
++    /// Whether the represented Cartesian set is empty.
++    pub const fn is_empty(&self) -> bool {
++        self.lanes.is_none()
++    }
++
++    /// Whether the Cartesian set contains exactly one vector (including `()`).
++    pub fn is_singleton(&self) -> bool {
++        self.lanes
++            .as_ref()
++            .is_some_and(|lanes| lanes.iter().all(I::is_singleton))
++    }
++
++    /// Borrowed lanes, or `None` for the canonical empty set.
++    pub const fn lanes(&self) -> Option<&[I; N]> {
++        self.lanes.as_ref()
++    }
++
++    /// Transfers owned lanes without copying scalar data.
++    pub fn into_lanes(self) -> Option<[I; N]> {
++        self.lanes
++    }
++
++    /// Smallest Cartesian box containing both inputs; not their general union.
++    pub fn hull(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        match (&self.lanes, &other.lanes) {
++            (None, None) => Self::empty(),
++            (Some(lanes), None) | (None, Some(lanes)) => {
++                Self::new(array_result(|i| lanes[i].copy(context))?)
++            }
++            (Some(a), Some(b)) => Self::new(array_result(|i| a[i].hull(&b[i], context))?),
++        }
++    }
++
++    /// Exact Cartesian intersection, canonicalizing any empty component.
++    pub fn intersection(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::intersection)
++    }
++
++    /// Whether this set is included in the other set. Empty is always included.
++    pub fn subset_of(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<bool, IntervalLatticeError> {
++        self.relation(other, context, I::subset_of)
++    }
++
++    /// Inclusion in the other's real interior. In dimension zero the unit
++    /// product is open; in positive dimensions every lane needs strict inclusion.
++    pub fn interior_subset_of(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<bool, IntervalLatticeError> {
++        self.relation(other, context, I::interior_subset_of)
++    }
++
++    /// Coordinate sum enclosure. Empty operands have empty images.
++    pub fn add(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::add)
++    }
++
++    /// Coordinate difference enclosure, treating the two inputs independently.
++    pub fn sub(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.zip(other, context, I::sub)
++    }
++
++    /// Dot-product enclosure with left-to-right multiplication then addition.
++    /// The same caller budget is used for every scalar operation. The empty
++    /// Cartesian set has empty image; a zero-dimensional unit dot product is zero.
++    pub fn dot(&self, other: &Self, context: &mut I::Context) -> Result<I, IntervalLatticeError> {
++        match (&self.lanes, &other.lanes) {
++            (Some(a), Some(b)) => Ok(crate::dot(a.iter().zip(b), context)?),
++            _ => Ok(I::empty()?),
++        }
++    }
++
++    fn zip(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++        mut op: impl FnMut(&I, &I, &mut I::Context) -> Result<I, hyperinterval::IntervalError>,
++    ) -> Result<Self, IntervalLatticeError> {
++        match (&self.lanes, &other.lanes) {
++            (Some(a), Some(b)) => Self::new(array_result(|i| op(&a[i], &b[i], context))?),
++            _ => Self::empty(),
++        }
++    }
++
++    fn relation(
++        &self,
++        other: &Self,
++        context: &mut I::Context,
++        mut op: impl FnMut(&I, &I, &mut I::Context) -> Result<bool, hyperinterval::IntervalError>,
++    ) -> Result<bool, IntervalLatticeError> {
++        match (&self.lanes, &other.lanes) {
++            (None, _) => Ok(true),
++            (Some(_), None) => Ok(false),
++            (Some(a), Some(b)) => {
++                for (a, b) in a.iter().zip(b) {
++                    if !op(a, b, context)? {
++                        return Ok(false);
++                    }
++                }
++                Ok(true)
++            }
++        }
++    }
++}
+diff --git a/crates/hyperlattice-interval/tests/cartesian.rs b/crates/hyperlattice-interval/tests/cartesian.rs
+new file mode 100644
+index 000000000..4abc0e1d1
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/cartesian.rs
+@@ -0,0 +1,417 @@
++#![cfg(any(
++    feature = "fixed",
++    feature = "rational",
++    feature = "dyadic",
++    feature = "float-enclosure"
++))]
++use hyperlattice_interval::{IntervalArithmetic, IntervalMatrix, IntervalVector};
++
++// Independent endpoint oracle: enumerate every corner of the two independent
++// input boxes using exact i64 arithmetic, without calling any interval kernel.
++fn dot_bounds(a: &[(i32, i32)], b: &[(i32, i32)]) -> (i32, i32) {
++    let mut result = (i64::MAX, i64::MIN);
++    for mask in 0..(1_usize << (2 * a.len())) {
++        let mut sum = 0_i64;
++        for i in 0..a.len() {
++            let x = if mask & (1 << i) == 0 { a[i].0 } else { a[i].1 };
++            let y = if mask & (1 << (a.len() + i)) == 0 {
++                b[i].0
++            } else {
++                b[i].1
++            };
++            sum += i64::from(x) * i64::from(y);
++        }
++        result = (result.0.min(sum), result.1.max(sum));
++    }
++    (result.0.try_into().unwrap(), result.1.try_into().unwrap())
++}
++
++fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
++    scalar: impl Fn(i32, i32) -> I,
++    mut context: impl FnMut() -> I::Context,
++) {
++    let inner = IntervalVector::new([scalar(-1, 1), scalar(2, 3)]).unwrap();
++    let outer = IntervalVector::new([scalar(-2, 2), scalar(1, 4)]).unwrap();
++    assert!(inner.interior_subset_of(&outer, &mut context()).unwrap());
++    assert!(!outer.subset_of(&inner, &mut context()).unwrap());
++    assert_eq!(inner.intersection(&outer, &mut context()).unwrap(), inner);
++    assert_eq!(inner.hull(&outer, &mut context()).unwrap(), outer);
++    let difference = outer.sub(&inner, &mut context()).unwrap();
++    assert_eq!(difference.lanes(), Some(&[scalar(-3, 3), scalar(-2, 2)]));
++    let m = IntervalMatrix::new([inner.into_lanes().unwrap()]).unwrap();
++    let n = IntervalMatrix::new([outer.into_lanes().unwrap()]).unwrap();
++    assert!(m.subset_of(&n, &mut context()).unwrap());
++    assert!(m.interior_subset_of(&n, &mut context()).unwrap());
++    assert!(!n.subset_of(&m, &mut context()).unwrap());
++    assert_eq!(m.hull(&n, &mut context()).unwrap(), n);
++    assert_eq!(m.intersection(&n, &mut context()).unwrap(), m);
++    assert_eq!(
++        n.sub(&m, &mut context()).unwrap().into_rows(),
++        Some([difference.into_lanes().unwrap()])
++    );
++    let unit = IntervalMatrix::<I, 0, 2>::new([]).unwrap();
++    assert!(unit.interior_subset_of(&unit, &mut context()).unwrap());
++    assert_eq!(unit.into_rows(), Some([]));
++    let ranges = [(-1, -1), (-1, 0), (-1, 1), (0, 0), (0, 1), (1, 1)];
++    // Exhaust every two-lane dot product over this finite endpoint domain.
++    for a0 in ranges {
++        for a1 in ranges {
++            for b0 in ranges {
++                for b1 in ranges {
++                    let a = IntervalVector::new([scalar(a0.0, a0.1), scalar(a1.0, a1.1)]).unwrap();
++                    let b = IntervalVector::new([scalar(b0.0, b0.1), scalar(b1.0, b1.1)]).unwrap();
++                    let expected = dot_bounds(&[a0, a1], &[b0, b1]);
++                    assert_eq!(
++                        a.dot(&b, &mut context()).unwrap(),
++                        scalar(expected.0, expected.1)
++                    );
++                    let left = IntervalMatrix::new([
++                        a.clone().into_lanes().unwrap(),
++                        b.clone().into_lanes().unwrap(),
++                    ])
++                    .unwrap();
++                    let right = IntervalMatrix::new([
++                        [scalar(b0.0, b0.1), scalar(a0.0, a0.1)],
++                        [scalar(b1.0, b1.1), scalar(a1.0, a1.1)],
++                    ])
++                    .unwrap();
++                    let left_bounds = [[a0, a1], [b0, b1]];
++                    let columns = [[b0, b1], [a0, a1]];
++                    let expected_matrix = core::array::from_fn(|r| {
++                        core::array::from_fn(|c| {
++                            let bounds = dot_bounds(&left_bounds[r], &columns[c]);
++                            scalar(bounds.0, bounds.1)
++                        })
++                    });
++                    assert_eq!(
++                        left.mul_matrix(&right, &mut context()).unwrap().rows(),
++                        Some(&expected_matrix)
++                    );
++                    let row = IntervalMatrix::new([a.into_lanes().unwrap()]).unwrap();
++                    let column = IntervalMatrix::new(b.into_lanes().unwrap().map(|x| [x])).unwrap();
++                    let product = row.mul_matrix(&column, &mut context()).unwrap();
++                    assert_eq!(
++                        product.rows().unwrap()[0][0],
++                        scalar(expected.0, expected.1)
++                    );
++                }
++            }
++        }
++    }
++    // Every 2x2 point matrix and every 2D input box on the same endpoint grid.
++    for a in -1..=1 {
++        for b in -1..=1 {
++            for c in -1..=1 {
++                for d in -1..=1 {
++                    let matrix = IntervalMatrix::new([
++                        [scalar(a, a), scalar(b, b)],
++                        [scalar(c, c), scalar(d, d)],
++                    ])
++                    .unwrap();
++                    for x in ranges {
++                        for y in ranges {
++                            let vector =
++                                IntervalVector::new([scalar(x.0, x.1), scalar(y.0, y.1)]).unwrap();
++                            let shift =
++                                IntervalVector::new([scalar(2, 2), scalar(-3, -3)]).unwrap();
++                            let output = matrix
++                                .affine_enclosure(&vector, &shift, &mut context())
++                                .unwrap();
++                            let e0 = dot_bounds(&[(a, a), (b, b)], &[x, y]);
++                            let e1 = dot_bounds(&[(c, c), (d, d)], &[x, y]);
++                            assert_eq!(
++                                output.lanes().unwrap(),
++                                &[scalar(e0.0 + 2, e0.1 + 2), scalar(e1.0 - 3, e1.1 - 3)]
++                            );
++                            let restored = matrix
++                                .transpose(&mut context())
++                                .unwrap()
++                                .transpose(&mut context())
++                                .unwrap();
++                            assert_eq!(restored, matrix);
++                            // Consume generated output in another product, with independently
++                            // computed expectations for its declared Cartesian enclosure.
++                            let next = matrix.mul_vector(&output, &mut context()).unwrap();
++                            let input = [(e0.0 + 2, e0.1 + 2), (e1.0 - 3, e1.1 - 3)];
++                            let n0 = dot_bounds(&[(a, a), (b, b)], &input);
++                            let n1 = dot_bounds(&[(c, c), (d, d)], &input);
++                            assert_eq!(
++                                next.lanes().unwrap(),
++                                &[scalar(n0.0, n0.1), scalar(n1.0, n1.1)]
++                            );
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++#[cfg(feature = "fixed")]
++#[test]
++fn exhaustive_fixed_exact_oracles() {
++    exact_products(
++        |a, b| hyperlattice_interval::hyperinterval::FixedInterval::<i32, 0>::new(a, b).unwrap(),
++        || (),
++    );
++    exact_products(
++        |a, b| {
++            hyperlattice_interval::hyperinterval::FixedInterval::<i64, 0>::new(a.into(), b.into())
++                .unwrap()
++        },
++        || (),
++    );
++}
++
++#[cfg(feature = "rational")]
++#[test]
++fn exhaustive_rational_exact_oracles() {
++    exact_products(
++        |a, b| {
++            hyperlattice_interval::hyperinterval::RationalInterval::new(a.into(), b.into()).unwrap()
++        },
++        || (),
++    );
++}
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn exhaustive_dyadic_exact_oracles() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval};
++    exact_products(
++        |a, b| DyadicInterval::new(a.into(), b.into(), 0).unwrap(),
++        || DyadicBudget::new(256, 1_000_000),
++    );
++}
++
++#[cfg(feature = "float-enclosure")]
++#[test]
++fn exhaustive_strict_float_exact_oracles() {
++    use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure};
++    exact_products(|a, b| F32Enclosure::new(a as f32, b as f32).unwrap(), || ());
++    exact_products(|a, b| F64Enclosure::new(a.into(), b.into()).unwrap(), || ());
++}
++
++#[cfg(feature = "fixed")]
++mod fixed {
++    use super::*;
++    use hyperlattice_interval::hyperinterval::{FixedInterval, IntervalError};
++    use hyperlattice_interval::{BoxN, IntervalLatticeError};
++    type I = FixedInterval<i32, 2>;
++    fn i(a: i32, b: i32) -> I {
++        I::new(a, b).unwrap()
++    }
++
++    #[test]
++    fn fractional_products_are_outward_and_overflow_is_typed() {
++        let ranges: Vec<_> = (-2..=2)
++            .flat_map(|a| (a..=2).map(move |b| (a, b)))
++            .collect();
++        for a in &ranges {
++            for b in &ranges {
++                for c in &ranges {
++                    for d in &ranges {
++                        let x = IntervalVector::new([i(a.0, a.1), i(b.0, b.1)]).unwrap();
++                        let y = IntervalVector::new([i(c.0, c.1), i(d.0, d.1)]).unwrap();
++                        let (lo, hi) = x.dot(&y, &mut ()).unwrap().bounds().unwrap();
++                        let oracle = dot_bounds(&[*a, *b], &[*c, *d]);
++                        assert!(lo * 4 <= oracle.0 && hi * 4 >= oracle.1);
++                        // Two separately rounded products: at most two grid units of slack.
++                        assert!(oracle.0 - lo * 4 < 8 && hi * 4 - oracle.1 < 8);
++                    }
++                }
++            }
++        }
++        let huge = IntervalVector::new([i(i32::MAX, i32::MAX)]).unwrap();
++        let two = IntervalVector::new([i(8, 8)]).unwrap();
++        assert_eq!(
++            huge.dot(&two, &mut ()),
++            Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++        );
++        let identity = IntervalMatrix::new([[i(4, 4)]]).unwrap();
++        assert_eq!(identity.mul_vector(&huge, &mut ()).unwrap(), huge);
++        // Addition overflow after a representable product must also propagate.
++        let huge_two = IntervalVector::new([i(i32::MAX, i32::MAX); 2]).unwrap();
++        let ones = IntervalVector::new([i(4, 4); 2]).unwrap();
++        let error = huge_two.dot(&ones, &mut ()).unwrap_err();
++        assert_eq!(error, IntervalLatticeError::Scalar(IntervalError::Overflow));
++        use core::error::Error;
++        assert_eq!(
++            error.source().unwrap().to_string(),
++            "interval endpoint overflow"
++        );
++        assert_eq!(
++            error.to_string(),
++            "interval arithmetic failed: interval endpoint overflow"
++        );
++        let bad_index = identity.row(1, &mut ()).unwrap_err();
++        assert!(bad_index.source().is_none());
++        assert_eq!(bad_index.to_string(), "index 1 is outside dimension 1");
++    }
++
++    #[test]
++    fn canonical_empty_unit_and_invalid_families() {
++        let unit = IntervalVector::<I, 0>::new([]).unwrap();
++        let empty = IntervalVector::<I, 0>::empty().unwrap();
++        assert!(unit.is_singleton() && !unit.is_empty());
++        assert!(empty.is_empty() && !empty.is_singleton());
++        assert!(unit.interior_subset_of(&unit, &mut ()).unwrap());
++        assert_eq!(unit.dot(&unit, &mut ()).unwrap(), i(0, 0));
++        assert!(empty.dot(&unit, &mut ()).unwrap().is_empty());
++        assert!(empty.subset_of(&unit, &mut ()).unwrap());
++        assert!(!unit.subset_of(&empty, &mut ()).unwrap());
++        let mixed = IntervalVector::new([I::empty().unwrap(), i(1, 3)]).unwrap();
++        assert_eq!(mixed, BoxN::<I, 2>::empty().unwrap());
++        let a = IntervalMatrix::<I, 2, 0>::new([[], []]).unwrap();
++        let b = IntervalMatrix::<I, 0, 3>::new([]).unwrap();
++        let product = a.mul_matrix(&b, &mut ()).unwrap();
++        assert_eq!(product.rows(), Some(&[[i(0, 0); 3]; 2]));
++        assert!(
++            a.mul_matrix::<3>(&IntervalMatrix::empty().unwrap(), &mut ())
++                .unwrap()
++                .is_empty()
++        );
++        assert!(IntervalVector::<FixedInterval<i32, 32>, 0>::new([]).is_err());
++        assert!(IntervalVector::<FixedInterval<i64, 64>, 0>::empty().is_err());
++        assert!(IntervalMatrix::<FixedInterval<i32, 32>, 0, 4>::new([]).is_err());
++        assert!(IntervalMatrix::<FixedInterval<i32, 32>, 3, 0>::empty().is_err());
++    }
++
++    #[test]
++    fn relations_projections_and_empty_shortcuts() {
++        let a = IntervalVector::new([i(-4, 4), i(0, 8)]).unwrap();
++        let b = IntervalVector::new([i(-2, 2), i(2, 6)]).unwrap();
++        assert!(b.interior_subset_of(&a, &mut ()).unwrap());
++        assert!(!a.interior_subset_of(&a, &mut ()).unwrap());
++        assert_eq!(a.hull(&b, &mut ()).unwrap(), a);
++        assert_eq!(a.intersection(&b, &mut ()).unwrap(), b);
++        let disjoint = IntervalVector::new([i(5, 6), i(2, 3)]).unwrap();
++        let empty = a.intersection(&disjoint, &mut ()).unwrap();
++        assert!(empty.is_empty());
++        assert_eq!(empty.hull(&a, &mut ()).unwrap(), a);
++        assert_eq!(a.hull(&empty, &mut ()).unwrap(), a);
++        assert!(empty.hull(&empty, &mut ()).unwrap().is_empty());
++        assert!(a.add(&empty, &mut ()).unwrap().is_empty());
++        assert!(empty.sub(&a, &mut ()).unwrap().is_empty());
++        assert_eq!(
++            a.sub(&b, &mut ()).unwrap().lanes(),
++            Some(&[i(-6, 6), i(-6, 6)])
++        );
++        let m = IntervalMatrix::new([a.into_lanes().unwrap(), b.into_lanes().unwrap()]).unwrap();
++        assert_eq!(m.row(1, &mut ()).unwrap(), b);
++        assert_eq!(
++            m.column(0, &mut ()).unwrap().lanes(),
++            Some(&[i(-4, 4), i(-2, 2)])
++        );
++        let e = IntervalMatrix::<I, 2, 2>::empty().unwrap();
++        assert!(e.row(0, &mut ()).unwrap().is_empty());
++        assert!(e.column(0, &mut ()).unwrap().is_empty());
++        assert_eq!(
++            e.row(2, &mut ()),
++            Err(IntervalLatticeError::IndexOutOfBounds {
++                index: 2,
++                dimension: 2
++            })
++        );
++        assert_eq!(
++            m.column(2, &mut ()),
++            Err(IntervalLatticeError::IndexOutOfBounds {
++                index: 2,
++                dimension: 2
++            })
++        );
++        assert!(e.transpose(&mut ()).unwrap().is_empty());
++        assert_eq!(m.hull(&e, &mut ()).unwrap(), m);
++        assert_eq!(e.hull(&m, &mut ()).unwrap(), m);
++        assert!(e.hull(&e, &mut ()).unwrap().is_empty());
++        assert!(e.subset_of(&m, &mut ()).unwrap());
++        assert!(e.interior_subset_of(&m, &mut ()).unwrap());
++        assert!(!m.subset_of(&e, &mut ()).unwrap());
++        assert!(!m.interior_subset_of(&m, &mut ()).unwrap());
++        assert_eq!(m.intersection(&m, &mut ()).unwrap(), m);
++        assert!(m.intersection(&e, &mut ()).unwrap().is_empty());
++        assert!(m.add(&e, &mut ()).unwrap().is_empty());
++        let zero = IntervalMatrix::new([[i(0, 0); 2]; 2]).unwrap();
++        assert_eq!(m.sub(&zero, &mut ()).unwrap(), m);
++        assert_eq!(m.add(&zero, &mut ()).unwrap(), m);
++        assert!(m.mul_vector(&empty, &mut ()).unwrap().is_empty());
++        let huge = IntervalMatrix::new([[i(i32::MAX, i32::MAX)]]).unwrap();
++        let two = IntervalVector::new([i(8, 8)]).unwrap();
++        assert!(
++            huge.affine_enclosure(&two, &IntervalVector::empty().unwrap(), &mut ())
++                .unwrap()
++                .is_empty()
++        );
++    }
++}
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn shared_budget_copies_exhaustion_and_retry() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I, IntervalError};
++    let i = |n: i32| I::point(n.into(), 0).unwrap();
++    let a = IntervalMatrix::new([[i(2), i(-3)], [i(5), i(7)]]).unwrap();
++    let x = IntervalVector::new([i(11), i(13)]).unwrap();
++    let mut one_row_budget = DyadicBudget::new(256, 1_000_000);
++    let row = IntervalVector::new([i(2), i(-3)]).unwrap();
++    row.dot(&x, &mut one_row_budget).unwrap();
++    let spent = 1_000_000 - one_row_budget.remaining_work();
++    let mut insufficient = DyadicBudget::new(256, spent);
++    assert_eq!(
++        a.mul_vector(&x, &mut insufficient),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    let result = a
++        .mul_vector(&x, &mut DyadicBudget::new(256, 1_000_000))
++        .unwrap();
++    assert_eq!(result.lanes(), Some(&[i(-17), i(146)]));
++    assert_eq!(
++        a.transpose(&mut DyadicBudget::new(256, 0)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    assert!(a.row(0, &mut DyadicBudget::new(256, 0)).is_err());
++    assert!(a.column(0, &mut DyadicBudget::new(256, 0)).is_err());
++    assert!(
++        a.hull(
++            &IntervalMatrix::empty().unwrap(),
++            &mut DyadicBudget::new(256, 0)
++        )
++        .is_err()
++    );
++    assert!(
++        x.hull(
++            &IntervalVector::empty().unwrap(),
++            &mut DyadicBudget::new(256, 0)
++        )
++        .is_err()
++    );
++    for error in [
++        a.mul_matrix(&a, &mut DyadicBudget::new(256, 0))
++            .unwrap_err(),
++        a.hull(&a, &mut DyadicBudget::new(256, 0)).unwrap_err(),
++        a.intersection(&a, &mut DyadicBudget::new(256, 0))
++            .unwrap_err(),
++        a.subset_of(&a, &mut DyadicBudget::new(256, 0)).unwrap_err(),
++        x.hull(&x, &mut DyadicBudget::new(256, 0)).unwrap_err(),
++        x.intersection(&x, &mut DyadicBudget::new(256, 0))
++            .unwrap_err(),
++        x.subset_of(&x, &mut DyadicBudget::new(256, 0)).unwrap_err(),
++        a.affine_enclosure(&x, &x, &mut DyadicBudget::new(256, 0))
++            .unwrap_err(),
++    ] {
++        assert_eq!(
++            error,
++            IntervalLatticeError::Scalar(IntervalError::WorkExhausted)
++        );
++    }
++    assert!(
++        a.mul_vector(&x, &mut DyadicBudget::new(1, 1_000_000))
++            .is_err()
++    );
++    assert_eq!(
++        a.mul_vector(&x, &mut DyadicBudget::new(256, 1_000_000))
++            .unwrap(),
++        result
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/no_alloc.rs b/crates/hyperlattice-interval/tests/no_alloc.rs
+new file mode 100644
+index 000000000..8ebacd336
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/no_alloc.rs
+@@ -0,0 +1,31 @@
++#![cfg(feature = "fixed")]
++use hyperlattice_interval::hyperinterval::FixedInterval;
++use hyperlattice_interval::{IntervalMatrix, IntervalVector};
++#[path = "../conformance/allocations.rs"]
++mod allocations;
++
++#[test]
++fn primitive_construction_composition_and_errors_do_not_allocate() {
++    type I = FixedInterval<i64, 16>;
++    let ((subset, interior), count, bytes) = allocations::measure(|| {
++        let p = I::point(1 << 16).unwrap();
++        let x = IntervalVector::new([I::new(-(1 << 16), 1 << 16).unwrap(); 3]).unwrap();
++        let m = IntervalMatrix::new([[p; 3]; 3]).unwrap();
++        let result = m.affine_enclosure(&x, &x, &mut ()).unwrap();
++        let transposed = m.transpose(&mut ()).unwrap();
++        let squared = m.mul_matrix(&transposed, &mut ()).unwrap();
++        let row = squared.row(0, &mut ()).unwrap();
++        let column = squared.column(0, &mut ()).unwrap();
++        let dot = row.dot(&column, &mut ()).unwrap();
++        let empty = IntervalVector::empty().unwrap();
++        let hull = result.hull(&empty, &mut ()).unwrap();
++        let intersection = hull.intersection(&result, &mut ()).unwrap();
++        let subset = intersection.subset_of(&result, &mut ()).unwrap();
++        let interior = intersection.interior_subset_of(&result, &mut ()).unwrap();
++        let error = squared.row(3, &mut ()).unwrap_err();
++        std::hint::black_box((result, transposed, squared, dot, hull, intersection, error));
++        (subset, interior)
++    });
++    assert!(subset && !interior);
++    assert_eq!((count, bytes), (0, 0));
++}
+diff --git a/crates/hyperlattice-interval/tests/replay.rs b/crates/hyperlattice-interval/tests/replay.rs
+new file mode 100644
+index 000000000..53f093a6d
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/replay.rs
+@@ -0,0 +1,79 @@
++#![cfg(all(feature = "serde", feature = "fixed"))]
++use hyperlattice_interval::hyperinterval::FixedInterval;
++use hyperlattice_interval::{IntervalMatrix, IntervalVector};
++type I = FixedInterval<i32, 0>;
++
++#[test]
++fn arbitrary_dimensions_and_output_replay() {
++    let wide = IntervalVector::new([I::new(-2, 3).unwrap(); 65]).unwrap();
++    let bytes = serde_json::to_string(&wide).unwrap();
++    let replay: IntervalVector<I, 65> = serde_json::from_str(&bytes).unwrap();
++    assert_eq!(wide, replay);
++    assert_eq!(bytes, serde_json::to_string(&replay).unwrap());
++    let tall = IntervalMatrix::new([[I::point(2).unwrap(); 2]; 40]).unwrap();
++    let text = serde_json::to_string(&tall).unwrap();
++    let replay: IntervalMatrix<I, 40, 2> = serde_json::from_str(&text).unwrap();
++    assert_eq!(tall, replay);
++    let vector = IntervalVector::new([I::new(-1, 2).unwrap(), I::new(4, 5).unwrap()]).unwrap();
++    let output = replay.mul_vector(&vector, &mut ()).unwrap();
++    assert_eq!(output.lanes(), Some(&[I::new(6, 14).unwrap(); 40]));
++    let replay: IntervalVector<I, 40> =
++        serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
++    assert_eq!(
++        replay.dot(&output, &mut ()).unwrap(),
++        I::new(1440, 7840).unwrap()
++    );
++}
++
++#[test]
++fn malformed_replay_and_empty_canonicalization() {
++    for input in [
++        "[]",
++        "[[1,2]]",
++        "[[1,2],[3,4],[5,6]]",
++        "[[2,1],[3,4]]",
++        "[null,[4,3]]",
++    ] {
++        assert!(
++            serde_json::from_str::<IntervalVector<I, 2>>(input).is_err(),
++            "{input}"
++        );
++    }
++    for input in [
++        "[]",
++        "[[[0,1]]]",
++        "[[[0,1],[1,2]],[[0,1]]]",
++        "[[[0,1],[1,2]],[[0,1],[2,1]]]",
++        "[[],[]]",
++    ] {
++        assert!(
++            serde_json::from_str::<IntervalMatrix<I, 2, 2>>(input).is_err(),
++            "{input}"
++        );
++    }
++    let vector: IntervalVector<I, 2> = serde_json::from_str("[null,[1,2]]").unwrap();
++    assert!(vector.is_empty());
++    assert_eq!(serde_json::to_string(&vector).unwrap(), "null");
++    let matrix: IntervalMatrix<I, 1, 2> = serde_json::from_str("[[[1,2],null]]").unwrap();
++    assert!(matrix.is_empty());
++    assert_eq!(serde_json::to_string(&matrix).unwrap(), "null");
++    assert!(serde_json::from_str::<IntervalVector<FixedInterval<i32, 32>, 0>>("null").is_err());
++    assert!(serde_json::from_str::<IntervalVector<FixedInterval<i32, 32>, 0>>("[]").is_err());
++    assert!(
++        serde_json::from_str::<IntervalMatrix<FixedInterval<i64, 64>, 2, 0>>("[[],[]]").is_err()
++    );
++    assert!(serde_json::from_str::<IntervalMatrix<FixedInterval<i64, 64>, 2, 0>>("null").is_err());
++}
++
++#[test]
++fn unit_and_empty_products_have_distinct_replays() {
++    let unit: IntervalVector<I, 0> = serde_json::from_str("[]").unwrap();
++    let empty: IntervalVector<I, 0> = serde_json::from_str("null").unwrap();
++    assert!(unit.is_singleton() && empty.is_empty());
++    assert_ne!(unit, empty);
++    let unit: IntervalMatrix<I, 2, 0> = serde_json::from_str("[[],[]]").unwrap();
++    let empty: IntervalMatrix<I, 2, 0> = serde_json::from_str("null").unwrap();
++    assert!(unit.is_singleton() && empty.is_empty());
++    assert_eq!(serde_json::to_string(&unit).unwrap(), "[[],[]]");
++    assert_eq!(serde_json::to_string(&empty).unwrap(), "null");
++}
+diff --git a/crates/hyperlattice/CHANGELOG.md b/crates/hyperlattice/CHANGELOG.md
+index ca7152f2b..274fea4eb 100644
+--- a/crates/hyperlattice/CHANGELOG.md
++++ b/crates/hyperlattice/CHANGELOG.md
+@@ -52,6 +52,10 @@
+ 
+ ### Added
+ 
++- Add optional Cartesian `IntervalVector`, `IntervalMatrix` and `BoxN`
++  re-exports from the Rust 1.88 `no_std` `hyperlattice-interval` companion.
++  Backend features are additive; existing no-default Real APIs remain available.
++
+ - `Complex::jacobi_sncndn` and `Complex::jacobi_epsilon` evaluate Jacobi's
+   sn, cn, dn and epsilon at complex arguments for a real parameter `m < 1`,
+   including negative parameters. Poles return `Problem::DivideByZero` and an
+diff --git a/crates/hyperlattice/Cargo.toml b/crates/hyperlattice/Cargo.toml
+index 5b9473ace..a80579783 100644
+--- a/crates/hyperlattice/Cargo.toml
++++ b/crates/hyperlattice/Cargo.toml
+@@ -19,6 +19,7 @@ all-features = true
+ 
+ [dependencies]
+ hyperreal = { version = "0.14.0", path = "../hyperreal" }
++hyperlattice-interval = { version = "0.1.0", path = "../hyperlattice-interval", default-features = false, optional = true }
+ arbitrary = { version = "1", features = ["derive"], optional = true }
+ serde = { version = "1", features = ["derive"], optional = true }
+ 
+@@ -33,7 +34,12 @@ symbolica = "1.5.0"
+ default = []
+ hyperreal-dispatch-trace = ["hyperreal/dispatch-trace"]
+ arbitrary = ["dep:arbitrary"]
+-serde = ["dep:serde", "hyperreal/serde"]
++serde = ["dep:serde", "hyperreal/serde", "hyperlattice-interval?/serde"]
++interval = ["dep:hyperlattice-interval"]
++interval-fixed = ["interval", "hyperlattice-interval/fixed"]
++interval-dyadic = ["interval", "hyperlattice-interval/dyadic"]
++interval-rational = ["interval", "hyperlattice-interval/rational"]
++interval-float-enclosure = ["interval", "hyperlattice-interval/float-enclosure"]
+ 
+ [[example]]
+ name = "readme_quickstart"
+diff --git a/crates/hyperlattice/README.md b/crates/hyperlattice/README.md
+index a6f28e88d..b8ba6ffb9 100644
+--- a/crates/hyperlattice/README.md
++++ b/crates/hyperlattice/README.md
+@@ -349,3 +349,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+ Extensions follow the stack-wide [admission protocol](../../docs/admission.md).
+ It defines the exactness, certainty, boundary, cache, validation, and evidence
+ requirements shared by the Hyper crates.
++
++## Interval algebra
++
++Enable `interval-fixed`, `interval-dyadic`, `interval-rational`, or
++`interval-float-enclosure` for `IntervalVector`, `IntervalMatrix` and `BoxN`.
++These are Cartesian enclosures with explicit empty sets, checked scalar
++arithmetic and shared dyadic budgets. Scalar backends are available under
++`hyperlattice::interval::hyperinterval`. The same implementation is available
++in `hyperlattice-interval` for Rust 1.88 `no_std` firmware; the existing
++Hyperreal-backed Hyperlattice API still requires Rust 1.95.
+diff --git a/crates/hyperlattice/src/lib.rs b/crates/hyperlattice/src/lib.rs
+index 2d29f708c..c3a8d6d1b 100644
+--- a/crates/hyperlattice/src/lib.rs
++++ b/crates/hyperlattice/src/lib.rs
+@@ -36,6 +36,15 @@
+ 
+ #![warn(missing_docs)]
+ 
++/// Cartesian interval algebra. The companion package also provides the
++/// allocation-free Rust 1.88 dependency path for firmware consumers.
++#[cfg(feature = "interval")]
++pub use hyperlattice_interval as interval;
++#[cfg(feature = "interval")]
++pub use hyperlattice_interval::{
++    BoxN, IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector,
++};
++
+ pub use hyperreal::{
+     DomainFacts, DomainStatus, ExpressionDegree, MagnitudeBits, Rational, RationalStorageClass,
+     Real, RealExactSetDenominatorKind, RealExactSetDyadicExponentClass, RealExactSetFacts,
+diff --git a/crates/hyperlattice/tests/interval_surface.rs b/crates/hyperlattice/tests/interval_surface.rs
+new file mode 100644
+index 000000000..1d874f207
+--- /dev/null
++++ b/crates/hyperlattice/tests/interval_surface.rs
+@@ -0,0 +1,14 @@
++#![cfg(feature = "interval-rational")]
++use hyperlattice::interval::hyperinterval::RationalInterval;
++use hyperlattice::{BoxN, IntervalMatrix, IntervalVector};
++
++#[test]
++fn shared_interval_types_are_consumable_through_hyperlattice() {
++    let interval = |a: i32, b: i32| RationalInterval::new(a.into(), b.into()).unwrap();
++    let matrix = IntervalMatrix::new([[interval(2, 2), interval(-1, -1)]]).unwrap();
++    let vector: BoxN<_, 2> = IntervalVector::new([interval(1, 3), interval(4, 5)]).unwrap();
++    let output = matrix.mul_vector(&vector, &mut ()).unwrap();
++    assert_eq!(output.lanes(), Some(&[interval(-3, 2)]));
++    // This is the companion's actual type, not a wrapper or duplicate kernel.
++    let _: hyperlattice::interval::IntervalVector<_, 1> = output;
++}
