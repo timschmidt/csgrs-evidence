@@ -1,0 +1,994 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index e7b669bcb..412acf0c1 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -130,7 +130,7 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
+-          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers" "$RUNNER_TEMP/interval-square-roots" "$RUNNER_TEMP/interval-primitive-roots"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+@@ -138,3 +138,4 @@ jobs:
+           cargo +nightly fuzz run strict_float "$RUNNER_TEMP/interval-strict-float" -- -runs=100000 -max_len=24 -max_total_time=30 -seed=20261114
+           cargo +nightly fuzz run rational_powers --features rational "$RUNNER_TEMP/interval-rational-powers" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261115
+           cargo +nightly fuzz run square_roots --features rational "$RUNNER_TEMP/interval-square-roots" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261116
++          cargo +nightly fuzz run primitive_roots "$RUNNER_TEMP/interval-primitive-roots" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261117
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 0d01e79b4..b250cb576 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -46,7 +46,7 @@ No existing arithmetic or predicate dispatch has been changed.
+ | 2 integer/fixed | local correctness/cost probes passed | firmware cycles/HIL and coordinated baseline gaps remain |
+ | 3 rational/dyadic/ball | carriers and local acceptance implemented | solver kernel migration, full coverage and consumer cost gates |
+ | 4 proposals/float | proposal wrappers and strict integer IEEE core implemented; local x86_64 qualification passed | full surface/coverage, further targets and shipped consumers |
+-| 5 elementary functions | abs/min/max, rational signed powers and rational/dyadic square roots implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
++| 5 elementary functions | abs/min/max, rational signed powers and rational/dyadic/fixed/IEEE square roots implemented | remaining powers/functions, domain/extrema/pole corpus and full coverage |
+ | 6 lattice | not started | component oracles and allocation/cost evidence |
+ | 7 solver | qualification started; production migration rejected | satisfy size/performance gates with unchanged statuses, certificates and dispatch |
+ | 8 interface | not started | unchanged canonical bytes and profiles |
+@@ -881,6 +881,78 @@ registered in `docs/evidence-archive.tsv`; all prior records are preserved.
+ Remaining elementary functions, primitive square-root backends, consumer
+ migrations, full coverage and release qualification remain open.
+ 
++## Primitive square-root admission (2026-11-12)
++
++Owner: Hyperinterval primitive scalar-set layer, P1/P3/P5/P6/P19. Baseline
++`225daa5f4`; missing fixed/IEEE `sqrt` methods reproduced by compile failure.
++Domain: every valid i32/i64 fixed interval at each supported scale, and finite
++binary32/binary64 intervals under the existing x86_64 backend qualification;
++canonical empty is accepted. Principal root clips negative source members with
++Partial coverage, rejects strictly negative nonempty inputs with EmptyDomain,
++and maps empty to empty with Complete coverage. Returned carriers remain
++ordinary arithmetic, set-operation and validated replay operands. The domain
++receipt remains explicit even when two ranges happen to be identical.
++
++Both kernels share one primitive `u128::isqrt` floor/ceiling helper. For fixed
++m/2^F, output-grid mantissas enclose sqrt(m*2^F); the radicand has at most 126
++bits. A rounded upper mantissa can exceed signed storage at maximal F, which
++returns Overflow rather than saturation. For IEEE m*2^e, h=floor(log2(m)) and
++output-grid exponent g=floor((e+h)/2)-F, where F is the fraction width. The
++scaled radicand m*2^(e-2g) has at most 2F+2 <= 106 bits. Every nonzero IEEE
++root is normal, even for subnormal source values. Integer square testing
++selects the exact ceiling; existing encoding authority builds the endpoints.
++No new float comparison, arithmetic, allocation, arbitrary-precision
++production dependency or ambient-mode mutation is introduced.
++
++Work and storage are bounded by primitive widths and at most two integer root
++calls; no configurable precision budget is needed. This is not a measured
++firmware-cycle or stack-byte bound. Existing predicate order and consumer
++kernels are untouched. The existing opaque finite-validation boundary remains
++in place. Codegen qualification now requires six client symbols, including
++both root widths, and scans emitted integer-root helpers as well as the
++existing IEEE/Bounds and wide-division paths. No old exclusion or assertion
++was weakened.
++
++Qualification at `/tmp/interval-refactor/primitive-roots` passes the final
++33-command matrix: 96 all-feature unit/integration tests and 11 doctests;
++Rust 1.88/1.95/stable feature, release, strict lint and documentation checks;
++formatting, fuzz harnesses, whole-repository zizmor and retention budget;
++unchanged downstream solver value/dispatch witnesses; primitive dependency
++closure; and ARM/WASM compilation. No hosted OS, HIL or release-distribution
++claim follows. A final test-only cfg prevents unused imports on non-x86
++float-only builds.
++
++The acceptance corpus covers
++all 96 fixed endpoint/scale combinations, exact GMP adjacent-grid witnesses,
++all finite IEEE exponent classes, deterministic random images, directed MPFR
++and exact GMP endpoint checks, maximal scales, zero/partial/empty domains,
++replay and successive operation tests. Release MXCSR tests exercise all 16
++combinations before comparing to independent expectations prepared in the
++normal environment. The ASan campaign completed 100,000 cases in 12 seconds, seed 20261117,
++16-byte cap, 30-second wall limit, with no failure. It validates eight fixed
++endpoint/scale configurations, both IEEE widths, ingress failures, tightness,
++domain qualification, serialization and subsequent squaring. Expected
++fixed-scale Overflow and EmptyDomain are checked separately from completion.
++
++Codegen scans passed on Rust 1.88, 1.95 and stable and under stable fat LTO;
++the corresponding release mode tests pass for both IEEE widths and every
++MXCSR combination. Coverage reports 2,240/2,284 production lines (98.07%) and
++4,222/4,396 regions (96.04%). Tests, dependencies and probes are excluded;
++there is no reported branch denominator. Diagnostic dump identifies three
++excluded Rug OptRational::parts profile mismatches. Report/export/dump all
++complete; full coverage remains open.
++
++The cost probe completed all 960 samples across four source widths and eight
++endpoint configurations, each with 4,096 warmups then 30 samples of 8,192
++owned images. Independent exact checks precede timing. The crate performance
++ledger contains the complete median table. No comparative improvement or
++firmware cost is inferred. The `2026-11-12-interval-primitive-roots` evidence
++record is pending registration.
++
++Later elementary functions, remaining signed-power surfaces, symbolic-ball
++function adapters, consumer migrations, full coverage and release
++qualification remain open. No phase completion is inferred from this addition.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index e526e6518..742b7ea8d 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add allocation-free fixed-point and qualified IEEE square roots with tight
++  endpoints and explicit domain coverage. Validate maximal-scale overflow,
++  subnormal inputs and independence from native rounding/FTZ/DAZ modes.
++
+ - Add budgeted rational/dyadic square-root enclosures with tight grid bounds,
+   explicit partial-domain coverage and typed empty-domain failures. Exact
+   integer arithmetic establishes direction; generated bounds remain dyadic
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index ab7464901..fa1b2c4e7 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -78,3 +78,8 @@ required-features = ["float-enclosure"]
+ name = "sqrt_cost"
+ path = "conformance/sqrt_cost.rs"
+ required-features = ["rational", "dyadic"]
++
++[[example]]
++name = "primitive_root_cost"
++path = "conformance/primitive_root_cost.rs"
++required-features = ["fixed", "float-enclosure"]
+diff --git a/crates/hyperinterval/PERFORMANCE.md b/crates/hyperinterval/PERFORMANCE.md
+index 4f85faa4b..7b56cde9e 100644
+--- a/crates/hyperinterval/PERFORMANCE.md
++++ b/crates/hyperinterval/PERFORMANCE.md
+@@ -192,3 +192,39 @@ scaled quotient bit length, plus existing scaling/division and rational
+ cloning reservations. These are deterministic work/size units, not CPU cycles
+ or peak retained/temporary bytes. Allocation accounting, cancellation, full
+ coverage and consumer qualification remain separate work.
++
++## Primitive square-root completion probe
++
++`conformance/primitive_root_cost.rs` consumes preconstructed exact inputs:
++point 1/4, narrow [1/4,1/2], wide [0,3/4], and partial-domain [-1/4,1/2].
++Each run returns and consumes the complete range and domain receipt. Independent
++GMP/MPFR checks precede timing. Rust 1.99 release on x86_64 Linux, fixed and
++float-enclosure features, 4,096 warmups, 30 samples of 8,192 images per case:
++
++| Endpoint / scale | Point | Narrow | Wide | Partial domain |
++| --- | ---: | ---: | ---: | ---: |
++| i32/8 | 25.323 | 40.549 | 29.953 | 29.959 |
++| i32/16 | 36.830 | 62.811 | 41.528 | 41.526 |
++| i32/30 | 45.795 | 89.795 | 58.151 | 58.148 |
++| i64/16 | 34.853 | 62.886 | 40.892 | 40.952 |
++| i64/30 | 45.362 | 89.241 | 57.985 | 57.999 |
++| i64/62 | 67.633 | 155.899 | 101.671 | 101.671 |
++| f32 | 80.796 | 156.981 | 93.167 | 93.164 |
++| f64 | 100.867 | 218.976 | 136.015 | 129.738 |
++
++Values are median ns/image. All 960 samples completed. Fixed scale F means
++spacing 2^-F; IEEE uses its own magnitude-dependent grid. Thus cross-row times
++are costs of different endpoint contracts, not speedup comparisons. Source
++construction/oracle work is excluded; complete output materialization is
++included. Raw samples, environment, executable hash and whole-probe size are
++in the primitive-root evidence record. The executable includes GMP/MPFR test
++oracles, so its size is not the production-kernel size.
++
++Primitive implementations use at most two u128 integer root calls, with at
++most 126-bit fixed or 106-bit IEEE radicands. Their production dependency
++closure and source contain no allocation path. Firmware cycle/stack and HIL
++measurements remain open. Release tests cover all 16 native rounding/FTZ/DAZ
++combinations, and emitted code scans on Rust 1.88, 1.95 and stable, plus stable
++fat LTO, find no native floating arithmetic/comparison in the selected root
++and existing strict-float paths. This target/compiler evidence does not
++qualify a different platform or replace the exact mathematical argument.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index e969bdb44..780765310 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -13,6 +13,12 @@ retains zero when its input crosses zero; a signed primitive minimum that
+ cannot be reflected returns Overflow. Dyadic methods use the existing shared
+ size/work budget. These total real functions do not clip their input domain.
+ 
++Fixed-point and qualified IEEE intervals provide `sqrt()` with tight outward
++bounds and explicit domain coverage. They use bounded primitive integer
++arithmetic without allocation. Fixed-point upper rounding can return Overflow
++at maximal fractional scales. IEEE square roots include subnormal inputs and
++retain the existing x86_64 qualification gate.
++
+ Rational and dyadic intervals provide `sqrt(precision, &mut budget)`, returning
+ `RangeEnclosure<DyadicInterval>` with tight outward endpoints on the grid
+ `2^precision`. Rational inputs require both features. Negative source points
+diff --git a/crates/hyperinterval/conformance/float_cost.rs b/crates/hyperinterval/conformance/float_cost.rs
+index bf2e363fc..56175444f 100644
+--- a/crates/hyperinterval/conformance/float_cost.rs
++++ b/crates/hyperinterval/conformance/float_cost.rs
+@@ -24,6 +24,23 @@ pub fn hyperinterval_strict_chain32(a: f32, b: f32) -> Result<F32Enclosure, Inte
+         .reciprocal()
+ }
+ 
++#[unsafe(no_mangle)]
++#[inline(never)]
++pub fn hyperinterval_strict_sqrt32(
++    a: f32,
++    b: f32,
++) -> Result<hyperinterval::RangeEnclosure<F32Enclosure>, IntervalError> {
++    F32Enclosure::new(a, b)?.sqrt()
++}
++#[unsafe(no_mangle)]
++#[inline(never)]
++pub fn hyperinterval_strict_sqrt64(
++    a: f64,
++    b: f64,
++) -> Result<hyperinterval::RangeEnclosure<F64Enclosure>, IntervalError> {
++    F64Enclosure::new(a, b)?.sqrt()
++}
++
+ macro_rules! inspect {
+     ($name:ident, $interval:ident, $float:ty) => {
+         #[unsafe(no_mangle)]
+@@ -84,6 +101,8 @@ fn main() {
+     black_box(
+         hyperinterval_strict_surface64(black_box(0.75), black_box(1.25), black_box(3)).unwrap(),
+     );
++    black_box(hyperinterval_strict_sqrt32(black_box(-1.0), black_box(2.0)).unwrap());
++    black_box(hyperinterval_strict_sqrt64(black_box(-1.0), black_box(2.0)).unwrap());
+     println!("width,sample,elapsed_ns,completed_chains,checksum");
+     macro_rules! measure {
+         ($name:ident, $width:literal) => {
+diff --git a/crates/hyperinterval/conformance/primitive_root_cost.rs b/crates/hyperinterval/conformance/primitive_root_cost.rs
+new file mode 100644
+index 000000000..4a609bdba
+--- /dev/null
++++ b/crates/hyperinterval/conformance/primitive_root_cost.rs
+@@ -0,0 +1,86 @@
++//! Owned primitive square-root outputs across widths and endpoint lattices.
++use hyperinterval::{F32Enclosure, F64Enclosure, FixedInterval};
++use std::{hint::black_box, time::Instant};
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/fixed_sqrt_oracle.rs"]
++mod fixed_oracle;
++#[cfg(not(target_env = "msvc"))]
++#[path = "../tests/support/primitive_sqrt_oracle.rs"]
++mod oracle;
++
++fn measure<T>(backend: &str, case: &str, work: impl Fn() -> T) {
++    for _ in 0..4096 {
++        black_box(work());
++    }
++    for sample in 0..30 {
++        let start = Instant::now();
++        for _ in 0..8192 {
++            black_box(work());
++        }
++        println!(
++            "{backend},{case},{sample},{},8192",
++            start.elapsed().as_nanos()
++        );
++    }
++}
++fn main() {
++    println!("backend,case,sample,elapsed_ns,completed_images");
++    for (case, a, b) in [
++        ("point", 1, 1),
++        ("narrow", 1, 2),
++        ("wide", 0, 3),
++        ("partial", -1, 2),
++    ] {
++        macro_rules! fixed {
++            ($ty:ty,$p:literal) => {{
++                let input = FixedInterval::<$ty, $p>::new(
++                    (a as $ty) * (1 << ($p - 2)),
++                    (b as $ty) * (1 << ($p - 2)),
++                )
++                .unwrap();
++                let work = || black_box(input).sqrt().unwrap();
++                #[cfg(not(target_env = "msvc"))]
++                {
++                    let (lo, hi) = input.bounds().unwrap();
++                    let result = work();
++                    let (l, u) = result.range.bounds().unwrap();
++                    fixed_oracle::fixed(
++                        i64::from(lo),
++                        i64::from(hi),
++                        $p,
++                        i64::from(<$ty>::MAX),
++                        Ok(((i64::from(l), i64::from(u)), result.domain)),
++                    );
++                }
++                measure(concat!(stringify!($ty), "/", stringify!($p)), case, work);
++            }};
++        }
++        fixed!(i32, 8);
++        fixed!(i32, 16);
++        fixed!(i32, 30);
++        fixed!(i64, 16);
++        fixed!(i64, 30);
++        fixed!(i64, 62);
++        macro_rules! ieee {
++            ($interval:ident,$float:ty,$root:ident) => {{
++                let input = $interval::new(a as $float / 4.0, b as $float / 4.0).unwrap();
++                let work = || black_box(input).sqrt().unwrap();
++                #[cfg(not(target_env = "msvc"))]
++                {
++                    let result = work();
++                    let (lo, hi) = result.range.bounds().unwrap();
++                    assert_eq!(
++                        (lo.to_bits(), hi.to_bits()),
++                        (
++                            oracle::$root(a.max(0) as $float / 4.0).unwrap().0,
++                            oracle::$root(b as $float / 4.0).unwrap().1
++                        )
++                    );
++                }
++                measure(stringify!($float), case, work);
++            }};
++        }
++        ieee!(F32Enclosure, f32, sqrt_f32);
++        ieee!(F64Enclosure, f64, sqrt_f64);
++    }
++}
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 85d9cfa92..de75544e1 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -71,3 +71,10 @@ required-features = ["rational"]
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "primitive_roots"
++path = "fuzz_targets/primitive_roots.rs"
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs b/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs
+new file mode 100644
+index 000000000..e65d5be9a
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/primitive_roots.rs
+@@ -0,0 +1,74 @@
++#![no_main]
++use hyperinterval::{DomainCoverage, F32Enclosure, F64Enclosure, FixedInterval, IntervalError};
++use libfuzzer_sys::fuzz_target;
++#[path = "../../tests/support/fixed_sqrt_oracle.rs"]
++mod fixed_oracle;
++#[path = "../../tests/support/primitive_sqrt_oracle.rs"]
++mod oracle;
++
++fuzz_target!(|data: [u64; 2]| {
++    macro_rules! fixed {
++        ($ty:ty, $($frac:literal),*) => {$({
++            let a=data[0] as $ty;
++            let b=data[1] as $ty;
++            let (a,b)=(a.min(b),a.max(b));
++            let result=FixedInterval::<$ty,$frac>::new(a,b).unwrap().sqrt()
++                .map(|x| {let (a,b)=x.range.bounds().unwrap(); ((i64::from(a),i64::from(b)),x.domain)});
++            fixed_oracle::fixed(i64::from(a),i64::from(b),$frac,i64::from(<$ty>::MAX),result);
++        })*};
++    }
++    fixed!(i32, 0, 15, 30, 31);
++    fixed!(i64, 0, 30, 62, 63);
++    macro_rules! ieee {
++        ($float:ty, $bits:ty, $interval:ident, $root:ident) => {{
++            let a = <$float>::from_bits(data[0] as $bits);
++            let b = <$float>::from_bits(data[1] as $bits);
++            let (x, y) = ($interval::point(a), $interval::point(b));
++            if !a.is_finite() {
++                assert_eq!(x, Err(IntervalError::NonFiniteEndpoint));
++            }
++            if !b.is_finite() {
++                assert_eq!(y, Err(IntervalError::NonFiniteEndpoint));
++            }
++            if let (Ok(x), Ok(y)) = (x, y) {
++                let result = x.hull(&y).sqrt();
++                if a.max(b) < 0.0 {
++                    assert_eq!(result, Err(IntervalError::EmptyDomain));
++                } else {
++                    let result = result.unwrap();
++                    let (lower, upper) = result.range.bounds().unwrap();
++                    assert_eq!(
++                        (lower.to_bits(), upper.to_bits()),
++                        (
++                            oracle::$root(a.min(b).max(0.0)).unwrap().0,
++                            oracle::$root(a.max(b)).unwrap().1
++                        )
++                    );
++                    assert_eq!(
++                        result.domain,
++                        if a.min(b) < 0.0 {
++                            DomainCoverage::Partial
++                        } else {
++                            DomainCoverage::Complete
++                        }
++                    );
++                    let restored: $interval =
++                        serde_json::from_slice(&serde_json::to_vec(&result.range).unwrap())
++                            .unwrap();
++                    assert_eq!(restored, result.range);
++                    // Finite squaring may legitimately overflow for a rounded
++                    // upper root of MAX. A successful square contains the source.
++                    if let Ok(square) = restored.square() {
++                        assert!(
++                            x.hull(&y)
++                                .intersection(&$interval::new(0.0, <$float>::MAX).unwrap())
++                                .subset_of(&square)
++                        );
++                    }
++                }
++            }
++        }};
++    }
++    ieee!(f32, u32, F32Enclosure, sqrt_f32);
++    ieee!(f64, u64, F64Enclosure, sqrt_f64);
++});
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index dcd5de8c4..20cab4b78 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -1,6 +1,6 @@
+ //! Widened arithmetic for the sealed i32/i64 fixed-point families.
+ 
+-use crate::{FixedInterval, IntervalError, MidpointRounding};
++use crate::{DomainCoverage, FixedInterval, IntervalError, MidpointRounding, RangeEnclosure};
+ 
+ // Every caller supplies a positive denominator. Numerators here are products
+ // of signed 64-bit values and a scale at most 2^63, so division cannot meet
+@@ -267,6 +267,43 @@ macro_rules! arithmetic {
+                 }
+             }
+ 
++            /// Tight outward principal square root on this fixed-point lattice.
++            /// Negative source members are excluded with `Partial` coverage;
++            /// strictly negative nonempty input returns `EmptyDomain`. Empty
++            /// maps to empty with `Complete` coverage. An unrepresentable upper
++            /// bound returns `Overflow`, including rounding to one at a maximal
++            /// fractional scale. Uses bounded integer arithmetic, no allocation.
++            pub fn sqrt(&self) -> Result<RangeEnclosure<Self>, IntervalError> {
++                Self::scale()?;
++                let Some((a, b)) = self.bounds() else {
++                    return Ok(RangeEnclosure {
++                        range: Self::empty()?,
++                        domain: DomainCoverage::Complete,
++                    });
++                };
++                if b < 0 {
++                    return Err(IntervalError::EmptyDomain);
++                }
++                let domain = if a < 0 {
++                    DomainCoverage::Partial
++                } else {
++                    DomainCoverage::Complete
++                };
++                // sqrt(m / 2^FRAC) * 2^FRAC = sqrt(m * 2^FRAC).
++                // At most 63 magnitude bits + 63 scale bits, fitting u128.
++                let (lower, lower_ceil) =
++                    crate::sqrt::integer_sqrt_bounds((a.max(0) as u128) << FRAC);
++                let upper = if a == b {
++                    lower_ceil
++                } else {
++                    crate::sqrt::integer_sqrt_bounds((b as u128) << FRAC).1
++                };
++                Ok(RangeEnclosure {
++                    range: Self::from_wide(lower as i128, upper as i128)?,
++                    domain,
++                })
++            }
++
+             /// Tight zero-aware square enclosure.
+             pub fn square(&self) -> Result<Self, IntervalError> {
+                 let scale = Self::scale()?;
+diff --git a/crates/hyperinterval/src/float.rs b/crates/hyperinterval/src/float.rs
+index 876a7493e..c8bf153d4 100644
+--- a/crates/hyperinterval/src/float.rs
++++ b/crates/hyperinterval/src/float.rs
+@@ -1,6 +1,6 @@
+ use crate::bounds::Bounds;
+ use crate::ieee::{BINARY32, BINARY64};
+-use crate::{IntervalError, SignSet};
++use crate::{DomainCoverage, IntervalError, RangeEnclosure, SignSet};
+ use core::cmp::Ordering;
+ 
+ fn qualify() -> Result<(), IntervalError> {
+@@ -315,6 +315,38 @@ let enclosure: F64Enclosure = proposal.into();
+                 Self::from_bits($format.one(), $format.one())?.div(self)
+             }
+ 
++            /// Tight finite outward principal square root, using integer
++            /// arithmetic independent of native rounding and FTZ/DAZ modes.
++            /// Negative source members are excluded with `Partial` coverage;
++            /// strictly negative nonempty input returns `EmptyDomain`. Empty
++            /// maps to empty with `Complete` coverage on every target.
++            pub fn sqrt(&self) -> Result<RangeEnclosure<Self>, IntervalError> {
++                let Some((a, b)) = self.bits() else {
++                    return Ok(RangeEnclosure {
++                        range: Self::empty(),
++                        domain: DomainCoverage::Complete,
++                    });
++                };
++                if $format.compare(b, 0).is_lt() {
++                    return Err(IntervalError::EmptyDomain);
++                }
++                let partial = $format.compare(a, 0).is_lt();
++                let (lower, lower_ceil) = $format.sqrt(if partial { 0 } else { a })?;
++                let upper = if a == b {
++                    lower_ceil
++                } else {
++                    $format.sqrt(b)?.1
++                };
++                Ok(RangeEnclosure {
++                    range: Self::from_bits(lower, upper)?,
++                    domain: if partial {
++                        DomainCoverage::Partial
++                    } else {
++                        DomainCoverage::Complete
++                    },
++                })
++            }
++
+             /// Tight outward pointwise square, with zero minimum across zero.
+             pub fn square(&self) -> Result<Self, IntervalError> {
+                 let Some((a, b)) = self.bits() else {
+diff --git a/crates/hyperinterval/src/ieee.rs b/crates/hyperinterval/src/ieee.rs
+index d9b4751eb..d174a6c3a 100644
+--- a/crates/hyperinterval/src/ieee.rs
++++ b/crates/hyperinterval/src/ieee.rs
+@@ -144,6 +144,24 @@ impl Format {
+         Ok(((top + self.bias()) as u64) << f | ((significand as u64) & ((1u64 << f) - 1)))
+     }
+ 
++    // Principal root of a nonnegative finite endpoint. For x=m*2^e with
++    // h=floor(log2(m)), sqrt(x) has top exponent floor((e+h)/2).
++    // Its target grid g=top-F yields a nonnegative shift e-2g=2F-h+parity.
++    // Thus m << (e-2g) has at most 2F+2 <= 106 bits. Every nonzero
++    // binary32/64 root is normal, including roots of subnormal inputs.
++    pub(crate) fn sqrt(self, bits: u64) -> Result<(u64, u64), IntervalError> {
++        let value = self.decode(bits);
++        debug_assert!(!value.negative);
++        if value.magnitude == 0 {
++            return Ok((0, 0));
++        }
++        let high = 127 - value.magnitude.leading_zeros() as i32;
++        let grid = (value.exponent + high).div_euclid(2) - self.fraction() as i32;
++        let shift = value.exponent - 2 * grid;
++        let (lower, upper) = crate::sqrt::integer_sqrt_bounds(value.magnitude << shift);
++        Ok((self.encode(lower, grid)?, self.encode(upper, grid)?))
++    }
++
+     fn signed(self, lower: u64, upper: u64, negative: bool) -> (u64, u64) {
+         if negative {
+             (self.negate(upper), self.negate(lower))
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index c8323f247..c14f8b929 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -41,6 +41,8 @@ mod proposal;
+ mod rational;
+ #[cfg(feature = "real-ball")]
+ mod real_ball;
++#[cfg(any(feature = "fixed", feature = "float-enclosure"))]
++mod sqrt;
+ mod state;
+ 
+ #[cfg(feature = "dyadic")]
+diff --git a/crates/hyperinterval/src/sqrt.rs b/crates/hyperinterval/src/sqrt.rs
+new file mode 100644
+index 000000000..f34d70782
+--- /dev/null
++++ b/crates/hyperinterval/src/sqrt.rs
+@@ -0,0 +1,6 @@
++// Exact integer square-root floor/ceiling shared by primitive enclosures.
++// The floor has at most 64 bits, so its square and ceiling fit u128.
++pub(crate) fn integer_sqrt_bounds(value: u128) -> (u128, u128) {
++    let lower = value.isqrt();
++    (lower, lower + u128::from(lower * lower != value))
++}
+diff --git a/crates/hyperinterval/tests/float.rs b/crates/hyperinterval/tests/float.rs
+index 24d417b54..c3fba8f26 100644
+--- a/crates/hyperinterval/tests/float.rs
++++ b/crates/hyperinterval/tests/float.rs
+@@ -7,8 +7,12 @@ use hyperinterval::{F32Enclosure, F64Enclosure, IntervalError};
+ #[path = "support/float_oracle.rs"]
+ mod independent;
+ 
++#[cfg(all(not(target_env = "msvc"), target_arch = "x86_64"))]
++#[path = "support/primitive_sqrt_oracle.rs"]
++mod root_oracle;
++
+ macro_rules! cases {
+-    ($module:ident, $interval:ident, $float:ty, $bits:ty, $from:ident, $round:ident, $fraction:literal) => {
++    ($module:ident, $interval:ident, $float:ty, $bits:ty, $from:ident, $round:ident, $root:ident, $fraction:literal) => {
+         mod $module {
+             use super::*;
+ 
+@@ -16,6 +20,9 @@ macro_rules! cases {
+             fn target_gate_and_empty_are_explicit() {
+                 assert_eq!($interval::backend_supported(), cfg!(target_arch = "x86_64"));
+                 assert!($interval::empty().is_empty());
++                let root = $interval::empty().sqrt().unwrap();
++                assert!(root.range.is_empty());
++                assert_eq!(root.domain, hyperinterval::DomainCoverage::Complete);
+                 if !$interval::backend_supported() {
+                     assert_eq!(
+                         $interval::point(1.0),
+@@ -536,6 +543,18 @@ macro_rules! cases {
+                                     + Rational::$from(c).unwrap()),
+                             ));
+                         }
++                        for (a, b) in cases {
++                            let lower = a.min(b);
++                            let upper = a.max(b);
++                            wanted.push(if upper < 0.0 {
++                                Err(IntervalError::EmptyDomain)
++                            } else {
++                                Ok((
++                                    crate::root_oracle::$root(lower.max(0.0)).unwrap().0,
++                                    crate::root_oracle::$root(upper).unwrap().1,
++                                ))
++                            });
++                        }
+                         #[cfg(feature = "rational")]
+                         let rational_points: Vec<_> = cases
+                             .iter()
+@@ -572,6 +591,15 @@ macro_rules! cases {
+                             for (a, b, c) in affine_cases {
+                                 got.push(actual($interval::point(a).unwrap().affine(b, c)));
+                             }
++                            for (a, b) in cases {
++                                got.push(actual(
++                                    $interval::point(a)
++                                        .unwrap()
++                                        .hull(&$interval::point(b).unwrap())
++                                        .sqrt()
++                                        .map(|x| x.range),
++                                ));
++                            }
+                             #[cfg(feature = "rational")]
+                             for (&(a, _), expected) in cases.iter().zip(&rational_points) {
+                                 assert_eq!(&$interval::point(a).unwrap().to_rational(), expected);
+@@ -629,8 +657,26 @@ macro_rules! cases {
+     };
+ }
+ 
+-cases!(binary32, F32Enclosure, f32, u32, from_f32, round_f32, 23);
+-cases!(binary64, F64Enclosure, f64, u64, from_f64, round_f64, 52);
++cases!(
++    binary32,
++    F32Enclosure,
++    f32,
++    u32,
++    from_f32,
++    round_f32,
++    sqrt_f32,
++    23
++);
++cases!(
++    binary64,
++    F64Enclosure,
++    f64,
++    u64,
++    from_f64,
++    round_f64,
++    sqrt_f64,
++    52
++);
+ 
+ #[cfg(all(target_arch = "x86_64", not(target_env = "msvc")))]
+ fn with_mxcsr<T>(mode: u32, work: impl FnOnce() -> T) -> T {
+diff --git a/crates/hyperinterval/tests/primitive_roots.rs b/crates/hyperinterval/tests/primitive_roots.rs
+new file mode 100644
+index 000000000..c95fda0ec
+--- /dev/null
++++ b/crates/hyperinterval/tests/primitive_roots.rs
+@@ -0,0 +1,192 @@
++#![cfg(any(feature = "fixed", feature = "float-enclosure"))]
++#[cfg(any(feature = "fixed", target_arch = "x86_64"))]
++use hyperinterval::{DomainCoverage, IntervalError};
++
++#[cfg(feature = "fixed")]
++#[test]
++fn fixed_root_domain_and_extreme_scales() {
++    use hyperinterval::FixedInterval as F;
++    let result = F::<i32, 8>::new(-256, 1024).unwrap().sqrt().unwrap();
++    assert_eq!(result.range.bounds(), Some((0, 512)));
++    assert_eq!(result.domain, DomainCoverage::Partial);
++    assert_eq!(
++        F::<i64, 63>::point(i64::MAX).unwrap().sqrt(),
++        Err(IntervalError::Overflow)
++    );
++    assert_eq!(
++        F::<i32, 31>::point(i32::MAX).unwrap().sqrt(),
++        Err(IntervalError::Overflow)
++    );
++    assert_eq!(
++        F::<i64, 30>::new(-2, -1).unwrap().sqrt(),
++        Err(IntervalError::EmptyDomain)
++    );
++    assert!(
++        F::<i32, 30>::empty()
++            .unwrap()
++            .sqrt()
++            .unwrap()
++            .range
++            .is_empty()
++    );
++}
++
++#[cfg(all(feature = "float-enclosure", target_arch = "x86_64"))]
++#[test]
++fn ieee_root_domain_and_subnormals() {
++    use hyperinterval::{F32Enclosure as F, F64Enclosure as D};
++    let result = D::new(-1.0, 4.0).unwrap().sqrt().unwrap();
++    assert_eq!(result.range.bounds(), Some((0.0, 2.0)));
++    assert_eq!(result.domain, DomainCoverage::Partial);
++    assert_eq!(
++        F::new(-2.0, -1.0).unwrap().sqrt(),
++        Err(IntervalError::EmptyDomain)
++    );
++    assert!(D::empty().sqrt().unwrap().range.is_empty());
++    let result = D::point(f64::from_bits(1)).unwrap().sqrt().unwrap();
++    assert_eq!(result.range.bounds().unwrap().0.to_bits(), (486u64) << 52);
++    assert!(result.range.is_singleton());
++}
++
++#[cfg(all(
++    feature = "float-enclosure",
++    target_arch = "x86_64",
++    not(target_env = "msvc")
++))]
++#[path = "support/primitive_sqrt_oracle.rs"]
++mod oracle;
++
++#[cfg(all(feature = "fixed", not(target_env = "msvc")))]
++#[test]
++fn fixed_all_scales_match_independent_gmp_tightness() {
++    macro_rules! run {
++        ($ty:ty, $($frac:literal),*) => {$({
++            for a in -8..=16 {
++                for b in a..=16 {
++                    let actual = hyperinterval::FixedInterval::<$ty, $frac>::new(a, b).unwrap().sqrt()
++                        .map(|x| {let (a,b)=x.range.bounds().unwrap(); ((i64::from(a), i64::from(b)),x.domain)});
++                    fixed_oracle::fixed(i64::from(a),i64::from(b),$frac,i64::from(<$ty>::MAX),actual);
++                }
++            }
++            for a in [<$ty>::MIN, -1, 0, 1, <$ty>::MAX / 2, <$ty>::MAX - 1, <$ty>::MAX] {
++                let actual = hyperinterval::FixedInterval::<$ty, $frac>::point(a).unwrap().sqrt()
++                    .map(|x| {let (a,b)=x.range.bounds().unwrap(); ((i64::from(a), i64::from(b)),x.domain)});
++                fixed_oracle::fixed(i64::from(a),i64::from(a),$frac,i64::from(<$ty>::MAX),actual);
++            }
++        })*};
++    }
++    run!(
++        i32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
++        24, 25, 26, 27, 28, 29, 30, 31
++    );
++    run!(
++        i64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
++        24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
++        47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
++    );
++}
++
++#[cfg(all(
++    feature = "float-enclosure",
++    target_arch = "x86_64",
++    not(target_env = "msvc")
++))]
++#[test]
++fn ieee_all_exponents_and_random_images_match_directed_mpfr() {
++    macro_rules! run {
++        ($ty:ty, $bits:ty, $interval:ident, $root:ident, $f:literal, $maximum:literal) => {{
++            use hyperinterval::$interval;
++            let check = |value: $ty| {
++                let x = $interval::point(value).unwrap().sqrt().unwrap();
++                let (a, b) = x.range.bounds().unwrap();
++                assert_eq!((a.to_bits(), b.to_bits()), oracle::$root(value).unwrap());
++                assert_eq!(x.domain, DomainCoverage::Complete);
++            };
++            for exponent in 0..$maximum {
++                for tail in [
++                    0,
++                    1,
++                    (1 << ($f - 1)) - 1,
++                    1 << ($f - 1),
++                    (1 << $f) - 2,
++                    (1 << $f) - 1,
++                ] {
++                    check(<$ty>::from_bits((exponent << $f) | tail));
++                }
++            }
++            let mut state = 0x5f84_0c2a_771b_903du64;
++            for _ in 0..20_000 {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                let bits = (state as $bits) & (<$bits>::MAX >> 1);
++                if bits >= ($maximum << $f) {
++                    continue;
++                }
++                let value = <$ty>::from_bits(bits);
++                check(value);
++                let range = $interval::new(-value, value).unwrap().sqrt().unwrap();
++                let (lower, upper) = range.range.bounds().unwrap();
++                assert_eq!(lower.to_bits(), 0);
++                assert_eq!(upper.to_bits(), oracle::$root(value).unwrap().1);
++                assert_eq!(
++                    range.domain,
++                    if bits == 0 {
++                        DomainCoverage::Complete
++                    } else {
++                        DomainCoverage::Partial
++                    }
++                );
++            }
++        }};
++    }
++    run!(f32, u32, F32Enclosure, sqrt_f32, 23, 255u32);
++    run!(f64, u64, F64Enclosure, sqrt_f64, 52, 2047u64);
++}
++
++#[cfg(all(feature = "fixed", feature = "serde"))]
++#[test]
++fn fixed_root_replay_and_further_operation_enclose_source() {
++    use hyperinterval::FixedInterval;
++    let source = FixedInterval::<i64, 30>::new(1, 3 << 30).unwrap();
++    let result = source.sqrt().unwrap();
++    let bytes = serde_json::to_vec(&result.range).unwrap();
++    let restored: FixedInterval<i64, 30> = serde_json::from_slice(&bytes).unwrap();
++    assert_eq!(restored, result.range);
++    assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
++    assert!(source.subset_of(&restored.square().unwrap()));
++    let root = restored.sqrt().unwrap();
++    assert!(source.subset_of(&root.range.checked_pow(4).unwrap()));
++}
++
++#[cfg(all(feature = "fixed", not(target_env = "msvc")))]
++#[path = "support/fixed_sqrt_oracle.rs"]
++mod fixed_oracle;
++
++#[cfg(all(feature = "float-enclosure", feature = "serde", target_arch = "x86_64"))]
++#[test]
++fn ieee_root_replay_and_composition_keep_source_enclosed() {
++    macro_rules! run {
++        ($interval:ident) => {{
++            use hyperinterval::$interval;
++            let source = $interval::new(0.25, 7.0).unwrap();
++            let result = source.sqrt().unwrap();
++            let bytes = serde_json::to_vec(&result.range).unwrap();
++            let restored: $interval = serde_json::from_slice(&bytes).unwrap();
++            assert_eq!(restored, result.range);
++            assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
++            assert!(source.subset_of(&restored.square().unwrap()));
++            let root = restored.sqrt().unwrap().range;
++            assert!(source.subset_of(&root.checked_pow(4).unwrap()));
++            assert!(
++                restored
++                    .mul(&restored.reciprocal().unwrap())
++                    .unwrap()
++                    .contains_point(1.0)
++                    .unwrap()
++            );
++        }};
++    }
++    run!(F32Enclosure);
++    run!(F64Enclosure);
++}
+diff --git a/crates/hyperinterval/tests/support/fixed_sqrt_oracle.rs b/crates/hyperinterval/tests/support/fixed_sqrt_oracle.rs
+new file mode 100644
+index 000000000..1cdf85568
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/fixed_sqrt_oracle.rs
+@@ -0,0 +1,42 @@
++//! Independent exact GMP grid tightness for fixed square roots.
++use hyperinterval::{DomainCoverage, IntervalError};
++use rug::Rational;
++
++pub fn fixed(
++    a: i64,
++    b: i64,
++    frac: u32,
++    maximum: i64,
++    result: Result<((i64, i64), DomainCoverage), IntervalError>,
++) {
++    if b < 0 {
++        assert_eq!(result, Err(IntervalError::EmptyDomain));
++        return;
++    }
++    let scale = 1u64 << frac;
++    let lower_source = Rational::from((a.max(0), scale));
++    let upper_source = Rational::from((b, scale));
++    if Rational::from((maximum, scale)).square() < upper_source {
++        assert_eq!(result, Err(IntervalError::Overflow));
++        return;
++    }
++    let ((lower, upper), domain) = result.unwrap();
++    assert_eq!(
++        domain,
++        if a < 0 {
++            DomainCoverage::Partial
++        } else {
++            DomainCoverage::Complete
++        }
++    );
++    let lower = Rational::from((lower, scale));
++    let upper = Rational::from((upper, scale));
++    let step = Rational::from((1, scale));
++    assert!(lower >= 0 && upper >= 0);
++    assert!(lower.clone().square() <= lower_source);
++    assert!(upper.clone().square() >= upper_source);
++    assert!((lower + &step).square() > lower_source);
++    if upper > 0 {
++        assert!((upper - &step).square() < upper_source);
++    }
++}
+diff --git a/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs b/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs
+new file mode 100644
+index 000000000..2c10167f6
+--- /dev/null
++++ b/crates/hyperinterval/tests/support/primitive_sqrt_oracle.rs
+@@ -0,0 +1,38 @@
++//! Independent MPFR directed roots of exact finite IEEE inputs.
++use hyperinterval::IntervalError;
++use rug::{Float, Rational, float::Round};
++
++macro_rules! ieee_root {
++    ($name:ident, $float:ty, $bits:ty, $convert:ident, $from:ident) => {
++        pub fn $name(value: $float) -> Result<($bits, $bits), IntervalError> {
++            if value < 0.0 {
++                return Err(IntervalError::EmptyDomain);
++            }
++            // Ingress is exact at 128 bits. Same-direction nested rounding
++            // retains the tight target floor/ceiling after the MPFR root.
++            let mut lower = Float::with_val(128, value);
++            let mut upper = lower.clone();
++            lower.sqrt_round(Round::Down);
++            upper.sqrt_round(Round::Up);
++            let lower = lower.$convert(Round::Down);
++            let upper = upper.$convert(Round::Up);
++            let source = Rational::$from(value).unwrap();
++            let lo = Rational::$from(lower).unwrap();
++            let hi = Rational::$from(upper).unwrap();
++            assert!(lo.square() <= source);
++            assert!(hi.square() >= source);
++            let inward_lower = <$float>::from_bits(lower.to_bits() + 1);
++            assert!(Rational::$from(inward_lower).unwrap().square() > source);
++            if upper != 0.0 {
++                let inward_upper = <$float>::from_bits(upper.to_bits() - 1);
++                assert!(Rational::$from(inward_upper).unwrap().square() < source);
++            }
++            Ok((
++                if lower == 0.0 { 0 } else { lower.to_bits() },
++                if upper == 0.0 { 0 } else { upper.to_bits() },
++            ))
++        }
++    };
++}
++ieee_root!(sqrt_f32, f32, u32, to_f32_round, from_f32);
++ieee_root!(sqrt_f64, f64, u64, to_f64_round, from_f64);
+diff --git a/scripts/check_interval_float_codegen.py b/scripts/check_interval_float_codegen.py
+index d698337bc..a20492422 100644
+--- a/scripts/check_interval_float_codegen.py
++++ b/scripts/check_interval_float_codegen.py
+@@ -63,11 +63,12 @@ def main():
+     selected = {
+         name: lines for name, lines in blocks.items()
+         if "hyperinterval::float::" in name or "hyperinterval::ieee::" in name
+-        or "hyperinterval::bounds::" in name
++        or "hyperinterval::bounds::" in name or "hyperinterval::sqrt::" in name
++        or "core::num::int_sqrt::" in name
+         or name.startswith("hyperinterval_strict_")
+         or name.startswith(("__udiv", "__umod"))
+     }
+-    required = {f"hyperinterval_strict_{kind}{width}" for kind in ["chain", "surface"] for width in [32, 64]}
++    required = {f"hyperinterval_strict_{kind}{width}" for kind in ["chain", "surface", "sqrt"] for width in [32, 64]}
+     if not required.issubset(selected):
+         raise SystemExit(f"missing inspection entry points: {required - selected.keys()}")
+     if not any("hyperinterval::ieee::" in name and "finite" in name for name in selected):
+@@ -91,7 +92,7 @@ def main():
+         ]},
+         "binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+         "bytes": binary.stat().st_size, "symbols": sorted(selected), "findings": findings,
+-        "scope": "Emitted Hyperinterval float/IEEE/Bounds functions, four client entry points and unsigned wide-division helpers; bit moves permitted, runtime/panic code excluded.",
++        "scope": "Emitted Hyperinterval float/IEEE/Bounds functions, six client entry points, integer-square-root and unsigned wide-division helpers; bit moves permitted, runtime/panic code excluded.",
+     }
+     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+     if findings:
