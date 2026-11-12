@@ -1,0 +1,305 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index e48e187e0..ce8f02dc7 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -83,6 +83,7 @@ jobs:
+         if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+         run: |
+           cargo check --locked --manifest-path crates/hyperinterval/fuzz/Cargo.toml --bins
++          cargo check --locked --manifest-path crates/hyperinterval/fuzz/Cargo.toml --bins --features rational
+           rustfmt --edition 2024 --check crates/hyperinterval/fuzz/fuzz_targets/*.rs
+ 
+   portable:
+@@ -129,8 +130,10 @@ jobs:
+       - name: Run constructor and arithmetic campaigns
+         run: |
+           mkdir -p "$RUNNER_TEMP/interval-constructors" "$RUNNER_TEMP/interval-arithmetic" "$RUNNER_TEMP/interval-dyadic" "$RUNNER_TEMP/interval-proposals" "$RUNNER_TEMP/interval-strict-float"
++          mkdir -p "$RUNNER_TEMP/interval-rational-powers"
+           cargo +nightly fuzz run constructors "$RUNNER_TEMP/interval-constructors" -- -runs=10000 -max_len=1024 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run fixed_arithmetic "$RUNNER_TEMP/interval-arithmetic" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run dyadic_arithmetic "$RUNNER_TEMP/interval-dyadic" -- -runs=100000 -max_len=14 -max_total_time=30 -seed=20261112
+           cargo +nightly fuzz run primitive_proposals "$RUNNER_TEMP/interval-proposals" -- -runs=100000 -max_len=32 -max_total_time=30 -seed=20261113
+           cargo +nightly fuzz run strict_float "$RUNNER_TEMP/interval-strict-float" -- -runs=100000 -max_len=24 -max_total_time=30 -seed=20261114
++          cargo +nightly fuzz run rational_powers --features rational "$RUNNER_TEMP/interval-rational-powers" -- -runs=100000 -max_len=10 -max_total_time=30 -seed=20261115
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index ce98ddd7e..3dd43bc9a 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -702,6 +702,34 @@ SHA-256 `a5b6b9d2b1acb8f209179afcf948f6ef38ecb7bc3df81bb7e79ef13c4fad896e`.
+ Scoped verification passes and every prior manifest row is preserved. Both
+ commits are local; no push occurred.
+ 
++## Rational integer powers: admission
++
++Owner: Hyperinterval set images over Hyperreal rational arithmetic; plan
++§3.5/§3.13, P1/P3/P5/P6/P19/P35/P36. At `d45d4358c`, RationalInterval lacks
++integer powers. Add `checked_pow(i64)` for exact signed-integer images: empty
++maps to empty, exponent zero maps nonempty input to one, positive even powers
++retain the zero critical point, and negative powers reject any zero-containing
++input. Other negative-power images use monotonicity on the admitted nonzero
++interval. No pointwise dependency is replaced by repeated interval products.
++
++Reuse Hyperreal's public Rational::powi kernel and existing interval square/
++reciprocal specializations. Preserve kernel errors in a rational-feature
++IntervalError variant with the original Problem available through source().
++Do not convert Exhausted into empty, approximate geometry, unsupported or
++undecided. Hyperreal's current eager-power guard is inherited: exponents up
++to magnitude 255 have bounded amplification relative to the input; larger
++nontrivial powers are admitted only when their estimated combined numerator/
++denominator size does not exceed 65,536 bits. This is a fixed scalar growth
++policy, not a new caller-selected work,
++heap-byte or cancellation budget. Existing input normalization and rational
++allocation contracts remain in force. Stress tests must be externally bounded.
++
++Missing witnesses: positive/negative parity and zero-domain images against
++independent exact expectations, i64 exponent extremes on zero/unit/empty sets,
++the actual native guard boundary and retry, preserved typed source errors,
++generated-output composition/replay, feature isolation and affected downstream
++value/dispatch checks. Do not change Hyperreal's guard or existing consumers.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index da6407847..c12fc3490 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact signed-integer powers for rational intervals, preserving empty,
++  zero-domain, parity and monotonicity semantics. Retain scalar-kernel errors
++  and their source, including Hyperreal's existing eager-power growth refusal.
++
+ - Add exact absolute value and binary min/max images across integer, fixed,
+   rational, dyadic and qualified IEEE carriers. Preserve empty-image semantics,
+   checked signed overflow, dyadic accounting and IEEE subnormal endpoints.
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index 4ea387461..03b2f3167 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -59,6 +59,11 @@ name = "proposal_cost"
+ path = "conformance/proposal_cost.rs"
+ required-features = ["float-proposal"]
+ 
++[[example]]
++name = "rational_power_cost"
++path = "conformance/rational_power_cost.rs"
++required-features = ["rational"]
++
+ [[example]]
+ name = "order_cost"
+ path = "conformance/order_cost.rs"
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 5a81ceb3b..12629db1b 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -56,6 +56,10 @@ initial encoding, not a migration of any domain's canonical evidence.
+ The `rational` feature adds `RationalInterval` over Hyperreal's exact rationals
+ and requires Rust 1.95. It supplies exact sum, difference, product hull,
+ square, strict quotient, affine images and positive arithmetic helpers. The
++`checked_pow(i64)` operation gives exact signed-integer images, rejecting zero
++in a negative-power domain. It inherits Hyperreal's eager-growth guard; scalar
++refusals retain the typed `Problem` in `IntervalError::Scalar` and `source()`.
++This guard is not a cumulative work, memory-byte or cancellation budget. The
+ `dyadic` feature is allocation-enabled `no_std` on Rust 1.88: its BigInt
+ mantissas share an exponent, with explicit budgets for arithmetic and scale
+ changes. `hyperreal` enables both carriers and their certified Real bridge;
+diff --git a/crates/hyperinterval/fuzz/Cargo.lock b/crates/hyperinterval/fuzz/Cargo.lock
+index d1cb6682c..3acc66d7a 100644
+--- a/crates/hyperinterval/fuzz/Cargo.lock
++++ b/crates/hyperinterval/fuzz/Cargo.lock
+@@ -125,6 +125,7 @@ name = "hyperinterval-fuzz"
+ version = "0.0.0"
+ dependencies = [
+  "hyperinterval",
++ "hyperreal",
+  "libfuzzer-sys",
+  "rug",
+  "serde_json",
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 5f12ff086..3e1100fc5 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -8,11 +8,15 @@ rust-version = "1.88"
+ [package.metadata]
+ cargo-fuzz = true
+ 
++[features]
++rational = ["hyperinterval/rational", "dep:hyperreal"]
++
+ [dependencies]
+ libfuzzer-sys = "0.4"
+ hyperinterval = { path = "..", features = ["integer", "fixed", "dyadic", "float-proposal", "float-enclosure", "serde"] }
+ serde_json = "1.0"
+ rug = { version = "1.30.0", default-features = false, features = ["float", "rational", "std"] }
++hyperreal = { path = "../../hyperreal", default-features = false, optional = true }
+ 
+ [[bin]]
+ name = "constructors"
+@@ -45,6 +49,14 @@ test = false
+ doc = false
+ bench = false
+ 
++[[bin]]
++name = "rational_powers"
++path = "fuzz_targets/rational_powers.rs"
++required-features = ["rational"]
++test = false
++doc = false
++bench = false
++
+ [[bin]]
+ name = "strict_float"
+ path = "fuzz_targets/strict_float.rs"
+diff --git a/crates/hyperinterval/src/rational.rs b/crates/hyperinterval/src/rational.rs
+index 3fabae0d8..5909d3fc2 100644
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -261,6 +261,69 @@ impl RationalInterval {
+         }
+     }
+ 
++    /// Exact image of a signed integer power, preserving pointwise dependence.
++    ///
++    /// Empty maps to empty. Exponent zero maps nonempty input to one, including
++    /// zero. Negative powers reject every zero-containing interval. A connected
++    /// nonzero interval stays on one real half-line, so endpoint monotonicity
++    /// gives its exact image. Positive even powers include zero when needed.
++    ///
++    /// Reuses Hyperreal's exact eager-power kernel and growth guard. Refusals
++    /// retain the original `Problem` in `IntervalError::Scalar` and its source.
++    /// Currently nontrivial exponents above magnitude 255 require an estimated
++    /// combined numerator/denominator size of at most 65,536 bits. Smaller
++    /// exponents bound amplification relative to the input; this is not a total
++    /// work/heap-byte limit or cancellation contract. Zero/unit endpoints have
++    /// constant-size results even at i64 exponent extremes. No failure publishes
++    /// a partial image, and no approximate power replaces an exhausted result.
++    pub fn checked_pow(&self, exponent: i64) -> Result<Self, IntervalError> {
++        let Some((a, b)) = self.bounds() else {
++            return Ok(Self::empty());
++        };
++        match exponent {
++            0 => return Ok(Self::point(Rational::one())),
++            1 => return Ok(self.clone()),
++            2 => return Ok(self.square()),
++            -1 => return self.reciprocal(),
++            _ => {}
++        }
++        if exponent < 0 && self.contains_point(&Rational::zero()) {
++            return Err(IntervalError::ContainsZero);
++        }
++        let aa = a
++            .clone()
++            .powi(exponent.into())
++            .map_err(IntervalError::Scalar)?;
++        if a == b {
++            return Ok(Self::point(aa));
++        }
++        let bb = b
++            .clone()
++            .powi(exponent.into())
++            .map_err(IntervalError::Scalar)?;
++        let even = exponent.unsigned_abs().is_multiple_of(2);
++        if exponent > 0 && even && self.contains_point(&Rational::zero()) {
++            return Ok(Self::ordered(
++                Rational::zero(),
++                if aa >= bb { aa } else { bb },
++            ));
++        }
++        // Positive odd powers increase everywhere. Positive even powers
++        // decrease on the negative half-line. Negative odd powers decrease on
++        // either admitted half-line; negative even powers increase only on the
++        // negative half-line. No output comparison is needed on these branches.
++        let increasing = if exponent > 0 {
++            !even || !a.is_negative()
++        } else {
++            even && a.is_negative()
++        };
++        Ok(if increasing {
++            Self::ordered(aa, bb)
++        } else {
++            Self::ordered(bb, aa)
++        })
++    }
++
+     /// Exact reciprocal; a zero-containing input is rejected.
+     pub fn reciprocal(&self) -> Result<Self, IntervalError> {
+         if self.contains_point(&Rational::zero()) {
+diff --git a/crates/hyperinterval/src/state.rs b/crates/hyperinterval/src/state.rs
+index fb757666c..0cce6c7b7 100644
+--- a/crates/hyperinterval/src/state.rs
++++ b/crates/hyperinterval/src/state.rs
+@@ -4,6 +4,10 @@ use core::fmt;
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ #[non_exhaustive]
+ pub enum IntervalError {
++    /// The exact scalar kernel refused an operation. Its typed cause, including
++    /// resource exhaustion, is retained and available through `Error::source`.
++    #[cfg(feature = "rational")]
++    Scalar(hyperreal::Problem),
+     /// A primitive floating-point input is NaN or infinite.
+     #[cfg(any(feature = "float-proposal", feature = "float-enclosure"))]
+     NonFiniteEndpoint,
+@@ -47,6 +51,8 @@ pub enum IntervalError {
+ impl fmt::Display for IntervalError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.write_str(match self {
++            #[cfg(feature = "rational")]
++            Self::Scalar(problem) => return write!(f, "exact scalar operation failed: {problem}"),
+             #[cfg(any(feature = "float-proposal", feature = "float-enclosure"))]
+             Self::NonFiniteEndpoint => "interval endpoint is not finite",
+             Self::ReversedEndpoints => "interval endpoints are reversed",
+@@ -73,7 +79,15 @@ impl fmt::Display for IntervalError {
+     }
+ }
+ 
+-impl core::error::Error for IntervalError {}
++impl core::error::Error for IntervalError {
++    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
++        #[cfg(feature = "rational")]
++        if let Self::Scalar(problem) = self {
++            return Some(problem);
++        }
++        None
++    }
++}
+ 
+ /// Whether every source point belongs to the real domain of a function.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/hyperinterval/tests/real_bridge.rs b/crates/hyperinterval/tests/real_bridge.rs
+index 9d1e522ce..0ec27f18c 100644
+--- a/crates/hyperinterval/tests/real_bridge.rs
++++ b/crates/hyperinterval/tests/real_bridge.rs
+@@ -5,6 +5,10 @@ use hyperinterval::{
+ };
+ use hyperreal::{Rational, Real};
+ 
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/rational_oracle.rs"]
++mod rational_oracle;
++
+ fn budget() -> DyadicBudget {
+     DyadicBudget::new(4096, 1_000_000_000)
+ }
+@@ -97,18 +101,7 @@ mod mpfr {
+         float::{Constant, Round},
+     };
+ 
+-    fn mpq(value: &Rational) -> Mpq {
+-        let numerator: rug::Integer = value.numerator().to_string().parse().unwrap();
+-        let denominator: rug::Integer = value.denominator().to_string().parse().unwrap();
+-        Mpq::from((
+-            if value.is_negative() {
+-                -numerator
+-            } else {
+-                numerator
+-            },
+-            denominator,
+-        ))
+-    }
++    use crate::rational_oracle::mpq;
+     fn assert_encloses(range: &RationalInterval, lo: &Mpq, hi: &Mpq) {
+         let (a, b) = range.bounds().unwrap();
+         assert!(mpq(a) <= *lo, "lower {a} excludes {lo}");
