@@ -1,0 +1,1994 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index fabc59e52..a82e54f55 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,9 +2,16 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add optional finite endpoint covers with explicit infinity-norm epsilon
++  thickening, exact initial partitions and retained whole-cell/prefix evidence.
++  Outward endpoint transport is checked before continuation and final publication.
++  Bounded displacement-based proposals reuse the existing Picard authority;
++  the original `integrate` proposal strategy and its reports remain unchanged.
++  Stopped requests expose no full cover. Replay rebuilds source/request/policies.
++
+ - Add owned, replayable dyadic expression fields with explicit time/state
+   dimensions, immutable structural identity and regenerated state Jacobians.
+   Reuse native Cartesian carriers and source-domain checks, including empty and
+   zero-dimensional products. Shared graph/arithmetic budgets preserve typed
+   exhaustion and retry; scalar refinement and payload costs retain their
+-  documented accounting exclusions. Validated evolution remains open.
++  documented accounting exclusions.
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 01d775d92..a5caf9d1a 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -15,6 +15,7 @@ all-features = true
+ 
+ [features]
+ default = []
++reachability = ["field"]
+ rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+ field = ["dep:hyperreal", "dep:hyperinterval", "dep:hyperlattice-interval", "dep:hypersolve", "hypersolve/interval-program"]
+ serde = ["dep:serde", "hypersolve?/serde", "hyperlattice-interval?/serde"]
+@@ -38,3 +39,7 @@ required-features = ["field"]
+ [[example]]
+ name = "rk_proposal"
+ required-features = ["rk-proposal"]
++
++[[example]]
++name = "reachability"
++required-features = ["reachability"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index ca6c35258..e63f00b7b 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -68,3 +68,33 @@ cargo run -p hyperdynamics --features rk-proposal --example rk_proposal
+ 
+ The default feature set is empty. `dispatch-trace` enables underlying exact
+ arithmetic instrumentation when `field` is enabled.
++
++Enable `reachability` for `field.reach(request, policy, budget)`. The request gives
++an exact dyadic horizon, an initial box and nonnegative singleton `epsilon`.
++Only `end_cover()` on a completed report exposes a finite endpoint union `C`:
++`R ⊆ C ⊆ R + [-epsilon, epsilon]^N`, where `R` is the exact reachable set.
++This is an infinity-norm bound in the supplied state-coordinate units, not an
++exact reachable-set or per-trajectory pairing claim. Identity and empty requests
++retain their exact set meanings. Zero epsilon need not complete.
++
++The search partitions the widest initial coordinate exactly, choosing the first
++axis on ties and visiting the lower child first. Small cells may instead halve
++the time cap. Every cell, failed attempt and exact source identity is retained.
++Native certified prefixes are consumed explicitly: their local one-segment-limit
++status is preserved. Each continuation box is rounded outward on the enclosure
++policy's grid, with checked inclusion. The final transfer and endpoint diameter
++must pass before whole-horizon success. The original `integrate` strategy remains
++available; reachability selects displacement-based untrusted candidate padding
++and uses the same Picard verifier.
++
++`ReachabilityPolicy` bounds cells, depth, whole-cell evolution attempts and time
++refinements. Each attempt performs at most `max(1, evolution.maximum_steps)`
++native prefix searches. All calls share the supplied budget. These bounds retain
++the existing exclusions for scalar refinement, total CPU work and heap bytes.
++A rounding floor, a mathematical/domain failure or an exhausted bound yields a
++typed stopped report with no whole-request cover. Rebuild the field and rerun
++source/request/policies for replay; reports are not deserialized as proof.
++
++```sh
++cargo run -p hyperdynamics --features reachability --example reachability
++```
+diff --git a/crates/hyperdynamics/examples/reachability.rs b/crates/hyperdynamics/examples/reachability.rs
+new file mode 100644
+index 000000000..463156142
+--- /dev/null
++++ b/crates/hyperdynamics/examples/reachability.rs
+@@ -0,0 +1,50 @@
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::EvolutionRequest,
++    reachability::{ReachabilityPolicy, ReachabilityRequest},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let time = SymbolId(0);
++    let state = SymbolId(1);
++    let source = ExpressionProgram::compile(
++        &[Expr::int(2)],
++        &[time, state],
++        &mut ExpressionBudget::new(1000, 10000),
++    )?;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let field = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![state],
++        },
++        &mut budget,
++    )?;
++    let request = ReachabilityRequest {
++        evolution: EvolutionRequest {
++            start: DyadicInterval::point(0.into(), 0)?,
++            end: DyadicInterval::point(1.into(), -1)?,
++            initial: BoxN::new([DyadicInterval::new((-1).into(), 1.into(), 0)?])?,
++        },
++        epsilon: DyadicInterval::point(1.into(), -1)?,
++    };
++    let report = field.reach(request, ReachabilityPolicy::default(), &mut budget);
++    println!("{:?}", report.status());
++    if let Some(cover) = report.end_cover() {
++        println!(
++            "{} certified endpoint boxes at {:?}",
++            cover.boxes().len(),
++            cover.end_time()
++        );
++        for state in cover.boxes() {
++            println!("{state:?}");
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 71b0c7736..46cda9c18 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -472,3 +472,7 @@ impl<const N: usize> EnclosedVectorField<N> for ExpressionField<N> {
+ /// Source-bound primitive RK4 estimates consumed only through exact verification.
+ #[cfg(feature = "rk-proposal")]
+ pub mod proposal;
++
++/// Finite source-bound endpoint covers with explicit infinity-norm accuracy.
++#[cfg(feature = "reachability")]
++pub mod reachability;
+diff --git a/crates/hyperdynamics/src/field/evolution.rs b/crates/hyperdynamics/src/field/evolution.rs
+index 81031d696..5005f03e6 100644
+--- a/crates/hyperdynamics/src/field/evolution.rs
++++ b/crates/hyperdynamics/src/field/evolution.rs
+@@ -54,6 +54,13 @@ pub enum CandidateSource {
+         /// Index in the retained execution-order attempt list.
+         attempt: usize,
+     },
++    /// Hull with the named Picard image, then pad by its coordinate width
++    /// growth beyond the initial box. The resulting candidate still needs proof.
++    #[cfg(feature = "reachability")]
++    PicardDisplacementExpansion {
++        /// Index in the retained execution-order attempt list.
++        attempt: usize,
++    },
+ }
+ 
+ /// One actual invocation of the source-bound step verifier.
+@@ -262,14 +269,49 @@ impl<const N: usize> ExpressionField<N> {
+             segments: Vec::new(),
+             status: EvolutionStatus::Identity,
+         };
+-        report.status = match self.evolve(&mut report, budget) {
++        #[cfg(not(feature = "reachability"))]
++        {
++            report.status = match self.evolve(&mut report, budget) {
++                Ok(status) => status,
++                Err(error) => EvolutionStatus::Stopped(error),
++            };
++        }
++        #[cfg(feature = "reachability")]
++        {
++            report.status = match self.evolve::<false>(&mut report, budget) {
++                Ok(status) => status,
++                Err(error) => EvolutionStatus::Stopped(error),
++            };
++        }
++        report
++    }
++
++    // Reachability selects a tighter untrusted proposal. The search and
++    // source-bound verifier remain shared with the original public entry point.
++    #[cfg(feature = "reachability")]
++    pub(super) fn integrate_displacement(
++        &self,
++        request: EvolutionRequest<N>,
++        options: EvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> EvolutionReport<N> {
++        let mut report = EvolutionReport {
++            identity: self.identity(),
++            request,
++            options,
++            policy: budget.policy(),
++            attempts: Vec::new(),
++            segments: Vec::new(),
++            status: EvolutionStatus::Identity,
++        };
++        report.status = match self.evolve::<true>(&mut report, budget) {
+             Ok(status) => status,
+             Err(error) => EvolutionStatus::Stopped(error),
+         };
+         report
+     }
+ 
+-    fn evolve(
++    fn evolve<#[cfg(feature = "reachability")] const DISPLACEMENT: bool>(
+         &self,
+         report: &mut EvolutionReport<N>,
+         budget: &mut EnclosureBudget,
+@@ -390,12 +432,51 @@ impl<const N: usize> ExpressionField<N> {
+                             previous.evidence().picard_image().expect("self-map stage"),
+                             &mut budget.arithmetic,
+                         )?;
+-                        candidate = hull.add(
+-                            &hull.sub(&hull, &mut budget.arithmetic)?,
+-                            &mut budget.arithmetic,
+-                        )?;
++                        #[cfg(not(feature = "reachability"))]
++                        {
++                            candidate = hull.add(
++                                &hull.sub(&hull, &mut budget.arithmetic)?,
++                                &mut budget.arithmetic,
++                            )?;
++                        }
++                        #[cfg(feature = "reachability")]
++                        {
++                            candidate = if DISPLACEMENT {
++                                budget.graph.charge(
++                                    N.checked_mul(5).ok_or(ExpressionError::SizeExhausted)?,
++                                )?;
++                                let widths = BoxN::new(
++                                    hull.widths(&mut budget.arithmetic)?
++                                        .expect("nonempty candidate"),
++                                )?;
++                                let initial_widths = BoxN::new(
++                                    initial
++                                        .widths(&mut budget.arithmetic)?
++                                        .expect("nonempty initial state"),
++                                )?;
++                                let growth = widths.sub(&initial_widths, &mut budget.arithmetic)?;
++                                let reflection = growth.scale(
++                                    &DyadicInterval::point((-1).into(), 0)?,
++                                    &mut budget.arithmetic,
++                                )?;
++                                hull.add(
++                                    &growth.hull(&reflection, &mut budget.arithmetic)?,
++                                    &mut budget.arithmetic,
++                                )?
++                            } else {
++                                hull.add(
++                                    &hull.sub(&hull, &mut budget.arithmetic)?,
++                                    &mut budget.arithmetic,
++                                )?
++                            };
++                        }
+                         expansions += 1;
+                         source = CandidateSource::PicardExpansion { attempt: index };
++                        #[cfg(feature = "reachability")]
++                        if DISPLACEMENT {
++                            source =
++                                CandidateSource::PicardDisplacementExpansion { attempt: index };
++                        }
+                     } else {
+                         if halvings == report.options.maximum_halvings {
+                             return Err(EvolutionFailure::HalvingLimit {
+@@ -432,7 +513,7 @@ impl<const N: usize> ExpressionField<N> {
+     }
+ }
+ 
+-fn copy_state<const N: usize>(
++pub(super) fn copy_state<const N: usize>(
+     state: &BoxN<DyadicInterval, N>,
+     budget: &mut EnclosureBudget,
+ ) -> Result<BoxN<DyadicInterval, N>, EvolutionFailure> {
+diff --git a/crates/hyperdynamics/src/field/reachability.rs b/crates/hyperdynamics/src/field/reachability.rs
+new file mode 100644
+index 000000000..829c1ede9
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/reachability.rs
+@@ -0,0 +1,618 @@
++//! Finite endpoint covers over exact initial-state partitions.
++//!
++//! On success, the cover C satisfies R ⊆ C ⊆ R + [-ε, ε]^N, where R is the
++//! reachable set at the exact requested end time. Every positive-horizon leaf
++//! has a complete existence proof and an endpoint box of infinity-diameter at
++//! most ε. Its nonempty initial cell supplies a reachable point in that box;
++//! hence every point of the box is within ε of R. Exact closed subdivision
++//! preserves coverage. Identity and empty requests have exact set semantics.
++//! Each native certified prefix is outward-regridded, with checked inclusion,
++//! before continuation. Candidate padding uses displacement beyond the initial
++//! width, but the existing Picard verifier remains the sole step authority.
++//!
++//! This sufficient accuracy test is conservative. Finite search need not
++//! complete, including at zero ε or a rounding floor. Stopped reports expose
++//! attempts, never a whole-request end cover. Replay definitions, requests and
++//! policies; serialized success flags are not certificates.
++use super::{evolution::*, *};
++use core::cmp::Ordering;
++mod transport;
++pub use transport::{ReachabilityEvolution, ReachabilityStep};
++
++/// Original evolution and requested absolute infinity-norm thickening bound.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct ReachabilityRequest<const N: usize> {
++    /// Exact time horizon and initial set.
++    pub evolution: EvolutionRequest<N>,
++    /// Nonnegative singleton, in the caller's state-coordinate units.
++    pub epsilon: DyadicInterval,
++}
++
++/// Finite deterministic cover search, sharing one enclosing arithmetic budget.
++///
++/// These limits count retained cells, complete integration invocations and
++/// refinement depth. They do not bound total heap bytes or the scalar refinement
++/// excluded by `EnclosureBudget`. Every nested invocation spends the same counters.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct ReachabilityPolicy {
++    /// Existing exact integration search; no alternate ODE authority is used.
++    pub evolution: EvolutionOptions,
++    /// Maximum retained partition cells, including internal nodes and the root.
++    pub maximum_cells: usize,
++    /// Maximum whole-cell evolution attempts, including rejected ones. Each attempt
++    /// performs at most `max(1, evolution.maximum_steps)` native prefix searches.
++    pub maximum_evolutions: usize,
++    /// Maximum initial-box bisections along one root-to-leaf path.
++    pub maximum_depth: u32,
++    /// Maximum strict step-cap halvings per cell; children inherit the refined cap.
++    pub maximum_time_refinements: u32,
++}
++impl Default for ReachabilityPolicy {
++    fn default() -> Self {
++        Self {
++            evolution: EvolutionOptions::default(),
++            maximum_cells: 4095,
++            maximum_evolutions: 8192,
++            maximum_depth: 32,
++            maximum_time_refinements: 16,
++        }
++    }
++}
++
++/// One retained cell in an exact closed initial-state partition.
++#[derive(Clone, Debug)]
++pub struct ReachabilityCell<const N: usize> {
++    initial: BoxN<DyadicInterval, N>,
++    parent: Option<usize>,
++    depth: u32,
++    children: Option<[usize; 2]>,
++    split_axis: Option<usize>,
++    last_attempt: Option<usize>,
++    diameter: Option<DyadicInterval>,
++    time_refinements: u32,
++    step_cap: Option<DyadicInterval>,
++}
++impl<const N: usize> ReachabilityCell<N> {
++    /// Exact initial cell, not an endpoint approximation.
++    pub fn initial(&self) -> &BoxN<DyadicInterval, N> {
++        &self.initial
++    }
++    /// Parent cell index; only the root has none.
++    pub fn parent(&self) -> Option<usize> {
++        self.parent
++    }
++    /// Number of initial-box splits from the root.
++    pub fn depth(&self) -> u32 {
++        self.depth
++    }
++    /// Lower then upper child, sharing a closed midpoint facet.
++    pub fn children(&self) -> Option<[usize; 2]> {
++        self.children
++    }
++    /// Coordinate split by the exact Cartesian partition authority.
++    pub fn split_axis(&self) -> Option<usize> {
++        self.split_axis
++    }
++    /// Last integration attempt for this cell, if one was invoked.
++    pub fn last_attempt(&self) -> Option<usize> {
++        self.last_attempt
++    }
++    /// Exact diameter of the last completed endpoint box, when materialized.
++    /// This alone does not certify the requested accuracy or full cover.
++    pub fn end_diameter(&self) -> Option<&DyadicInterval> {
++        self.diameter.as_ref()
++    }
++    /// Number of strict time-cap refinements performed for this cell.
++    pub fn time_refinements(&self) -> u32 {
++        self.time_refinements
++    }
++}
++
++/// One whole-cell search, retaining every invocation of the native authority.
++#[derive(Clone, Debug)]
++pub struct ReachabilityAttempt<const N: usize> {
++    cell: usize,
++    evolution: ReachabilityEvolution<N>,
++}
++impl<const N: usize> ReachabilityAttempt<N> {
++    /// Cell whose initial set is bound by this evolution report.
++    pub fn cell(&self) -> usize {
++        self.cell
++    }
++    /// Full ordered prefix proofs, outward transfers, source and exact horizon.
++    pub fn evolution(&self) -> &ReachabilityEvolution<N> {
++        &self.evolution
++    }
++}
++
++/// Why the full requested cover was not certified.
++#[derive(Clone, Debug)]
++pub enum ReachabilityFailure {
++    /// Epsilon is empty, nonsingleton or negative.
++    InvalidEpsilon,
++    /// The next cell allocation would exceed the declared capacity.
++    CellCapacity {
++        /// Configured bound.
++        limit: usize,
++        /// Required retained cells.
++        required: usize,
++    },
++    /// The aggregate integration invocation bound has been reached.
++    EvolutionLimit {
++        /// Configured bound.
++        limit: usize,
++    },
++    /// A cell reached its initial-subdivision depth bound.
++    DepthLimit {
++        /// Cell still needing refinement.
++        cell: usize,
++        /// Configured bound.
++        limit: u32,
++    },
++    /// An indivisible initial state reached its time-refinement bound.
++    TimeRefinementLimit {
++        /// Cell still needing refinement.
++        cell: usize,
++        /// Configured bound.
++        limit: u32,
++    },
++    /// A nested evolution failed without a supported cover retry.
++    Evolution {
++        /// Retained attempt index.
++        attempt: usize,
++        /// Original typed reason.
++        reason: EvolutionFailure,
++    },
++    /// Required strict refinement could not be established.
++    NonProgress,
++    /// Arithmetic, structural resources, cancellation or preparation failed.
++    Preparation(EvolutionFailure),
++}
++impl fmt::Display for ReachabilityFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "reachability: {self:?}")
++    }
++}
++impl std::error::Error for ReachabilityFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Preparation(e) | Self::Evolution { reason: e, .. } => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<EvolutionFailure> for ReachabilityFailure {
++    fn from(e: EvolutionFailure) -> Self {
++        Self::Preparation(e)
++    }
++}
++impl From<ExpressionError> for ReachabilityFailure {
++    fn from(e: ExpressionError) -> Self {
++        Self::Preparation(e.into())
++    }
++}
++impl From<IntervalError> for ReachabilityFailure {
++    fn from(e: IntervalError) -> Self {
++        Self::Preparation(e.into())
++    }
++}
++impl From<IntervalLatticeError> for ReachabilityFailure {
++    fn from(e: IntervalLatticeError) -> Self {
++        Self::Preparation(e.into())
++    }
++}
++
++/// Whole-request coverage, distinct from any certified individual cell.
++#[derive(Clone, Debug)]
++pub enum ReachabilityStatus {
++    /// Every leaf reaches the requested horizon and satisfies the thickening bound.
++    Completed,
++    /// Exact zero-horizon identity, without an ODE existence claim.
++    Identity,
++    /// Successful empty reachable set, after input validation.
++    Empty,
++    /// Retained attempts do not establish the full requested end cover.
++    Stopped(ReachabilityFailure),
++}
++
++/// Immutable source-bound reachability evidence. Rebuild source and rerun for replay.
++#[derive(Clone, Debug)]
++pub struct ReachabilityReport<const N: usize> {
++    identity: FieldIdentity,
++    request: ReachabilityRequest<N>,
++    policy: ReachabilityPolicy,
++    enclosure_policy: EnclosurePolicy,
++    cells: Vec<ReachabilityCell<N>>,
++    attempts: Vec<ReachabilityAttempt<N>>,
++    accepted: Vec<usize>,
++    status: ReachabilityStatus,
++}
++impl<const N: usize> ReachabilityReport<N> {
++    /// Exact retained source identity.
++    pub fn identity(&self) -> &FieldIdentity {
++        &self.identity
++    }
++    /// Original time, initial set and accuracy contract.
++    pub fn request(&self) -> &ReachabilityRequest<N> {
++        &self.request
++    }
++    /// Recorded finite search policy.
++    pub fn policy(&self) -> &ReachabilityPolicy {
++        &self.policy
++    }
++    /// Shared enclosure precision and resource configuration.
++    pub fn enclosure_policy(&self) -> EnclosurePolicy {
++        self.enclosure_policy
++    }
++    /// Exact partition tree, including unfinished cells.
++    pub fn cells(&self) -> &[ReachabilityCell<N>] {
++        &self.cells
++    }
++    /// Every whole-cell evolution attempt, in deterministic execution order.
++    pub fn attempts(&self) -> &[ReachabilityAttempt<N>] {
++        &self.attempts
++    }
++    /// Whole-request outcome.
++    pub fn status(&self) -> &ReachabilityStatus {
++        &self.status
++    }
++    /// Completed endpoint cover only; never exposes a partial union as full coverage.
++    pub fn end_cover(&self) -> Option<EndCover<'_, N>> {
++        match self.status {
++            ReachabilityStatus::Stopped(_) => None,
++            _ => Some(EndCover { report: self }),
++        }
++    }
++}
++
++/// Borrowed certified finite union at the exact requested horizon.
++///
++/// Each box may include unreachable points, bounded by the stated epsilon
++/// thickening in infinity norm. The union is not asserted to be an exact reachable
++/// set. Empty covers contain zero boxes; zero-dimensional unit covers contain one.
++#[derive(Clone, Copy, Debug)]
++pub struct EndCover<'a, const N: usize> {
++    report: &'a ReachabilityReport<N>,
++}
++impl<'a, const N: usize> EndCover<'a, N> {
++    /// Certified endpoint boxes in depth-first, lower-child-first order.
++    pub fn boxes(&self) -> impl ExactSizeIterator<Item = &'a BoxN<DyadicInterval, N>> + '_ {
++        self.report.accepted.iter().map(|&i| {
++            let cell = &self.report.cells[i];
++            self.report.attempts[cell.last_attempt.expect("accepted cell")]
++                .evolution
++                .end_enclosure()
++                .expect("accepted horizon")
++        })
++    }
++    /// Explicit accuracy bound supplied with the original request.
++    pub fn epsilon(&self) -> &'a DyadicInterval {
++        &self.report.request.epsilon
++    }
++    /// Exact common end time; all completed leaf reports bind this value.
++    pub fn end_time(&self) -> &'a DyadicInterval {
++        &self.report.request.evolution.end
++    }
++}
++
++impl<const N: usize> ExpressionField<N> {
++    /// Certify a finite endpoint cover by bounded exact initial-state subdivision.
++    ///
++    /// The widest initial coordinate is bisected, with first-axis tie breaking.
++    /// Cells of initial diameter at most half epsilon first refine the exact
++    /// time cap. After their time-refinement limit, nonpoint cells split again.
++    /// Children inherit the refined cap; point cells can only refine time. Every nested
++    /// integration uses the same budget, retains all rejections, and checks its
++    /// final contribution before success. No finite completion bound is promised.
++    pub fn reach(
++        &self,
++        request: ReachabilityRequest<N>,
++        policy: ReachabilityPolicy,
++        budget: &mut EnclosureBudget,
++    ) -> ReachabilityReport<N> {
++        let mut report = ReachabilityReport {
++            identity: self.identity(),
++            request,
++            policy,
++            enclosure_policy: budget.policy(),
++            cells: Vec::new(),
++            attempts: Vec::new(),
++            accepted: Vec::new(),
++            status: ReachabilityStatus::Empty,
++        };
++        report.status = match self.cover(&mut report, budget) {
++            Ok(s) => s,
++            Err(e) => ReachabilityStatus::Stopped(e),
++        };
++        report
++    }
++
++    fn cover(
++        &self,
++        r: &mut ReachabilityReport<N>,
++        b: &mut EnclosureBudget,
++    ) -> Result<ReachabilityStatus, ReachabilityFailure> {
++        b.graph.charge(1)?;
++        if !r.request.epsilon.is_singleton()
++            || r.request.epsilon.signs() == hyperinterval::SignSet::Negative
++        {
++            return Err(ReachabilityFailure::InvalidEpsilon);
++        }
++        if r.policy.maximum_cells == 0 {
++            return Err(ReachabilityFailure::CellCapacity {
++                limit: 0,
++                required: 1,
++            });
++        }
++        b.graph.check_entries(&[1])?;
++        let initial = copy_state(&r.request.evolution.initial, b)?;
++        r.cells.push(new_cell(initial, None, 0));
++        let mut pending = vec![0];
++        while let Some(cell) = pending.pop() {
++            b.graph.charge(0)?;
++            if r.attempts.len() == r.policy.maximum_evolutions {
++                return Err(ReachabilityFailure::EvolutionLimit {
++                    limit: r.policy.maximum_evolutions,
++                });
++            }
++            let count = r
++                .attempts
++                .len()
++                .checked_add(1)
++                .ok_or(ExpressionError::SizeExhausted)?;
++            b.graph
++                .check_entries(&[r.cells.len(), count, r.accepted.len(), pending.len()])?;
++            b.graph.charge(1)?;
++            let request = EvolutionRequest {
++                start: r
++                    .request
++                    .evolution
++                    .start
++                    .checked_pow(1, &mut b.arithmetic)?,
++                end: r.request.evolution.end.checked_pow(1, &mut b.arithmetic)?,
++                initial: copy_state(&r.cells[cell].initial, b)?,
++            };
++            let source_cap = r.cells[cell].step_cap.as_ref().or(r
++                .policy
++                .evolution
++                .maximum_step
++                .as_ref());
++            let options = EvolutionOptions {
++                maximum_step: source_cap
++                    .map(|v| v.checked_pow(1, &mut b.arithmetic))
++                    .transpose()?,
++                maximum_steps: r.policy.evolution.maximum_steps,
++                maximum_halvings: r.policy.evolution.maximum_halvings,
++                maximum_expansions: r.policy.evolution.maximum_expansions,
++            };
++            let evolution = transport::integrate_cell(self, request, options, b);
++            let status = evolution.status().clone();
++            let attempt = r.attempts.len();
++            r.attempts.push(ReachabilityAttempt { cell, evolution });
++            r.cells[cell].last_attempt = Some(attempt);
++            r.cells[cell].diameter = None;
++            let mut step_limit = false;
++            match status {
++                EvolutionStatus::Empty => {
++                    b.graph.charge(0)?;
++                    return Ok(ReachabilityStatus::Empty);
++                }
++                EvolutionStatus::Identity => {
++                    b.graph
++                        .check_entries(&[r.cells.len(), r.attempts.len(), 1])?;
++                    b.graph.charge(1)?;
++                    r.accepted.push(cell);
++                    return Ok(ReachabilityStatus::Identity);
++                }
++                EvolutionStatus::Completed => {
++                    let end = r.attempts[attempt]
++                        .evolution
++                        .end_enclosure()
++                        .expect("complete evolution");
++                    let diameter = diameter(end, b)?;
++                    let fits = diameter.compare_singleton(&r.request.epsilon, &mut b.arithmetic)?
++                        != Ordering::Greater;
++                    r.cells[cell].diameter = Some(diameter);
++                    if fits {
++                        b.graph.check_entries(&[
++                            r.cells.len(),
++                            r.attempts.len(),
++                            r.accepted
++                                .len()
++                                .checked_add(1)
++                                .ok_or(ExpressionError::SizeExhausted)?,
++                            pending.len(),
++                        ])?;
++                        b.graph.charge(1)?;
++                        r.accepted.push(cell);
++                        continue;
++                    }
++                }
++                EvolutionStatus::Stopped(reason) => {
++                    step_limit = matches!(reason, EvolutionFailure::StepLimit { .. });
++                    if !matches!(
++                        reason,
++                        EvolutionFailure::HalvingLimit { .. } | EvolutionFailure::StepLimit { .. }
++                    ) {
++                        return Err(ReachabilityFailure::Evolution { attempt, reason });
++                    }
++                }
++            }
++            b.graph.charge(N)?;
++            let axis = r.cells[cell].initial.widest_axis(&mut b.arithmetic)?;
++            let split = axis.filter(|&axis| {
++                !r.cells[cell].initial.lanes().expect("nonempty cell")[axis].is_singleton()
++            });
++            let refine_time = if !step_limit
++                && r.cells[cell].time_refinements < r.policy.maximum_time_refinements
++            {
++                match split {
++                    Some(axis) => {
++                        let width = r.cells[cell].initial.lanes().expect("nonempty cell")[axis]
++                            .width(&mut b.arithmetic)?;
++                        width
++                            .add(&width, &mut b.arithmetic)?
++                            .compare_singleton(&r.request.epsilon, &mut b.arithmetic)?
++                            != Ordering::Greater
++                    }
++                    None => true,
++                }
++            } else {
++                false
++            };
++            if let Some(axis) = split.filter(|_| !refine_time) {
++                let depth = r.cells[cell].depth;
++                if depth == r.policy.maximum_depth {
++                    return Err(ReachabilityFailure::DepthLimit {
++                        cell,
++                        limit: r.policy.maximum_depth,
++                    });
++                }
++                let count = r
++                    .cells
++                    .len()
++                    .checked_add(2)
++                    .ok_or(ExpressionError::SizeExhausted)?;
++                if count > r.policy.maximum_cells {
++                    return Err(ReachabilityFailure::CellCapacity {
++                        limit: r.policy.maximum_cells,
++                        required: count,
++                    });
++                }
++                b.graph.check_entries(&[
++                    count,
++                    r.attempts.len(),
++                    r.accepted.len(),
++                    pending
++                        .len()
++                        .checked_add(2)
++                        .ok_or(ExpressionError::SizeExhausted)?,
++                ])?;
++                b.graph.charge(
++                    N.checked_mul(2)
++                        .and_then(|n| n.checked_add(2))
++                        .ok_or(ExpressionError::SizeExhausted)?,
++                )?;
++                let [left, right] = r.cells[cell]
++                    .initial
++                    .bisect_axis(axis, &mut b.arithmetic)?
++                    .ok_or(ReachabilityFailure::NonProgress)?;
++                let indices = [r.cells.len(), r.cells.len() + 1];
++                let mut left = new_cell(left, Some(cell), depth + 1);
++                let mut right = new_cell(right, Some(cell), depth + 1);
++                // Halving a cap that already exhausted the segment count cannot
++                // help. Children restart at this cell's last completed cap,
++                // retaining the failed finer attempt as evidence.
++                let inherited = if step_limit {
++                    r.attempts
++                        .iter()
++                        .rev()
++                        .find(|a| {
++                            a.cell == cell
++                                && matches!(a.evolution.status(), EvolutionStatus::Completed)
++                        })
++                        .and_then(|a| a.evolution.segments().next())
++                        .and_then(|s| s.evidence().duration())
++                        .or(r.policy.evolution.maximum_step.as_ref())
++                } else {
++                    r.cells[cell].step_cap.as_ref()
++                };
++                left.step_cap = inherited
++                    .map(|cap| cap.checked_pow(1, &mut b.arithmetic))
++                    .transpose()?;
++                right.step_cap = inherited
++                    .map(|cap| cap.checked_pow(1, &mut b.arithmetic))
++                    .transpose()?;
++                r.cells.push(left);
++                r.cells.push(right);
++                r.cells[cell].children = Some(indices);
++                r.cells[cell].split_axis = Some(axis);
++                pending.push(indices[1]);
++                pending.push(indices[0]);
++            } else {
++                if step_limit {
++                    let EvolutionStatus::Stopped(reason) = r.attempts[attempt].evolution.status()
++                    else {
++                        unreachable!("recorded step limit")
++                    };
++                    return Err(ReachabilityFailure::Evolution {
++                        attempt,
++                        reason: reason.clone(),
++                    });
++                }
++                if r.cells[cell].time_refinements == r.policy.maximum_time_refinements {
++                    return Err(ReachabilityFailure::TimeRefinementLimit {
++                        cell,
++                        limit: r.policy.maximum_time_refinements,
++                    });
++                }
++                let duration = r
++                    .request
++                    .evolution
++                    .end
++                    .sub(&r.request.evolution.start, &mut b.arithmetic)?;
++                let cap = match r.attempts[attempt]
++                    .evolution
++                    .segments()
++                    .next()
++                    .and_then(|step| step.evidence().duration())
++                    .or(r.attempts[attempt]
++                        .evolution
++                        .options()
++                        .maximum_step
++                        .as_ref())
++                {
++                    Some(cap) => duration.min_image(cap, &mut b.arithmetic)?,
++                    None => duration,
++                };
++                let half = cap
++                    .hull(&DyadicInterval::point(0.into(), 0)?, &mut b.arithmetic)?
++                    .midpoint(&mut b.arithmetic)?;
++                if half.signs() != hyperinterval::SignSet::Positive
++                    || half.compare_singleton(&cap, &mut b.arithmetic)? != Ordering::Less
++                {
++                    return Err(ReachabilityFailure::NonProgress);
++                }
++                b.graph.charge(1)?;
++                r.cells[cell].time_refinements += 1;
++                r.cells[cell].step_cap = Some(half);
++                pending.push(cell);
++            }
++        }
++        b.graph.charge(0)?;
++        Ok(ReachabilityStatus::Completed)
++    }
++}
++fn new_cell<const N: usize>(
++    initial: BoxN<DyadicInterval, N>,
++    parent: Option<usize>,
++    depth: u32,
++) -> ReachabilityCell<N> {
++    ReachabilityCell {
++        initial,
++        parent,
++        depth,
++        children: None,
++        split_axis: None,
++        last_attempt: None,
++        diameter: None,
++        time_refinements: 0,
++        step_cap: None,
++    }
++}
++fn diameter<const N: usize>(
++    state: &BoxN<DyadicInterval, N>,
++    b: &mut EnclosureBudget,
++) -> Result<DyadicInterval, ReachabilityFailure> {
++    b.graph.charge(N)?;
++    let mut maximum = DyadicInterval::point(0.into(), 0)?;
++    for lane in state.lanes().ok_or(ReachabilityFailure::NonProgress)? {
++        let width = lane.width(&mut b.arithmetic)?;
++        if width.compare_singleton(&maximum, &mut b.arithmetic)? == Ordering::Greater {
++            maximum = width
++        }
++    }
++    Ok(maximum)
++}
+diff --git a/crates/hyperdynamics/src/field/reachability/transport.rs b/crates/hyperdynamics/src/field/reachability/transport.rs
+new file mode 100644
+index 000000000..6dd3ca26e
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/reachability/transport.rs
+@@ -0,0 +1,201 @@
++//! Certified prefix composition with explicit outward endpoint transport.
++use super::*;
++
++/// A native one-segment search and its admitted outward continuation box.
++///
++/// The native request can stop at its deliberate one-segment limit. Only its
++/// certified prefix is consumed, explicitly; that native report is never relabeled
++/// complete. The outer evolution must concatenate all prefixes to the exact end.
++#[derive(Clone, Debug)]
++pub struct ReachabilityStep<const N: usize> {
++    native: EvolutionReport<N>,
++    carried: Option<BoxN<DyadicInterval, N>>,
++}
++impl<const N: usize> ReachabilityStep<N> {
++    /// Full native request, search attempts, prefix proofs and local status.
++    pub fn native(&self) -> &EvolutionReport<N> {
++        &self.native
++    }
++    /// Outward continuation box, after exact inclusion was checked.
++    pub fn carried(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.carried.as_ref()
++    }
++}
++
++/// Whole-cell evolution composed from certified prefixes and outward transport.
++///
++/// Endpoint rounding uses the recorded enclosure policy's grid. It does not
++/// modify the exact field or original initial set. Rounding is included in every
++/// subsequent proof and in the final endpoint diameter; no loss is discarded.
++#[derive(Clone, Debug)]
++pub struct ReachabilityEvolution<const N: usize> {
++    identity: FieldIdentity,
++    request: EvolutionRequest<N>,
++    options: EvolutionOptions,
++    policy: EnclosurePolicy,
++    steps: Vec<ReachabilityStep<N>>,
++    status: EvolutionStatus,
++}
++impl<const N: usize> ReachabilityEvolution<N> {
++    /// Source shared by every native prefix.
++    pub fn identity(&self) -> &FieldIdentity {
++        &self.identity
++    }
++    /// Original cell and whole horizon.
++    pub fn request(&self) -> &EvolutionRequest<N> {
++        &self.request
++    }
++    /// Whole-cell limits; maximum_steps counts transported positive segments.
++    pub fn options(&self) -> &EvolutionOptions {
++        &self.options
++    }
++    /// Shared arithmetic configuration, including outward transport grid.
++    pub fn policy(&self) -> EnclosurePolicy {
++        self.policy
++    }
++    /// All native invocations, including unsuccessful final attempts.
++    pub fn steps(&self) -> &[ReachabilityStep<N>] {
++        &self.steps
++    }
++    /// Certified, transported positive-duration segments in time order.
++    pub fn segments(&self) -> impl Iterator<Item = &super::super::picard::PicardReport<N>> {
++        self.steps
++            .iter()
++            .filter(|s| s.carried.is_some())
++            .filter_map(|s| s.native.segment(0))
++    }
++    /// Whole-cell status; local one-segment limits remain in their native reports.
++    pub fn status(&self) -> &EvolutionStatus {
++        &self.status
++    }
++    /// Endpoint only after whole-cell completion, identity or successful empty.
++    pub fn end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        match self.status {
++            EvolutionStatus::Completed => self.steps.last().and_then(|s| s.carried.as_ref()),
++            EvolutionStatus::Identity | EvolutionStatus::Empty => Some(&self.request.initial),
++            EvolutionStatus::Stopped(_) => None,
++        }
++    }
++}
++
++pub(super) fn integrate_cell<const N: usize>(
++    field: &ExpressionField<N>,
++    request: EvolutionRequest<N>,
++    options: EvolutionOptions,
++    b: &mut EnclosureBudget,
++) -> ReachabilityEvolution<N> {
++    let mut r = ReachabilityEvolution {
++        identity: field.identity(),
++        request,
++        options,
++        policy: b.policy(),
++        steps: Vec::new(),
++        status: EvolutionStatus::Identity,
++    };
++    r.status = match run(field, &mut r, b) {
++        Ok(status) => status,
++        Err(reason) => EvolutionStatus::Stopped(reason),
++    };
++    r
++}
++fn run<const N: usize>(
++    field: &ExpressionField<N>,
++    r: &mut ReachabilityEvolution<N>,
++    b: &mut EnclosureBudget,
++) -> Result<EvolutionStatus, EvolutionFailure> {
++    let mut start = r.request.start.checked_pow(1, &mut b.arithmetic)?;
++    let mut initial = copy_state(&r.request.initial, b)?;
++    let mut cap = r
++        .options
++        .maximum_step
++        .as_ref()
++        .map(|cap| cap.checked_pow(1, &mut b.arithmetic))
++        .transpose()?;
++    loop {
++        b.graph.charge(0)?;
++        // The first invocation still validates empty/identity requests even at
++        // maximum_steps=0. Later invocations require actual remaining capacity.
++        if !r.steps.is_empty() && r.steps.len() == r.options.maximum_steps {
++            return Err(EvolutionFailure::StepLimit {
++                limit: r.options.maximum_steps,
++            });
++        }
++        let count = r
++            .steps
++            .len()
++            .checked_add(1)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        b.graph.check_entries(&[count])?;
++        b.graph.charge(1)?;
++        let request = EvolutionRequest {
++            start,
++            end: r.request.end.checked_pow(1, &mut b.arithmetic)?,
++            initial,
++        };
++        let options = EvolutionOptions {
++            maximum_step: cap,
++            maximum_steps: r.options.maximum_steps.min(1),
++            maximum_halvings: r.options.maximum_halvings,
++            maximum_expansions: r.options.maximum_expansions,
++        };
++        let native = field.integrate_displacement(request, options, b);
++        let status = native.status().clone();
++        r.steps.push(ReachabilityStep {
++            native,
++            carried: None,
++        });
++        let step = r.steps.last_mut().expect("retained invocation");
++        match status {
++            EvolutionStatus::Empty => {
++                b.graph.charge(0)?;
++                return Ok(EvolutionStatus::Empty);
++            }
++            EvolutionStatus::Identity => {
++                b.graph.charge(0)?;
++                return Ok(EvolutionStatus::Identity);
++            }
++            EvolutionStatus::Completed => {}
++            EvolutionStatus::Stopped(EvolutionFailure::StepLimit { limit: 1 })
++                if step.native.segments().len() == 1 => {}
++            EvolutionStatus::Stopped(reason) => return Err(reason),
++        }
++        let proof = step.native.segment(0).expect("one certified segment");
++        let endpoint = proof.end_enclosure().expect("certified endpoint");
++        b.graph
++            .charge(N.checked_mul(2).ok_or(ExpressionError::SizeExhausted)?)?;
++        let carried = endpoint.regrid(b.policy.precision, &mut b.arithmetic)?;
++        if !endpoint.subset_of(&carried, &mut b.arithmetic)? {
++            return Err(EvolutionFailure::NonProgress);
++        }
++        if proof
++            .proposal()
++            .start
++            .compare_singleton(&proof.proposal().end, &mut b.arithmetic)?
++            != Ordering::Less
++        {
++            return Err(EvolutionFailure::NonProgress);
++        }
++        let order = proof
++            .proposal()
++            .end
++            .compare_singleton(&r.request.end, &mut b.arithmetic)?;
++        if order == Ordering::Greater {
++            return Err(EvolutionFailure::NonProgress);
++        }
++        // Final transport and its consumed inclusion proof precede success.
++        b.graph.charge(0)?;
++        step.carried = Some(carried);
++        if order == Ordering::Equal {
++            return Ok(EvolutionStatus::Completed);
++        }
++        start = proof.proposal().end.checked_pow(1, &mut b.arithmetic)?;
++        initial = copy_state(step.carried.as_ref().expect("admitted transport"), b)?;
++        cap = Some(
++            proof
++                .evidence()
++                .duration()
++                .expect("positive duration")
++                .checked_pow(1, &mut b.arithmetic)?,
++        );
++    }
++}
+diff --git a/crates/hyperdynamics/tests/evolution.rs b/crates/hyperdynamics/tests/evolution.rs
+index 1a6ac570a..765f37fa8 100644
+--- a/crates/hyperdynamics/tests/evolution.rs
++++ b/crates/hyperdynamics/tests/evolution.rs
+@@ -88,6 +88,10 @@ fn complete<const N: usize>(r: &EvolutionReport<N>) {
+     }
+     for (i, a) in r.attempts().iter().enumerate() {
+         match a.source() {
++            #[cfg(feature = "reachability")]
++            CandidateSource::PicardDisplacementExpansion { .. } => {
++                panic!("native integrate changed proposal strategy")
++            }
+             CandidateSource::InitialBox => assert_eq!(
+                 a.report().proposal().candidate,
+                 a.report().proposal().initial
+diff --git a/crates/hyperdynamics/tests/native_evolution_trace.rs b/crates/hyperdynamics/tests/native_evolution_trace.rs
+new file mode 100644
+index 000000000..b8375ce23
+--- /dev/null
++++ b/crates/hyperdynamics/tests/native_evolution_trace.rs
+@@ -0,0 +1,62 @@
++#![cfg(all(feature = "field", feature = "dispatch-trace"))]
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hyperreal::dispatch_trace;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++#[test]
++fn native_evolution_retains_fixed_dispatch_counts() {
++    let [t, x, v] = [SymbolId(100), SymbolId(0), SymbolId(1)];
++    for (case, outputs) in [
++        vec![Expr::int(2), Expr::int(0)],
++        vec![Expr::anonymous_symbol(v), -Expr::anonymous_symbol(x)],
++        vec![Expr::anonymous_symbol(x).powi(2), Expr::int(0)],
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let source = ExpressionProgram::compile(
++            &outputs,
++            &[v, t, x],
++            &mut ExpressionBudget::new(100000, 10000000),
++        )
++        .unwrap();
++        let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++        let field = ExpressionField::<2>::from_definition(
++            FieldDefinition {
++                source: source.definition().clone(),
++                time: t,
++                state: vec![x, v],
++            },
++            &mut budget,
++        )
++        .unwrap();
++        let request = EvolutionRequest {
++            start: DyadicInterval::point(0.into(), 0).unwrap(),
++            end: DyadicInterval::point(1.into(), -2).unwrap(),
++            initial: BoxN::new([
++                DyadicInterval::point(1.into(), 0).unwrap(),
++                DyadicInterval::point(0.into(), 0).unwrap(),
++            ])
++            .unwrap(),
++        };
++        dispatch_trace::reset();
++        let report = dispatch_trace::with_recording(|| {
++            field.integrate(request, EvolutionOptions::default(), &mut budget)
++        });
++        let trace = dispatch_trace::take_trace();
++        assert!(report.end_enclosure().is_some());
++        assert!(trace.dispatch.is_empty());
++        assert_eq!(
++            trace.rational,
++            dispatch_trace::RationalTraceStats::default()
++        );
++        println!("TRACECASE {case} {trace:?}");
++    }
++}
+diff --git a/crates/hyperdynamics/tests/reachability.rs b/crates/hyperdynamics/tests/reachability.rs
+new file mode 100644
+index 000000000..4d50521ca
+--- /dev/null
++++ b/crates/hyperdynamics/tests/reachability.rs
+@@ -0,0 +1,618 @@
++#![cfg(feature = "reachability")]
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition, FieldError, evolution::*,
++    reachability::*,
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionError, ExpressionProgram},
++    work_budget::CancellationToken,
++};
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn b() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn sb() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn field<const N: usize>(outputs: &[Expr]) -> ExpressionField<N> {
++    let state: Vec<_> = (0..N).map(|i| SymbolId(i as u32)).collect();
++    let time = SymbolId(100);
++    let mut vars = state.clone();
++    vars.push(time);
++    let source =
++        ExpressionProgram::compile(outputs, &vars, &mut ExpressionBudget::new(100000, 10000000))
++            .unwrap();
++    ExpressionField::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state,
++        },
++        &mut b(),
++    )
++    .unwrap()
++}
++fn request<const N: usize>(
++    initial: BoxN<DyadicInterval, N>,
++    epsilon: DyadicInterval,
++) -> ReachabilityRequest<N> {
++    ReachabilityRequest {
++        evolution: EvolutionRequest {
++            start: d(0, 0, 0),
++            end: d(1, 1, -1),
++            initial,
++        },
++        epsilon,
++    }
++}
++fn check<const N: usize>(r: &ReachabilityReport<N>) {
++    assert!(
++        matches!(r.status(), ReachabilityStatus::Completed),
++        "{:?}",
++        r.status()
++    );
++    assert!(r.end_cover().is_some());
++    for (i, cell) in r.cells().iter().enumerate() {
++        if let Some([left, right]) = cell.children() {
++            assert_eq!(r.cells()[left].parent(), Some(i));
++            assert_eq!(r.cells()[right].parent(), Some(i));
++            assert_eq!(r.cells()[left].depth(), cell.depth() + 1);
++            assert_eq!(r.cells()[right].depth(), cell.depth() + 1);
++            let axis = cell.split_axis().unwrap();
++            let source = cell.initial().lanes().unwrap();
++            let l = r.cells()[left].initial().lanes().unwrap();
++            let u = r.cells()[right].initial().lanes().unwrap();
++            for k in 0..N {
++                if k == axis {
++                    let s = source[k].to_rational(&mut sb()).unwrap();
++                    let a = l[k].to_rational(&mut sb()).unwrap();
++                    let z = u[k].to_rational(&mut sb()).unwrap();
++                    let midpoint = (s.lower().unwrap().clone() + s.upper().unwrap().clone())
++                        / hyperreal::Rational::from(2);
++                    assert_eq!(a.lower(), s.lower());
++                    assert_eq!(z.upper(), s.upper());
++                    assert_eq!(a.upper(), Some(&midpoint));
++                    assert_eq!(z.lower(), Some(&midpoint));
++                } else {
++                    assert_eq!(l[k], source[k]);
++                    assert_eq!(u[k], source[k]);
++                }
++            }
++        }
++    }
++    for a in r.attempts() {
++        assert_eq!(a.evolution().identity(), r.identity());
++        assert_eq!(
++            &a.evolution().request().initial,
++            r.cells()[a.cell()].initial()
++        );
++        assert_eq!(a.evolution().request().start, r.request().evolution.start);
++        assert_eq!(a.evolution().request().end, r.request().evolution.end);
++        assert_eq!(a.evolution().policy(), r.enclosure_policy());
++    }
++    for endpoint in r.end_cover().unwrap().boxes() {
++        for lane in endpoint.lanes().unwrap() {
++            assert!(
++                lane.width(&mut sb())
++                    .unwrap()
++                    .compare_singleton(&r.request().epsilon, &mut sb())
++                    .unwrap()
++                    != core::cmp::Ordering::Greater
++            );
++        }
++    }
++}
++#[test]
++fn exact_constant_cover_final_allowed_contribution_and_composition() {
++    let f = field::<1>(&[Expr::int(2)]);
++    let req = request(BoxN::new([d(-2, 2, 0)]).unwrap(), d(1, 1, 0));
++    let options = ReachabilityPolicy {
++        maximum_cells: 7,
++        maximum_evolutions: 7,
++        maximum_depth: 2,
++        ..Default::default()
++    };
++    let r = f.reach(req.clone(), options.clone(), &mut b());
++    check(&r);
++    assert_eq!(r.cells().len(), 7);
++    assert_eq!(r.attempts().len(), 7);
++    let cover = r.end_cover().unwrap();
++    let boxes: Vec<_> = cover.boxes().cloned().collect();
++    assert_eq!(
++        boxes,
++        (0..4)
++            .map(|i| BoxN::new([d(i - 1, i, 0)]).unwrap())
++            .collect::<Vec<_>>()
++    );
++    for (i, endpoint) in boxes.into_iter().enumerate() {
++        let mut next = request(endpoint, d(1, 1, 0));
++        next.evolution.start = d(1, 1, -1);
++        next.evolution.end = d(1, 1, 0);
++        let r = f.reach(next, Default::default(), &mut b());
++        check(&r);
++        assert_eq!(
++            r.end_cover().unwrap().boxes().next().unwrap(),
++            &BoxN::new([d(i as i64, i as i64 + 1, 0)]).unwrap()
++        );
++    }
++    let fail = f.reach(
++        req,
++        ReachabilityPolicy {
++            maximum_evolutions: 6,
++            ..options
++        },
++        &mut b(),
++    );
++    assert!(matches!(
++        fail.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::EvolutionLimit { limit: 6 })
++    ));
++    assert!(fail.end_cover().is_none());
++    assert_eq!(fail.attempts().len(), 6);
++}
++#[test]
++fn exact_partition_axis_ties_and_deterministic_source_replay() {
++    let f = field::<2>(&[Expr::int(0), Expr::int(0)]);
++    let req = request(BoxN::new([d(0, 2, 0), d(-1, 1, 0)]).unwrap(), d(1, 1, 0));
++    let r = f.reach(req.clone(), Default::default(), &mut b());
++    check(&r);
++    assert_eq!(r.cells()[0].split_axis(), Some(0));
++    let rebuilt = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: r.identity().source().clone(),
++            time: r.identity().time(),
++            state: r.identity().state().to_vec(),
++        },
++        &mut b(),
++    )
++    .unwrap();
++    let replay = rebuilt.reach(req, Default::default(), &mut b());
++    assert_eq!(format!("{r:?}"), format!("{replay:?}"));
++    assert_eq!(r.end_cover().unwrap().boxes().len(), 4);
++}
++#[test]
++fn empty_unit_identity_and_invalid_input_precedence() {
++    let f = field::<1>(&[Expr::int(0)]);
++    let empty = request(BoxN::empty().unwrap(), d(0, 0, 0));
++    let r = f.reach(empty.clone(), Default::default(), &mut b());
++    assert!(matches!(r.status(), ReachabilityStatus::Empty));
++    assert_eq!(r.end_cover().unwrap().boxes().len(), 0);
++    for epsilon in [DyadicInterval::empty(), d(-1, -1, 0), d(0, 1, 0)] {
++        let r = f.reach(
++            ReachabilityRequest {
++                epsilon,
++                ..empty.clone()
++            },
++            Default::default(),
++            &mut b(),
++        );
++        assert!(matches!(
++            r.status(),
++            ReachabilityStatus::Stopped(ReachabilityFailure::InvalidEpsilon)
++        ));
++        assert!(r.end_cover().is_none());
++    }
++    let mut invalid = empty.clone();
++    invalid.evolution.start = d(0, 1, 0);
++    let r = f.reach(invalid, Default::default(), &mut b());
++    assert!(matches!(
++        r.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::Evolution {
++            reason: EvolutionFailure::NonPointTime,
++            ..
++        })
++    ));
++    let mut invalid = empty;
++    invalid.evolution.start = d(1, 1, 0);
++    let r = f.reach(invalid, Default::default(), &mut b());
++    assert!(matches!(
++        r.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::Evolution {
++            reason: EvolutionFailure::ReversedTime,
++            ..
++        })
++    ));
++    let initial = BoxN::new([d(-10, 10, 0)]).unwrap();
++    let mut identity = request(initial.clone(), d(0, 0, 0));
++    identity.evolution.end = d(0, 0, 0);
++    let r = f.reach(identity, Default::default(), &mut b());
++    assert!(matches!(r.status(), ReachabilityStatus::Identity));
++    assert_eq!(r.end_cover().unwrap().boxes().next(), Some(&initial));
++    let unit = field::<0>(&[]).reach(
++        request(BoxN::new([]).unwrap(), d(0, 0, 0)),
++        Default::default(),
++        &mut b(),
++    );
++    check(&unit);
++    assert_eq!(unit.end_cover().unwrap().boxes().len(), 1);
++}
++#[test]
++fn limits_cancellation_exhaustion_and_retry_remain_typed() {
++    let f = field::<1>(&[Expr::int(0)]);
++    let req = request(BoxN::new([d(0, 4, 0)]).unwrap(), d(1, 1, 0));
++    let r = f.reach(
++        req.clone(),
++        ReachabilityPolicy {
++            maximum_cells: 2,
++            ..Default::default()
++        },
++        &mut b(),
++    );
++    assert!(matches!(
++        r.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::CellCapacity {
++            limit: 2,
++            required: 3
++        })
++    ));
++    let r = f.reach(
++        req.clone(),
++        ReachabilityPolicy {
++            maximum_depth: 0,
++            ..Default::default()
++        },
++        &mut b(),
++    );
++    assert!(matches!(
++        r.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::DepthLimit { cell: 0, limit: 0 })
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut budget = b();
++    budget.set_cancellation(Some(token));
++    let r = f.reach(req.clone(), Default::default(), &mut budget);
++    assert!(matches!(
++        r.status(),
++        ReachabilityStatus::Stopped(ReachabilityFailure::Preparation(EvolutionFailure::Field(
++            FieldError::Expression(ExpressionError::Cancelled)
++        )))
++    ));
++    let mut budget = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: 0,
++        ..Default::default()
++    });
++    let r = f.reach(req.clone(), Default::default(), &mut budget);
++    assert!(matches!(r.status(), ReachabilityStatus::Stopped(_)));
++    assert!(r.end_cover().is_none());
++    check(&f.reach(req, Default::default(), &mut b()));
++}
++#[test]
++fn affine_point_accuracy_refines_time_and_keeps_every_evolution() {
++    let f = field::<1>(&[Expr::anonymous_symbol(SymbolId(0))]);
++    let req = request(BoxN::new([d(1, 1, 0)]).unwrap(), d(1, 1, -3));
++    let r = f.reach(req, Default::default(), &mut b());
++    check(&r);
++    assert!(r.attempts().len() > 1);
++    assert_eq!(r.cells().len(), 1);
++    assert!(r.cells()[0].time_refinements() > 0);
++    let endpoint = r
++        .end_cover()
++        .unwrap()
++        .boxes()
++        .next()
++        .unwrap()
++        .lanes()
++        .unwrap()[0]
++        .to_rational(&mut sb())
++        .unwrap();
++    // Independent positive Taylor sum and geometric tail bound for exp(1/2).
++    let mut term = hyperreal::Rational::from(1);
++    let mut sum = term.clone();
++    for k in 1..=32 {
++        term = term / hyperreal::Rational::from(2 * k);
++        sum = sum + term.clone();
++    }
++    let upper = sum.clone()
++        + term / hyperreal::Rational::from(66) * hyperreal::Rational::fraction(68, 67).unwrap();
++    assert!(endpoint.lower().unwrap() <= &sum);
++    assert!(endpoint.upper().unwrap() >= &upper);
++    for pair in r.attempts().windows(2) {
++        let old = pair[0]
++            .evolution()
++            .segments()
++            .next()
++            .unwrap()
++            .evidence()
++            .duration()
++            .unwrap();
++        let new = pair[1].evolution().options().maximum_step.as_ref().unwrap();
++        assert!(new.compare_singleton(old, &mut sb()).unwrap() == core::cmp::Ordering::Less);
++    }
++}
++
++#[test]
++fn nonlinear_uncertain_cover_refines_time_and_encloses_exact_fiber_images() {
++    let x = Expr::anonymous_symbol(SymbolId(0));
++    let f = field::<1>(&[x.clone() * x]);
++    let req = request(BoxN::new([d(1, 2, -2)]).unwrap(), d(1, 1, -7));
++    let policy = ReachabilityPolicy {
++        maximum_depth: 8,
++        maximum_evolutions: 2048,
++        ..Default::default()
++    };
++    let r = f.reach(req, policy, &mut b());
++    if r.end_cover().is_none() {
++        for (i, a) in r.attempts().iter().enumerate() {
++            eprintln!(
++                "attempt {i} cell {} steps {} cap {:?} status {:?}",
++                a.cell(),
++                a.evolution().steps().len(),
++                a.evolution().options().maximum_step,
++                a.evolution().status()
++            );
++        }
++    }
++    check(&r);
++    assert!(r.cells().iter().any(|c| c.time_refinements() > 0));
++    let epsilon = hyperreal::Rational::fraction(1, 128).unwrap();
++    for cell in r.cells().iter().filter(|c| c.children().is_none()) {
++        let initial = cell.initial().lanes().unwrap()[0]
++            .to_rational(&mut sb())
++            .unwrap();
++        let endpoint = r.attempts()[cell.last_attempt().unwrap()]
++            .evolution()
++            .end_enclosure()
++            .unwrap()
++            .lanes()
++            .unwrap()[0]
++            .to_rational(&mut sb())
++            .unwrap();
++        let image = |x: &hyperreal::Rational| {
++            x.clone() / (hyperreal::Rational::from(1) - x.clone() / hyperreal::Rational::from(2))
++        };
++        let lower = image(initial.lower().unwrap());
++        let upper = image(initial.upper().unwrap());
++        assert!(endpoint.lower().unwrap() <= &lower);
++        assert!(endpoint.upper().unwrap() >= &upper);
++        assert!(endpoint.lower().unwrap() >= &(lower - epsilon.clone()));
++        assert!(endpoint.upper().unwrap() <= &(upper + epsilon.clone()));
++    }
++}
++
++#[test]
++fn every_structural_cutoff_and_final_scalar_boundary_withhold_partial_cover() {
++    let f = field::<1>(&[Expr::int(2)]);
++    let req = request(BoxN::new([d(0, 2, 0)]).unwrap(), d(1, 1, 0));
++    let policy = ReachabilityPolicy {
++        evolution: EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            ..Default::default()
++        },
++        ..Default::default()
++    };
++    let mut full = b();
++    let report = f.reach(req.clone(), policy.clone(), &mut full);
++    check(&report);
++    let work = full.policy().graph_work - full.remaining_graph_work();
++    let scalar = full.policy().scalar_work - full.remaining_scalar_work();
++    for limit in 0..=work {
++        let mut budget = EnclosureBudget::new(EnclosurePolicy {
++            graph_work: limit,
++            ..Default::default()
++        });
++        let r = f.reach(req.clone(), policy.clone(), &mut budget);
++        assert_eq!(
++            r.end_cover().is_some(),
++            limit == work,
++            "graph limit {limit}, {:?}",
++            r.status()
++        );
++        if limit < work {
++            assert!(matches!(r.status(), ReachabilityStatus::Stopped(_)));
++        }
++    }
++    for limit in [0, scalar / 2, scalar - 1, scalar] {
++        let mut budget = EnclosureBudget::new(EnclosurePolicy {
++            scalar_work: limit,
++            ..Default::default()
++        });
++        let r = f.reach(req.clone(), policy.clone(), &mut budget);
++        assert_eq!(
++            r.end_cover().is_some(),
++            limit == scalar,
++            "scalar limit {limit}, {:?}",
++            r.status()
++        );
++    }
++    check(&f.reach(req, policy, &mut b()));
++}
++
++#[test]
++fn prefix_transport_is_explicit_connected_and_does_not_relabel_native_limits() {
++    let f = field::<1>(&[Expr::anonymous_symbol(SymbolId(0))]);
++    let req = request(BoxN::new([d(1, 1, 0)]).unwrap(), d(1, 1, -3));
++    let r = f.reach(req, Default::default(), &mut b());
++    check(&r);
++    let mut saw_partial = false;
++    let mut saw_rounding = false;
++    let mut saw_displacement = false;
++    for attempt in r.attempts() {
++        let evolution = attempt.evolution();
++        let mut time = &evolution.request().start;
++        let mut state = &evolution.request().initial;
++        for step in evolution.steps() {
++            assert_eq!(&step.native().request().start, time);
++            assert_eq!(&step.native().request().initial, state);
++            // Reconstruct proposal provenance with exact rational endpoints,
++            // independently of the interval padding implementation.
++            for (index, search) in step.native().attempts().iter().enumerate() {
++                if let CandidateSource::PicardDisplacementExpansion { attempt } = search.source() {
++                    saw_displacement = true;
++                    assert_eq!(attempt + 1, index);
++                    let previous = &step.native().attempts()[attempt];
++                    assert_eq!(previous.segment(), search.segment());
++                    assert_eq!(previous.halvings(), search.halvings());
++                    assert_eq!(previous.expansions() + 1, search.expansions());
++                    let old = previous.report();
++                    assert!(matches!(
++                        old.status(),
++                        hyperdynamics::field::picard::PicardStatus::Rejected(
++                            hyperdynamics::field::picard::PicardFailure::SelfMapNotCertified
++                        )
++                    ));
++                    let initial = old.proposal().initial.lanes().unwrap()[0]
++                        .to_rational(&mut sb())
++                        .unwrap();
++                    let candidate = old.proposal().candidate.lanes().unwrap()[0]
++                        .to_rational(&mut sb())
++                        .unwrap();
++                    let image = old.evidence().picard_image().unwrap().lanes().unwrap()[0]
++                        .to_rational(&mut sb())
++                        .unwrap();
++                    let lower = if candidate.lower().unwrap() < image.lower().unwrap() {
++                        candidate.lower().unwrap()
++                    } else {
++                        image.lower().unwrap()
++                    };
++                    let upper = if candidate.upper().unwrap() > image.upper().unwrap() {
++                        candidate.upper().unwrap()
++                    } else {
++                        image.upper().unwrap()
++                    };
++                    let growth = upper.clone()
++                        - lower.clone()
++                        - (initial.upper().unwrap().clone() - initial.lower().unwrap().clone());
++                    assert!(growth >= hyperreal::Rational::from(0));
++                    let next = search.report().proposal().candidate.lanes().unwrap()[0]
++                        .to_rational(&mut sb())
++                        .unwrap();
++                    assert_eq!(next.lower().unwrap(), &(lower.clone() - growth.clone()));
++                    assert_eq!(next.upper().unwrap(), &(upper.clone() + growth));
++                }
++            }
++            if let Some(carried) = step.carried() {
++                let proof = step.native().segment(0).unwrap();
++                assert!(
++                    proof
++                        .end_enclosure()
++                        .unwrap()
++                        .subset_of(carried, &mut sb())
++                        .unwrap()
++                );
++                saw_rounding |= proof.end_enclosure().unwrap() != carried;
++                if matches!(
++                    step.native().status(),
++                    EvolutionStatus::Stopped(EvolutionFailure::StepLimit { limit: 1 })
++                ) {
++                    saw_partial = true;
++                    assert!(step.native().end_enclosure().is_none());
++                }
++                time = &proof.proposal().end;
++                state = carried;
++            }
++        }
++        if evolution.end_enclosure().is_some() {
++            assert_eq!(time, &evolution.request().end);
++            assert_eq!(Some(state), evolution.end_enclosure());
++        }
++    }
++    assert!(saw_partial);
++    assert!(saw_rounding);
++    assert!(saw_displacement);
++}
++
++#[test]
++fn domain_failure_and_coarse_grid_never_become_an_accuracy_success() {
++    let x = Expr::anonymous_symbol(SymbolId(0));
++    let f = field::<1>(&[Expr::int(1) / x]);
++    let req = request(BoxN::new([d(-1, 1, 0)]).unwrap(), d(1, 1, -3));
++    let r = f.reach(
++        req,
++        ReachabilityPolicy {
++            maximum_depth: 2,
++            maximum_evolutions: 32,
++            ..Default::default()
++        },
++        &mut b(),
++    );
++    assert!(matches!(r.status(), ReachabilityStatus::Stopped(_)));
++    assert!(r.end_cover().is_none());
++    assert!(
++        r.attempts()
++            .iter()
++            .any(|a| matches!(a.evolution().status(), EvolutionStatus::Stopped(_)))
++    );
++    let f = field::<1>(&[Expr::anonymous_symbol(SymbolId(0))]);
++    let req = request(BoxN::new([d(1, 1, 0)]).unwrap(), d(1, 1, -7));
++    let mut budget = EnclosureBudget::new(EnclosurePolicy {
++        precision: -2,
++        ..Default::default()
++    });
++    let r = f.reach(
++        req,
++        ReachabilityPolicy {
++            maximum_time_refinements: 2,
++            ..Default::default()
++        },
++        &mut budget,
++    );
++    assert!(matches!(r.status(), ReachabilityStatus::Stopped(_)));
++    assert!(r.end_cover().is_none());
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn source_request_and_policy_replay_in_fresh_processes() {
++    const KEY: &str = "HYPERDYNAMICS_REACHABILITY_REPLAY";
++    if let Ok(encoded) = std::env::var(KEY) {
++        let (source, request, policy): (
++            FieldDefinition,
++            ReachabilityRequest<2>,
++            ReachabilityPolicy,
++        ) = serde_json::from_str(&encoded).unwrap();
++        let mut budget = b();
++        let field = ExpressionField::<2>::from_definition(source, &mut budget).unwrap();
++        let result = field.reach(request, policy, &mut budget);
++        check(&result);
++        println!(
++            "REPLAY|{result:?}|{}|{}",
++            budget.remaining_graph_work(),
++            budget.remaining_scalar_work()
++        );
++        return;
++    }
++    let f = field::<2>(&[Expr::int(2), Expr::int(-1)]);
++    let req = request(BoxN::new([d(-1, 1, 0), d(0, 2, 0)]).unwrap(), d(1, 1, 0));
++    let r = f.reach(req.clone(), Default::default(), &mut b());
++    let encoded =
++        serde_json::to_string(&(r.identity(), req, ReachabilityPolicy::default())).unwrap();
++    let mut expected = None;
++    for _ in 0..2 {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "source_request_and_policy_replay_in_fresh_processes",
++                "--nocapture",
++            ])
++            .env(KEY, &encoded)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let text = String::from_utf8(output.stdout).unwrap();
++        let row = text
++            .lines()
++            .find(|s| s.starts_with("REPLAY|"))
++            .unwrap()
++            .to_string();
++        if let Some(old) = expected.as_ref() {
++            assert_eq!(old, &row)
++        } else {
++            expected = Some(row)
++        }
++    }
++    let mut bad: serde_json::Value = serde_json::from_str(&encoded).unwrap();
++    bad[0]["state"] = serde_json::json!([0, 0]);
++    let (source, _, _): (FieldDefinition, ReachabilityRequest<2>, ReachabilityPolicy) =
++        serde_json::from_value(bad).unwrap();
++    assert!(ExpressionField::<2>::from_definition(source, &mut b()).is_err());
++}
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index 9ddb8d3d4..a82562c09 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact closed dyadic box bisection and outward grid transport, preserving
++  empty/unit products, typed boundaries and shared scalar budgets.
++
+ - Add exact translated parameter boxes for authored center/radius vectors,
+   with affine composition, offset restrictions and validated native replay.
+ 
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+index 8ba6c01d5..d571b2885 100644
+--- a/crates/hyperlattice-interval/src/lib.rs
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -136,3 +136,6 @@ fn dot<'a, I: IntervalArithmetic + 'a>(
+     }
+     Ok(sum)
+ }
++
++#[cfg(feature = "dyadic")]
++mod subdivision;
+diff --git a/crates/hyperlattice-interval/src/subdivision.rs b/crates/hyperlattice-interval/src/subdivision.rs
+new file mode 100644
+index 000000000..18dd73111
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/subdivision.rs
+@@ -0,0 +1,66 @@
++//! Exact closed dyadic Cartesian partitions.
++use crate::{IntervalLatticeError, IntervalVector, array_result};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++
++impl<const N: usize> IntervalVector<DyadicInterval, N> {
++    /// Split one coordinate exactly at its midpoint, retaining both closed halves.
++    ///
++    /// The children union equals the source and they intersect on the midpoint
++    /// facet. Other coordinates retain their exact intervals. An empty source or
++    /// singleton selected coordinate returns `None`; invalid indices reject even
++    /// for empty sources. An unrepresentable exact half returns typed overflow,
++    /// never a rounded split or a nonprogressing successful partition.
++    /// All arithmetic and retained scalar copies share the caller's budget.
++    pub fn bisect_axis(
++        &self,
++        axis: usize,
++        budget: &mut DyadicBudget,
++    ) -> Result<Option<[Self; 2]>, IntervalLatticeError> {
++        if axis >= N {
++            return Err(IntervalLatticeError::IndexOutOfBounds {
++                index: axis,
++                dimension: N,
++            });
++        }
++        let Some(lanes) = self.lanes() else {
++            return Ok(None);
++        };
++        let lane = &lanes[axis];
++        if lane.is_singleton() {
++            return Ok(None);
++        }
++        let radius = lane.radius(budget)?;
++        let mut left = Some(lane.intersection(&lane.sub(&radius, budget)?, budget)?);
++        let mut right = Some(lane.intersection(&lane.add(&radius, budget)?, budget)?);
++        let left = array_result(|i| {
++            if i == axis {
++                Ok(left.take().expect("axis visited once"))
++            } else {
++                lanes[i].checked_pow(1, budget)
++            }
++        })?;
++        let right = array_result(|i| {
++            if i == axis {
++                Ok(right.take().expect("axis visited once"))
++            } else {
++                lanes[i].checked_pow(1, budget)
++            }
++        })?;
++        Ok(Some([Self::new(left)?, Self::new(right)?]))
++    }
++}
++
++impl<const N: usize> IntervalVector<DyadicInterval, N> {
++    /// Outward coordinate enclosure on `2^precision`, preserving empty/unit sets.
++    /// All rounding and retained scalar copies share the caller's budget.
++    pub fn regrid(
++        &self,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<Self, IntervalLatticeError> {
++        match self.lanes() {
++            None => Self::empty(),
++            Some(lanes) => Self::new(array_result(|i| lanes[i].regrid(precision, budget))?),
++        }
++    }
++}
+diff --git a/crates/hyperlattice-interval/tests/dyadic_subdivision.rs b/crates/hyperlattice-interval/tests/dyadic_subdivision.rs
+new file mode 100644
+index 000000000..756015d7c
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/dyadic_subdivision.rs
+@@ -0,0 +1,70 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hyperlattice_interval::{BoxN, IntervalLatticeError};
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(16384, 100000000)
++}
++#[test]
++fn exact_closed_partition_and_first_axis_geometry() {
++    let source = BoxN::new([d(-3, 4, 0), d(9, 11, 0)]).unwrap();
++    let [left, right] = source.bisect_axis(0, &mut budget()).unwrap().unwrap();
++    assert_eq!(left, BoxN::new([d(-6, 1, -1), d(9, 11, 0)]).unwrap());
++    assert_eq!(right, BoxN::new([d(1, 8, -1), d(9, 11, 0)]).unwrap());
++    assert_eq!(left.hull(&right, &mut budget()).unwrap(), source);
++    assert_eq!(
++        left.intersection(&right, &mut budget()).unwrap(),
++        BoxN::new([d(1, 1, -1), d(9, 11, 0)]).unwrap()
++    );
++    assert!(left.subset_of(&source, &mut budget()).unwrap());
++    assert!(right.subset_of(&source, &mut budget()).unwrap());
++}
++#[test]
++fn empty_point_invalid_axis_and_exact_half_failure() {
++    let empty = BoxN::<DyadicInterval, 1>::empty().unwrap();
++    assert!(empty.bisect_axis(0, &mut budget()).unwrap().is_none());
++    assert!(matches!(
++        empty.bisect_axis(1, &mut budget()),
++        Err(IntervalLatticeError::IndexOutOfBounds {
++            index: 1,
++            dimension: 1
++        })
++    ));
++    let point = BoxN::new([d(3, 3, 0)]).unwrap();
++    assert!(point.bisect_axis(0, &mut budget()).unwrap().is_none());
++    let unit = BoxN::<DyadicInterval, 0>::new([]).unwrap();
++    assert!(matches!(
++        unit.bisect_axis(0, &mut budget()),
++        Err(IntervalLatticeError::IndexOutOfBounds { .. })
++    ));
++    let tiny = BoxN::new([d(0, 1, i32::MIN)]).unwrap();
++    assert_eq!(
++        tiny.bisect_axis(0, &mut budget()),
++        Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++    );
++}
++#[test]
++fn exhaustion_does_not_mutate_or_poison_retry() {
++    let source = BoxN::new([d(-7, 9, 0), d(3, 8, -3)]).unwrap();
++    let copy = source.clone();
++    assert!(source.bisect_axis(1, &mut DyadicBudget::new(1, 0)).is_err());
++    assert_eq!(source, copy);
++    assert!(source.bisect_axis(1, &mut budget()).unwrap().is_some());
++}
++
++#[test]
++fn outward_grid_transport_preserves_empty_unit_and_exact_containment() {
++    let source = BoxN::new([d(-3, 7, -3), d(1, 3, -4)]).unwrap();
++    let result = source.regrid(-2, &mut budget()).unwrap();
++    assert_eq!(result, BoxN::new([d(-2, 4, -2), d(0, 1, -2)]).unwrap());
++    assert!(source.subset_of(&result, &mut budget()).unwrap());
++    assert_eq!(source.regrid(-16, &mut budget()).unwrap(), source);
++    let empty = BoxN::<DyadicInterval, 0>::empty().unwrap();
++    let unit = BoxN::<DyadicInterval, 0>::new([]).unwrap();
++    assert_eq!(empty.regrid(-64, &mut budget()).unwrap(), empty);
++    assert_eq!(unit.regrid(-64, &mut budget()).unwrap(), unit);
++    assert!(source.regrid(-100, &mut DyadicBudget::new(1, 0)).is_err());
++    assert!(source.regrid(-2, &mut budget()).is_ok());
++}

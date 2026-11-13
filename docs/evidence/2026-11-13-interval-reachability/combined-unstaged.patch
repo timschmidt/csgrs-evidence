@@ -1,0 +1,270 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 509445e67..3a1ebb0be 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,12 +2,19 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add optional finite endpoint covers with explicit infinity-norm epsilon
++  thickening, exact initial partitions and retained whole-cell/prefix evidence.
++  Outward endpoint transport is checked before continuation and final publication.
++  Bounded displacement-based proposals reuse the existing Picard authority;
++  the original `integrate` proposal strategy and its reports remain unchanged.
++  Stopped requests expose no full cover. Replay rebuilds source/request/policies.
++
+ - Add owned, replayable dyadic expression fields with explicit time/state
+   dimensions, immutable structural identity and regenerated state Jacobians.
+   Reuse native Cartesian carriers and source-domain checks, including empty and
+   zero-dimensional products. Shared graph/arithmetic budgets preserve typed
+   exhaustion and retry; scalar refinement and payload costs retain their
+-  documented accounting exclusions. Validated evolution remains open.
++  documented accounting exclusions.
+ 
+ - Feed equations, corner limits and lookahead now have a geometry-independent
+   Hyperdynamics owner, with complete source-owned join receipts. Hyperpath
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index da46bfdba..8f8ccb156 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -15,6 +15,7 @@ all-features = true
+ 
+ [features]
+ default = []
++reachability = ["field"]
+ rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+ field = ["dep:hyperinterval", "dep:hyperlattice-interval", "hypersolve/interval-program"]
+ serde = ["dep:serde", "hypersolve/serde", "hyperlattice-interval?/serde"]
+@@ -38,3 +39,7 @@ required-features = ["field"]
+ [[example]]
+ name = "rk_proposal"
+ required-features = ["rk-proposal"]
++
++[[example]]
++name = "reachability"
++required-features = ["reachability"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 503072506..9d13ebded 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -74,3 +74,33 @@ The motion-limit adapters also select exact route-wide axis limits and consume
+ jerk work. Hyperpath supplies retained geometry and full join receipts. Run
+ `cargo run -p hyperdynamics --example feed_schedule` for an exact provider.
+ These adapters' extraction retention qualification remains in progress.
++
++Enable `reachability` for `field.reach(request, policy, budget)`. The request gives
++an exact dyadic horizon, an initial box and nonnegative singleton `epsilon`.
++Only `end_cover()` on a completed report exposes a finite endpoint union `C`:
++`R ⊆ C ⊆ R + [-epsilon, epsilon]^N`, where `R` is the exact reachable set.
++This is an infinity-norm bound in the supplied state-coordinate units, not an
++exact reachable-set or per-trajectory pairing claim. Identity and empty requests
++retain their exact set meanings. Zero epsilon need not complete.
++
++The search partitions the widest initial coordinate exactly, choosing the first
++axis on ties and visiting the lower child first. Small cells may instead halve
++the time cap. Every cell, failed attempt and exact source identity is retained.
++Native certified prefixes are consumed explicitly: their local one-segment-limit
++status is preserved. Each continuation box is rounded outward on the enclosure
++policy's grid, with checked inclusion. The final transfer and endpoint diameter
++must pass before whole-horizon success. The original `integrate` strategy remains
++available; reachability selects displacement-based untrusted candidate padding
++and uses the same Picard verifier.
++
++`ReachabilityPolicy` bounds cells, depth, whole-cell evolution attempts and time
++refinements. Each attempt performs at most `max(1, evolution.maximum_steps)`
++native prefix searches. All calls share the supplied budget. These bounds retain
++the existing exclusions for scalar refinement, total CPU work and heap bytes.
++A rounding floor, a mathematical/domain failure or an exhausted bound yields a
++typed stopped report with no whole-request cover. Rebuild the field and rerun
++source/request/policies for replay; reports are not deserialized as proof.
++
++```sh
++cargo run -p hyperdynamics --features reachability --example reachability
++```
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 71b0c7736..46cda9c18 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -472,3 +472,7 @@ impl<const N: usize> EnclosedVectorField<N> for ExpressionField<N> {
+ /// Source-bound primitive RK4 estimates consumed only through exact verification.
+ #[cfg(feature = "rk-proposal")]
+ pub mod proposal;
++
++/// Finite source-bound endpoint covers with explicit infinity-norm accuracy.
++#[cfg(feature = "reachability")]
++pub mod reachability;
+diff --git a/crates/hyperdynamics/src/field/evolution.rs b/crates/hyperdynamics/src/field/evolution.rs
+index 81031d696..5005f03e6 100644
+--- a/crates/hyperdynamics/src/field/evolution.rs
++++ b/crates/hyperdynamics/src/field/evolution.rs
+@@ -54,6 +54,13 @@ pub enum CandidateSource {
+         /// Index in the retained execution-order attempt list.
+         attempt: usize,
+     },
++    /// Hull with the named Picard image, then pad by its coordinate width
++    /// growth beyond the initial box. The resulting candidate still needs proof.
++    #[cfg(feature = "reachability")]
++    PicardDisplacementExpansion {
++        /// Index in the retained execution-order attempt list.
++        attempt: usize,
++    },
+ }
+ 
+ /// One actual invocation of the source-bound step verifier.
+@@ -262,14 +269,49 @@ impl<const N: usize> ExpressionField<N> {
+             segments: Vec::new(),
+             status: EvolutionStatus::Identity,
+         };
+-        report.status = match self.evolve(&mut report, budget) {
++        #[cfg(not(feature = "reachability"))]
++        {
++            report.status = match self.evolve(&mut report, budget) {
++                Ok(status) => status,
++                Err(error) => EvolutionStatus::Stopped(error),
++            };
++        }
++        #[cfg(feature = "reachability")]
++        {
++            report.status = match self.evolve::<false>(&mut report, budget) {
++                Ok(status) => status,
++                Err(error) => EvolutionStatus::Stopped(error),
++            };
++        }
++        report
++    }
++
++    // Reachability selects a tighter untrusted proposal. The search and
++    // source-bound verifier remain shared with the original public entry point.
++    #[cfg(feature = "reachability")]
++    pub(super) fn integrate_displacement(
++        &self,
++        request: EvolutionRequest<N>,
++        options: EvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> EvolutionReport<N> {
++        let mut report = EvolutionReport {
++            identity: self.identity(),
++            request,
++            options,
++            policy: budget.policy(),
++            attempts: Vec::new(),
++            segments: Vec::new(),
++            status: EvolutionStatus::Identity,
++        };
++        report.status = match self.evolve::<true>(&mut report, budget) {
+             Ok(status) => status,
+             Err(error) => EvolutionStatus::Stopped(error),
+         };
+         report
+     }
+ 
+-    fn evolve(
++    fn evolve<#[cfg(feature = "reachability")] const DISPLACEMENT: bool>(
+         &self,
+         report: &mut EvolutionReport<N>,
+         budget: &mut EnclosureBudget,
+@@ -390,12 +432,51 @@ impl<const N: usize> ExpressionField<N> {
+                             previous.evidence().picard_image().expect("self-map stage"),
+                             &mut budget.arithmetic,
+                         )?;
+-                        candidate = hull.add(
+-                            &hull.sub(&hull, &mut budget.arithmetic)?,
+-                            &mut budget.arithmetic,
+-                        )?;
++                        #[cfg(not(feature = "reachability"))]
++                        {
++                            candidate = hull.add(
++                                &hull.sub(&hull, &mut budget.arithmetic)?,
++                                &mut budget.arithmetic,
++                            )?;
++                        }
++                        #[cfg(feature = "reachability")]
++                        {
++                            candidate = if DISPLACEMENT {
++                                budget.graph.charge(
++                                    N.checked_mul(5).ok_or(ExpressionError::SizeExhausted)?,
++                                )?;
++                                let widths = BoxN::new(
++                                    hull.widths(&mut budget.arithmetic)?
++                                        .expect("nonempty candidate"),
++                                )?;
++                                let initial_widths = BoxN::new(
++                                    initial
++                                        .widths(&mut budget.arithmetic)?
++                                        .expect("nonempty initial state"),
++                                )?;
++                                let growth = widths.sub(&initial_widths, &mut budget.arithmetic)?;
++                                let reflection = growth.scale(
++                                    &DyadicInterval::point((-1).into(), 0)?,
++                                    &mut budget.arithmetic,
++                                )?;
++                                hull.add(
++                                    &growth.hull(&reflection, &mut budget.arithmetic)?,
++                                    &mut budget.arithmetic,
++                                )?
++                            } else {
++                                hull.add(
++                                    &hull.sub(&hull, &mut budget.arithmetic)?,
++                                    &mut budget.arithmetic,
++                                )?
++                            };
++                        }
+                         expansions += 1;
+                         source = CandidateSource::PicardExpansion { attempt: index };
++                        #[cfg(feature = "reachability")]
++                        if DISPLACEMENT {
++                            source =
++                                CandidateSource::PicardDisplacementExpansion { attempt: index };
++                        }
+                     } else {
+                         if halvings == report.options.maximum_halvings {
+                             return Err(EvolutionFailure::HalvingLimit {
+@@ -432,7 +513,7 @@ impl<const N: usize> ExpressionField<N> {
+     }
+ }
+ 
+-fn copy_state<const N: usize>(
++pub(super) fn copy_state<const N: usize>(
+     state: &BoxN<DyadicInterval, N>,
+     budget: &mut EnclosureBudget,
+ ) -> Result<BoxN<DyadicInterval, N>, EvolutionFailure> {
+diff --git a/crates/hyperdynamics/tests/evolution.rs b/crates/hyperdynamics/tests/evolution.rs
+index 1a6ac570a..765f37fa8 100644
+--- a/crates/hyperdynamics/tests/evolution.rs
++++ b/crates/hyperdynamics/tests/evolution.rs
+@@ -88,6 +88,10 @@ fn complete<const N: usize>(r: &EvolutionReport<N>) {
+     }
+     for (i, a) in r.attempts().iter().enumerate() {
+         match a.source() {
++            #[cfg(feature = "reachability")]
++            CandidateSource::PicardDisplacementExpansion { .. } => {
++                panic!("native integrate changed proposal strategy")
++            }
+             CandidateSource::InitialBox => assert_eq!(
+                 a.report().proposal().candidate,
+                 a.report().proposal().initial
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index 9ddb8d3d4..a82562c09 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact closed dyadic box bisection and outward grid transport, preserving
++  empty/unit products, typed boundaries and shared scalar budgets.
++
+ - Add exact translated parameter boxes for authored center/radius vectors,
+   with affine composition, offset restrictions and validated native replay.
+ 
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+index 8ba6c01d5..d571b2885 100644
+--- a/crates/hyperlattice-interval/src/lib.rs
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -136,3 +136,6 @@ fn dot<'a, I: IntervalArithmetic + 'a>(
+     }
+     Ok(sum)
+ }
++
++#[cfg(feature = "dyadic")]
++mod subdivision;
