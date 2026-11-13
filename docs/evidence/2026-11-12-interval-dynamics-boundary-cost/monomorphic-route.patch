@@ -1,0 +1,154 @@
+diff --git a/crates/hyperdynamics/src/jerk_schedule.rs b/crates/hyperdynamics/src/jerk_schedule.rs
+index ea505e04f..7083db16a 100644
+--- a/crates/hyperdynamics/src/jerk_schedule.rs
++++ b/crates/hyperdynamics/src/jerk_schedule.rs
+@@ -28,6 +28,29 @@ use crate::guards::require_positive_feed;
+ use crate::guards::require_positive_jerk;
+ use crate::{DynamicsError, MetricSpan};
+ 
++// Only these private slice adapters implement the route protocol. Schedule
++// shape checks precede indexing; every query retains the caller's policy and
++// exact position in the original validation/replay sequence. Keeping this
++// adapter small avoids duplicating the scheduling body for every metric owner.
++trait MetricRoute {
++    fn len(&self) -> usize;
++    fn exact_length(&self, index: usize, policy: PredicatePolicy) -> Result<Real, DynamicsError>;
++    fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++}
++
++struct SliceRoute<'a, S>(&'a [S]);
++
++impl<S: MetricSpan> MetricRoute for SliceRoute<'_, S> {
++    fn len(&self) -> usize {
++        self.0.len()
++    }
++    fn exact_length(&self, index: usize, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
++        self.0[index].exact_length(policy)
++    }
++}
++
+ /// Exact constant-jerk proposal for one retained path span.
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct JerkRampSpanProposal {
+@@ -224,6 +247,26 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
++) -> Result<PlannedMonotonicJerkTransition, DynamicsError> {
++    plan_single_span_transition(
++        &SliceRoute(std::slice::from_ref(element)),
++        start_feed,
++        end_feed,
++        max_feed_rate,
++        max_acceleration,
++        max_jerk,
++        policy,
++    )
++}
++
++fn plan_single_span_transition(
++    route: &dyn MetricRoute,
++    start_feed: Real,
++    end_feed: Real,
++    max_feed_rate: Real,
++    max_acceleration: Real,
++    max_jerk: Real,
++    policy: PredicatePolicy,
+ ) -> Result<PlannedMonotonicJerkTransition, DynamicsError> {
+     require_nonnegative_feed(&start_feed, policy)?;
+     require_nonnegative_feed(&end_feed, policy)?;
+@@ -231,7 +274,7 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+     require_positive_acceleration(&max_acceleration, policy)?;
+     require_positive_jerk(&max_jerk, policy)?;
+ 
+-    let path_length = element.exact_length(policy)?;
++    let path_length = route.exact_length(0, policy)?;
+     require_positive_length(&path_length, policy)?;
+     let feed_sum = &start_feed + &end_feed;
+     match classify_real_sign(&feed_sum, policy).value() {
+@@ -273,8 +316,8 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+     ];
+     let construction_certification =
+         certify_monotonic_transition_construction(&phases, start_feed.clone(), end_feed.clone());
+-    let mut report = certify_multi_phase_jerk_ramp_feed_schedule(
+-        std::slice::from_ref(element),
++    let mut report = certify_phase_schedule(
++        route,
+         std::slice::from_ref(&phases),
+         max_feed_rate,
+         max_acceleration,
+@@ -313,6 +356,24 @@ pub fn certify_jerk_ramp_feed_schedule<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
++) -> Result<JerkRampFeedScheduleReport, DynamicsError> {
++    certify_span_schedule(
++        &SliceRoute(route),
++        proposals,
++        max_feed_rate,
++        max_acceleration,
++        max_jerk,
++        policy,
++    )
++}
++
++fn certify_span_schedule(
++    route: &dyn MetricRoute,
++    proposals: &[JerkRampSpanProposal],
++    max_feed_rate: Real,
++    max_acceleration: Real,
++    max_jerk: Real,
++    policy: PredicatePolicy,
+ ) -> Result<JerkRampFeedScheduleReport, DynamicsError> {
+     if route.is_empty() {
+         return Err(DynamicsError::EmptyRoute);
+@@ -325,9 +386,9 @@ pub fn certify_jerk_ramp_feed_schedule<S: MetricSpan>(
+     require_positive_jerk(&max_jerk, policy)?;
+ 
+     let mut spans = Vec::with_capacity(route.len());
+-    for (index, (element, proposal)) in route.iter().zip(proposals).enumerate() {
++    for (index, proposal) in proposals.iter().enumerate() {
+         validate_proposal(proposal, policy)?;
+-        let path_length = element.exact_length(policy)?;
++        let path_length = route.exact_length(index, policy)?;
+         let certification = certify_jerk_ramp_span_candidate(
+             path_length.clone(),
+             proposal,
+@@ -367,6 +428,24 @@ pub fn certify_multi_phase_jerk_ramp_feed_schedule<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
++) -> Result<MultiPhaseJerkRampFeedScheduleReport, DynamicsError> {
++    certify_phase_schedule(
++        &SliceRoute(route),
++        phases,
++        max_feed_rate,
++        max_acceleration,
++        max_jerk,
++        policy,
++    )
++}
++
++fn certify_phase_schedule(
++    route: &dyn MetricRoute,
++    phases: &[Vec<JerkRampPhaseProposal>],
++    max_feed_rate: Real,
++    max_acceleration: Real,
++    max_jerk: Real,
++    policy: PredicatePolicy,
+ ) -> Result<MultiPhaseJerkRampFeedScheduleReport, DynamicsError> {
+     if route.is_empty() {
+         return Err(DynamicsError::EmptyRoute);
+@@ -379,8 +458,8 @@ pub fn certify_multi_phase_jerk_ramp_feed_schedule<S: MetricSpan>(
+     require_positive_jerk(&max_jerk, policy)?;
+ 
+     let mut elements = Vec::with_capacity(route.len());
+-    for (index, (element, element_phases)) in route.iter().zip(phases).enumerate() {
+-        let route_length = element.exact_length(policy)?;
++    for (index, element_phases) in phases.iter().enumerate() {
++        let route_length = route.exact_length(index, policy)?;
+         let mut phase_reports = Vec::with_capacity(element_phases.len());
+         for (phase_index, phase) in element_phases.iter().enumerate() {
+             validate_phase(phase, policy)?;
