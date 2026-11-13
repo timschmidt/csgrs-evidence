@@ -1,0 +1,393 @@
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 3392ef602..5986752f9 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add dyadic principal `asin`, `acos`, `acosh` and `atanh` enclosures using
++  certified native arithmetic, square root, arctangent and logarithm. Preserve
++  complete/partial/empty domains, exact zero special values and unbounded atanh
++  endpoint limits. Bounds are outward but are not promised tight.
++
+ - Keep exact zero on the other dyadic operand's grid for arithmetic, set
+   operations and comparisons. Zero regridding and extreme-scale compositions
+   no longer reserve storage for an irrelevant exponent gap; work and size
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 352b5f42c..87cd6f359 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -55,6 +55,12 @@ series and refinement attempts. Keep earlier domain receipts when chaining
+ operations; for example, `log` followed by `atan` can still have inherited
+ Partial coverage.
+ 
++Dyadic `asin`, `acos`, `acosh` and `atanh` use the same shared work budget and
++retain Complete/Partial coverage for their real domains. The first three return
++finite outward enclosures; `atanh` retains explicit unbounded limits at -1 and 1.
++Inputs with no defined member return EmptyDomain. These composed enclosures are
++not promised tight. Exact zero special values and empty inputs are preserved.
++
+ Rational, dyadic and extended dyadic `sin`/`cos` return outward dyadic images
+ with Complete local coverage. They certify phase reduction and include
+ interior extrema. A full period or unbounded connected source produces an
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 667b5daec..28592a071 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -48,6 +48,8 @@ mod integer;
+ #[cfg(feature = "integer")]
+ mod integer_arithmetic;
+ #[cfg(feature = "dyadic")]
++mod inverse_functions;
++#[cfg(feature = "dyadic")]
+ mod logarithm;
+ #[cfg(feature = "float-proposal")]
+ mod proposal;
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index ec78bcf11..5ff567370 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add experimental `interval-program` evaluation of owned expressions over
++  dyadic input boxes. Share traversal with exact point evaluation and preserve
++  source guards, including Expr's exclusion of zero-to-zero. Refuse partial
++  domains instead of treating their images as complete field evidence. Graph
++  and dyadic budgets remain separate; Hyperreal constant refinement and symbolic
++  derivative construction still lack whole-operation resource accounting.
++
+ - Add experimental `expression-program` support for immutable flat symbolic
+   definitions, explicit ordered bindings, validated DAG replay, and exact scalar
+   evaluation. Preserve source guards and typed scalar failures. Structural work
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 38d29e783..46a4e94b4 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -25,6 +25,7 @@ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features =
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+ serde = { version = "1.0", features = ["derive"], optional = true }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, optional = true }
+ [dev-dependencies]
+ # Test-only interval migration candidates; production remains gated by cost.
+ hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
+@@ -42,7 +43,8 @@ serde_json = "1.0.149"
+ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
+-serde = ["dep:serde", "hyperreal/serde"]
++interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+@@ -81,6 +83,10 @@ name = "allocation_profile"
+ name = "owned_program"
+ required-features = ["expression-program"]
+ 
++[[example]]
++name = "enclosed_program"
++required-features = ["interval-program"]
++
+ [[bench]]
+ name = "expression_program"
+ harness = false
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index da138e384..faa81ca49 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -50,14 +50,21 @@ graphs with ordered bindings and validated replay. It retains the existing
+ `Expr` grammar and exact scalar definitions. Enable `serde` to serialize its
+ unvalidated definitions; load them through `ExpressionProgram::from_definition`
+ before evaluation. Graph budgets cover structural work and entry counts, not
+-scalar arithmetic or heap bytes. Interval images, bounded derivative
+-construction and validated evolution remain separate work. Run the source and
++scalar arithmetic or heap bytes. Bounded derivative construction and validated
++evolution remain separate work. Run the source and
+ symbolic-Jacobian example with:
+ 
+ ```sh
+ cargo run -p hypersolve --features expression-program --example owned_program
+ ```
+ 
++`interval-program` adds `eval_dyadic` over input boxes, retaining the exact
++definition and refusing partial-domain images. Graph work and dyadic arithmetic
++have separate budgets; Hyperreal constant refinement is outside their total-work
++accounting. This is an interval expression evaluator, not a validated ODE solver.
++Run `cargo run -p hypersolve --features interval-program --example enclosed_program`
++for an oscillator image and symbolic-Jacobian enclosure.
++
+ `work_budget::with_budget` bounds instrumented root-subdivision and tensor-image
+ promotion attempts across nested synchronous operations. Exhaustion is a typed
+ resource failure and never authorizes approximation. The counters do not yet
+@@ -479,6 +486,7 @@ their use case.
+ | --- | --- | --- |
+ | `dispatch-trace` | no | Hyperreal/Hyperlattice/Hyperlimit exact-dispatch instrumentation |
+ | `expression-program` | no | Experimental owned flat expression definitions and exact scalar evaluation |
++| `interval-program` | no | Experimental dyadic expression images with complete-domain checks |
+ | `serde` | no | Symbol and expression-definition serialization using validated Hyperreal scalar replay |
+ 
+ ## Validation and performance
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index dfcb4b733..5a1b4191d 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -16,6 +16,9 @@ use hyperreal::{Problem, Real};
+ 
+ use crate::{Expr, SymbolId, SymbolRef, work_budget::CancellationToken};
+ 
++#[cfg(feature = "interval-program")]
++mod dyadic;
++
+ /// An operation on two expressions, preserving left-to-right evaluation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+@@ -183,6 +186,16 @@ pub enum ExpressionError {
+     Cancelled,
+     /// Scalar failure, retaining its source node and original diagnostic.
+     Scalar { node: usize, source: Problem },
++    /// The operand enclosure does not certify the operation's whole domain.
++    /// Dependency overestimation can cause this even for valid exact inputs.
++    #[cfg(feature = "interval-program")]
++    DomainNotCertified { node: usize },
++    /// Interval failure, preserving the node and native resource/domain cause.
++    #[cfg(feature = "interval-program")]
++    Enclosure {
++        node: usize,
++        source: hyperinterval::IntervalError,
++    },
+ }
+ 
+ impl fmt::Display for ExpressionError {
+@@ -195,6 +208,8 @@ impl std::error::Error for ExpressionError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+         match self {
+             Self::Scalar { source, .. } => Some(source),
++            #[cfg(feature = "interval-program")]
++            Self::Enclosure { source, .. } => Some(source),
+             _ => None,
+         }
+     }
+@@ -328,6 +343,15 @@ impl ExpressionProgram {
+         values: &[Real],
+         budget: &mut ExpressionBudget,
+     ) -> Result<Vec<Real>, ExpressionError> {
++        self.evaluate(values, budget, &mut RealArithmetic)
++    }
++
++    fn evaluate<A: ProgramArithmetic>(
++        &self,
++        values: &[A::Value],
++        budget: &mut ExpressionBudget,
++        arithmetic: &mut A,
++    ) -> Result<Vec<A::Value>, ExpressionError> {
+         budget.charge(0)?;
+         let source = &self.definition;
+         if values.len() != source.variables.len() {
+@@ -343,7 +367,7 @@ impl ExpressionProgram {
+         ])?;
+         let mut uses = self.operand_uses(budget)?;
+         budget.charge(source.nodes.len())?;
+-        let mut cache: Vec<Option<Real>> = vec![None; source.nodes.len()];
++        let mut cache: Vec<Option<A::Value>> = vec![None; source.nodes.len()];
+         let mut outputs = Vec::new();
+         for &root in &source.outputs {
+             budget.charge(1)?;
+@@ -366,33 +390,28 @@ impl ExpressionProgram {
+                     continue;
+                 }
+                 let value = match node {
+-                    ExpressionNode::Constant(value) => value.clone(),
+-                    ExpressionNode::Variable(_) => {
+-                        values[self.slots[index].expect("validated binding")].clone()
++                    ExpressionNode::Constant(value) => arithmetic.constant(index, value)?,
++                    ExpressionNode::Variable(_) => arithmetic.copy(
++                        index,
++                        &values[self.slots[index].expect("validated binding")],
++                    )?,
++                    ExpressionNode::Unary { operation, input } => {
++                        let value = consume_operand(&mut cache, &mut uses, *input, arithmetic)?;
++                        arithmetic.unary(index, *operation, value)?
+                     }
+-                    ExpressionNode::Unary { operation, input } => operation
+-                        .eval(consume_operand(&mut cache, &mut uses, *input))
+-                        .map_err(|source| ExpressionError::Scalar {
+-                            node: index,
+-                            source,
+-                        })?,
+                     ExpressionNode::Binary {
+                         operation,
+                         left,
+                         right,
+-                    } => operation
+-                        .eval(
+-                            consume_operand(&mut cache, &mut uses, *left),
+-                            consume_operand(&mut cache, &mut uses, *right),
+-                        )
+-                        .map_err(|source| ExpressionError::Scalar {
+-                            node: index,
+-                            source,
+-                        })?,
++                    } => {
++                        let left = consume_operand(&mut cache, &mut uses, *left, arithmetic)?;
++                        let right = consume_operand(&mut cache, &mut uses, *right, arithmetic)?;
++                        arithmetic.binary(index, *operation, left, right)?
++                    }
+                 };
+                 cache[index] = Some(value);
+             }
+-            outputs.push(consume_operand(&mut cache, &mut uses, root));
++            outputs.push(consume_operand(&mut cache, &mut uses, root, arithmetic)?);
+         }
+         budget.charge(0)?;
+         Ok(outputs)
+@@ -431,15 +450,72 @@ impl ExpressionProgram {
+     }
+ }
+ 
+-fn consume_operand(cache: &mut [Option<Real>], uses: &mut [usize], index: usize) -> Real {
++fn consume_operand<A: ProgramArithmetic>(
++    cache: &mut [Option<A::Value>],
++    uses: &mut [usize],
++    index: usize,
++    arithmetic: &mut A,
++) -> Result<A::Value, ExpressionError> {
+     uses[index] -= 1;
+     if uses[index] == 0 {
+-        cache[index].take().expect("last use of evaluated operand")
++        Ok(cache[index].take().expect("last use of evaluated operand"))
+     } else {
+-        cache[index]
+-            .as_ref()
+-            .expect("shared evaluated operand")
+-            .clone()
++        arithmetic.copy(
++            index,
++            cache[index].as_ref().expect("shared evaluated operand"),
++        )
++    }
++}
++
++trait ProgramArithmetic {
++    type Value: Clone;
++    fn constant(&mut self, node: usize, value: &Real) -> Result<Self::Value, ExpressionError>;
++    fn copy(&mut self, node: usize, value: &Self::Value) -> Result<Self::Value, ExpressionError>;
++    fn unary(
++        &mut self,
++        node: usize,
++        operation: UnaryOperation,
++        value: Self::Value,
++    ) -> Result<Self::Value, ExpressionError>;
++    fn binary(
++        &mut self,
++        node: usize,
++        operation: BinaryOperation,
++        left: Self::Value,
++        right: Self::Value,
++    ) -> Result<Self::Value, ExpressionError>;
++}
++
++struct RealArithmetic;
++
++impl ProgramArithmetic for RealArithmetic {
++    type Value = Real;
++    fn constant(&mut self, _: usize, value: &Real) -> Result<Real, ExpressionError> {
++        Ok(value.clone())
++    }
++    fn copy(&mut self, _: usize, value: &Real) -> Result<Real, ExpressionError> {
++        Ok(value.clone())
++    }
++    fn unary(
++        &mut self,
++        node: usize,
++        operation: UnaryOperation,
++        value: Real,
++    ) -> Result<Real, ExpressionError> {
++        operation
++            .eval(value)
++            .map_err(|source| ExpressionError::Scalar { node, source })
++    }
++    fn binary(
++        &mut self,
++        node: usize,
++        operation: BinaryOperation,
++        left: Real,
++        right: Real,
++    ) -> Result<Real, ExpressionError> {
++        operation
++            .eval(left, right)
++            .map_err(|source| ExpressionError::Scalar { node, source })
+     }
+ }
+ 
+diff --git a/crates/hypersolve/tests/expression_program.rs b/crates/hypersolve/tests/expression_program.rs
+index 404f1ed32..87f006b9d 100644
+--- a/crates/hypersolve/tests/expression_program.rs
++++ b/crates/hypersolve/tests/expression_program.rs
+@@ -439,6 +439,31 @@ fn fresh_process_replay_retains_symbolic_constants_and_revalidates_edges() {
+         .unwrap();
+     let replayed: Vec<Real> = serde_json::from_str(encoded).unwrap();
+     assert_eq!(replayed, [Real::from(5) + Real::from(2).sqrt().unwrap()]);
++    #[cfg(feature = "interval-program")]
++    {
++        let encoded = stdout
++            .lines()
++            .find_map(|line| line.strip_prefix("INTERVAL_REPLAY="))
++            .unwrap();
++        let replayed: Vec<hyperinterval::DyadicInterval> = serde_json::from_str(encoded).unwrap();
++        // Independent integer-square-root witness for floor(sqrt(2)*2^32).
++        let lower = num::BigInt::from((5_u128 << 32) + (2_u128 << 64).isqrt());
++        let minimal = hyperinterval::DyadicInterval::new(lower.clone(), lower + 1, -32).unwrap();
++        let mut arithmetic = hyperinterval::DyadicBudget::new(16384, 1_000_000_000_000);
++        assert_eq!(replayed.len(), 1);
++        assert!(minimal.subset_of(&replayed[0], &mut arithmetic).unwrap());
++        // Hyperreal promises certified grid bounds, not a one-cell enclosure.
++        // Check replay equality separately from the independent root witness.
++        let live = program
++            .eval_dyadic(
++                &[hyperinterval::DyadicInterval::point(5.into(), 0).unwrap()],
++                -32,
++                &mut budget(),
++                &mut arithmetic,
++            )
++            .unwrap();
++        assert_eq!(replayed, live);
++    }
+     let mut bad = program.definition().clone();
+     bad.nodes[2] = ExpressionNode::Unary {
+         operation: UnaryOperation::Neg,
+@@ -463,11 +488,26 @@ fn replay_child() {
+     let definition: ExpressionDefinition =
+         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+     match ExpressionProgram::from_definition(definition, &mut budget()) {
+-        Ok(program) => println!(
+-            "REPLAY={}",
+-            serde_json::to_string(&program.eval_real(&[Real::from(5)], &mut budget()).unwrap())
+-                .unwrap()
+-        ),
++        Ok(program) => {
++            println!(
++                "REPLAY={}",
++                serde_json::to_string(&program.eval_real(&[Real::from(5)], &mut budget()).unwrap())
++                    .unwrap()
++            );
++            #[cfg(feature = "interval-program")]
++            {
++                let values = [hyperinterval::DyadicInterval::point(5.into(), 0).unwrap()];
++                let image = program
++                    .eval_dyadic(
++                        &values,
++                        -32,
++                        &mut budget(),
++                        &mut hyperinterval::DyadicBudget::new(16384, 1_000_000_000_000),
++                    )
++                    .unwrap();
++                println!("INTERVAL_REPLAY={}", serde_json::to_string(&image).unwrap());
++            }
++        }
+         Err(ExpressionError::InvalidReference { .. }) => println!("INVALID_REFERENCE"),
+         Err(error) => panic!("unexpected replay failure: {error}"),
+     }
