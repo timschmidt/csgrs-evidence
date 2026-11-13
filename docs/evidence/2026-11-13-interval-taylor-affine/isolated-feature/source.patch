@@ -1,0 +1,1282 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index c953b78da..c2752756d 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add a nonlinear-field affine Taylor observable example with explicit downstream projection.
+ - Add optional midpoint-centered field Taylor models, retaining exact source,
+   time/state bindings, coefficient/remainder evidence and native images.
+   Subdomain reuse preserves the original grid and global remainder. Empty/unit
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index a5f8409ca..eb8ee6ac0 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ taylor-model = ["field", "hypersolve/taylor-model"]
++taylor-affine = ["taylor-model", "hypersolve/taylor-affine"]
+ reachability = ["field"]
+ rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+ field = ["dep:hyperreal", "dep:hyperinterval", "dep:hyperlattice-interval", "dep:hypersolve", "hypersolve/interval-program"]
+@@ -48,3 +49,7 @@ required-features = ["reachability"]
+ [[example]]
+ name = "taylor_model"
+ required-features = ["taylor-model"]
++
++[[example]]
++name = "taylor_affine"
++required-features = ["taylor-affine"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 38d5c5dcd..3815093e0 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -111,3 +111,9 @@ source/request/policies for replay; reports are not deserialized as proof.
+ ```sh
+ cargo run -p hyperdynamics --features reachability --example reachability
+ ```
++
++Run `cargo run -p hyperdynamics --features taylor-affine --example taylor_affine`
++for source-bound linear observables of a nonlinear field. The example retains
++shared Taylor coefficients through an exact output map, then explicitly projects
++the result for a further field operation. It does not transform an ODE proof or
++replace the authoritative model with its Cartesian image.
+diff --git a/crates/hyperdynamics/examples/taylor_affine.rs b/crates/hyperdynamics/examples/taylor_affine.rs
+new file mode 100644
+index 000000000..ccd544b29
+--- /dev/null
++++ b/crates/hyperdynamics/examples/taylor_affine.rs
+@@ -0,0 +1,80 @@
++//! Exact linear observables of a nonlinear field, retaining shared Taylor terms.
++//! This is a field-image certificate, not an ODE coordinate-change proof.
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    taylor::FieldTaylorRequest,
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperreal::{Rational, Real};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorAffineMap, TaylorAffineModel, TaylorAffineRow,
++    },
++};
++use std::sync::Arc;
++fn d(a: i64, b: i64) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), 0).unwrap()
++}
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let (time, x, y) = (SymbolId(1), SymbolId(2), SymbolId(3));
++    let (u, v) = (Expr::anonymous_symbol(x), Expr::anonymous_symbol(y));
++    let square = u.clone() * u;
++    let mut graph = ExpressionBudget::new(100_000, 10_000_000);
++    let source = ExpressionProgram::compile(
++        &[square.clone() + v.clone(), square - v],
++        &[time, x, y],
++        &mut graph,
++    )?;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let field = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![x, y],
++        },
++        &mut budget,
++    )?;
++    let field_model = field.taylor_model(
++        FieldTaylorRequest {
++            time: d(0, 0),
++            state: BoxN::new([d(-1, 1), d(-1, 1)])?,
++            order: 2,
++        },
++        &mut budget,
++    )?;
++    // The explicit one-time model clone is caller-owned work. Further output
++    // transformations share this model and do not rebuild its derivative graph.
++    let model = Arc::new(field_model.model().expect("nonempty domain").clone());
++    let half = Real::from(Rational::from(1) / Rational::from(2));
++    let map = TaylorAffineMap {
++        input_count: 2,
++        rows: vec![
++            TaylorAffineRow {
++                coefficients: vec![half.clone(), half.clone()],
++                offset: Real::zero(),
++            },
++            TaylorAffineRow {
++                coefficients: vec![half.clone(), -half],
++                offset: Real::zero(),
++            },
++        ],
++    };
++    let mut scalar = DyadicBudget::new(16384, 1_000_000_000_000);
++    let observables = TaylorAffineModel::new(model, map, &mut graph, &mut scalar)?;
++    // (f0+f1)/2=x² and (f0-f1)/2=y, independently known exact identities.
++    assert_eq!(observables.range().bounds(), &[d(0, 1), d(-1, 1)]);
++    assert_eq!(observables.remainder(), &[d(0, 0), d(0, 0)]);
++    // The explicit projected result can enter a later field operation. Keep
++    // `observables` itself for further affine transforms without boxing first.
++    let next = field.image(
++        &d(0, 0),
++        &BoxN::new(observables.range().bounds().to_vec().try_into().unwrap())?,
++        &mut budget,
++    )?;
++    println!("original image: {:?}", field_model.image());
++    println!("shared-coefficient observables: {:?}", observables.range());
++    println!("further field image after explicit projection: {next:?}");
++    Ok(())
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 8d8282cba..42faca346 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add source-bound affine Taylor forms with exact coefficient combination, retained original residual coordinates, subdomain reuse and composed-map replay.
+ - Add optional demanded sparse normalized partials and exact-coefficient Taylor
+   models with explicit certified remainders, source guards and analytic-domain
+   evidence. Subdomain reuse preserves the global remainder; replay rebuilds
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 7ff34a7d8..f22378026 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -44,6 +44,7 @@ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
+ taylor-model = ["interval-program"]
++taylor-affine = ["taylor-model"]
+ float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 768b11c3b..beb3b6a4a 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -622,3 +622,14 @@ tests, and strict Clippy.
+ Extensions follow the stack-wide [admission protocol](../../docs/admission.md).
+ It defines the exactness, certainty, boundary, cache, validation, and evidence
+ requirements shared by the Hyper crates.
++
++Enable `taylor-affine` for `TaylorAffineModel`, which retains exact affine output maps over a shared `TaylorModel`.
++It combines equal polynomial monomials before enclosure and composes subsequent
++maps against the original residual coordinates. A shear followed by its inverse
++therefore does not adopt an intermediate output box. Rectangular/singular maps,
++nonrational exact coefficients, empty/unit dimensions and subdomain reuse are
++supported. Replay the original source/request and the composed `TaylorAffineMap`;
++serialized derived coefficients or flags are not proof. This is an image of a
++function, not an ODE coordinate-change certificate or nonlinear model arithmetic.
++The graph/native budgets apply with the existing scalar/payload exclusions;
++entry checks are stage-local, not a total live-memory bound.
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index da0a5b03a..7ca8d1626 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -599,3 +599,9 @@ pub use taylor::{
+     CoefficientProgram, CoefficientRequest, TaylorError, TaylorModel, TaylorRemainderTerm,
+     TaylorRequest, TaylorTerm,
+ };
++
++#[cfg(feature = "taylor-affine")]
++pub use taylor::{
++    TaylorAffineError, TaylorAffineMap, TaylorAffineModel, TaylorAffineRange, TaylorAffineRow,
++    TaylorAffineTerm,
++};
+diff --git a/crates/hypersolve/src/expression_program/taylor.rs b/crates/hypersolve/src/expression_program/taylor.rs
+index ab4d8b17f..a83e219d5 100644
+--- a/crates/hypersolve/src/expression_program/taylor.rs
++++ b/crates/hypersolve/src/expression_program/taylor.rs
+@@ -358,3 +358,9 @@ impl From<hyperinterval::IntervalError> for TaylorError {
+         Self::Interval(error)
+     }
+ }
++
++#[cfg(feature = "taylor-affine")]
++pub use model::{
++    TaylorAffineError, TaylorAffineMap, TaylorAffineModel, TaylorAffineRange, TaylorAffineRow,
++    TaylorAffineTerm,
++};
+diff --git a/crates/hypersolve/src/expression_program/taylor/model.rs b/crates/hypersolve/src/expression_program/taylor/model.rs
+index 6bec390ce..9ac3e3260 100644
+--- a/crates/hypersolve/src/expression_program/taylor/model.rs
++++ b/crates/hypersolve/src/expression_program/taylor/model.rs
+@@ -570,3 +570,11 @@ fn generate(
+     }
+     Ok(())
+ }
++
++#[cfg(feature = "taylor-affine")]
++mod affine;
++#[cfg(feature = "taylor-affine")]
++pub use affine::{
++    TaylorAffineError, TaylorAffineMap, TaylorAffineModel, TaylorAffineRange, TaylorAffineRow,
++    TaylorAffineTerm,
++};
+diff --git a/crates/hypersolve/src/expression_program/taylor/model/affine.rs b/crates/hypersolve/src/expression_program/taylor/model/affine.rs
+new file mode 100644
+index 000000000..9fe9b3476
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/taylor/model/affine.rs
+@@ -0,0 +1,410 @@
++//! Exact output maps over a shared Taylor source and its original residual coordinates.
++use super::super::*;
++use hyperinterval::{DyadicBudget, DyadicInterval};
++
++/// One exact affine output row. Replay data, not an enclosure certificate.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct TaylorAffineRow {
++    /// Weights in the immediate input's output order.
++    pub coefficients: Vec<Real>,
++    /// Exact additive constant.
++    pub offset: Real,
++}
++/// Finite exact output transformation, including rectangular and singular maps.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct TaylorAffineMap {
++    /// Explicit input dimension, also when there are no output rows.
++    pub input_count: usize,
++    /// Output rows in order.
++    pub rows: Vec<TaylorAffineRow>,
++}
++/// Invalid map shape or an original scalar, Taylor or resource failure.
++#[derive(Clone, Debug)]
++pub enum TaylorAffineError {
++    /// Map input dimension differs from its source output dimension.
++    InputCount { expected: usize, actual: usize },
++    /// A row does not have one coefficient per input.
++    RowWidth {
++        row: usize,
++        expected: usize,
++        actual: usize,
++    },
++    /// Original Taylor/domain/resource diagnostic.
++    Taylor(TaylorError),
++    /// Original exact aggregate diagnostic.
++    Scalar(hyperreal::Problem),
++}
++impl fmt::Display for TaylorAffineError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "affine Taylor form: {self:?}")
++    }
++}
++impl std::error::Error for TaylorAffineError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Taylor(e) => Some(e),
++            Self::Scalar(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<TaylorError> for TaylorAffineError {
++    fn from(e: TaylorError) -> Self {
++        Self::Taylor(e)
++    }
++}
++impl From<ExpressionError> for TaylorAffineError {
++    fn from(e: ExpressionError) -> Self {
++        Self::Taylor(e.into())
++    }
++}
++impl From<hyperinterval::IntervalError> for TaylorAffineError {
++    fn from(e: hyperinterval::IntervalError) -> Self {
++        Self::Taylor(e.into())
++    }
++}
++impl TaylorAffineMap {
++    fn validate(
++        &self,
++        expected: usize,
++        graph: &mut ExpressionBudget,
++    ) -> Result<usize, TaylorAffineError> {
++        graph.charge(0)?;
++        if self.input_count != expected {
++            return Err(TaylorAffineError::InputCount {
++                expected,
++                actual: self.input_count,
++            });
++        }
++        let mut entries = 0usize;
++        for (row, value) in self.rows.iter().enumerate() {
++            graph.charge(1)?;
++            if value.coefficients.len() != expected {
++                return Err(TaylorAffineError::RowWidth {
++                    row,
++                    expected,
++                    actual: value.coefficients.len(),
++                });
++            }
++            entries = entries
++                .checked_add(expected)
++                .and_then(|n| n.checked_add(1))
++                .ok_or(ExpressionError::SizeExhausted)?;
++        }
++        graph.check_entries(&[entries])?;
++        Ok(entries)
++    }
++}
++/// A shared centered monomial and its exact coefficients in transformed output order.
++#[derive(Clone, Debug)]
++pub struct TaylorAffineTerm {
++    monomial: CoefficientRequest,
++    coefficients: Vec<Real>,
++}
++impl TaylorAffineTerm {
++    /// Sparse powers of original source variables; empty denotes the constant.
++    pub fn powers(&self) -> &[(SymbolId, usize)] {
++        &self.monomial.powers
++    }
++    /// Exact coefficients, including the affine translation in the constant term.
++    pub fn coefficients(&self) -> &[Real] {
++        &self.coefficients
++    }
++}
++/// Certified Cartesian outer enclosure, distinguishing empty from the zero-dimensional unit.
++#[derive(Clone, Debug)]
++pub struct TaylorAffineRange {
++    bounds: Vec<DyadicInterval>,
++    empty: bool,
++}
++impl TaylorAffineRange {
++    /// Coordinate bounds; an explicit projection, not a replacement source.
++    pub fn bounds(&self) -> &[DyadicInterval] {
++        &self.bounds
++    }
++    /// Whether the input parameter domain was empty, even with zero outputs.
++    pub fn is_empty(&self) -> bool {
++        self.empty
++    }
++}
++/// Source-bound exact affine image of a Taylor-certified function.
++///
++/// Represents `A*f(x)+b` on the original certified domain. Exact polynomial
++/// coefficients are combined before enclosure. Original residual coordinates
++/// remain distinct; their interval bounds do not imply independence or equality.
++/// Repeated transforms compose exact weights against the original source before
++/// projecting either polynomial or residual. Intermediate boxes are never adopted.
++///
++/// Replay the source definition/request and the composed `map()`. This retains
++/// the final exact transformation, not a history of authored transformation steps.
++/// No nonlinear model composition or ODE coordinate certificate is implied.
++/// Structural budgets cover new coefficient/map/scratch entries and loops;
++/// shared input storage is not copied. Exact Real arithmetic/refinement and
++/// payload/heap-byte lifecycle keep TaylorModel's documented exclusions.
++/// Entry checks bound individual structural stages, not total live entries or
++/// bytes across the retained source and nested enclosure routines.
++#[derive(Clone, Debug)]
++pub struct TaylorAffineModel {
++    source: Arc<TaylorModel>,
++    map: TaylorAffineMap,
++    terms: Vec<TaylorAffineTerm>,
++    remainder: Vec<DyadicInterval>,
++    range: TaylorAffineRange,
++}
++impl TaylorAffineModel {
++    /// Validate an exact output map and transport an existing Taylor certificate.
++    /// Shape is validated even for empty sources; all work shares the supplied budgets.
++    pub fn new(
++        source: Arc<TaylorModel>,
++        map: TaylorAffineMap,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<Self, TaylorAffineError> {
++        let inputs = source.source().definition().outputs.len();
++        let map_entries = map.validate(inputs, graph)?;
++        graph.check_entries(&[map_entries, map.rows.len(), map.rows.len()])?;
++        let mut result = Self {
++            source,
++            map,
++            terms: Vec::new(),
++            remainder: Vec::new(),
++            range: TaylorAffineRange {
++                bounds: Vec::new(),
++                empty: false,
++            },
++        };
++        if !result.source.is_empty() {
++            // Group by the existing canonical sparse powers, retaining shared
++            // monomials across output rows rather than boxing each output first.
++            graph.check_entries(&[map_entries, inputs, 1])?;
++            graph.charge(inputs + 1)?;
++            let mut groups = BTreeMap::from([(Vec::new(), vec![Real::zero(); inputs])]);
++            let mut group_entries = inputs + 1;
++            for term in result.source.terms() {
++                let request = &result.source.coefficient_program().requests()[term.request_index()];
++                graph.charge(request.powers.len())?;
++                graph.charge(1)?;
++                if !groups.contains_key(&request.powers) {
++                    group_entries = group_entries
++                        .checked_add(inputs)
++                        .and_then(|n| n.checked_add(request.powers.len()))
++                        .and_then(|n| n.checked_add(1))
++                        .ok_or(ExpressionError::SizeExhausted)?;
++                    graph.check_entries(&[map_entries, group_entries])?;
++                    graph.charge(inputs)?;
++                    groups.insert(request.powers.clone(), vec![Real::zero(); inputs]);
++                }
++                groups.get_mut(&request.powers).expect("inserted group")[request.output] =
++                    term.coefficient().clone();
++            }
++            let output_entries = groups
++                .len()
++                .checked_mul(result.map.rows.len())
++                .ok_or(ExpressionError::SizeExhausted)?;
++            graph.check_entries(&[
++                map_entries,
++                group_entries,
++                output_entries,
++                result.map.rows.len(),
++                result.map.rows.len(),
++            ])?;
++            for (powers, values) in groups {
++                graph.charge(1)?;
++                let mut coefficients = Vec::new();
++                for row in &result.map.rows {
++                    graph.charge(inputs)?;
++                    graph.charge(1)?;
++                    let coefficient = Real::sum_products(&row.coefficients, &values)
++                        .map_err(TaylorAffineError::Scalar)?;
++                    let coefficient = if powers.is_empty() {
++                        coefficient + &row.offset
++                    } else {
++                        coefficient
++                    };
++                    coefficients.push(coefficient);
++                }
++                result.terms.push(TaylorAffineTerm {
++                    monomial: CoefficientRequest { output: 0, powers },
++                    coefficients,
++                });
++            }
++            for row in &result.map.rows {
++                graph.charge(1)?;
++                result.remainder.push(bound_row(
++                    row,
++                    result.source.remainder(),
++                    false,
++                    result.source.request().precision,
++                    graph,
++                    arithmetic,
++                )?);
++            }
++        }
++        result.range = result.enclose_on(&result.source.request().domain, graph, arithmetic)?;
++        graph.charge(0)?;
++        Ok(result)
++    }
++    /// Original shared certificate, unchanged by every subsequent output map.
++    pub fn source(&self) -> &Arc<TaylorModel> {
++        &self.source
++    }
++    /// Exact composed map acting on the original source output coordinates.
++    pub fn map(&self) -> &TaylorAffineMap {
++        &self.map
++    }
++    /// Shared centered monomials with exact mapped coefficients.
++    pub fn terms(&self) -> &[TaylorAffineTerm] {
++        &self.terms
++    }
++    /// Projection of the original residual coordinates, with no dropped contribution.
++    /// Empty sources carry no residual claim.
++    pub fn remainder(&self) -> &[DyadicInterval] {
++        &self.remainder
++    }
++    /// Certified image on the original parameter domain.
++    pub fn range(&self) -> &TaylorAffineRange {
++        &self.range
++    }
++    /// Apply another exact output map. Compose before projecting original residuals.
++    /// Failure leaves this form and its shared source unchanged for retry.
++    pub fn transform(
++        &self,
++        next: TaylorAffineMap,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<Self, TaylorAffineError> {
++        let entries = next.validate(self.map.rows.len(), graph)?;
++        let inputs = self.map.input_count;
++        let outputs = next.rows.len();
++        let composed = inputs
++            .checked_add(1)
++            .and_then(|n| n.checked_mul(outputs))
++            .ok_or(ExpressionError::SizeExhausted)?;
++        graph.check_entries(&[entries, composed, self.map.rows.len(), self.map.rows.len()])?;
++        graph.charge(self.map.rows.len())?;
++        let offsets: Vec<_> = self.map.rows.iter().map(|row| row.offset.clone()).collect();
++        let mut rows = Vec::new();
++        for row in next.rows {
++            graph.charge(1)?;
++            let mut coefficients = Vec::new();
++            for column in 0..inputs {
++                graph.charge(self.map.rows.len())?;
++                graph.charge(1)?;
++                let values: Vec<_> = self
++                    .map
++                    .rows
++                    .iter()
++                    .map(|old| old.coefficients[column].clone())
++                    .collect();
++                coefficients.push(
++                    Real::sum_products(&row.coefficients, &values)
++                        .map_err(TaylorAffineError::Scalar)?,
++                );
++            }
++            graph.charge(self.map.rows.len())?;
++            let offset = Real::sum_products(&row.coefficients, &offsets)
++                .map_err(TaylorAffineError::Scalar)?
++                + row.offset;
++            rows.push(TaylorAffineRow {
++                coefficients,
++                offset,
++            });
++        }
++        drop(offsets);
++        Self::new(
++            self.source.clone(),
++            TaylorAffineMap {
++                input_count: inputs,
++                rows,
++            },
++            graph,
++            arithmetic,
++        )
++    }
++    /// Reuse on a subdomain, preserving the original global residual and grid.
++    /// Even a zero output map cannot bypass the original domain restriction.
++    pub fn enclose_on(
++        &self,
++        domain: &[DyadicInterval],
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<TaylorAffineRange, TaylorAffineError> {
++        // The original owner validates containment, dimensions and empty products.
++        // Its image also supplies an independent projected enclosure below.
++        let original = self.source.enclose_on(domain, graph, arithmetic)?;
++        graph.check_entries(&[self.map.rows.len(), self.map.rows.len(), domain.len()])?;
++        graph.charge(self.map.rows.len())?;
++        graph.charge(domain.len())?;
++        if domain.iter().any(DyadicInterval::is_empty) {
++            graph.charge(0)?;
++            return Ok(TaylorAffineRange {
++                bounds: vec![DyadicInterval::empty(); self.map.rows.len()],
++                empty: true,
++            });
++        }
++        let shifts = model::shifts(domain, &self.source.request().center, graph, arithmetic)?;
++        let precision = self.source.request().precision;
++        let mut bounds = Vec::new();
++        for (output, row) in self.map.rows.iter().enumerate() {
++            graph.charge(1)?;
++            let mut polynomial = model::zero()?;
++            for term in &self.terms {
++                graph.charge(1)?;
++                let coefficient =
++                    DyadicInterval::from_real(&term.coefficients[output], precision, arithmetic)?;
++                let (_, contribution) = model::contribution(
++                    &term.monomial,
++                    &coefficient,
++                    &shifts,
++                    self.source.source().definition(),
++                    precision,
++                    graph,
++                    arithmetic,
++                )?;
++                polynomial = polynomial.add(&contribution, arithmetic)?;
++            }
++            let independent = bound_row(row, &original, true, precision, graph, arithmetic)?;
++            let value = polynomial
++                .add(&self.remainder[output], arithmetic)?
++                .intersection(&independent, arithmetic)?;
++            if value.is_empty() {
++                return Err(TaylorError::InconsistentEnclosure { output }.into());
++            }
++            bounds.push(value);
++        }
++        graph.charge(0)?;
++        Ok(TaylorAffineRange {
++            bounds,
++            empty: false,
++        })
++    }
++}
++// One projection routine for source image bounds and original residual bounds.
++// Exact point/interval arithmetic remains owned by Hyperreal/Hyperinterval.
++fn bound_row(
++    row: &TaylorAffineRow,
++    values: &[DyadicInterval],
++    translated: bool,
++    precision: i32,
++    graph: &mut ExpressionBudget,
++    arithmetic: &mut DyadicBudget,
++) -> Result<DyadicInterval, TaylorAffineError> {
++    assert_eq!(
++        row.coefficients.len(),
++        values.len(),
++        "validated source output shape"
++    );
++    let mut result = if translated {
++        DyadicInterval::from_real(&row.offset, precision, arithmetic)?
++    } else {
++        model::zero()?
++    };
++    for (coefficient, value) in row.coefficients.iter().zip(values) {
++        graph.charge(1)?;
++        let weight = DyadicInterval::from_real(coefficient, precision, arithmetic)?;
++        result = result.add(&weight.mul(value, arithmetic)?, arithmetic)?;
++    }
++    Ok(result)
++}
+diff --git a/crates/hypersolve/tests/program_taylor_affine.rs b/crates/hypersolve/tests/program_taylor_affine.rs
+new file mode 100644
+index 000000000..d8fa3bd1c
+--- /dev/null
++++ b/crates/hypersolve/tests/program_taylor_affine.rs
+@@ -0,0 +1,641 @@
++#![cfg(feature = "taylor-affine")]
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorAffineMap, TaylorAffineModel, TaylorAffineRow,
++        TaylorRequest,
++    },
++};
++use std::sync::Arc;
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 10_000_000)
++}
++fn scalar() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn map(rows: &[&[i32]], inputs: usize) -> TaylorAffineMap {
++    TaylorAffineMap {
++        input_count: inputs,
++        rows: rows
++            .iter()
++            .map(|r| TaylorAffineRow {
++                coefficients: r.iter().map(|&x| Real::from(x)).collect(),
++                offset: Real::zero(),
++            })
++            .collect(),
++    }
++}
++#[test]
++fn shear_inverse_preserves_original_polynomial_correlation() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let program =
++        ExpressionProgram::compile(&[x.clone(), x.clone() * x], &[SymbolId(7)], &mut graph())
++            .unwrap();
++    let source = Arc::new(
++        program
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![d(0, 0, 0)],
++                    domain: vec![d(-1, 1, 0)],
++                    order: 2,
++                    precision: -64,
++                },
++                &mut graph(),
++                &mut scalar(),
++            )
++            .unwrap(),
++    );
++    let mut image = TaylorAffineModel::new(
++        source.clone(),
++        map(&[&[1, 1], &[0, 1]], 2),
++        &mut graph(),
++        &mut scalar(),
++    )
++    .unwrap();
++    assert_eq!(image.range().bounds(), &[d(-1, 2, 0), d(0, 1, 0)]);
++    // Projecting this intermediate image would widen x to [-2,2].
++    assert_eq!(
++        image.range().bounds()[0]
++            .sub(&image.range().bounds()[1], &mut scalar())
++            .unwrap(),
++        d(-2, 2, 0)
++    );
++    image = image
++        .transform(map(&[&[1, -1], &[0, 1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(image.range().bounds(), source.image());
++    assert!(Arc::ptr_eq(image.source(), &source));
++    for _ in 0..8 {
++        image = image
++            .transform(map(&[&[1, 1], &[0, 1]], 2), &mut graph(), &mut scalar())
++            .unwrap()
++            .transform(map(&[&[1, -1], &[0, 1]], 2), &mut graph(), &mut scalar())
++            .unwrap();
++        assert_eq!(image.range().bounds(), &[d(-1, 1, 0), d(0, 1, 0)]);
++        assert_eq!(image.terms().len(), 3);
++    }
++}
++
++fn reciprocal(outputs: usize) -> Arc<hypersolve::expression_program::TaylorModel> {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let expression = Expr::int(1) / (Expr::int(1) - x);
++    let program =
++        ExpressionProgram::compile(&vec![expression; outputs], &[SymbolId(7)], &mut graph())
++            .unwrap();
++    Arc::new(
++        program
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![d(0, 0, 0)],
++                    domain: vec![d(-1, 1, -2)],
++                    order: 0,
++                    precision: -64,
++                },
++                &mut graph(),
++                &mut scalar(),
++            )
++            .unwrap(),
++    )
++}
++#[test]
++fn original_remainder_coordinates_survive_duplication_and_cancellation() {
++    let source = reciprocal(1);
++    assert_ne!(source.remainder(), &[d(0, 0, 0)]);
++    let duplicate = TaylorAffineModel::new(
++        source.clone(),
++        map(&[&[1], &[1]], 1),
++        &mut graph(),
++        &mut scalar(),
++    )
++    .unwrap();
++    let difference = duplicate
++        .transform(map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(difference.map().rows[0].coefficients, vec![Real::zero()]);
++    assert_eq!(difference.remainder(), &[d(0, 0, 0)]);
++    assert_eq!(difference.range().bounds(), &[d(0, 0, 0)]);
++    // Keep the identical-output case, whose exact difference is zero.
++    let equal = TaylorAffineModel::new(
++        reciprocal(2),
++        map(&[&[1, -1]], 2),
++        &mut graph(),
++        &mut scalar(),
++    )
++    .unwrap();
++    assert!(
++        equal.range().bounds()[0]
++            .to_rational(&mut scalar())
++            .unwrap()
++            .contains_point(&hyperreal::Rational::from(0))
++    );
++    // Distinct f(x)=1/(1-x), g(x)=1/(1+x) have equal order-zero residual
++    // intervals on this symmetric box, but f(1/4)-g(1/4)=8/15, not zero.
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let p = ExpressionProgram::compile(
++        &[
++            Expr::int(1) / (Expr::int(1) - x.clone()),
++            Expr::int(1) / (Expr::int(1) + x),
++        ],
++        &[SymbolId(7)],
++        &mut graph(),
++    )
++    .unwrap();
++    let reflected = Arc::new(
++        p.taylor_model(
++            TaylorRequest {
++                center: vec![d(0, 0, 0)],
++                domain: vec![d(-1, 1, -2)],
++                order: 0,
++                precision: -64,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    assert_eq!(reflected.remainder()[0], reflected.remainder()[1]);
++    let distinct =
++        TaylorAffineModel::new(reflected, map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++            .unwrap();
++    assert_ne!(distinct.remainder(), &[d(0, 0, 0)]);
++    let value = hyperreal::Rational::from(8) / hyperreal::Rational::from(15);
++    assert!(
++        distinct
++            .enclose_on(&[d(1, 1, -2)], &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds()[0]
++            .to_rational(&mut scalar())
++            .unwrap()
++            .contains_point(&value)
++    );
++    assert!(
++        d(0, 0, 0)
++            .subset_of(&distinct.range().bounds()[0], &mut scalar())
++            .unwrap()
++    );
++    // A nonzero signed combination retains the full original tail.
++    let scaled = duplicate
++        .transform(map(&[&[-2, 1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(
++        scaled.remainder()[0],
++        d(-1, -1, 0)
++            .mul(&source.remainder()[0], &mut scalar())
++            .unwrap()
++    );
++    assert!(
++        d(-4, -4, -2)
++            .subset_of(&scaled.range().bounds()[0], &mut scalar())
++            .unwrap()
++    );
++}
++#[test]
++fn nonrational_translation_cancels_before_interval_projection() {
++    use hyperreal::Rational;
++    let a = Real::from(Rational::from(1) / Rational::from(2)).sin();
++    let program = ExpressionProgram::compile(&[Expr::real(a.clone())], &[], &mut graph()).unwrap();
++    let source = Arc::new(
++        program
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![],
++                    domain: vec![],
++                    order: 0,
++                    precision: -64,
++                },
++                &mut graph(),
++                &mut scalar(),
++            )
++            .unwrap(),
++    );
++    let mut transform = map(&[&[1]], 1);
++    transform.rows[0].offset = -a;
++    let result = TaylorAffineModel::new(source, transform, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(result.terms()[0].coefficients(), &[Real::zero()]);
++    assert_eq!(result.range().bounds(), &[d(0, 0, 0)]);
++}
++#[test]
++fn affine_translation_composes_exactly_and_source_domain_stays_authoritative() {
++    use hypersolve::expression_program::{TaylorAffineError, TaylorError};
++    let source = reciprocal(1);
++    let mut first = map(&[&[2]], 1);
++    first.rows[0].offset = Real::from(3);
++    let image = TaylorAffineModel::new(source.clone(), first, &mut graph(), &mut scalar()).unwrap();
++    let mut second = map(&[&[-3]], 1);
++    second.rows[0].offset = Real::from(4);
++    let image = image
++        .transform(second, &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(image.map().rows[0].coefficients, vec![Real::from(-6)]);
++    assert_eq!(image.map().rows[0].offset, Real::from(-5));
++    assert!(
++        d(-11, -11, 0)
++            .subset_of(
++                &image
++                    .enclose_on(&[d(0, 0, 0)], &mut graph(), &mut scalar())
++                    .unwrap()
++                    .bounds()[0],
++                &mut scalar()
++            )
++            .unwrap()
++    );
++    let zero = image
++        .transform(map(&[&[0]], 1), &mut graph(), &mut scalar())
++        .unwrap();
++    assert!(matches!(
++        zero.enclose_on(&[d(2, 3, 0)], &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::Taylor(TaylorError::OutsideDomain {
++            slot: 0
++        }))
++    ));
++    assert!(
++        zero.enclose_on(&[DyadicInterval::empty()], &mut graph(), &mut scalar())
++            .unwrap()
++            .is_empty()
++    );
++}
++#[test]
++fn empty_and_unit_products_and_invalid_shapes_stay_distinct() {
++    use hypersolve::expression_program::{ExpressionError, TaylorAffineError, TaylorError};
++    let source = reciprocal(1);
++    assert!(matches!(
++        TaylorAffineModel::new(source.clone(), map(&[], 0), &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::InputCount {
++            expected: 1,
++            actual: 0
++        })
++    ));
++    assert!(matches!(
++        TaylorAffineModel::new(source.clone(), map(&[&[]], 1), &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::RowWidth {
++            row: 0,
++            expected: 1,
++            actual: 0
++        })
++    ));
++    let unit = TaylorAffineModel::new(source, map(&[], 1), &mut graph(), &mut scalar()).unwrap();
++    assert!(!unit.range().is_empty());
++    assert!(unit.range().bounds().is_empty());
++    let mut from_unit = map(&[&[]], 0);
++    from_unit.rows[0].offset = Real::from(7);
++    let lifted_unit = unit
++        .transform(from_unit, &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(lifted_unit.range().bounds(), &[d(7, 7, 0)]);
++    assert!(!lifted_unit.range().is_empty());
++    assert!(Arc::ptr_eq(unit.source(), lifted_unit.source()));
++    let empty = unit
++        .enclose_on(&[DyadicInterval::empty()], &mut graph(), &mut scalar())
++        .unwrap();
++    assert!(empty.is_empty());
++    assert!(empty.bounds().is_empty());
++    let p = ExpressionProgram::compile(&[], &[], &mut graph()).unwrap();
++    let source = Arc::new(
++        p.taylor_model(
++            TaylorRequest {
++                center: vec![],
++                domain: vec![],
++                order: 0,
++                precision: -32,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    let mut constant = map(&[&[]], 0);
++    constant.rows[0].offset = Real::from(7);
++    let result = TaylorAffineModel::new(source, constant, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(result.range().bounds(), &[d(7, 7, 0)]);
++    assert!(!result.range().is_empty());
++    let p = ExpressionProgram::compile(&[], &[SymbolId(7)], &mut graph()).unwrap();
++    let source = Arc::new(
++        p.taylor_model(
++            TaylorRequest {
++                center: vec![d(0, 0, 0)],
++                domain: vec![DyadicInterval::empty()],
++                order: 0,
++                precision: -32,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    let result =
++        TaylorAffineModel::new(source.clone(), map(&[], 0), &mut graph(), &mut scalar()).unwrap();
++    assert!(result.range().is_empty());
++    assert!(result.range().bounds().is_empty());
++    let mut from_empty = map(&[&[]], 0);
++    from_empty.rows[0].offset = Real::from(7);
++    let lifted_empty = result
++        .transform(from_empty, &mut graph(), &mut scalar())
++        .unwrap();
++    assert!(lifted_empty.range().is_empty());
++    assert_eq!(lifted_empty.range().bounds(), &[DyadicInterval::empty()]);
++    assert!(matches!(
++        TaylorAffineModel::new(source, map(&[&[1]], 0), &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::RowWidth { .. })
++    ));
++    assert!(matches!(
++        result.enclose_on(&[], &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::BindingCount { .. }
++        )))
++    ));
++}
++#[test]
++fn final_graph_and_scalar_work_cutoffs_cancel_cleanly_and_retry() {
++    use hypersolve::{
++        expression_program::{ExpressionError, TaylorAffineError, TaylorError},
++        work_budget::CancellationToken,
++    };
++    let source = reciprocal(1);
++    let mut g = graph();
++    let mut a = scalar();
++    let before_g = g.remaining_work();
++    let before_a = a.remaining_work();
++    let expected = TaylorAffineModel::new(source.clone(), map(&[&[2]], 1), &mut g, &mut a).unwrap();
++    let graph_work = before_g - g.remaining_work();
++    let scalar_work = before_a - a.remaining_work();
++    assert!(graph_work > 0 && scalar_work > 0);
++    let exact = TaylorAffineModel::new(
++        source.clone(),
++        map(&[&[2]], 1),
++        &mut ExpressionBudget::new(100_000, graph_work),
++        &mut DyadicBudget::new(16384, scalar_work),
++    )
++    .unwrap();
++    assert_eq!(exact.range().bounds(), expected.range().bounds());
++    assert!(matches!(
++        TaylorAffineModel::new(
++            source.clone(),
++            map(&[&[2]], 1),
++            &mut ExpressionBudget::new(100_000, graph_work - 1),
++            &mut scalar()
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::WorkExhausted
++        )))
++    ));
++    assert!(matches!(
++        TaylorAffineModel::new(
++            source.clone(),
++            map(&[&[2]], 1),
++            &mut graph(),
++            &mut DyadicBudget::new(16384, scalar_work - 1)
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Interval(
++            hyperinterval::IntervalError::WorkExhausted
++        )))
++    ));
++    assert!(matches!(
++        TaylorAffineModel::new(
++            source.clone(),
++            map(&[&[2]], 1),
++            &mut ExpressionBudget::new(1, 10_000_000),
++            &mut scalar()
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::SizeExhausted
++        )))
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        expected.transform(map(&[&[1]], 1), &mut cancelled, &mut scalar()),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    let retried = expected
++        .transform(map(&[&[1]], 1), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(retried.range().bounds(), expected.range().bounds());
++    assert!(Arc::ptr_eq(retried.source(), &source));
++}
++
++#[test]
++fn mixed_polynomial_coefficients_follow_independent_expansion() {
++    let (x, y) = (
++        Expr::anonymous_symbol(SymbolId(7)),
++        Expr::anonymous_symbol(SymbolId(3)),
++    );
++    let outputs = [
++        x.clone().powi(2) + Expr::int(3) * x.clone() * y.clone() + Expr::int(2) * y.clone().powi(2),
++        Expr::int(2) * x.clone().powi(2) - x * y.clone() + Expr::int(5) * y.powi(2),
++    ];
++    let program =
++        ExpressionProgram::compile(&outputs, &[SymbolId(7), SymbolId(3)], &mut graph()).unwrap();
++    let source = Arc::new(
++        program
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![d(0, 0, 0); 2],
++                    domain: vec![d(-1, 1, 0), d(-2, 2, 0)],
++                    order: 2,
++                    precision: -64,
++                },
++                &mut graph(),
++                &mut scalar(),
++            )
++            .unwrap(),
++    );
++    let result =
++        TaylorAffineModel::new(source, map(&[&[2, -1]], 2), &mut graph(), &mut scalar()).unwrap();
++    // 2*(x²+3xy+2y²) - (2x²-xy+5y²) = 7xy-y².
++    for term in result.terms() {
++        let expected = match term.powers() {
++            [(SymbolId(3), 2)] => -1,
++            [(SymbolId(3), 1), (SymbolId(7), 1)] => 7,
++            _ => 0,
++        };
++        assert_eq!(term.coefficients(), &[Real::from(expected)]);
++    }
++    assert_eq!(result.remainder(), &[d(0, 0, 0)]);
++    assert_eq!(result.range().bounds(), &[d(-18, 14, 0)]);
++    for a in -1..=1 {
++        for b in -2..=2 {
++            let point = result
++                .enclose_on(&[d(a, a, 0), d(b, b, 0)], &mut graph(), &mut scalar())
++                .unwrap();
++            assert_eq!(
++                point.bounds(),
++                &[d(7 * a * b - b * b, 7 * a * b - b * b, 0)]
++            );
++        }
++    }
++}
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replay_validates_source_and_composed_map() {
++    const KEY: &str = "HYPERSOLVE_TAYLOR_AFFINE_REPLAY";
++    if let Ok(data) = std::env::var(KEY) {
++        let (definition, request, map): (
++            hypersolve::expression_program::ExpressionDefinition,
++            TaylorRequest,
++            TaylorAffineMap,
++        ) = serde_json::from_str(&data).unwrap();
++        let mut corrupt = definition.clone();
++        corrupt.outputs[0] = usize::MAX;
++        assert!(ExpressionProgram::from_definition(corrupt, &mut graph()).is_err());
++        let source = ExpressionProgram::from_definition(definition, &mut graph()).unwrap();
++        let model = Arc::new(
++            source
++                .taylor_model(request, &mut graph(), &mut scalar())
++                .unwrap(),
++        );
++        assert_ne!(model.remainder(), &[d(0, 0, 0)]);
++        let mut invalid = map.clone();
++        invalid.rows[0].coefficients.clear();
++        assert!(matches!(
++            TaylorAffineModel::new(model.clone(), invalid, &mut graph(), &mut scalar()),
++            Err(hypersolve::expression_program::TaylorAffineError::RowWidth { .. })
++        ));
++        let mut g = graph();
++        let mut a = scalar();
++        let result = TaylorAffineModel::new(model, map, &mut g, &mut a).unwrap();
++        assert_eq!(result.range().bounds(), &[d(0, 0, 0)]);
++        println!(
++            "AFFINE {:?} {:?} {} {}",
++            result.map(),
++            result.range(),
++            g.remaining_work(),
++            a.remaining_work()
++        );
++        return;
++    }
++    let source = reciprocal(1);
++    let result = TaylorAffineModel::new(
++        source.clone(),
++        map(&[&[1], &[1]], 1),
++        &mut graph(),
++        &mut scalar(),
++    )
++    .unwrap()
++    .transform(map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++    .unwrap();
++    let data =
++        serde_json::to_string(&(source.source().definition(), source.request(), result.map()))
++            .unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "fresh_process_replay_validates_source_and_composed_map",
++                "--nocapture",
++            ])
++            .env(KEY, &data)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{} {}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let text = String::from_utf8(child.stdout).unwrap();
++        let row = text
++            .lines()
++            .find(|s| s.starts_with("AFFINE "))
++            .unwrap()
++            .to_owned();
++        if let Some(expected) = &previous {
++            assert_eq!(expected, &row);
++        }
++        previous = Some(row);
++    }
++}
++
++#[test]
++fn transform_budget_failure_does_not_replace_the_source_or_publish_a_partial_map() {
++    use hypersolve::expression_program::{ExpressionError, TaylorAffineError, TaylorError};
++    let image = TaylorAffineModel::new(
++        reciprocal(1),
++        map(&[&[1], &[1]], 1),
++        &mut graph(),
++        &mut scalar(),
++    )
++    .unwrap();
++    let mut g = graph();
++    let before = g.remaining_work();
++    let full = image
++        .transform(map(&[&[1, -1]], 2), &mut g, &mut scalar())
++        .unwrap();
++    let work = before - g.remaining_work();
++    for limit in [0, work / 2, work - 1] {
++        assert!(matches!(
++            image.transform(
++                map(&[&[1, -1]], 2),
++                &mut ExpressionBudget::new(100_000, limit),
++                &mut scalar()
++            ),
++            Err(TaylorAffineError::Taylor(TaylorError::Expression(
++                ExpressionError::WorkExhausted
++            )))
++        ));
++        assert_eq!(image.map().rows.len(), 2);
++        assert_eq!(image.map().rows[0].coefficients, vec![Real::one()]);
++    }
++    let retry = image
++        .transform(
++            map(&[&[1, -1]], 2),
++            &mut ExpressionBudget::new(100_000, work),
++            &mut scalar(),
++        )
++        .unwrap();
++    assert_eq!(retry.range().bounds(), full.range().bounds());
++    assert!(Arc::ptr_eq(image.source(), retry.source()));
++}
++
++#[test]
++fn query_accounts_for_its_domain_scan_and_shift_construction() {
++    // Subtract the unchanged source-owner work to isolate affine transport.
++    // This constant fixture still visits each supplied coordinate twice:
++    // empty-domain classification and centered-shift construction. The four
++    // remaining units cover output storage, output/term visits and its weight.
++    for dimensions in [0, 1, 12] {
++        let variables: Vec<_> = (0..dimensions).map(|i| SymbolId(i as u32)).collect();
++        let program =
++            ExpressionProgram::compile(&[Expr::int(1)], &variables, &mut graph()).unwrap();
++        let domain = vec![d(-1, 1, 0); dimensions];
++        let source = Arc::new(
++            program
++                .taylor_model(
++                    TaylorRequest {
++                        center: vec![d(0, 0, 0); dimensions],
++                        domain: domain.clone(),
++                        order: 0,
++                        precision: -64,
++                    },
++                    &mut graph(),
++                    &mut scalar(),
++                )
++                .unwrap(),
++        );
++        let image =
++            TaylorAffineModel::new(source.clone(), map(&[&[1]], 1), &mut graph(), &mut scalar())
++                .unwrap();
++        let mut original = graph();
++        source
++            .enclose_on(&domain, &mut original, &mut scalar())
++            .unwrap();
++        let mut projected = graph();
++        let result = image
++            .enclose_on(&domain, &mut projected, &mut scalar())
++            .unwrap();
++        assert_eq!(result.bounds(), &[d(1, 1, 0)]);
++        assert_eq!(
++            original.remaining_work() - projected.remaining_work(),
++            2 * dimensions + 4
++        );
++    }
++}
