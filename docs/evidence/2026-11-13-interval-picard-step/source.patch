@@ -1,0 +1,1482 @@
+diff --git a/crates/hyperdynamics/examples/expression_field.rs b/crates/hyperdynamics/examples/expression_field.rs
+index d76a34a6a..2921bc880 100644
+--- a/crates/hyperdynamics/examples/expression_field.rs
++++ b/crates/hyperdynamics/examples/expression_field.rs
+@@ -1,6 +1,7 @@
+-//! An owned time-dependent field; this example does not certify a trajectory.
++//! An owned time-dependent field and two verified Picard steps.
+ use hyperdynamics::field::{
+     EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    picard::{PicardProposal, PicardStatus},
+ };
+ use hyperinterval::DyadicInterval;
+ use hyperlattice_interval::BoxN;
+@@ -48,5 +49,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         Some(&[d(-1, 1), d(-2, -1)])
+     );
+     println!("field: ([-1,1], [-2,0]); state Jacobian: [[0,1], [-1,0]]");
++    let quarter = DyadicInterval::point(1.into(), -2)?;
++    let first = field.certify_step(
++        PicardProposal {
++            start: d(0, 0),
++            end: quarter.clone(),
++            initial: BoxN::new([d(1, 1), d(0, 0)])?,
++            candidate: BoxN::new([d(0, 2), d(-1, 1)])?,
++        },
++        &mut budget,
++    );
++    assert!(matches!(first.status(), PicardStatus::Certified));
++    assert_eq!(
++        first.end_enclosure().unwrap().lanes(),
++        Some(&[
++            DyadicInterval::new(3.into(), 5.into(), -2)?,
++            DyadicInterval::new((-8).into(), 1.into(), -4)?,
++        ])
++    );
++    let second = field.certify_step(
++        PicardProposal {
++            start: quarter,
++            end: DyadicInterval::point(1.into(), -1)?,
++            initial: first.end_enclosure().unwrap().clone(),
++            candidate: BoxN::new([d(0, 2), d(-1, 1)])?,
++        },
++        &mut budget,
++    );
++    assert!(matches!(second.status(), PicardStatus::Certified));
++    println!(
++        "two certified steps reach exact time 1/2 with endpoint {:?}",
++        second.end_enclosure()
++    );
+     Ok(())
+ }
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 0a17dd74e..82fdb50b5 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -1,5 +1,8 @@
+ //! Owned dyadic fields. Scalar refinement and payload costs retain the
+ //! Hypersolve accounting exclusions; these are not yet whole-work-bounded ODEs.
++
++/// Source-bound Picard self-map and contraction verification for dyadic steps.
++pub mod picard;
+ use std::{collections::BTreeSet, fmt, sync::Arc};
+ 
+ use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
+diff --git a/crates/hyperdynamics/src/field/picard.rs b/crates/hyperdynamics/src/field/picard.rs
+new file mode 100644
+index 000000000..e5ae45900
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/picard.rs
+@@ -0,0 +1,367 @@
++//! Verify a proposed forward dyadic step with native interval evidence.
++//!
++//! The proposal is data, not a trajectory. For each initial point in X0,
++//! `X0 + [0,h] F(T,Y) ⊆ Y` and `h sup ||J(T,Y)||∞ < 1` prove a Picard
++//! self-map contraction on continuous Y-valued curves. The source regularity
++//! certificate supplies continuity and state-local C1, rather than assuming
++//! those properties from a finite derivative-formula value. The returned tube
++//! and endpoint enclose the integral equation directly: no Taylor terms are
++//! discarded and no numerical point trajectory is claimed exact. All scalar
++//! rounding is included in the images at the recorded enclosure policy.
++//!
++//! This is one-step verification, not automatic proposal generation, halving
++//! or horizon integration. General symbolic refinement and other budget
++//! exclusions of `EnclosureBudget` still apply. Replay the exact field definition
++//! and proposal; no serialized success flag is accepted as evidence.
++use super::*;
++
++/// Exact input and an untrusted candidate enclosure for one step.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct PicardProposal<const N: usize> {
++    /// Exact singleton start time.
++    pub start: DyadicInterval,
++    /// Exact singleton end time, strictly greater than start.
++    pub end: DyadicInterval,
++    /// Initial state set at start time; uncertainty is retained.
++    pub initial: BoxN<DyadicInterval, N>,
++    /// Proposed trajectory box, independent of how it was selected.
++    pub candidate: BoxN<DyadicInterval, N>,
++}
++
++/// Why this particular proposal could not be certified.
++#[derive(Clone, Debug)]
++pub enum PicardFailure {
++    /// Start or end is empty or not a singleton.
++    NonPointTime,
++    /// End is not strictly after start.
++    NonPositiveDuration,
++    /// The initial set is not included in the candidate.
++    InitialOutsideCandidate,
++    /// The full Picard image is not included in the candidate.
++    SelfMapNotCertified,
++    /// The available Lipschitz bound does not prove a strict contraction.
++    ContractionNotCertified,
++    /// Final endpoint inclusion was not established.
++    EndNotCertified,
++    /// Native validation, domain, regularity, resource or cancellation failure.
++    Field(FieldError),
++}
++impl fmt::Display for PicardFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "Picard step: {self:?}")
++    }
++}
++impl std::error::Error for PicardFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Field(error) => Some(error),
++            _ => None,
++        }
++    }
++}
++impl From<FieldError> for PicardFailure {
++    fn from(error: FieldError) -> Self {
++        Self::Field(error)
++    }
++}
++impl From<ExpressionError> for PicardFailure {
++    fn from(error: ExpressionError) -> Self {
++        Self::Field(error.into())
++    }
++}
++impl From<IntervalError> for PicardFailure {
++    fn from(error: IntervalError) -> Self {
++        Self::Field(error.into())
++    }
++}
++impl From<IntervalLatticeError> for PicardFailure {
++    fn from(error: IntervalLatticeError) -> Self {
++        Self::Field(error.into())
++    }
++}
++
++/// Completion of one attempted proposal, retaining typed failure.
++#[derive(Clone, Debug)]
++pub enum PicardStatus {
++    /// Existence and uniqueness proved for every initial point on this step.
++    Certified,
++    /// The initial set is empty; no existence claim is made.
++    Empty,
++    /// The proposal failed or its proof is unavailable. This is not no-solution evidence.
++    Rejected(PicardFailure),
++}
++
++/// Retained intermediate enclosures, including those from a rejected proposal.
++/// Getters expose only completed stages; they are evidence of their individual
++/// inclusions, not by themselves a trajectory certificate.
++#[derive(Clone, Debug, Default)]
++pub struct PicardEvidence<const N: usize> {
++    time: Option<DyadicInterval>,
++    duration: Option<DyadicInterval>,
++    image: Option<IntervalVector<DyadicInterval, N>>,
++    jacobian: Option<IntervalMatrix<DyadicInterval, N, N>>,
++    picard_image: Option<BoxN<DyadicInterval, N>>,
++    lipschitz: Option<DyadicInterval>,
++    contraction: Option<DyadicInterval>,
++    end: Option<BoxN<DyadicInterval, N>>,
++}
++impl<const N: usize> PicardEvidence<N> {
++    /// Exact closed time interval.
++    pub fn time(&self) -> Option<&DyadicInterval> {
++        self.time.as_ref()
++    }
++    /// Exact positive singleton duration.
++    pub fn duration(&self) -> Option<&DyadicInterval> {
++        self.duration.as_ref()
++    }
++    /// Continuous source image on time × candidate, with certified state regularity.
++    pub fn image(&self) -> Option<&IntervalVector<DyadicInterval, N>> {
++        self.image.as_ref()
++    }
++    /// Associated state partials on the same product.
++    pub fn jacobian(&self) -> Option<&IntervalMatrix<DyadicInterval, N, N>> {
++        self.jacobian.as_ref()
++    }
++    /// Full integral/Picard image; only a successful report makes this a flow tube.
++    pub fn picard_image(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.picard_image.as_ref()
++    }
++    /// Induced Jacobian infinity-norm enclosure; its upper endpoint bounds L.
++    pub fn lipschitz(&self) -> Option<&DyadicInterval> {
++        self.lipschitz.as_ref()
++    }
++    /// Enclosure of h times the Jacobian norm; upper < 1 proves contraction.
++    pub fn contraction(&self) -> Option<&DyadicInterval> {
++        self.contraction.as_ref()
++    }
++    /// Final integral contribution, if materialized; certification also checks inclusion.
++    pub fn end(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.end.as_ref()
++    }
++}
++
++/// Immutable attempted step, retaining exact source, input, policy and stages.
++///
++/// The candidate source is explicitly caller-supplied. These values are never
++/// deserialized as a certificate. Use `end_enclosure` only after it returns Some;
++/// rejected partial stages are available separately through `evidence`.
++#[derive(Clone, Debug)]
++pub struct PicardReport<const N: usize> {
++    identity: FieldIdentity,
++    proposal: PicardProposal<N>,
++    policy: EnclosurePolicy,
++    evidence: PicardEvidence<N>,
++    status: PicardStatus,
++}
++impl<const N: usize> PicardReport<N> {
++    /// Original exact field identity and coordinate interpretation.
++    pub fn identity(&self) -> &FieldIdentity {
++        &self.identity
++    }
++    /// Caller-supplied exact inputs and candidate.
++    pub fn proposal(&self) -> &PicardProposal<N> {
++        &self.proposal
++    }
++    /// Policy governing this attempt; nested calls share its counters.
++    pub fn policy(&self) -> EnclosurePolicy {
++        self.policy
++    }
++    /// Completed intermediate stages, including rejected attempts.
++    pub fn evidence(&self) -> &PicardEvidence<N> {
++        &self.evidence
++    }
++    /// Mathematical completion or exact typed rejection.
++    pub fn status(&self) -> &PicardStatus {
++        &self.status
++    }
++    /// Certified endpoint set, including successful canonical empty.
++    pub fn end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        match self.status {
++            PicardStatus::Certified | PicardStatus::Empty => self.evidence.end.as_ref(),
++            PicardStatus::Rejected(_) => None,
++        }
++    }
++    /// Certified trajectory enclosure, including successful canonical empty.
++    pub fn tube(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        match self.status {
++            PicardStatus::Certified | PicardStatus::Empty => self.evidence.picard_image.as_ref(),
++            PicardStatus::Rejected(_) => None,
++        }
++    }
++}
++impl<const N: usize> ExpressionField<N> {
++    /// Verify one caller-supplied forward step, retaining every attempted stage.
++    ///
++    /// Exact singleton times are validated even for empty initial states. Empty
++    /// success is distinct from a nonempty existence/uniqueness proof. Source
++    /// regularity, self-map inclusion, strict contraction and the final endpoint
++    /// contribution must all pass before certification. Unresolved conditions
++    /// do not prove that an ODE solution is absent. No scalar budget is reset.
++    pub fn certify_step(
++        &self,
++        proposal: PicardProposal<N>,
++        budget: &mut EnclosureBudget,
++    ) -> PicardReport<N> {
++        let mut report = PicardReport {
++            identity: self.identity(),
++            proposal,
++            policy: budget.policy(),
++            evidence: PicardEvidence::default(),
++            status: PicardStatus::Empty,
++        };
++        report.status = match self.verify_step(&report.proposal, &mut report.evidence, budget) {
++            Ok(status) => status,
++            Err(error) => PicardStatus::Rejected(error),
++        };
++        report
++    }
++
++    fn verify_step(
++        &self,
++        proposal: &PicardProposal<N>,
++        evidence: &mut PicardEvidence<N>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<PicardStatus, PicardFailure> {
++        budget.graph.charge(0)?;
++        let matrix = N.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
++        budget.graph.check_entries(&[matrix, N, N, N, N, N, 4])?;
++        budget.graph.charge(2)?;
++        if !proposal.start.is_singleton() || !proposal.end.is_singleton() {
++            return Err(PicardFailure::NonPointTime);
++        }
++        let duration = proposal.end.sub(&proposal.start, &mut budget.arithmetic)?;
++        if duration.signs() != hyperinterval::SignSet::Positive {
++            return Err(PicardFailure::NonPositiveDuration);
++        }
++        let time = proposal.start.hull(&proposal.end, &mut budget.arithmetic)?;
++        evidence.duration = Some(duration);
++        evidence.time = Some(time);
++        if proposal.initial.is_empty() {
++            evidence.picard_image = Some(BoxN::empty()?);
++            evidence.end = Some(BoxN::empty()?);
++            budget.graph.charge(0)?;
++            return Ok(PicardStatus::Empty);
++        }
++        budget.graph.charge(N)?;
++        if !proposal
++            .initial
++            .subset_of(&proposal.candidate, &mut budget.arithmetic)?
++        {
++            return Err(PicardFailure::InitialOutsideCandidate);
++        }
++        let time = evidence.time.as_ref().expect("time established");
++        let arguments = self
++            .arguments(
++                self.data.jacobian.program(),
++                time,
++                &proposal.candidate,
++                budget,
++            )?
++            .expect("nonempty candidate and time");
++        let regular = self.data.jacobian.enclose_regular(
++            &arguments,
++            budget.policy.precision,
++            &mut budget.graph,
++            &mut budget.arithmetic,
++        )?;
++        budget.graph.charge(
++            matrix
++                .checked_add(N)
++                .ok_or(ExpressionError::SizeExhausted)?,
++        )?;
++        let mut values: Vec<_> = regular.into_values().into_iter().map(Some).collect();
++        budget.graph.charge(
++            matrix
++                .checked_add(N)
++                .ok_or(ExpressionError::SizeExhausted)?,
++        )?;
++        let image = IntervalVector::new(core::array::from_fn(|i| {
++            values[i].take().expect("source output")
++        }))?;
++        let jacobian = IntervalMatrix::new(core::array::from_fn(|row| {
++            core::array::from_fn(|column| {
++                values[self
++                    .data
++                    .jacobian
++                    .partial_output(row, column)
++                    .expect("validated shape")]
++                .take()
++                .expect("distinct partial")
++            })
++        }))?;
++        evidence.image = Some(image);
++        evidence.jacobian = Some(jacobian);
++        let duration = evidence.duration.as_ref().expect("duration established");
++        let zero = DyadicInterval::point(0.into(), 0)?;
++        let elapsed = zero.hull(duration, &mut budget.arithmetic)?;
++        budget
++            .graph
++            .charge(N.checked_mul(3).ok_or(ExpressionError::SizeExhausted)?)?;
++        evidence.picard_image = Some(
++            proposal.initial.add(
++                &evidence
++                    .image
++                    .as_ref()
++                    .expect("image")
++                    .scale(&elapsed, &mut budget.arithmetic)?,
++                &mut budget.arithmetic,
++            )?,
++        );
++        if !evidence
++            .picard_image
++            .as_ref()
++            .expect("Picard image")
++            .subset_of(&proposal.candidate, &mut budget.arithmetic)?
++        {
++            return Err(PicardFailure::SelfMapNotCertified);
++        }
++        budget.graph.charge(
++            matrix
++                .checked_add(N)
++                .ok_or(ExpressionError::SizeExhausted)?,
++        )?;
++        evidence.lipschitz = Some(
++            evidence
++                .jacobian
++                .as_ref()
++                .expect("Jacobian")
++                .norm_infinity(&mut budget.arithmetic)?,
++        );
++        evidence.contraction = Some(duration.mul(
++            evidence.lipschitz.as_ref().expect("norm"),
++            &mut budget.arithmetic,
++        )?);
++        let one = DyadicInterval::point(1.into(), 0)?;
++        if !evidence
++            .contraction
++            .as_ref()
++            .expect("contraction")
++            .strictly_left_of(&one, &mut budget.arithmetic)?
++        {
++            return Err(PicardFailure::ContractionNotCertified);
++        }
++        budget
++            .graph
++            .charge(N.checked_mul(3).ok_or(ExpressionError::SizeExhausted)?)?;
++        evidence.end = Some(
++            proposal.initial.add(
++                &evidence
++                    .image
++                    .as_ref()
++                    .expect("image")
++                    .scale(duration, &mut budget.arithmetic)?,
++                &mut budget.arithmetic,
++            )?,
++        );
++        // Materialize and check the last new contribution before publishing success.
++        if !evidence.end.as_ref().expect("end image").subset_of(
++            evidence.picard_image.as_ref().expect("Picard image"),
++            &mut budget.arithmetic,
++        )? {
++            return Err(PicardFailure::EndNotCertified);
++        }
++        budget.graph.charge(0)?;
++        Ok(PicardStatus::Certified)
++    }
++}
+diff --git a/crates/hyperdynamics/tests/expression_field.rs b/crates/hyperdynamics/tests/expression_field.rs
+index 6202635a7..f45a8bd95 100644
+--- a/crates/hyperdynamics/tests/expression_field.rs
++++ b/crates/hyperdynamics/tests/expression_field.rs
+@@ -524,3 +524,469 @@ fn fresh_process_replay_revalidates_source_and_regenerates_field_partials() {
+     let replay = ExpressionField::<1>::from_definition(replay, &mut b()).unwrap();
+     assert_eq!(field.identity(), replay.identity());
+ }
++
++mod picard {
++    use super::*;
++    use hyperdynamics::field::picard::{PicardFailure, PicardProposal, PicardReport, PicardStatus};
++    fn scaled(a: i64, b: i64, e: i32) -> DyadicInterval {
++        DyadicInterval::new(a.into(), b.into(), e).unwrap()
++    }
++    fn certified<const N: usize>(report: &PicardReport<N>) {
++        assert!(
++            matches!(report.status(), PicardStatus::Certified),
++            "{:?}",
++            report.status()
++        );
++        assert!(report.end_enclosure().is_some());
++        assert!(report.tube().is_some());
++    }
++    #[test]
++    fn constant_flows_retain_uncertainty_and_compose_exact_endpoints() {
++        for c in -3_i64..=3 {
++            let field = ExpressionField::<1>::from_definition(
++                definition(&[Expr::int(c)], &[T, X], &[X]),
++                &mut b(),
++            )
++            .unwrap();
++            for k in -3_i64..=3 {
++                let candidate = BoxN::new([scaled(
++                    (4 * k).min(4 * k + c),
++                    (4 * k + 4).max(4 * k + 4 + c),
++                    -2,
++                )])
++                .unwrap();
++                let first = field.certify_step(
++                    PicardProposal {
++                        start: d(0, 0),
++                        end: scaled(1, 1, -2),
++                        initial: BoxN::new([d(k, k + 1)]).unwrap(),
++                        candidate,
++                    },
++                    &mut b(),
++                );
++                certified(&first);
++                assert_eq!(
++                    first.end_enclosure().unwrap().lanes(),
++                    Some(&[scaled(4 * k + c, 4 * k + 4 + c, -2)])
++                );
++                assert_eq!(first.tube().unwrap(), &first.proposal().candidate);
++                assert_eq!(first.evidence().contraction(), Some(&d(0, 0)));
++                let second = field.certify_step(
++                    PicardProposal {
++                        start: scaled(1, 1, -2),
++                        end: scaled(1, 1, -1),
++                        initial: first.end_enclosure().unwrap().clone(),
++                        candidate: BoxN::new([scaled(
++                            4 * k + c.min(2 * c),
++                            4 * k + 4 + c.max(2 * c),
++                            -2,
++                        )])
++                        .unwrap(),
++                    },
++                    &mut b(),
++                );
++                certified(&second);
++                assert_eq!(
++                    second.end_enclosure().unwrap().lanes(),
++                    Some(&[scaled(2 * k + c, 2 * k + 2 + c, -1)])
++                );
++                assert_eq!(first.identity(), second.identity());
++            }
++        }
++    }
++    #[test]
++    fn time_dependence_oscillator_and_riccati_have_independent_controls() {
++        let field = ExpressionField::<1>::from_definition(
++            definition(&[Expr::int(2) * variable(T) + Expr::int(3)], &[X, T], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let report = field.certify_step(
++            PicardProposal {
++                start: d(0, 0),
++                end: scaled(1, 1, -1),
++                initial: BoxN::new([d(0, 0)]).unwrap(),
++                candidate: BoxN::new([d(0, 2)]).unwrap(),
++            },
++            &mut b(),
++        );
++        certified(&report);
++        assert_eq!(
++            report.end_enclosure().unwrap().lanes(),
++            Some(&[scaled(3, 4, -1)])
++        );
++        // Integral of 2t+3 from 0 to 1/2 is exactly 7/4.
++        assert!(
++            scaled(7, 7, -2)
++                .subset_of(
++                    &report.end_enclosure().unwrap().lanes().unwrap()[0],
++                    &mut DyadicBudget::new(16384, 1_000_000_000)
++                )
++                .unwrap()
++        );
++        let coupled = ExpressionField::<2>::from_definition(
++            definition(
++                &[
++                    variable(X) + Expr::int(2) * variable(V),
++                    Expr::int(3) * variable(X) + Expr::int(4) * variable(V),
++                ],
++                &[V, T, X],
++                &[X, V],
++            ),
++            &mut b(),
++        )
++        .unwrap();
++        let coupled_report = coupled.certify_step(
++            PicardProposal {
++                start: d(0, 0),
++                end: scaled(1, 1, -4),
++                initial: BoxN::new([d(0, 0), d(0, 0)]).unwrap(),
++                candidate: BoxN::new([d(-1, 1), d(-1, 1)]).unwrap(),
++            },
++            &mut b(),
++        );
++        certified(&coupled_report);
++        assert_eq!(
++            coupled_report.evidence().jacobian().unwrap().rows(),
++            Some(&[[d(1, 1), d(2, 2)], [d(3, 3), d(4, 4)]])
++        );
++        assert_eq!(coupled_report.evidence().lipschitz(), Some(&d(7, 7)));
++        assert_eq!(
++            coupled_report.evidence().contraction(),
++            Some(&scaled(7, 7, -4))
++        );
++        let oscillator = ExpressionField::<2>::from_definition(
++            definition(&[variable(V), -variable(X)], &[V, T, X], &[X, V]),
++            &mut b(),
++        )
++        .unwrap();
++        let report = oscillator.certify_step(
++            PicardProposal {
++                start: d(0, 0),
++                end: scaled(1, 1, -2),
++                initial: BoxN::new([d(1, 1), d(0, 0)]).unwrap(),
++                candidate: BoxN::new([d(0, 2), d(-1, 1)]).unwrap(),
++            },
++            &mut b(),
++        );
++        certified(&report);
++        assert_eq!(report.evidence().contraction(), Some(&scaled(1, 1, -2)));
++        // y=(cos t,-sin t): 1-t²/2 <= cos t <=1, -t <= -sin t <=0 at t=1/4.
++        let analytic = BoxN::new([scaled(31, 32, -5), scaled(-1, 0, -2)]).unwrap();
++        assert!(
++            analytic
++                .subset_of(
++                    report.end_enclosure().unwrap(),
++                    &mut DyadicBudget::new(16384, 1_000_000_000)
++                )
++                .unwrap()
++        );
++        let riccati = ExpressionField::<1>::from_definition(
++            definition(&[variable(X).powi(2)], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let proposal = PicardProposal {
++            start: d(0, 0),
++            end: scaled(1, 1, -3),
++            initial: BoxN::new([d(1, 1)]).unwrap(),
++            candidate: BoxN::new([d(1, 2)]).unwrap(),
++        };
++        let report = riccati.certify_step(proposal.clone(), &mut b());
++        certified(&report);
++        let exact = DyadicInterval::from_rational(
++            &hyperreal::Rational::fraction(8, 7).unwrap(),
++            -64,
++            &mut DyadicBudget::new(16384, 1_000_000_000),
++        )
++        .unwrap();
++        assert!(
++            exact
++                .subset_of(
++                    &report.end_enclosure().unwrap().lanes().unwrap()[0],
++                    &mut DyadicBudget::new(16384, 1_000_000_000)
++                )
++                .unwrap()
++        );
++        let mut blowup = proposal;
++        blowup.end = d(1, 1);
++        assert!(matches!(
++            riccati.certify_step(blowup, &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::SelfMapNotCertified)
++        ));
++    }
++    #[test]
++    fn regularity_and_proposal_failures_do_not_become_trajectory_claims() {
++        let time_root = ExpressionField::<1>::from_definition(
++            definition(&[variable(T).sqrt()], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let proposal = PicardProposal {
++            start: d(0, 0),
++            end: d(1, 1),
++            initial: BoxN::new([d(0, 0)]).unwrap(),
++            candidate: BoxN::new([d(0, 1)]).unwrap(),
++        };
++        let report = time_root.certify_step(proposal.clone(), &mut b());
++        certified(&report);
++        // The exact temporal integral is 2/3 even though its time derivative is singular at zero.
++        let two_thirds = DyadicInterval::from_rational(
++            &hyperreal::Rational::fraction(2, 3).unwrap(),
++            -64,
++            &mut DyadicBudget::new(16384, 1_000_000_000),
++        )
++        .unwrap();
++        assert!(
++            two_thirds
++                .subset_of(
++                    &report.end_enclosure().unwrap().lanes().unwrap()[0],
++                    &mut DyadicBudget::new(16384, 1_000_000_000)
++                )
++                .unwrap()
++        );
++        let state_root = ExpressionField::<1>::from_definition(
++            definition(&[variable(X).sqrt()], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let rejected = state_root.certify_step(proposal.clone(), &mut b());
++        assert!(matches!(
++            rejected.status(),
++            PicardStatus::Rejected(PicardFailure::Field(FieldError::Expression(
++                ExpressionError::RegularityNotCertified { .. }
++            )))
++        ));
++        assert!(rejected.end_enclosure().is_none());
++        let linear = ExpressionField::<1>::from_definition(
++            definition(&[variable(X)], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let mut p = proposal.clone();
++        p.candidate = BoxN::new([d(-1, 1)]).unwrap();
++        let rejected = linear.certify_step(p, &mut b());
++        assert!(matches!(
++            rejected.status(),
++            PicardStatus::Rejected(PicardFailure::ContractionNotCertified)
++        ));
++        assert_eq!(rejected.evidence().contraction(), Some(&d(1, 1)));
++        let constant = ExpressionField::<1>::from_definition(
++            definition(&[Expr::int(1)], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let mut p = proposal.clone();
++        p.candidate = BoxN::new([d(0, 0)]).unwrap();
++        let rejected = constant.certify_step(p, &mut b());
++        assert!(matches!(
++            rejected.status(),
++            PicardStatus::Rejected(PicardFailure::SelfMapNotCertified)
++        ));
++        assert_eq!(
++            rejected.evidence().picard_image().unwrap().lanes(),
++            Some(&[d(0, 1)])
++        );
++        assert!(rejected.tube().is_none());
++        let pole = ExpressionField::<1>::from_definition(
++            definition(&[Expr::int(1) / variable(X)], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        assert!(matches!(
++            pole.certify_step(proposal, &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::Field(_))
++        ));
++    }
++    #[test]
++    fn empty_initial_and_zero_dimensional_unit_steps_remain_distinct() {
++        let field =
++            ExpressionField::<0>::from_definition(definition(&[], &[T], &[]), &mut b()).unwrap();
++        let proposal = PicardProposal {
++            start: d(0, 0),
++            end: d(1, 1),
++            initial: BoxN::new([]).unwrap(),
++            candidate: BoxN::new([]).unwrap(),
++        };
++        let unit = field.certify_step(proposal.clone(), &mut b());
++        certified(&unit);
++        assert!(!unit.end_enclosure().unwrap().is_empty());
++        let mut p = proposal.clone();
++        p.initial = BoxN::empty().unwrap();
++        p.candidate = BoxN::empty().unwrap();
++        let empty = field.certify_step(p.clone(), &mut b());
++        assert!(matches!(empty.status(), PicardStatus::Empty));
++        assert!(empty.end_enclosure().unwrap().is_empty());
++        p.start = DyadicInterval::empty();
++        assert!(matches!(
++            field.certify_step(p.clone(), &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::NonPointTime)
++        ));
++        p.start = d(0, 0);
++        p.end = d(0, 0);
++        assert!(matches!(
++            field.certify_step(p, &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::NonPositiveDuration)
++        ));
++        let mut p = proposal;
++        p.candidate = BoxN::empty().unwrap();
++        assert!(matches!(
++            field.certify_step(p, &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::InitialOutsideCandidate)
++        ));
++    }
++    #[test]
++    fn aggregate_limits_and_last_contribution_failure_precede_certification() {
++        let field = ExpressionField::<1>::from_definition(
++            definition(&[Expr::int(1)], &[T, X], &[X]),
++            &mut b(),
++        )
++        .unwrap();
++        let proposal = PicardProposal {
++            start: d(0, 0),
++            end: d(1, 1),
++            initial: BoxN::new([d(0, 0)]).unwrap(),
++            candidate: BoxN::new([d(0, 1)]).unwrap(),
++        };
++        let mut measured = b();
++        certified(&field.certify_step(proposal.clone(), &mut measured));
++        let policy = measured.policy();
++        let gw = policy.graph_work - measured.remaining_graph_work();
++        let sw = policy.scalar_work - measured.remaining_scalar_work();
++        let exact = EnclosurePolicy {
++            graph_work: gw,
++            scalar_work: sw,
++            ..policy
++        };
++        let mut work = EnclosureBudget::new(exact);
++        certified(&field.certify_step(proposal.clone(), &mut work));
++        assert_eq!(work.remaining_graph_work(), 0);
++        assert_eq!(work.remaining_scalar_work(), 0);
++        let graph_failure = field.certify_step(
++            proposal.clone(),
++            &mut EnclosureBudget::new(EnclosurePolicy {
++                graph_work: gw - 1,
++                ..policy
++            }),
++        );
++        assert!(matches!(
++            graph_failure.status(),
++            PicardStatus::Rejected(PicardFailure::Field(FieldError::Expression(
++                ExpressionError::WorkExhausted
++            )))
++        ));
++        let last = field.certify_step(
++            proposal.clone(),
++            &mut EnclosureBudget::new(EnclosurePolicy {
++                scalar_work: sw - 1,
++                ..policy
++            }),
++        );
++        assert!(
++            last.evidence().end().is_some(),
++            "last contribution must have been materialized"
++        );
++        assert!(last.end_enclosure().is_none());
++        assert!(matches!(
++            last.status(),
++            PicardStatus::Rejected(PicardFailure::Field(_))
++        ));
++        let mut two = EnclosureBudget::new(EnclosurePolicy {
++            graph_work: 2 * gw,
++            scalar_work: 2 * sw,
++            ..policy
++        });
++        certified(&field.certify_step(proposal.clone(), &mut two));
++        certified(&field.certify_step(proposal.clone(), &mut two));
++        assert_eq!(two.remaining_graph_work(), 0);
++        assert_eq!(two.remaining_scalar_work(), 0);
++        let token = CancellationToken::new();
++        token.cancel();
++        let mut cancelled = b();
++        cancelled.set_cancellation(Some(token));
++        assert!(matches!(
++            field
++                .certify_step(proposal.clone(), &mut cancelled)
++                .status(),
++            PicardStatus::Rejected(PicardFailure::Field(FieldError::Expression(
++                ExpressionError::Cancelled
++            )))
++        ));
++        certified(&field.certify_step(proposal, &mut b()));
++    }
++    #[cfg(feature = "serde")]
++    #[test]
++    fn picard_replay_reexecutes_source_and_candidate_validation_in_a_fresh_process() {
++        fn signature(report: &PicardReport<1>) -> String {
++            certified(report);
++            let e = report.evidence();
++            serde_json::to_string(&(
++                report.identity(),
++                report.proposal(),
++                report.policy(),
++                e.time(),
++                e.duration(),
++                e.image(),
++                e.jacobian(),
++                e.picard_image(),
++                e.lipschitz(),
++                e.contraction(),
++                e.end(),
++            ))
++            .unwrap()
++        }
++        const KEY: &str = "HYPERDYNAMICS_PICARD_REPLAY";
++        if let Ok(encoded) = std::env::var(KEY) {
++            let (definition, proposal, policy): (
++                FieldDefinition,
++                PicardProposal<1>,
++                EnclosurePolicy,
++            ) = serde_json::from_str(&encoded).unwrap();
++            let field = ExpressionField::<1>::from_definition(definition, &mut b()).unwrap();
++            println!(
++                "PICARD_REPLAY={}",
++                signature(&field.certify_step(proposal, &mut EnclosureBudget::new(policy)))
++            );
++            return;
++        }
++        let source = definition(
++            &[variable(X).powi(2) + Expr::real(Real::from(2).sqrt().unwrap())],
++            &[X, T],
++            &[X],
++        );
++        let field = ExpressionField::<1>::from_definition(source.clone(), &mut b()).unwrap();
++        let proposal = PicardProposal {
++            start: d(0, 0),
++            end: scaled(1, 1, -4),
++            initial: BoxN::new([d(0, 0)]).unwrap(),
++            candidate: BoxN::new([d(0, 2)]).unwrap(),
++        };
++        let encoded =
++            serde_json::to_string(&(field.identity(), &proposal, EnclosurePolicy::default()))
++                .unwrap();
++        let original = field.certify_step(proposal.clone(), &mut b());
++        let expected = signature(&original);
++        let child=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","picard::picard_replay_reexecutes_source_and_candidate_validation_in_a_fresh_process","--nocapture"]).env(KEY,encoded).output().unwrap();
++        assert!(
++            child.status.success(),
++            "{}",
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let stdout = String::from_utf8(child.stdout).unwrap();
++        let actual = stdout
++            .lines()
++            .find_map(|l| l.strip_prefix("PICARD_REPLAY="))
++            .unwrap();
++        assert_eq!(actual, expected);
++        let mut changed = proposal;
++        changed.candidate = BoxN::new([d(0, 0)]).unwrap();
++        assert!(matches!(
++            field.certify_step(changed, &mut b()).status(),
++            PicardStatus::Rejected(PicardFailure::SelfMapNotCertified)
++        ));
++        let mut invalid = source;
++        invalid.source.outputs[0] = usize::MAX;
++        assert!(ExpressionField::<1>::from_definition(invalid, &mut b()).is_err());
++        assert_eq!(signature(&original), expected);
++    }
++}
+diff --git a/crates/hyperlattice-interval/src/vector.rs b/crates/hyperlattice-interval/src/vector.rs
+index 314705892..f02346420 100644
+--- a/crates/hyperlattice-interval/src/vector.rs
++++ b/crates/hyperlattice-interval/src/vector.rs
+@@ -113,6 +113,26 @@ impl<I: IntervalArithmetic, const N: usize> IntervalVector<I, N> {
+         self.zip(other, context, I::sub)
+     }
+ 
++    /// Enclose `{ s*x : s in scalar, x in self }` coordinate by coordinate.
++    ///
++    /// A shared scalar can correlate coordinates; this returns their Cartesian
++    /// enclosure, not an exact correlated image. Empty operands give empty,
++    /// including dimension zero. A nonempty scalar times the unit product is
++    /// the unit product. Every multiplication shares the caller's context.
++    pub fn scale(
++        &self,
++        scalar: &I,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        let Some(lanes) = self.lanes() else {
++            return Self::empty();
++        };
++        if scalar.is_empty() {
++            return Self::empty();
++        }
++        Self::new(array_result(|i| lanes[i].mul(scalar, context))?)
++    }
++
+     /// Dot-product enclosure with left-to-right multiplication then addition.
+     /// The same caller budget is used for every scalar operation. The empty
+     /// Cartesian set has empty image; a zero-dimensional unit dot product is zero.
+diff --git a/crates/hyperlattice-interval/tests/cartesian.rs b/crates/hyperlattice-interval/tests/cartesian.rs
+index 4abc0e1d1..d1b19434a 100644
+--- a/crates/hyperlattice-interval/tests/cartesian.rs
++++ b/crates/hyperlattice-interval/tests/cartesian.rs
+@@ -53,6 +53,37 @@ fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
+     assert!(unit.interior_subset_of(&unit, &mut context()).unwrap());
+     assert_eq!(unit.into_rows(), Some([]));
+     let ranges = [(-1, -1), (-1, 0), (-1, 1), (0, 0), (0, 1), (1, 1)];
++    // Independent corner enumeration for each scaled coordinate, including
++    // signed scalars and a scalar interval shared between coordinates.
++    for a in ranges {
++        for scale in ranges {
++            let vector = IntervalVector::new([scalar(a.0, a.1), scalar(-a.1, -a.0)]).unwrap();
++            let expected = [
++                dot_bounds(&[a], &[scale]),
++                dot_bounds(&[(-a.1, -a.0)], &[scale]),
++            ];
++            assert_eq!(
++                vector
++                    .scale(&scalar(scale.0, scale.1), &mut context())
++                    .unwrap()
++                    .into_lanes(),
++                Some(expected.map(|(lo, hi)| scalar(lo, hi)))
++            );
++            assert!(
++                vector
++                    .scale(&I::empty().unwrap(), &mut context())
++                    .unwrap()
++                    .is_empty()
++            );
++        }
++    }
++    let unit = IntervalVector::<I, 0>::new([]).unwrap();
++    assert_eq!(unit.scale(&scalar(-1, 1), &mut context()).unwrap(), unit);
++    assert!(
++        unit.scale(&I::empty().unwrap(), &mut context())
++            .unwrap()
++            .is_empty()
++    );
+     // Exhaust every two-lane dot product over this finite endpoint domain.
+     for a0 in ranges {
+         for a1 in ranges {
+@@ -415,3 +446,30 @@ fn shared_budget_copies_exhaustion_and_retry() {
+         result
+     );
+ }
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn vector_scale_shares_work_across_coordinates_and_retries() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I};
++    let x = IntervalVector::new([
++        I::new((-2).into(), 3.into(), -1).unwrap(),
++        I::new(4.into(), 7.into(), -2).unwrap(),
++    ])
++    .unwrap();
++    let scalar = I::new((-3).into(), 2.into(), -1).unwrap();
++    let mut measured = DyadicBudget::new(256, 1_000_000);
++    let expected = x.scale(&scalar, &mut measured).unwrap();
++    let work = 1_000_000 - measured.remaining_work();
++    let mut exact = DyadicBudget::new(256, work);
++    assert_eq!(x.scale(&scalar, &mut exact).unwrap(), expected);
++    assert_eq!(exact.remaining_work(), 0);
++    assert!(
++        x.scale(&scalar, &mut DyadicBudget::new(256, work - 1))
++            .is_err()
++    );
++    assert_eq!(
++        x.scale(&scalar, &mut DyadicBudget::new(256, 1_000_000))
++            .unwrap(),
++        expected
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/no_alloc.rs b/crates/hyperlattice-interval/tests/no_alloc.rs
+index e46587bfa..a02fa9f6d 100644
+--- a/crates/hyperlattice-interval/tests/no_alloc.rs
++++ b/crates/hyperlattice-interval/tests/no_alloc.rs
+@@ -12,6 +12,11 @@ fn primitive_construction_composition_and_errors_do_not_allocate() {
+         let x = IntervalVector::new([I::new(-(1 << 16), 1 << 16).unwrap(); 3]).unwrap();
+         let m = IntervalMatrix::new([[p; 3]; 3]).unwrap();
+         let result = m.affine_enclosure(&x, &x, &mut ()).unwrap();
++        assert_eq!(x.scale(&p, &mut ()).unwrap(), x);
++        std::hint::black_box(
++            x.scale(&I::new(-(1 << 16), 1 << 16).unwrap(), &mut ())
++                .unwrap(),
++        );
+         let transposed = m.transpose(&mut ()).unwrap();
+         let squared = m.mul_matrix(&transposed, &mut ()).unwrap();
+         let row = squared.row(0, &mut ()).unwrap();
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 14c3066b7..6303f46a1 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -19,6 +19,8 @@ use crate::{Expr, SymbolId, SymbolRef, work_budget::CancellationToken};
+ 
+ #[cfg(feature = "interval-program")]
+ mod dyadic;
++#[cfg(feature = "interval-program")]
++pub use dyadic::RegularJacobianEnclosure;
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
+ 
+@@ -203,6 +205,18 @@ pub enum ExpressionError {
+     /// Dependency overestimation can cause this even for valid exact inputs.
+     #[cfg(feature = "interval-program")]
+     DomainNotCertified { node: usize },
++    /// A state-dependent primitive enclosure touches a differentiability boundary.
++    /// This is a failed sufficient proof, not a claim of nondifferentiability.
++    #[cfg(feature = "interval-program")]
++    RegularityNotCertified { node: usize },
++    /// Native failure while retaining an argument for a domain certificate.
++    #[cfg(feature = "interval-program")]
++    ArgumentEnclosure {
++        /// Original binding slot.
++        slot: usize,
++        /// Native resource/domain cause.
++        source: hyperinterval::IntervalError,
++    },
+     /// Interval failure, preserving the node and native resource/domain cause.
+     #[cfg(feature = "interval-program")]
+     Enclosure {
+@@ -223,6 +237,8 @@ impl std::error::Error for ExpressionError {
+             Self::Scalar { source, .. } => Some(source),
+             #[cfg(feature = "interval-program")]
+             Self::Enclosure { source, .. } => Some(source),
++            #[cfg(feature = "interval-program")]
++            Self::ArgumentEnclosure { source, .. } => Some(source),
+             _ => None,
+         }
+     }
+diff --git a/crates/hypersolve/src/expression_program/dyadic.rs b/crates/hypersolve/src/expression_program/dyadic.rs
+index 6af018411..b064d4a78 100644
+--- a/crates/hypersolve/src/expression_program/dyadic.rs
++++ b/crates/hypersolve/src/expression_program/dyadic.rs
+@@ -6,6 +6,9 @@ use super::{
+     UnaryOperation,
+ };
+ 
++mod regularity;
++pub use regularity::RegularJacobianEnclosure;
++
+ impl ExpressionProgram {
+     /// Enclose every output over the Cartesian product of the input intervals.
+     ///
+@@ -60,6 +63,7 @@ impl ExpressionProgram {
+                 precision,
+                 budget: arithmetic_budget,
+             },
++            None,
+         )
+     }
+ 
+@@ -72,6 +76,7 @@ impl ExpressionProgram {
+         values: &[DyadicInterval],
+         budget: &mut ExpressionBudget,
+         arithmetic: &mut DyadicArithmetic<'_>,
++        regularity: Option<&[bool]>,
+     ) -> Result<Vec<DyadicInterval>, ExpressionError> {
+         budget.charge(0)?;
+         let source = &self.definition;
+@@ -121,9 +126,26 @@ impl ExpressionProgram {
+                         let value =
+                             consume_dyadic_operand(&mut cache, &mut uses, *input, arithmetic)
+                                 .map_err(|error| DyadicArithmetic::copy_error(*input, error))?;
+-                        arithmetic
++                        let regular = if regularity
++                            .and_then(|active| active.get(index))
++                            .copied()
++                            .unwrap_or(false)
++                        {
++                            arithmetic
++                                .regular_input(*operation, &value)
++                                .map_err(|error| DyadicArithmetic::copy_error(index, error))?
++                        } else {
++                            true
++                        };
++                        let result = arithmetic
+                             .unary(*operation, value)
+-                            .map_err(|error| DyadicArithmetic::operation_error(index, error))?
++                            .map_err(|error| DyadicArithmetic::operation_error(index, error))?;
++                        // Preserve original domain failures before reporting a
++                        // stronger differentiability proof as unavailable.
++                        if !regular {
++                            return Err(ExpressionError::RegularityNotCertified { node: index });
++                        }
++                        result
+                     }
+                     ExpressionNode::Binary {
+                         operation,
+diff --git a/crates/hypersolve/src/expression_program/dyadic/regularity.rs b/crates/hypersolve/src/expression_program/dyadic/regularity.rs
+new file mode 100644
+index 000000000..0f829f572
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/dyadic/regularity.rs
+@@ -0,0 +1,149 @@
++//! Sufficient source-domain regularity, separate from formula evaluability.
++use super::{
++    DyadicArithmetic, DyadicBudget, DyadicInterval, ExpressionBudget, ExpressionError,
++    ExpressionNode, IntervalError, UnaryOperation,
++};
++use crate::expression_program::JacobianProgram;
++
++/// Source-bound continuous image and continuously differentiable selected partials.
++///
++/// Original outputs are jointly continuous on the retained argument product.
++/// For fixed other arguments they are C1 in the selected variables on a
++/// neighborhood of their box, with partials enclosed by the generated program.
++/// Primitive boundary checks are sufficient, not necessary: removable composite
++/// singularities can remain unproved. Empty products make these claims vacuous.
++/// No deserialization of this evidence is provided; replay source, variables
++/// and arguments through the validated constructors and `enclose_regular`.
++#[derive(Clone, Debug)]
++pub struct RegularJacobianEnclosure {
++    program: JacobianProgram,
++    arguments: Vec<DyadicInterval>,
++    precision: i32,
++    values: Vec<DyadicInterval>,
++}
++impl RegularJacobianEnclosure {
++    /// Exact source and generated derivative association.
++    pub fn program(&self) -> &JacobianProgram {
++        &self.program
++    }
++    /// Cartesian domain, in original binding order.
++    pub fn arguments(&self) -> &[DyadicInterval] {
++        &self.arguments
++    }
++    /// Requested enclosure grid; not a final-width bound.
++    pub fn precision(&self) -> i32 {
++        self.precision
++    }
++    /// Original outputs followed by column-major partials.
++    pub fn values(&self) -> &[DyadicInterval] {
++        &self.values
++    }
++    /// Consume the association and return its ordinary numerical enclosures.
++    pub fn into_values(self) -> Vec<DyadicInterval> {
++        self.values
++    }
++}
++impl JacobianProgram {
++    /// Prove source continuity and C1 regularity in the differentiation variables.
++    ///
++    /// Reached source operations must cover their full operand enclosures.
++    /// State-dependent sqrt/asin/acos/acosh operands must additionally lie in
++    /// their open smooth domains. Inactive-variable-only operands may touch a
++    /// continuous boundary, e.g. sqrt(time) at time zero when differentiating
++    /// only state. Division, logarithm and integer powers retain their existing
++    /// full-domain guards. Generated partials are then enclosed as usual.
++    ///
++    /// Arguments and source association are retained immutably. Native interval
++    /// copies and guard comparisons share the supplied budgets. Existing scalar
++    /// refinement, payload/ingress and total-heap exclusions remain in force.
++    pub fn enclose_regular(
++        &self,
++        values: &[DyadicInterval],
++        precision: i32,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<RegularJacobianEnclosure, ExpressionError> {
++        graph.charge(0)?;
++        let original = self.source().definition();
++        let combined = self.program().definition();
++        if values.len() != original.variables.len() {
++            return Err(ExpressionError::BindingCount {
++                expected: original.variables.len(),
++                actual: values.len(),
++            });
++        }
++        graph.check_entries(&[
++            combined.variables.len(),
++            combined.nodes.len(),
++            combined.outputs.len(),
++            original.nodes.len(),
++            values.len(),
++        ])?;
++        let mut arguments = Vec::new();
++        for (slot, value) in values.iter().enumerate() {
++            graph.charge(1)?;
++            arguments.push(value.checked_pow(1, arithmetic).map_err(|source| {
++                // This is an argument copy, before a source node is selected.
++                ExpressionError::ArgumentEnclosure { slot, source }
++            })?);
++        }
++        graph.charge(values.len())?;
++        let output = if values.iter().any(DyadicInterval::is_empty) {
++            self.program()
++                .eval_dyadic(values, precision, graph, arithmetic)?
++        } else {
++            let mut active = Vec::new();
++            for node in &original.nodes {
++                graph.charge(1)?;
++                let depends = match node {
++                    ExpressionNode::Constant(_) => false,
++                    ExpressionNode::Variable(reference) => {
++                        graph.charge(self.variables().len())?;
++                        self.variables().contains(&reference.id)
++                    }
++                    ExpressionNode::Unary { input, .. } => active[*input],
++                    ExpressionNode::Binary { left, right, .. } => active[*left] || active[*right],
++                };
++                active.push(depends);
++            }
++            self.program().evaluate_dyadic(
++                values,
++                graph,
++                &mut DyadicArithmetic {
++                    precision,
++                    budget: arithmetic,
++                },
++                Some(&active),
++            )?
++        };
++        graph.charge(1)?;
++        let result = RegularJacobianEnclosure {
++            program: self.clone(),
++            arguments,
++            precision,
++            values: output,
++        };
++        graph.charge(0)?;
++        Ok(result)
++    }
++}
++impl DyadicArithmetic<'_> {
++    pub(super) fn regular_input(
++        &mut self,
++        operation: UnaryOperation,
++        input: &DyadicInterval,
++    ) -> Result<bool, IntervalError> {
++        match operation {
++            UnaryOperation::Sqrt => Ok(input.signs() == hyperinterval::SignSet::Positive),
++            UnaryOperation::Asin | UnaryOperation::Acos => {
++                let open = DyadicInterval::new((-1).into(), 1.into(), 0)?;
++                input.interior_subset_of(&open, self.budget)
++            }
++            UnaryOperation::Acosh => {
++                let one = DyadicInterval::point(1.into(), 0)?;
++                one.strictly_left_of(input, self.budget)
++            }
++            _ => Ok(true),
++        }
++    }
++}
+diff --git a/crates/hypersolve/src/expression_program/jacobian.rs b/crates/hypersolve/src/expression_program/jacobian.rs
+index 88fe51094..ba14f35b3 100644
+--- a/crates/hypersolve/src/expression_program/jacobian.rs
++++ b/crates/hypersolve/src/expression_program/jacobian.rs
+@@ -16,7 +16,9 @@ use crate::{Expr, SymbolId};
+ /// even when a derivative is identically zero. A derivative formula can have a
+ /// smaller domain than a differentiable composite (for example at a removable
+ /// chain-rule singularity); failure to evaluate it is not proof of
+-/// nondifferentiability. No global smoothness or trajectory certificate is made.
++/// nondifferentiability. Construction alone makes no smoothness or trajectory
++/// certificate. The `interval-program` feature supplies `enclose_regular` for
++/// a separate sufficient source-domain regularity proof.
+ ///
+ /// Identity and replay consist of [`Self::source`]'s complete definition and the
+ /// ordered [`Self::variables`]. Replay validates the source and calls
+diff --git a/crates/hypersolve/tests/program_jacobian.rs b/crates/hypersolve/tests/program_jacobian.rs
+index 0a4885823..d889b1c0b 100644
+--- a/crates/hypersolve/tests/program_jacobian.rs
++++ b/crates/hypersolve/tests/program_jacobian.rs
+@@ -433,3 +433,176 @@ fn fresh_process_replay_regenerates_partials_from_source_and_variables() {
+         values
+     );
+ }
++
++#[cfg(feature = "interval-program")]
++mod regularity {
++    use super::*;
++    use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++    fn arithmetic() -> DyadicBudget {
++        DyadicBudget::new(16_384, 1_000_000_000_000)
++    }
++    fn d(a: i64, b: i64) -> DyadicInterval {
++        DyadicInterval::new(a.into(), b.into(), 0).unwrap()
++    }
++
++    #[test]
++    fn strict_active_primitive_domains_are_distinct_from_time_continuity() {
++        for (expression, boundary, interior) in [
++            (x().sqrt(), d(0, 1), d(1, 4)),
++            (
++                x().asin(),
++                d(-1, 0),
++                DyadicInterval::new((-1).into(), 1.into(), -1).unwrap(),
++            ),
++            (
++                x().acos(),
++                d(0, 1),
++                DyadicInterval::new((-1).into(), 1.into(), -1).unwrap(),
++            ),
++            (x().acosh(), d(1, 2), d(2, 3)),
++        ] {
++            let source = compile(&[expression], &[SymbolId(0)]);
++            assert!(
++                source
++                    .eval_dyadic(
++                        std::slice::from_ref(&boundary),
++                        -32,
++                        &mut budget(),
++                        &mut arithmetic()
++                    )
++                    .is_ok()
++            );
++            let active = source.jacobian(&[SymbolId(0)], &mut budget()).unwrap();
++            assert!(matches!(
++                active.enclose_regular(
++                    std::slice::from_ref(&boundary),
++                    -32,
++                    &mut budget(),
++                    &mut arithmetic()
++                ),
++                Err(ExpressionError::RegularityNotCertified { .. })
++            ));
++            assert!(
++                active
++                    .enclose_regular(&[interior], -32, &mut budget(), &mut arithmetic())
++                    .is_ok()
++            );
++            let inactive = source.jacobian(&[], &mut budget()).unwrap();
++            let proof = inactive
++                .enclose_regular(
++                    std::slice::from_ref(&boundary),
++                    -32,
++                    &mut budget(),
++                    &mut arithmetic(),
++                )
++                .unwrap();
++            assert_eq!(proof.arguments(), [boundary]);
++            assert_eq!(proof.program().source().definition(), source.definition());
++        }
++        let constant = compile(&[Expr::int(0).sqrt()], &[SymbolId(0)])
++            .jacobian(&[SymbolId(0)], &mut budget())
++            .unwrap();
++        assert_eq!(
++            constant
++                .enclose_regular(&[d(-1, 1)], -32, &mut budget(), &mut arithmetic())
++                .unwrap()
++                .values(),
++            [d(0, 0), d(0, 0)]
++        );
++        // Invalid source domains retain their original diagnosis.
++        let source = compile(&[x().sqrt()], &[SymbolId(0)])
++            .jacobian(&[SymbolId(0)], &mut budget())
++            .unwrap();
++        assert!(matches!(
++            source.enclose_regular(&[d(-2, -1)], -32, &mut budget(), &mut arithmetic()),
++            Err(ExpressionError::Enclosure {
++                source: IntervalError::EmptyDomain,
++                ..
++            })
++        ));
++    }
++
++    #[test]
++    fn regular_jacobian_retains_domains_values_limits_and_retry() {
++        let source = compile(&[x().powi(3) + Expr::int(2) * x()], &[SymbolId(0)]);
++        let jacobian = source.jacobian(&[SymbolId(0)], &mut budget()).unwrap();
++        let inputs = [d(1, 2)];
++        let mut graph = budget();
++        let mut scalar = arithmetic();
++        let proof = jacobian
++            .enclose_regular(&inputs, -32, &mut graph, &mut scalar)
++            .unwrap();
++        assert_eq!(proof.values(), [d(3, 12), d(5, 14)]);
++        assert_eq!(proof.precision(), -32);
++        assert_eq!(proof.program().variables(), [SymbolId(0)]);
++        let gw = budget().remaining_work() - graph.remaining_work();
++        let sw = arithmetic().remaining_work() - scalar.remaining_work();
++        assert!(
++            jacobian
++                .enclose_regular(
++                    &inputs,
++                    -32,
++                    &mut ExpressionBudget::new(1_000_000, gw),
++                    &mut DyadicBudget::new(16_384, sw)
++                )
++                .is_ok()
++        );
++        assert!(matches!(
++            jacobian.enclose_regular(
++                &inputs,
++                -32,
++                &mut ExpressionBudget::new(1_000_000, gw - 1),
++                &mut arithmetic()
++            ),
++            Err(ExpressionError::WorkExhausted)
++        ));
++        assert!(
++            jacobian
++                .enclose_regular(
++                    &inputs,
++                    -32,
++                    &mut budget(),
++                    &mut DyadicBudget::new(16_384, sw - 1)
++                )
++                .is_err()
++        );
++        let token = CancellationToken::new();
++        token.cancel();
++        let mut cancelled = budget();
++        cancelled.cancellation = Some(token);
++        assert!(matches!(
++            jacobian.enclose_regular(&inputs, -32, &mut cancelled, &mut arithmetic()),
++            Err(ExpressionError::Cancelled)
++        ));
++        assert_eq!(
++            jacobian
++                .enclose_regular(&inputs, -32, &mut budget(), &mut arithmetic())
++                .unwrap()
++                .values(),
++            proof.values()
++        );
++        // Changing caller input cannot mutate the retained domain or proof.
++        let changed = [d(9, 10)];
++        assert_ne!(
++            jacobian
++                .enclose_regular(&changed, -32, &mut budget(), &mut arithmetic())
++                .unwrap()
++                .values(),
++            proof.values()
++        );
++        assert_eq!(proof.arguments(), inputs);
++        assert!(matches!(
++            jacobian.enclose_regular(&[], -32, &mut budget(), &mut arithmetic()),
++            Err(ExpressionError::BindingCount { .. })
++        ));
++        let empty = jacobian
++            .enclose_regular(
++                &[DyadicInterval::empty()],
++                -32,
++                &mut budget(),
++                &mut arithmetic(),
++            )
++            .unwrap();
++        assert!(empty.values().iter().all(DyadicInterval::is_empty));
++    }
++}
