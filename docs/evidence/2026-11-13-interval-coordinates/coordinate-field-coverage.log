@@ -1,0 +1,320 @@
+    1|       |//! Exact state charts consumed by the existing field and Picard owners.
+    2|       |use super::{
+    3|       |    picard::{PicardFailure, PicardProposal, PicardReport, PicardStatus},
+    4|       |    *,
+    5|       |};
+    6|       |use hypersolve::expression_program::{CoordinateChange, CoordinateError, CoordinateProgram};
+    7|       |
+    8|       |/// Replay data; source, inverse proof and derivatives are revalidated on load.
+    9|       |#[derive(Clone, Debug)]
+   10|       |#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+   11|       |pub struct CoordinateFieldDefinition {
+   12|       |    /// Original field and its time/state interpretation.
+   13|       |    pub source: FieldDefinition,
+   14|       |    /// Exact state chart in the source field's state order.
+   15|       |    pub change: CoordinateChange,
+   16|       |}
+   17|       |/// Invalid state interpretation or an original construction/materialization error.
+   18|       |#[derive(Clone, Debug)]
+   19|       |pub enum CoordinateFieldError {
+   20|       |    /// The chart must name exactly the field's ordered state variables, excluding time.
+   21|       |    StateOrder,
+   22|       |    /// Original exact chart, inverse or graph diagnostic.
+   23|       |    Coordinate(CoordinateError),
+   24|       |    /// Original field, native interval or carrier diagnostic.
+   25|       |    Field(FieldError),
+   26|       |}
+   27|       |impl fmt::Display for CoordinateFieldError {
+   28|      0|    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   29|      0|        write!(f, "coordinate field: {self:?}")
+   30|      0|    }
+   31|       |}
+   32|       |impl std::error::Error for CoordinateFieldError {
+   33|      0|    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+   34|      0|        match self {
+   35|      0|            Self::Coordinate(e) => Some(e),
+   36|      0|            Self::Field(e) => Some(e),
+   37|      0|            _ => None,
+   38|       |        }
+   39|      0|    }
+   40|       |}
+   41|       |impl From<CoordinateError> for CoordinateFieldError {
+   42|      2|    fn from(e: CoordinateError) -> Self {
+   43|      2|        Self::Coordinate(e)
+   44|      2|    }
+   45|       |}
+   46|       |impl From<FieldError> for CoordinateFieldError {
+   47|      0|    fn from(e: FieldError) -> Self {
+   48|      0|        Self::Field(e)
+   49|      0|    }
+   50|       |}
+   51|       |impl From<ExpressionError> for CoordinateFieldError {
+   52|      1|    fn from(e: ExpressionError) -> Self {
+   53|      1|        Self::Field(e.into())
+   54|      1|    }
+   55|       |}
+   56|       |impl From<IntervalError> for CoordinateFieldError {
+   57|      1|    fn from(e: IntervalError) -> Self {
+   58|      1|        Self::Field(e.into())
+   59|      1|    }
+   60|       |}
+   61|       |impl From<IntervalLatticeError> for CoordinateFieldError {
+   62|      0|    fn from(e: IntervalLatticeError) -> Self {
+   63|      0|        Self::Field(e.into())
+   64|      0|    }
+   65|       |}
+   66|       |#[derive(Debug)]
+   67|       |struct CoordinateData<const N: usize> {
+   68|       |    original: ExpressionField<N>,
+   69|       |    transformation: CoordinateProgram,
+   70|       |    field: ExpressionField<N>,
+   71|       |}
+   72|       |/// Shared original field, exact state chart and transformed derivative field.
+   73|       |///
+   74|       |/// A box of new coordinates represents the exact correlated original set c+A*Y.
+   75|       |/// `source_enclosure` explicitly projects it to a Cartesian outer enclosure;
+   76|       |/// that box never replaces the authoritative chart in this object or its proofs.
+   77|       |/// Time is unchanged. This supplies fixed coordinates, not adaptive QR selection.
+   78|       |#[derive(Clone, Debug)]
+   79|       |pub struct CoordinateField<const N: usize> {
+   80|       |    data: Arc<CoordinateData<N>>,
+   81|       |}
+   82|       |impl<const N: usize> ExpressionField<N> {
+   83|       |    /// Certify x=c+A*y and construct y'=A^-1*f(t,c+A*y), retaining the association.
+   84|       |    /// Exact scalar/predicate payload and total-heap exclusions remain explicit.
+   85|     16|    pub fn in_coordinates(
+   86|     16|        &self,
+   87|     16|        change: CoordinateChange,
+   88|     16|        budget: &mut EnclosureBudget,
+   89|     16|    ) -> Result<CoordinateField<N>, CoordinateFieldError> {
+   90|     16|        budget.graph.charge(N)?;
+                                            ^0
+   91|     16|        if change.variables != self.identity().state() {
+   92|      2|            return Err(CoordinateFieldError::StateOrder);
+   93|     14|        }
+   94|     14|        let transformation = self
+                          ^12
+   95|     14|            .data
+   96|     14|            .identity
+   97|     14|            .0
+   98|     14|            .source
+   99|     14|            .change_coordinates(change, &mut budget.graph)?;
+                                                                        ^2
+  100|     12|        budget.graph.charge(N)?;
+                                            ^0
+  101|     12|        let field = Self::from_validated_source(
+  102|     12|            transformation.program().clone(),
+  103|     12|            self.data.identity.time(),
+  104|     12|            self.data.identity.state().to_vec(),
+  105|     12|            self.data.inputs.len(),
+  106|     12|            budget,
+  107|      0|        )?;
+  108|     12|        budget.graph.charge(1)?;
+                                            ^0
+  109|     12|        let result = CoordinateField {
+  110|     12|            data: Arc::new(CoordinateData {
+  111|     12|                original: self.clone(),
+  112|     12|                transformation,
+  113|     12|                field,
+  114|     12|            }),
+  115|     12|        };
+  116|     12|        budget.graph.charge(0)?;
+                                            ^0
+  117|     12|        Ok(result)
+  118|     16|    }
+  119|       |}
+  120|       |impl<const N: usize> CoordinateField<N> {
+  121|       |    /// Reconstruct the source and regenerate every inverse/derivative proof.
+  122|      4|    pub fn from_definition(
+  123|      4|        definition: CoordinateFieldDefinition,
+  124|      4|        budget: &mut EnclosureBudget,
+  125|      4|    ) -> Result<Self, CoordinateFieldError> {
+  126|      4|        ExpressionField::<N>::from_definition(definition.source, budget)?
+                                                                                      ^0
+  127|      4|            .in_coordinates(definition.change, budget)
+  128|      4|    }
+  129|       |    /// Original field, with the original state/time meaning.
+  130|      3|    pub fn original_field(&self) -> &ExpressionField<N> {
+  131|      3|        &self.data.original
+  132|      3|    }
+  133|       |    /// Exact chart, original source mapping and inverse evidence.
+  134|     56|    pub fn transformation(&self) -> &CoordinateProgram {
+  135|     56|        &self.data.transformation
+  136|     56|    }
+  137|       |    /// Owned transformed field consumable by existing Jacobian/Taylor/ODE routines.
+  138|     73|    pub fn transformed_field(&self) -> &ExpressionField<N> {
+  139|     73|        &self.data.field
+  140|     73|    }
+  141|       |    /// Cartesian enclosure of the exact image c+A*Y. Correlation stays in the chart.
+  142|       |    /// Uses the caller's grid and shared native budget; empty/unit remain distinct.
+  143|     59|    pub fn source_enclosure(
+  144|     59|        &self,
+  145|     59|        state: &BoxN<DyadicInterval, N>,
+  146|     59|        budget: &mut EnclosureBudget,
+  147|     59|    ) -> Result<BoxN<DyadicInterval, N>, CoordinateFieldError> {
+  148|     59|        budget.graph.charge(0)?;
+                                            ^0
+  149|     59|        let square = N.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
+                                                                                         ^0
+  150|     59|        budget.graph.check_entries(&[square, N, N, N])?;
+                                                                    ^0
+  151|     59|        if state.is_empty() {
+  152|      3|            let empty = BoxN::empty()?;
+                                                   ^0
+  153|      3|            budget.graph.charge(0)?;
+                                                ^0
+  154|      3|            return Ok(empty);
+  155|     56|        }
+  156|     56|        let chart = self.transformation().change();
+  157|     56|        let mut matrix = Vec::new();
+  158|     56|        let mut translation = Vec::new();
+  159|    102|        for row in &chart.to_source {
+                                 ^56
+  160|    102|            budget.graph.charge(1)?;
+                                                ^1
+  161|    101|            let mut values = Vec::new();
+  162|    203|            for value in row {
+                                       ^101
+  163|    203|                budget.graph.charge(1)?;
+                                                    ^0
+  164|    203|                values.push(DyadicInterval::from_real(
+                                     ^202
+  165|    203|                    value,
+  166|    203|                    budget.policy.precision,
+  167|    203|                    &mut budget.arithmetic,
+  168|      1|                )?);
+  169|       |            }
+  170|    100|            matrix.push(values.try_into().expect("validated chart row"));
+  171|       |        }
+  172|    100|        for value in &chart.origin {
+                                   ^54
+  173|    100|            budget.graph.charge(1)?;
+                                                ^0
+  174|    100|            translation.push(DyadicInterval::from_real(
+  175|    100|                value,
+  176|    100|                budget.policy.precision,
+  177|    100|                &mut budget.arithmetic,
+  178|      0|            )?);
+  179|       |        }
+  180|     54|        budget.graph.charge(square)?;
+                                                 ^0
+  181|     54|        let matrix = IntervalMatrix::<DyadicInterval, N, N>::new(
+  182|     54|            matrix.try_into().expect("validated chart dimension"),
+  183|      0|        )?;
+  184|     54|        budget.graph.charge(N)?;
+                                            ^0
+  185|     54|        let translation =
+  186|     54|            IntervalVector::new(translation.try_into().expect("validated translation"))?;
+                                                                                                     ^0
+  187|     54|        let result = matrix.affine_enclosure(state, &translation, &mut budget.arithmetic)?;
+                                                                                                       ^0
+  188|     54|        budget.graph.charge(0)?;
+                                            ^0
+  189|     54|        Ok(result)
+  190|     59|    }
+  191|       |    /// Verify one step in chart coordinates and transport its complete tube/end.
+  192|       |    ///
+  193|       |    /// The original initial set is c+A*proposal.initial, generally correlated.
+  194|       |    /// Existence is for that exact set, not every point of its Cartesian envelope.
+  195|       |    /// Transport failure preserves the native report but cannot publish success.
+  196|     21|    pub fn certify_step(
+  197|     21|        &self,
+  198|     21|        proposal: PicardProposal<N>,
+  199|     21|        budget: &mut EnclosureBudget,
+  200|     21|    ) -> CoordinateStep<N> {
+  201|     21|        let native = self.transformed_field().certify_step(proposal, budget);
+  202|     21|        let status = match native.status() {
+  203|     18|            PicardStatus::Certified => CoordinateStatus::Certified,
+  204|      1|            PicardStatus::Empty => CoordinateStatus::Empty,
+  205|      2|            PicardStatus::Rejected(reason) => CoordinateStatus::Rejected(reason.clone()),
+  206|       |        };
+  207|     21|        let mut result = CoordinateStep {
+  208|     21|            chart: self.clone(),
+  209|     21|            native,
+  210|     21|            status,
+  211|     21|            source_boxes: None,
+  212|     21|        };
+  213|      2|        if matches!(
+  214|     21|            result.status,
+  215|       |            CoordinateStatus::Certified | CoordinateStatus::Empty
+  216|       |        ) {
+  217|     19|            let materialized = (|| {
+  218|     19|                let initial = self.source_enclosure(&result.native.proposal().initial, budget)?;
+                                  ^18                                                                       ^1
+  219|     18|                let tube = self.source_enclosure(
+  220|     18|                    result
+  221|     18|                        .native
+  222|     18|                        .tube()
+  223|     18|                        .expect("certified or empty native tube"),
+  224|     18|                    budget,
+  225|      0|                )?;
+  226|     18|                let end = self.source_enclosure(
+  227|     18|                    result
+  228|     18|                        .native
+  229|     18|                        .end_enclosure()
+  230|     18|                        .expect("certified or empty native report"),
+  231|     18|                    budget,
+  232|      0|                )?;
+  233|     18|                budget.graph.charge(1)?;
+                                                    ^0
+  234|     18|                Ok::<_, CoordinateFieldError>((initial, tube, end))
+  235|       |            })();
+  236|     19|            match materialized {
+  237|     18|                Ok(boxes) => result.source_boxes = Some(boxes),
+  238|      1|                Err(e) => result.status = CoordinateStatus::TransportFailed(e),
+  239|       |            }
+  240|      2|        }
+  241|     21|        result
+  242|     21|    }
+  243|       |}
+  244|       |/// Whole chart step status, including final original-coordinate materialization.
+  245|       |#[derive(Clone, Debug)]
+  246|       |pub enum CoordinateStatus {
+  247|       |    /// The transformed proof and original-coordinate tube/end transport succeeded.
+  248|       |    Certified,
+  249|       |    /// The original initial set is empty; no existence claim is made.
+  250|       |    Empty,
+  251|       |    /// Original native proposal failure, retained without relabeling.
+  252|       |    Rejected(PicardFailure),
+  253|       |    /// Native proof exists, but final original-coordinate output could not be completed.
+  254|       |    TransportFailed(CoordinateFieldError),
+  255|       |}
+  256|       |/// Native Picard proof and exact chart association, with explicit outer projections.
+  257|       |#[derive(Clone, Debug)]
+  258|       |pub struct CoordinateStep<const N: usize> {
+  259|       |    chart: CoordinateField<N>,
+  260|       |    native: PicardReport<N>,
+  261|       |    status: CoordinateStatus,
+  262|       |    source_boxes: Option<(
+  263|       |        BoxN<DyadicInterval, N>,
+  264|       |        BoxN<DyadicInterval, N>,
+  265|       |        BoxN<DyadicInterval, N>,
+  266|       |    )>,
+  267|       |}
+  268|       |impl<const N: usize> CoordinateStep<N> {
+  269|       |    /// Retained original/transformed field association and inverse proof.
+  270|      1|    pub fn chart(&self) -> &CoordinateField<N> {
+  271|      1|        &self.chart
+  272|      1|    }
+  273|       |    /// Full native attempt, including its own local status and intermediate evidence.
+  274|      3|    pub fn native(&self) -> &PicardReport<N> {
+  275|      3|        &self.native
+  276|      3|    }
+  277|       |    /// Whole-step status; native success alone does not establish transported success.
+  278|     12|    pub fn status(&self) -> &CoordinateStatus {
+  279|     12|        &self.status
+  280|     12|    }
+  281|       |    /// Cartesian envelope of the exact correlated original initial set.
+  282|      2|    pub fn source_initial_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
+  283|      2|        self.source_boxes.as_ref().map(|v| &v.0)
+  284|      2|    }
+  285|       |    /// Original-coordinate trajectory envelope, only after all transport succeeds.
+  286|      4|    pub fn source_tube(&self) -> Option<&BoxN<DyadicInterval, N>> {
+  287|      4|        self.source_boxes.as_ref().map(|v| &v.1)
+  288|      4|    }
+  289|       |    /// Original-coordinate endpoint envelope, only after all transport succeeds.
+  290|     19|    pub fn source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
+  291|     19|        self.source_boxes.as_ref().map(|v| &v.2)
+  292|     19|    }
+  293|       |}
+
