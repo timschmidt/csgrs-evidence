@@ -1,0 +1,527 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 5f321908f..5a1fb6708 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -2900,6 +2900,67 @@ Source commit `728ea5d7d63f9d98e9cf44fbeb55202d8fffa423`; evidence commit
+ `18cbe6601bff2737896a5f74b7946f0470492f14d8d22085288a44005e03c3fd`. The committed record was regenerated and verified;
+ every previous archive row remains unchanged.
+ 
++## 2026-11-12: exact zero uses a compact dyadic grid
++
++The preceding turn completed the authored affine-source bridge. Baseline
++`6bd212482843261c9d514fdff3fe9b5b5bd2deac`, all four managed trees clean.
++The new scalar acceptance witness reproduces SizeExhausted when adding zero to
++a compact value at exponent i32::MIN. Owner: Hyperinterval's private dyadic
++alignment (P1–P7, P18–P20, P35–P37; plan Phases 3 and 6). The admission and
++raw results are staged at `/tmp/interval-refactor/dyadic-zero-grid`.
++
++Kept as a resource-completion fix: common-grid operations use the nonzero
++operand's exponent when the other operand is exactly zero. Alignment reserves
++two work units before copying zero without a shift; its magnitude needs zero
++bits on any grid. All five shared-grid sites use one private helper. Merely
++zero-containing intervals keep ordinary alignment and exhaustion. Empty paths,
++left/right reservation order, Bounds predicates, division preconditions and
++normalization remain unchanged. There are no Hyperlimit policy or dispatch
++calls in this path. Nonzero budget formulas are unchanged; the deliberately
++smaller mixed-zero charges reflect work that is no longer performed. This is
++not a behavior-preserving refactor or a new resource/cancellation mechanism.
++
++Five scalar tests cover 1,320 small signed intervals across eleven exponents,
++all nine affected binary operations in both orders, zero regridding, true
++nonzero extreme-gap exhaustion, empty identities, 1/7/64/257-bit mantissas,
++every insufficient work budget and fresh retry, independent integer arithmetic
++expectations for 2,025 nonzero pairs, and fresh-process replay followed by
++further operations. Downstream authored and translated zero-centered sources,
++identity maps and accumulated sums complete at both exponent extremes.
++The initial test compilation error (missing BigInt type annotation) is retained
++alongside its correction; no failing arithmetic witness or budget was weakened.
++
++All twelve selected checks pass: Rust 1.88/stable dyadic suites (71 tests and
++doctests each), Rust 1.95 all-feature scalar debug/release suites (188 each),
++the all-feature interval-lattice suite (84), Hyperlattice's interval surface
++(7), strict all-target Clippy, docs, ARM and Wasm no_std compilation, root fmt
++and diff checks. ASan passes five scalar and two dyadic affine tests. The
++compile checks are not Wasm execution or hardware qualification. No new full
++coverage, fuzz, formal proof or complete pre-push matrix claim is made.
++
++Matched local probes preserve all 60 serialized sum/difference/hull/intersection
++outputs and nonzero work charges. The primary runs use identical registry
++versions/checksums from the repository lock; the initial alternate-dependency
++runs are retained separately and do not supply the primary claims. Each case
++has 64 warmups and 30 samples of 4,096 completed/materialized/dropped outputs,
++pinned to CPU 0 without frequency control. Sixteen additional extreme-zero
++cases complete only on the candidate; an old exhausted attempt is not counted
++as a successful baseline. Ordinary nonzero median timing ratios range from
++0.855 to 1.009; this short sequential probe is not a global speedup or
++no-regression claim. For [-3,7]*2^e plus zero, e=-17/+17, work falls from
++48/84 to 16 units; measured allocations remain two (16 bytes). Hull uses four
++allocations (32 bytes), intersection two (16 bytes). The probe executable grows
++from 524,952 to 526,112 bytes (+1,160); this lower-priority cost is retained for
++new exact completion. Peak temporary memory, stack and monomorphized size are
++unmeasured. Input construction is outside the timed/accounted scope.
++
++This repairs scalar zero alignment and its tested downstream compositions.
++All broader Phase 3/6 qualification and adoption gaps, the earlier solver and
++firmware migration blockers, and the remaining 15-phase goal stay open.
++No Interface or firmware source changed; no push was attempted.
++
++DYADIC_ZERO_GRID_ARCHIVE_PENDING
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 8c46cce5a..3392ef602 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Keep exact zero on the other dyadic operand's grid for arithmetic, set
++  operations and comparisons. Zero regridding and extreme-scale compositions
++  no longer reserve storage for an irrelevant exponent gap; work and size
++  exhaustion remain explicit.
++
+ - Add tight fixed-point division by an exact signed integer, including divisors
+   outside the fixed-point value range and signed extremes, with allocation-free
+   arithmetic and checked replay into further operations.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index bf718285f..352b5f42c 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -143,7 +143,10 @@ refusals retain the typed `Problem` in `IntervalError::Scalar` and `source()`.
+ This guard is not a cumulative work, memory-byte or cancellation budget. The
+ `dyadic` feature is allocation-enabled `no_std` on Rust 1.88: its BigInt
+ mantissas share an exponent, with explicit budgets for arithmetic and scale
+-changes. `hyperreal` enables both carriers and their certified Real bridge;
++changes. Common-grid arithmetic, set operations and comparisons keep exact
++zero on the other operand's grid; zero copies consume work without reserving
++bits for a shift. An interval that merely contains zero still uses ordinary
++alignment accounting. `hyperreal` enables both carriers and their certified Real bridge;
+ `real-ball` adds exact symbolic centers with nonnegative rational radii.
+ 
+ Dyadic width, midpoint and radius return exact singleton intervals, or empty
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 81f84d3bc..3a84a9867 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -70,6 +70,9 @@ impl DyadicBudget {
+ /// up to the exponent's maximum; zero and empty have canonical exponent zero.
+ /// Normalization preserves the set, not the originally requested grid tag.
+ /// Arithmetic is exact except explicitly outward-rounded division/regridding.
++/// Common-grid operations keep exact zero on the other operand's grid. Copying
++/// zero still consumes work, but requires no magnitude-bit shift reservation;
++/// an interval that merely contains zero receives ordinary alignment accounting.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct DyadicInterval {
+     bounds: Option<Bounds<BigInt>>,
+@@ -343,7 +346,22 @@ impl DyadicInterval {
+         self.bounds().map_or(0, |(a, b, _)| a.bits().max(b.bits()))
+     }
+ 
+-    // Align exactly to a no-coarser grid. Reserve before cloning or shifting.
++    // Nonempty operands share the finer grid unless one is exactly zero.
++    // Canonical zero has exponent zero and is representable on every grid.
++    fn common_exponent(&self, other: &Self) -> i32 {
++        if self.exponent == other.exponent {
++            self.exponent
++        } else if self.exponent == 0 && self.bits() == 0 {
++            other.exponent
++        } else if other.exponent == 0 && other.bits() == 0 {
++            self.exponent
++        } else {
++            self.exponent.min(other.exponent)
++        }
++    }
++
++    // Align exactly to a no-coarser grid (zero permits any grid).
++    // Reserve before cloning or shifting.
+     fn align(
+         &self,
+         exponent: i32,
+@@ -352,10 +370,14 @@ impl DyadicInterval {
+         let Some((a, b, e)) = self.bounds() else {
+             return Ok(None);
+         };
++        let bits = self.bits();
++        if bits == 0 {
++            budget.reserve(0, 2, false)?;
++            return Ok(Some(Bounds::new(a.clone(), b.clone())?));
++        }
+         let shift = u64::try_from(i64::from(e) - i64::from(exponent))
+             .map_err(|_| IntervalError::InvalidScale)?;
+-        let bits = self
+-            .bits()
++        let bits = bits
+             .checked_add(shift)
+             .ok_or(IntervalError::SizeExhausted)?;
+         budget.reserve(bits, 2, false)?;
+@@ -405,7 +427,7 @@ impl DyadicInterval {
+         if self.is_empty() || other.is_empty() {
+             return Ok(Self::empty());
+         }
+-        let exponent = self.exponent.min(other.exponent);
++        let exponent = self.common_exponent(other);
+         let (a, b) = self
+             .align(exponent, budget)?
+             .expect("nonempty input")
+@@ -476,7 +498,7 @@ impl DyadicInterval {
+         if self.is_empty() || other.is_empty() {
+             return Ok(Self::empty());
+         }
+-        let exponent = self.exponent.min(other.exponent);
++        let exponent = self.common_exponent(other);
+         let a = self.align(exponent, budget)?.expect("nonempty input");
+         let b = other.align(exponent, budget)?.expect("nonempty input");
+         let selected = if maximum {
+@@ -632,7 +654,7 @@ impl DyadicInterval {
+         } else if other.is_empty() {
+             self.exponent
+         } else {
+-            self.exponent.min(other.exponent)
++            self.common_exponent(other)
+         };
+         let a = self.align(exponent, budget)?;
+         let b = other.align(exponent, budget)?;
+@@ -661,7 +683,7 @@ impl DyadicInterval {
+         if self.is_empty() || other.is_empty() {
+             return Ok(Self::empty());
+         }
+-        let exponent = self.exponent.min(other.exponent);
++        let exponent = self.common_exponent(other);
+         let a = self.align(exponent, budget)?.expect("nonempty input");
+         let b = other.align(exponent, budget)?.expect("nonempty input");
+         match a.as_refs().intersection(b.as_refs()) {
+@@ -714,7 +736,7 @@ impl DyadicInterval {
+         if other.is_empty() {
+             return Ok(false);
+         }
+-        let exponent = self.exponent.min(other.exponent);
++        let exponent = self.common_exponent(other);
+         let a = self.align(exponent, budget)?.expect("nonempty input");
+         let b = other.align(exponent, budget)?.expect("nonempty input");
+         Ok(if left {
+diff --git a/crates/hyperinterval/tests/dyadic_zero_grid.rs b/crates/hyperinterval/tests/dyadic_zero_grid.rs
+new file mode 100644
+index 000000000..c530b9862
+--- /dev/null
++++ b/crates/hyperinterval/tests/dyadic_zero_grid.rs
+@@ -0,0 +1,269 @@
++#![cfg(feature = "dyadic")]
++use hyperinterval::{DyadicBudget, DyadicInterval as D, IntervalError};
++
++fn d(a: i32, b: i32, e: i32) -> D {
++    D::new(a.into(), b.into(), e).unwrap()
++}
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(64, 1000)
++}
++
++#[test]
++fn zero_does_not_force_an_irrelevant_grid() {
++    let zero = d(0, 0, 0);
++    for exponent in [
++        i32::MIN,
++        i32::MIN + 1,
++        -1000,
++        -17,
++        -1,
++        0,
++        1,
++        17,
++        1000,
++        i32::MAX - 1,
++        i32::MAX,
++    ] {
++        for a in -7..=7 {
++            for b in a..=7 {
++                let x = d(a, b, exponent);
++                assert_eq!(x.add(&zero, &mut budget()).unwrap(), x);
++                assert_eq!(zero.add(&x, &mut budget()).unwrap(), x);
++                assert_eq!(x.sub(&zero, &mut budget()).unwrap(), x);
++                assert_eq!(zero.sub(&x, &mut budget()).unwrap(), d(-b, -a, exponent));
++                let hull = d(a.min(0), b.max(0), exponent);
++                assert_eq!(x.hull(&zero, &mut budget()).unwrap(), hull);
++                assert_eq!(zero.hull(&x, &mut budget()).unwrap(), hull);
++                let intersection = if a <= 0 && b >= 0 {
++                    zero.clone()
++                } else {
++                    D::empty()
++                };
++                assert_eq!(x.intersection(&zero, &mut budget()).unwrap(), intersection);
++                assert_eq!(zero.intersection(&x, &mut budget()).unwrap(), intersection);
++                assert_eq!(
++                    x.min_image(&zero, &mut budget()).unwrap(),
++                    d(a.min(0), b.min(0), exponent)
++                );
++                assert_eq!(
++                    zero.min_image(&x, &mut budget()).unwrap(),
++                    d(a.min(0), b.min(0), exponent)
++                );
++                assert_eq!(
++                    x.max_image(&zero, &mut budget()).unwrap(),
++                    d(a.max(0), b.max(0), exponent)
++                );
++                assert_eq!(
++                    zero.max_image(&x, &mut budget()).unwrap(),
++                    d(a.max(0), b.max(0), exponent)
++                );
++                assert_eq!(zero.subset_of(&x, &mut budget()).unwrap(), a <= 0 && b >= 0);
++                assert_eq!(x.subset_of(&zero, &mut budget()).unwrap(), a == 0 && b == 0);
++                assert_eq!(
++                    zero.interior_subset_of(&x, &mut budget()).unwrap(),
++                    a < 0 && b > 0
++                );
++                assert!(!x.interior_subset_of(&zero, &mut budget()).unwrap());
++                assert_eq!(zero.strictly_left_of(&x, &mut budget()).unwrap(), a > 0);
++                assert_eq!(x.strictly_left_of(&zero, &mut budget()).unwrap(), b < 0);
++            }
++        }
++        assert_eq!(zero.regrid(exponent, &mut budget()).unwrap(), zero);
++    }
++}
++
++#[test]
++fn genuinely_distinct_nonzero_scales_still_exhaust() {
++    let tiny = d(1, 1, i32::MIN);
++    let huge = d(1, 1, i32::MAX);
++    for result in [
++        huge.add(&tiny, &mut budget()),
++        huge.sub(&tiny, &mut budget()),
++        huge.hull(&tiny, &mut budget()),
++    ] {
++        assert_eq!(result, Err(IntervalError::SizeExhausted));
++    }
++    assert_eq!(
++        d(-1, 1, 0).add(&tiny, &mut budget()),
++        Err(IntervalError::SizeExhausted)
++    );
++    assert_eq!(
++        d(0, 1, 0).sub(&tiny, &mut budget()),
++        Err(IntervalError::SizeExhausted)
++    );
++    let empty = D::empty();
++    assert_eq!(
++        empty.add(&huge, &mut DyadicBudget::new(0, 0)).unwrap(),
++        empty
++    );
++    assert_eq!(
++        empty
++            .intersection(&tiny, &mut DyadicBudget::new(0, 0))
++            .unwrap(),
++        empty
++    );
++}
++
++// Every operation retains its own result type; comparisons are mapped to a
++// point only in this test dispatcher so the resource sweep can share a loop.
++fn operation(which: usize, a: &D, b: &D, budget: &mut DyadicBudget) -> Result<D, IntervalError> {
++    match which {
++        0 => a.add(b, budget),
++        1 => a.sub(b, budget),
++        2 => a.hull(b, budget),
++        3 => a.intersection(b, budget),
++        4 => a.min_image(b, budget),
++        5 => a.max_image(b, budget),
++        6 => a
++            .subset_of(b, budget)
++            .map(|v| d(i32::from(v), i32::from(v), 0)),
++        7 => a
++            .interior_subset_of(b, budget)
++            .map(|v| d(i32::from(v), i32::from(v), 0)),
++        8 => a
++            .strictly_left_of(b, budget)
++            .map(|v| d(i32::from(v), i32::from(v), 0)),
++        _ => unreachable!(),
++    }
++}
++
++#[test]
++fn work_thresholds_large_mantissas_and_retry() {
++    use num_bigint::BigInt;
++    let zero = d(0, 0, 0);
++    for bits in [1, 7, 64, 257] {
++        let magnitude: BigInt = (BigInt::from(1) << bits) - 1;
++        for exponent in [i32::MIN, -17, 0, 17, i32::MAX] {
++            for (lo, hi) in [
++                (-&magnitude, magnitude.clone()),
++                (magnitude.clone(), magnitude.clone()),
++            ] {
++                let x = D::new(lo, hi, exponent).unwrap();
++                let before = x.clone();
++                for (a, b) in [(&x, &zero), (&zero, &x)] {
++                    for which in 0..9 {
++                        let mut ample = DyadicBudget::new(258, 10000);
++                        let expected = operation(which, a, b, &mut ample).unwrap();
++                        let cost = 10000 - ample.remaining_work();
++                        assert!(cost > 0);
++                        for work in 0..cost {
++                            assert_eq!(
++                                operation(which, a, b, &mut DyadicBudget::new(258, work)),
++                                Err(IntervalError::WorkExhausted)
++                            );
++                        }
++                        assert_eq!(
++                            operation(which, a, b, &mut DyadicBudget::new(258, cost)).unwrap(),
++                            expected
++                        );
++                        // The mantissa still has to fit; zero does not bypass
++                        // the size contract for the nonzero operand.
++                        assert_eq!(
++                            operation(which, a, b, &mut DyadicBudget::new(0, 10000)),
++                            Err(IntervalError::SizeExhausted)
++                        );
++                    }
++                }
++                assert_eq!(x, before);
++                assert_eq!(
++                    zero.add(&x, &mut DyadicBudget::new(bits + 1, 10000))
++                        .unwrap(),
++                    x
++                );
++            }
++        }
++    }
++    for exponent in [i32::MIN, -1, 0, 1, i32::MAX] {
++        let cost = if exponent <= 0 { 2 } else { 4 };
++        for work in 0..cost {
++            assert_eq!(
++                zero.regrid(exponent, &mut DyadicBudget::new(0, work)),
++                Err(IntervalError::WorkExhausted)
++            );
++        }
++        assert_eq!(
++            zero.regrid(exponent, &mut DyadicBudget::new(0, cost))
++                .unwrap(),
++            zero
++        );
++    }
++}
++
++#[test]
++fn nonzero_addition_preserves_exact_output_and_accounting() {
++    // Independently align small signed integers on an i64 grid. No scalar
++    // arithmetic or interval wrapper supplies the expectation.
++    for e in -7..=7 {
++        for f in -7..=7 {
++            for (a, b) in [(-7, -1), (-3, 5), (1, 7)] {
++                for (c, z) in [(-5, -3), (-1, 3), (3, 7)] {
++                    let x = d(a, b, e);
++                    let y = d(c, z, f);
++                    let grid = e.min(f);
++                    let values = [
++                        i64::from(a) << (e - grid),
++                        i64::from(b) << (e - grid),
++                        i64::from(c) << (f - grid),
++                        i64::from(z) << (f - grid),
++                    ];
++                    let [aa, bb, cc, dd] = values;
++                    let bits = |v: i32| u64::from(32 - v.unsigned_abs().leading_zeros());
++                    let left = bits(a).max(bits(b)) + (e - grid) as u64;
++                    let right = bits(c).max(bits(z)) + (f - grid) as u64;
++                    let cost = 2 * (left + right + left.max(right) + 1);
++                    let mut budget = DyadicBudget::new(64, cost);
++                    assert_eq!(
++                        x.add(&y, &mut budget).unwrap(),
++                        D::new((aa + cc).into(), (bb + dd).into(), grid).unwrap()
++                    );
++                    assert_eq!(budget.remaining_work(), 0);
++                    let mut budget = DyadicBudget::new(64, cost);
++                    assert_eq!(
++                        x.sub(&y, &mut budget).unwrap(),
++                        D::new((aa - dd).into(), (bb - cc).into(), grid).unwrap()
++                    );
++                    assert_eq!(budget.remaining_work(), 0);
++                }
++            }
++        }
++    }
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replay_then_operation() {
++    const CHILD: &str = "HYPERINTERVAL_ZERO_GRID_REPLAY";
++    if let Ok(encoded) = std::env::var(CHILD) {
++        let values: Vec<D> = serde_json::from_str(&encoded).unwrap();
++        assert_eq!(serde_json::to_string(&values).unwrap(), encoded);
++        for (index, exponent) in [i32::MIN, -17, 0, 17, i32::MAX].into_iter().enumerate() {
++            let x = &values[index];
++            assert_eq!(*x, d(-3, 7, exponent));
++            assert_eq!(x.add(&d(0, 0, 0), &mut budget()).unwrap(), *x);
++            assert_eq!(
++                x.intersection(&d(0, 0, 0), &mut budget()).unwrap(),
++                d(0, 0, 0)
++            );
++        }
++        return;
++    }
++    let values: Vec<_> = [i32::MIN, -17, 0, 17, i32::MAX]
++        .into_iter()
++        .map(|e| d(-3, 7, e))
++        .collect();
++    let output = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "fresh_process_replay_then_operation",
++            "--nocapture",
++        ])
++        .env(CHILD, serde_json::to_string(&values).unwrap())
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/centered_affine.rs b/crates/hyperlattice-interval/tests/centered_affine.rs
+index 998af906d..a97df8e63 100644
+--- a/crates/hyperlattice-interval/tests/centered_affine.rs
++++ b/crates/hyperlattice-interval/tests/centered_affine.rs
+@@ -368,3 +368,43 @@ fn dyadic_sources_and_shared_retry() {
+         result
+     );
+ }
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn dyadic_zero_centers_and_extreme_scale_accumulators() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I};
++    let point = |v: i32, e| I::point(v.into(), e).unwrap();
++    let budget = || DyadicBudget::new(64, 10000);
++    for exponent in [i32::MIN, -1000, 0, 1000, i32::MAX] {
++        let form = CenteredVector::new(
++            IntervalVector::new([point(0, 0), point(0, 0)]).unwrap(),
++            IntervalVector::new([point(1, exponent), point(3, exponent)]).unwrap(),
++        )
++        .unwrap();
++        let expected = IntervalVector::new([
++            I::new((-1).into(), 1.into(), exponent).unwrap(),
++            I::new((-3).into(), 3.into(), exponent).unwrap(),
++        ])
++        .unwrap();
++        assert_eq!(form.enclosure(&mut budget()).unwrap(), expected);
++        let source = form.affine_source(&mut budget()).unwrap();
++        assert_eq!(source.enclosure(&mut budget()).unwrap(), expected);
++        let identity = AffineMap::new(
++            IntervalMatrix::new([[point(1, 0), point(0, 0)], [point(0, 0), point(1, 0)]]).unwrap(),
++            IntervalVector::new([point(0, 0), point(0, 0)]).unwrap(),
++        )
++        .unwrap();
++        let image = identity.image(source);
++        assert_eq!(image.enclosure(&mut budget()).unwrap(), expected);
++        let sum = AffineMap::new(
++            IntervalMatrix::new([[point(1, 0), point(1, 0)]]).unwrap(),
++            IntervalVector::new([point(0, 0)]).unwrap(),
++        )
++        .unwrap()
++        .image(image);
++        assert_eq!(
++            sum.enclosure(&mut budget()).unwrap(),
++            IntervalVector::new([I::new((-4).into(), 4.into(), exponent).unwrap(),]).unwrap()
++        );
++    }
++}
