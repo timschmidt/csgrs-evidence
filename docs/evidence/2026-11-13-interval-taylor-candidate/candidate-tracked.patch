@@ -1,0 +1,168 @@
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 0bb57fd70..f89c73b52 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -25,6 +25,8 @@ mod affine;
+ pub use affine::{AffineParameterization, AffineProgram};
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
++mod taylor;
++pub use taylor::{CoefficientProgram, CoefficientRequest, TaylorError};
+ 
+ /// An operation on two expressions, preserving left-to-right evaluation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/hypersolve/src/expression_program/jacobian.rs b/crates/hypersolve/src/expression_program/jacobian.rs
+index ba14f35b3..47164ecab 100644
+--- a/crates/hypersolve/src/expression_program/jacobian.rs
++++ b/crates/hypersolve/src/expression_program/jacobian.rs
+@@ -136,60 +136,8 @@ impl ExpressionProgram {
+                 if uses[index] == 0 {
+                     continue;
+                 }
+-                derivatives[index] = match node {
+-                    ExpressionNode::Constant(_) => zero,
+-                    ExpressionNode::Variable(reference) => {
+-                        if reference.id == *variable {
+-                            one
+-                        } else {
+-                            zero
+-                        }
+-                    }
+-                    ExpressionNode::Unary { operation, input } => {
+-                        let derivative = derivatives[*input];
+-                        if derivative == zero {
+-                            zero
+-                        } else {
+-                            let template = unary(*operation, Expr::anonymous_symbol(SymbolId(0)));
+-                            let partial = builder.partial(template, 0, &[*input], zero, one)?;
+-                            builder.chain(partial, derivative, zero, one)?
+-                        }
+-                    }
+-                    ExpressionNode::Binary {
+-                        operation,
+-                        left,
+-                        right,
+-                    } => {
+-                        let mut terms = [zero; 2];
+-                        for (column, input) in [*left, *right].into_iter().enumerate() {
+-                            let derivative = derivatives[input];
+-                            if derivative != zero {
+-                                let template = binary(
+-                                    *operation,
+-                                    Expr::anonymous_symbol(SymbolId(0)),
+-                                    Expr::anonymous_symbol(SymbolId(1)),
+-                                );
+-                                let partial = builder.partial(
+-                                    template,
+-                                    column as u32,
+-                                    &[*left, *right],
+-                                    zero,
+-                                    one,
+-                                )?;
+-                                terms[column] = builder.chain(partial, derivative, zero, one)?;
+-                            }
+-                        }
+-                        match terms {
+-                            [a, b] if a == zero => b,
+-                            [a, b] if b == zero => a,
+-                            [left, right] => builder.push(ExpressionNode::Binary {
+-                                operation: BinaryOperation::Add,
+-                                left,
+-                                right,
+-                            })?,
+-                        }
+-                    }
+-                };
++                derivatives[index] =
++                    builder.derive_node(node, *variable, |input| derivatives[input], zero, one)?;
+             }
+             for &root in &source.outputs {
+                 builder.budget.charge(1)?;
+@@ -206,13 +154,13 @@ impl ExpressionProgram {
+     }
+ }
+ 
+-struct Builder<'a> {
+-    definition: ExpressionDefinition,
+-    outputs: usize,
+-    budget: &'a mut ExpressionBudget,
++pub(super) struct Builder<'a> {
++    pub(super) definition: ExpressionDefinition,
++    pub(super) outputs: usize,
++    pub(super) budget: &'a mut ExpressionBudget,
+ }
+ impl Builder<'_> {
+-    fn push(&mut self, node: ExpressionNode) -> Result<usize, ExpressionError> {
++    pub(super) fn push(&mut self, node: ExpressionNode) -> Result<usize, ExpressionError> {
+         self.budget.entries(&[
+             self.definition.variables.len(),
+             self.definition.nodes.len(),
+@@ -224,6 +172,68 @@ impl Builder<'_> {
+         self.definition.nodes.push(node);
+         Ok(index)
+     }
++    // Reuse exactly the same local derivative authority for first partials and
++    // demanded higher partials. Inlining preserves the original Jacobian loop.
++    #[inline(always)]
++    pub(super) fn derive_node(
++        &mut self,
++        node: &ExpressionNode,
++        variable: SymbolId,
++        derivative: impl Fn(usize) -> usize,
++        zero: usize,
++        one: usize,
++    ) -> Result<usize, ExpressionError> {
++        Ok(match node {
++            ExpressionNode::Constant(_) => zero,
++            ExpressionNode::Variable(reference) => {
++                if reference.id == variable {
++                    one
++                } else {
++                    zero
++                }
++            }
++            ExpressionNode::Unary { operation, input } => {
++                let derivative = derivative(*input);
++                if derivative == zero {
++                    zero
++                } else {
++                    let template = unary(*operation, Expr::anonymous_symbol(SymbolId(0)));
++                    let partial = self.partial(template, 0, &[*input], zero, one)?;
++                    self.chain(partial, derivative, zero, one)?
++                }
++            }
++            ExpressionNode::Binary {
++                operation,
++                left,
++                right,
++            } => {
++                let mut terms = [zero; 2];
++                for (column, input) in [*left, *right].into_iter().enumerate() {
++                    let derivative = derivative(input);
++                    if derivative != zero {
++                        let template = binary(
++                            *operation,
++                            Expr::anonymous_symbol(SymbolId(0)),
++                            Expr::anonymous_symbol(SymbolId(1)),
++                        );
++                        let partial =
++                            self.partial(template, column as u32, &[*left, *right], zero, one)?;
++                        terms[column] = self.chain(partial, derivative, zero, one)?;
++                    }
++                }
++                match terms {
++                    [a, b] if a == zero => b,
++                    [a, b] if b == zero => a,
++                    [left, right] => self.push(ExpressionNode::Binary {
++                        operation: BinaryOperation::Add,
++                        left,
++                        right,
++                    })?,
++                }
++            }
++        })
++    }
++
+     fn chain(
+         &mut self,
+         partial: usize,
