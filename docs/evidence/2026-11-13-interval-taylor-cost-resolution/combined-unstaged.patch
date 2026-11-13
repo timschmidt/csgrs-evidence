@@ -1,0 +1,382 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 3a1ebb0be..63d4d9d7f 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add optional midpoint-centered field Taylor models, retaining exact source,
++  time/state bindings, coefficient/remainder evidence and native images.
++  Subdomain reuse preserves the original grid and global remainder. Empty/unit
++  products, shared budgets and typed failures remain explicit.
++
+ - Add optional finite endpoint covers with explicit infinity-norm epsilon
+   thickening, exact initial partitions and retained whole-cell/prefix evidence.
+   Outward endpoint transport is checked before continuation and final publication.
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 8f8ccb156..55f4937cb 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -15,6 +15,7 @@ all-features = true
+ 
+ [features]
+ default = []
++taylor-model = ["field", "hypersolve/taylor-model"]
+ reachability = ["field"]
+ rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+ field = ["dep:hyperinterval", "dep:hyperlattice-interval", "hypersolve/interval-program"]
+@@ -43,3 +44,7 @@ required-features = ["rk-proposal"]
+ [[example]]
+ name = "reachability"
+ required-features = ["reachability"]
++
++[[example]]
++name = "taylor_model"
++required-features = ["taylor-model"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 9d13ebded..5ed72f7ab 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -26,6 +26,19 @@ serialization, scalar payload cloning, Hyperreal constant refinement and heap
+ bytes remain outside total-work accounting. These counters do not yet provide
+ whole-work or total-heap bounds.
+ 
++Enable `taylor-model` for `field.taylor_model(request, budget)`. The request
++specifies a time/state box and total polynomial degree; each exact midpoint
++defines the center. Hypersolve constructs exact coefficients and a certified
++finite remainder. The result retains the original field identity, request,
++coefficient/remainder evidence and native image. `enclose_on` consumes subdomains
++with the retained grid and global remainder, preserving empty/unit products.
++Source replay reconstructs the proof. This certifies a field image; flow
++existence, model composition and wrapping control require additional work.
++
++```sh
++cargo run -p hyperdynamics --features taylor-model --example taylor_model
++```
++
+ `ExpressionField::certify_step` checks a proposed Picard self-map and contraction,
+ returning source-bound tube and endpoint evidence or a typed rejection.
+ `ExpressionField::integrate` searches bounded expansions and step halvings on a
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 46cda9c18..fe62c6858 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -476,3 +476,7 @@ pub mod proposal;
+ /// Finite source-bound endpoint covers with explicit infinity-norm accuracy.
+ #[cfg(feature = "reachability")]
+ pub mod reachability;
++
++/// Exact centered field polynomials with certified finite remainders.
++#[cfg(feature = "taylor-model")]
++pub mod taylor;
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 5dbfe509c..8d8282cba 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,12 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add optional demanded sparse normalized partials and exact-coefficient Taylor
++  models with explicit certified remainders, source guards and analytic-domain
++  evidence. Subdomain reuse preserves the global remainder; replay rebuilds
++  coefficients and proof from original definitions. Graph/native budgets retain
++  scalar-refinement and heap-byte exclusions.
++
+ - Add graph-bounded `ExpressionProgram::jacobian` construction through the
+   existing symbolic derivative rules and shared source references. Retain source
+   guards, ordered variables and replay by regeneration. This does not establish
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 5890d281a..7ff34a7d8 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -43,6 +43,7 @@ serde_json = "1.0.149"
+ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
++taylor-model = ["interval-program"]
+ float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 2d7daa8b5..768b11c3b 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -69,6 +69,18 @@ accounting. This is an interval expression evaluator, not a validated ODE solver
+ Run `cargo run -p hypersolve --features interval-program --example enclosed_program`
+ for an oscillator image and source-bound symbolic-Jacobian enclosure.
+ 
++`taylor-model` adds demanded normalized mixed partials through
++`ExpressionProgram::coefficients` and centered exact-coefficient models through
++`taylor_model`. Supply an exact singleton dyadic center, a finite box, total
++polynomial degree and enclosure grid. The model retains exact `Real` coefficients,
++source regularity and every degree-(n+1) contribution to a certified remainder.
++Its image includes that remainder and intersects an independent natural source
++enclosure. Subdomain reuse retains the original global remainder and grid;
++replay regenerates evidence from the source and request. This requires the
++current primitive grammar's open analytic domains, which can be stricter than
++value evaluation. Empty products remain explicit. Structural/native arithmetic
++budgets retain the scalar-refinement and heap-byte exclusions above.
++
+ `float-proposal-program` adds `ExpressionProgram::float_proposal` and a prepared
+ `FloatProposalProgram::estimate` view. Demanded constants are projected once;
+ ordered bindings, original domain guards and shared nodes remain in the schedule.
+diff --git a/crates/hypersolve/benches/support/benchmark_report.rs b/crates/hypersolve/benches/support/benchmark_report.rs
+index 642f7c0f9..8e09e9aa7 100644
+--- a/crates/hypersolve/benches/support/benchmark_report.rs
++++ b/crates/hypersolve/benches/support/benchmark_report.rs
+@@ -465,7 +465,27 @@ mod tests {
+     fn manifest_catalog_matches_registered_targets() {
+         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+         let suites = super::read_bench_suites(root).unwrap();
+-        assert_eq!(suites.len(), 6);
++        assert_eq!(
++            suites
++                .iter()
++                .map(|suite| suite.name.as_str())
++                .collect::<Vec<_>>(),
++            [
++                "algebraic_fiber",
++                "certification",
++                "competitive",
++                "dispatch_trace",
++                "expression_program",
++                "representations",
++                "retained_fuzz",
++            ]
++        );
++        let expressions = suites
++            .iter()
++            .find(|suite| suite.name == "expression_program")
++            .unwrap();
++        assert!(expressions.criterion);
++        assert_eq!(expressions.required_features, ["expression-program"]);
+         assert!(suites.iter().any(|suite| suite.name == "competitive"));
+         assert!(suites.iter().any(|suite| !suite.criterion));
+     }
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 0bb57fd70..384b2a9fa 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -25,6 +25,13 @@ mod affine;
+ pub use affine::{AffineParameterization, AffineProgram};
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
++#[cfg(feature = "taylor-model")]
++mod taylor;
++#[cfg(feature = "taylor-model")]
++pub use taylor::{
++    CoefficientProgram, CoefficientRequest, TaylorError, TaylorModel, TaylorRemainderTerm,
++    TaylorRequest, TaylorTerm,
++};
+ 
+ /// An operation on two expressions, preserving left-to-right evaluation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/hypersolve/src/expression_program/jacobian.rs b/crates/hypersolve/src/expression_program/jacobian.rs
+index ba14f35b3..1647feb68 100644
+--- a/crates/hypersolve/src/expression_program/jacobian.rs
++++ b/crates/hypersolve/src/expression_program/jacobian.rs
+@@ -9,6 +9,77 @@ use super::{
+ };
+ use crate::{Expr, SymbolId};
+ 
++// One local derivative rule, expanded into the original visitation loop or
++// the demanded-partial traversal. This keeps operation and temporary order
++// while avoiding another symbolic differentiation authority. Keep unary and
++// binary checked indexing at distinct caller sites, as in the original loop:
++// merging their panic locations also moves the downstream global address table.
++macro_rules! derive_node {
++    ($builder:ident, $node:expr, $variable:expr, $unary_input:expr, $binary_input:expr, $zero:ident, $one:ident) => {
++        match $node {
++            $crate::expression_program::ExpressionNode::Constant(_) => $zero,
++            $crate::expression_program::ExpressionNode::Variable(reference) => {
++                if reference.id == $variable {
++                    $one
++                } else {
++                    $zero
++                }
++            }
++            $crate::expression_program::ExpressionNode::Unary { operation, input } => {
++                let derivative = ($unary_input)(*input);
++                if derivative == $zero {
++                    $zero
++                } else {
++                    let template = $crate::expression_program::jacobian::unary(
++                        *operation,
++                        $crate::Expr::anonymous_symbol($crate::SymbolId(0)),
++                    );
++                    let partial = $builder.partial(template, 0, &[*input], $zero, $one)?;
++                    $builder.chain(partial, derivative, $zero, $one)?
++                }
++            }
++            $crate::expression_program::ExpressionNode::Binary {
++                operation,
++                left,
++                right,
++            } => {
++                let mut terms = [$zero; 2];
++                for (column, input) in [*left, *right].into_iter().enumerate() {
++                    let derivative = ($binary_input)(input);
++                    if derivative != $zero {
++                        let template = $crate::expression_program::jacobian::binary(
++                            *operation,
++                            $crate::Expr::anonymous_symbol($crate::SymbolId(0)),
++                            $crate::Expr::anonymous_symbol($crate::SymbolId(1)),
++                        );
++                        let partial = $builder.partial(
++                            template,
++                            column as u32,
++                            &[*left, *right],
++                            $zero,
++                            $one,
++                        )?;
++                        terms[column] = $builder.chain(partial, derivative, $zero, $one)?;
++                    }
++                }
++                match terms {
++                    [a, b] if a == $zero => b,
++                    [a, b] if b == $zero => a,
++                    [left, right] => {
++                        $builder.push($crate::expression_program::ExpressionNode::Binary {
++                            operation: $crate::expression_program::BinaryOperation::Add,
++                            left,
++                            right,
++                        })?
++                    }
++                }
++            }
++        }
++    };
++}
++#[cfg(feature = "taylor-model")]
++pub(super) use derive_node;
++
+ /// An owned source and its generated symbolic partial derivatives.
+ ///
+ /// The executable program first evaluates every original output, then partials
+@@ -136,60 +207,15 @@ impl ExpressionProgram {
+                 if uses[index] == 0 {
+                     continue;
+                 }
+-                derivatives[index] = match node {
+-                    ExpressionNode::Constant(_) => zero,
+-                    ExpressionNode::Variable(reference) => {
+-                        if reference.id == *variable {
+-                            one
+-                        } else {
+-                            zero
+-                        }
+-                    }
+-                    ExpressionNode::Unary { operation, input } => {
+-                        let derivative = derivatives[*input];
+-                        if derivative == zero {
+-                            zero
+-                        } else {
+-                            let template = unary(*operation, Expr::anonymous_symbol(SymbolId(0)));
+-                            let partial = builder.partial(template, 0, &[*input], zero, one)?;
+-                            builder.chain(partial, derivative, zero, one)?
+-                        }
+-                    }
+-                    ExpressionNode::Binary {
+-                        operation,
+-                        left,
+-                        right,
+-                    } => {
+-                        let mut terms = [zero; 2];
+-                        for (column, input) in [*left, *right].into_iter().enumerate() {
+-                            let derivative = derivatives[input];
+-                            if derivative != zero {
+-                                let template = binary(
+-                                    *operation,
+-                                    Expr::anonymous_symbol(SymbolId(0)),
+-                                    Expr::anonymous_symbol(SymbolId(1)),
+-                                );
+-                                let partial = builder.partial(
+-                                    template,
+-                                    column as u32,
+-                                    &[*left, *right],
+-                                    zero,
+-                                    one,
+-                                )?;
+-                                terms[column] = builder.chain(partial, derivative, zero, one)?;
+-                            }
+-                        }
+-                        match terms {
+-                            [a, b] if a == zero => b,
+-                            [a, b] if b == zero => a,
+-                            [left, right] => builder.push(ExpressionNode::Binary {
+-                                operation: BinaryOperation::Add,
+-                                left,
+-                                right,
+-                            })?,
+-                        }
+-                    }
+-                };
++                derivatives[index] = derive_node!(
++                    builder,
++                    node,
++                    *variable,
++                    |input: usize| derivatives[input],
++                    |input: usize| derivatives[input],
++                    zero,
++                    one
++                );
+             }
+             for &root in &source.outputs {
+                 builder.budget.charge(1)?;
+@@ -206,13 +232,13 @@ impl ExpressionProgram {
+     }
+ }
+ 
+-struct Builder<'a> {
+-    definition: ExpressionDefinition,
+-    outputs: usize,
+-    budget: &'a mut ExpressionBudget,
++pub(super) struct Builder<'a> {
++    pub(super) definition: ExpressionDefinition,
++    pub(super) outputs: usize,
++    pub(super) budget: &'a mut ExpressionBudget,
+ }
+ impl Builder<'_> {
+-    fn push(&mut self, node: ExpressionNode) -> Result<usize, ExpressionError> {
++    pub(super) fn push(&mut self, node: ExpressionNode) -> Result<usize, ExpressionError> {
+         self.budget.entries(&[
+             self.definition.variables.len(),
+             self.definition.nodes.len(),
+@@ -224,7 +250,7 @@ impl Builder<'_> {
+         self.definition.nodes.push(node);
+         Ok(index)
+     }
+-    fn chain(
++    pub(super) fn chain(
+         &mut self,
+         partial: usize,
+         derivative: usize,
+@@ -245,7 +271,7 @@ impl Builder<'_> {
+             })
+         }
+     }
+-    fn partial(
++    pub(super) fn partial(
+         &mut self,
+         template: Expr,
+         variable: u32,
+@@ -288,7 +314,7 @@ impl Builder<'_> {
+     }
+ }
+ 
+-fn binary(operation: BinaryOperation, left: Expr, right: Expr) -> Expr {
++pub(super) fn binary(operation: BinaryOperation, left: Expr, right: Expr) -> Expr {
+     match operation {
+         BinaryOperation::Add => left + right,
+         BinaryOperation::Sub => left - right,
+@@ -296,7 +322,7 @@ fn binary(operation: BinaryOperation, left: Expr, right: Expr) -> Expr {
+         BinaryOperation::Div => left / right,
+     }
+ }
+-fn unary(operation: UnaryOperation, value: Expr) -> Expr {
++pub(super) fn unary(operation: UnaryOperation, value: Expr) -> Expr {
+     match operation {
+         UnaryOperation::Neg => -value,
+         UnaryOperation::PowI(n) => value.powi(n),
