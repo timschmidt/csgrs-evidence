@@ -1,0 +1,879 @@
+diff --git a/INTERVAL_REFACTOR_PROGRESS.md b/INTERVAL_REFACTOR_PROGRESS.md
+index 2eb9e72c2..064d94779 100644
+--- a/INTERVAL_REFACTOR_PROGRESS.md
++++ b/INTERVAL_REFACTOR_PROGRESS.md
+@@ -2815,6 +2815,87 @@ Source commit `87c0b59c4907fe9ac2403c6655b13cde45583647`; evidence commit
+ `24b6af26d27693cd5555d2f829f8ca59f2e6ef54f5456e04898cd13a62476cd8`. The committed record was regenerated and verified;
+ every previous archive row remains unchanged.
+ 
++## 2026-11-12: exact affine sources for authored centers and radii
++
++The preceding turn made progress through authored definitions and qualification.
++Baseline `b02248ec61add81ea21414ac183a7b804283e4af`, all managed trees clean.
++A fresh checkout of that revision reproduces the missing `affine_source` method;
++the same external Rust 1.88 witness passes against this implementation.
++Admission, raw commands and outcomes are staged at
++`/tmp/interval-refactor/centered-affine`. Owner: Hyperlattice's affine source and
++parameter protocol (P1–P7, P18–P20, P25–P27, P35–P37; plan Phase 6).
++
++`CenteredVector::affine_source(context)` now converts the borrowed exact
++definition into `TranslatedBox<I,N>`, retaining a point center and signed offset
++parameter box `[-radius,radius]`. It never computes overflowing absolute bounds
++and requires no scalar one or identity matrix. Static `AffineImage` and bounded
++`AffineChain` consume this source through the existing protocol. Restriction
++intersects offsets, not absolute coordinates, and retains the exact center even
++when the selected domain becomes empty. Replay validates native dimensions,
++families and singleton centers; a missing center is valid only for an empty
++domain. Source and existing map definitions remain authoritative.
++
++The exact identity is B(c+u)+t = Bu+(Bc+t). Pullback composes existing maps first,
++then evaluates the shifted center and offset domain with the same scalar
++context. Exact rational/dyadic success gives the coordinate hull; primitive
++rounding may widen or fail typed, leaving the retained source reusable. No
++existing scalar algorithm, affine/chain body or predicate order was changed.
++The sealed arithmetic adapter gains only direct forwarding to existing scalar
++negation kernels. Initial construction using `0-radius` failed the maintained
++i32::MIN-exponent dyadic witness with SizeExhausted, because the old subtraction
++path aligns canonical zero across the exponent gap. Exact native negation
++removes that avoidable alignment in this bridge. The original failure and a
++reproduction patch remain; the witness and its budget were not weakened.
++General scalar zero-alignment behavior is not claimed repaired.
++
++The five new tests cover 918 six-backend center/radius fixtures, exact source
++bounds, offset restrictions, correlated duplication/difference, three-map
++runtime chains, empty/unit and rectangular images, malformed/fresh-process
++replay and further operation. F31/F63 tests retain overflowing [0,1] sources
++and successfully apply a half-scale map although scalar one is unrepresentable.
++IEEE and fresh-process fixed cases recover exact zero through a duplicated
++source whose original/intermediate bounds overflow. Every insufficient dyadic
++work limit below a completed bridge and a completed affine query is rejected;
++the unchanged source succeeds at the measured cost and with a larger budget.
++Primitive conversion/projection remains allocation-free in the shared counter.
++
++All 15 selected commands pass: Rust 1.88 owning suite (70 tests/doctests),
++Rust 1.95 debug/release and stable suites (83 each), strict Clippy, docs, ARM
++no_std compilation, Hyperlattice interval surface (7), downstream library Clippy,
++Wasm build/Clippy, root formatting and diff checks. The final expanded affine
++budget test and strict Clippy pass; ASan passes all five new tests plus the
++allocation test. The full unrelated elliptic suite was not repeated: its source
++and arithmetic remain unchanged, and the prior checkpoint retains that result.
++No new full-coverage/fuzz or pre-push claim; no CI files changed.
++
++The maintained zero-import Wasm consumer now also exercises F31 half-scale
++sources with exact integer expected endpoints. Across old and new cases it
++passes 8,027 cases: 4,401 successes, 2,462 invalid radii and 1,164 overflow
++outcomes; 19,046 returned calls plus two invalid-selector traps. The module is
++48,514 bytes, SHA-256
++`b91b28749e6ba7dfb01d106e17c03f2fcde0e70f6547f91dc199f1f98fa05db0`.
++Maximum returned-call fuel is 4,684 under a 1,000,000 allowance. Fuel is not a
++hardware cycle or timing measurement; IEEE ingress remains unqualified on Wasm.
++
++The extended native probe records 1,440 samples after 32 warmups, 128 completed
++operations/sample, six backends and dimensions 4/64 on allowed CPU 0. Separate
++bridge and retained-source projection actions supplement the existing controls;
++all primitive actions allocate zero. The translated source has the same inline
++size as the authored component pair for these host types. At N=64, prepared
++rational bridge/projection use 0/60 allocations (0/2,400 bytes), while dyadic
++uses 462/210 (3,696/1,680 bytes). These are local warmed fixtures, not general
++rational resource bounds. The expanded all-backend executable is 1,619,448
++bytes; absolute size, raw samples and adverse costs are retained. No speedup,
++whole-stack no-regression, peak-stack or monomorphization claim is made.
++
++This completes the vector affine-source bridge, not Phase 6 or the full goal.
++Heterogeneous center/radius arithmetic, matrix-form operations, Jacobian
++carriers, measured facts/specializations, broader coverage and consumer adoption
++remain open, together with all later phases and prior migration blockers.
++No Interface/firmware source changed and no push was attempted.
++
++Source and evidence registration: pending.
++
+ ## Priority order and non-negotiable rules (verbatim from plan)
+ 
+ 
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index 4894747a1..9ddb8d3d4 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact translated parameter boxes for authored center/radius vectors,
++  with affine composition, offset restrictions and validated native replay.
++
+ - Add independently authored center/radius vector and matrix definitions,
+   retaining exact components through projection overflow and validated replay.
+ 
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 994764ac2..3d05873c0 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -74,7 +74,11 @@ with overflow or a resource error. The explicit enclosure uses shared scalar
+ subtraction, addition and hull; it can round outward and remains separate from
+ the exact definition. Empty or nonsingleton components are invalid; `empty()`
+ creates the canonical empty set. Serde revalidates both components. Both use
+-the same scalar backend; these authored forms are not yet affine sources.
++the same scalar backend. A vector’s `affine_source(context)` creates a
++`TranslatedBox` with its exact center and signed offset parameters `[-r,r]`.
++Affine images and chains consume this definition before any absolute endpoint
++projection. Restrictions select offsets, not absolute coordinates. Replay
++validates the center and parameter box. Matrix forms are not affine sources.
+ 
+ Square matrices provide `identity_minus()` for the Cartesian image of `Id - A`,
+ and `contraction_margin_one()` / `contraction_margin_infinity()` for the ranges
+diff --git a/crates/hyperlattice-interval/conformance/centered-wasm/lib.rs b/crates/hyperlattice-interval/conformance/centered-wasm/lib.rs
+index 9cc1b50ee..204840390 100644
+--- a/crates/hyperlattice-interval/conformance/centered-wasm/lib.rs
++++ b/crates/hyperlattice-interval/conformance/centered-wasm/lib.rs
+@@ -1,10 +1,43 @@
+ //! Headless boundary consumer: 1 = success, -1 = invalid radius, -2 = overflow.
+ //! Selectors 1/2 return full endpoints only after status selector 0 succeeds.
+ use hyperlattice_interval::{
+-    CenteredMatrix, CenteredVector, IntervalLatticeError, IntervalMatrix, IntervalVector,
++    AffineMap, CenteredMatrix, CenteredVector, IntervalLatticeError, IntervalMatrix,
++    IntervalVector,
+     hyperinterval::{F64Enclosure, FixedInterval, IntervalError},
+ };
+ 
++#[unsafe(no_mangle)]
++pub extern "C" fn translated_half(c: i32, r: i32, selector: u32) -> i64 {
++    assert!(selector <= 2);
++    type I = FixedInterval<i32, 31>;
++    let p = |x| I::point(x).unwrap();
++    let result = CenteredVector::new(
++        IntervalVector::new([p(c)]).unwrap(),
++        IntervalVector::new([p(r)]).unwrap(),
++    )
++    .and_then(|form| form.affine_source(&mut ()))
++    .and_then(|source| {
++        AffineMap::new(
++            IntervalMatrix::new([[p(1 << 30)]]).unwrap(),
++            IntervalVector::new([p(0)]).unwrap(),
++        )
++        .unwrap()
++        .image(source)
++        .enclosure(&mut ())
++    });
++    match result {
++        Err(error) => failure(error),
++        Ok(bounds) => {
++            let (lower, upper) = bounds.lanes().unwrap()[0].bounds().unwrap();
++            match selector {
++                0 => 1,
++                1 => i64::from(lower),
++                _ => i64::from(upper),
++            }
++        }
++    }
++}
++
+ fn failure(error: IntervalLatticeError) -> i64 {
+     match error {
+         IntervalLatticeError::NegativeRadius => -1,
+diff --git a/crates/hyperlattice-interval/conformance/centered_cost.rs b/crates/hyperlattice-interval/conformance/centered_cost.rs
+index 5a92fc535..22845e312 100644
+--- a/crates/hyperlattice-interval/conformance/centered_cost.rs
++++ b/crates/hyperlattice-interval/conformance/centered_cost.rs
+@@ -57,7 +57,13 @@ fn family<I: IntervalArithmetic + PartialEq + core::fmt::Debug, const N: usize>(
+         core::mem::size_of_val(&matrix)
+     );
+     let mut owned = Some((center.clone(), radius.clone()));
+-    for action in 0..4 {
++    let translated = form.affine_source(&mut context()).unwrap();
++    assert_eq!(translated.enclosure(&mut context()).unwrap(), expected);
++    eprintln!(
++        "{name},{N},translated_bytes={}",
++        core::mem::size_of_val(&translated)
++    );
++    for action in 0..6 {
+         let mut execute = || match action {
+             0 => {
+                 let (c, r) = black_box(owned.take().unwrap());
+@@ -74,6 +80,12 @@ fn family<I: IntervalArithmetic + PartialEq + core::fmt::Debug, const N: usize>(
+                 let high = c.add(r, &mut context).unwrap();
+                 black_box(low.hull(&high, &mut context).unwrap());
+             }
++            4 => {
++                black_box(black_box(&form).affine_source(&mut context()).unwrap());
++            }
++            5 => {
++                black_box(black_box(&translated).enclosure(&mut context()).unwrap());
++            }
+             _ => {
+                 black_box(black_box(&matrix).enclosure(&mut context()).unwrap());
+             }
+diff --git a/crates/hyperlattice-interval/src/affine.rs b/crates/hyperlattice-interval/src/affine.rs
+index 855070bbd..eab803272 100644
+--- a/crates/hyperlattice-interval/src/affine.rs
++++ b/crates/hyperlattice-interval/src/affine.rs
+@@ -1,7 +1,9 @@
+ use crate::{IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector};
+ 
+ mod chain;
++mod translated;
+ pub use chain::AffineChain;
++pub use translated::TranslatedBox;
+ 
+ // One internal traversal. Coefficients may acquire outward bounds during
+ // pullback, but those temporary bounds never replace the stored point maps.
+diff --git a/crates/hyperlattice-interval/src/affine/translated.rs b/crates/hyperlattice-interval/src/affine/translated.rs
+new file mode 100644
+index 000000000..e1fc9482a
+--- /dev/null
++++ b/crates/hyperlattice-interval/src/affine/translated.rs
+@@ -0,0 +1,157 @@
++use super::{AffineSource, sealed};
++use crate::{
++    CenteredVector, IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector,
++    array_result,
++};
++
++/// Exact translated parameter box `{ center + u | u in parameter_domain }`.
++///
++/// Constructed from an authored [`CenteredVector`] without projecting its
++/// absolute bounds. Initially the offsets are `[-radius, radius]`. Restrictions
++/// act on these offsets, not absolute coordinates. The center is retained even
++/// when restriction removes all parameters; a canonical empty source may have
++/// no center. Equality compares definitions, not geometric image equality.
++///
++/// Static affine images and bounded chains compose before evaluating this
++/// source. No identity matrix or representable scalar one is required.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct TranslatedBox<I: IntervalArithmetic, const N: usize> {
++    center: Option<IntervalVector<I, N>>,
++    parameters: IntervalVector<I, N>,
++}
++
++impl<I: IntervalArithmetic, const N: usize> CenteredVector<I, N> {
++    /// Converts this exact definition to an affine source with signed offset
++    /// parameters, preserving this object on failure. Copies and arithmetic
++    /// share the context. No absolute endpoint `center +/- radius` is computed.
++    pub fn affine_source(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<TranslatedBox<I, N>, IntervalLatticeError> {
++        let Some(center) = self.center() else {
++            return TranslatedBox::new(None, IntervalVector::empty()?);
++        };
++        let center = center.hull(&IntervalVector::empty()?, context)?;
++        let radius = self.radius().expect("nonempty authored definition");
++        let radii = radius.lanes().expect("singleton radius");
++        let negative = IntervalVector::new(array_result(|i| radii[i].neg(context))?)?;
++        let parameters = negative.hull(radius, context)?;
++        TranslatedBox::new(Some(center), parameters)
++    }
++}
++
++impl<I: IntervalArithmetic, const N: usize> TranslatedBox<I, N> {
++    fn new(
++        center: Option<IntervalVector<I, N>>,
++        parameters: IntervalVector<I, N>,
++    ) -> Result<Self, IntervalLatticeError> {
++        match &center {
++            Some(center) if !center.is_singleton() => {
++                return Err(IntervalLatticeError::NonPointCenter);
++            }
++            None if !parameters.is_empty() => return Err(IntervalLatticeError::NonPointCenter),
++            _ => {}
++        }
++        Ok(Self { center, parameters })
++    }
++
++    /// Exact authored translation, absent only for a canonical empty source.
++    pub const fn center(&self) -> Option<&IntervalVector<I, N>> {
++        self.center.as_ref()
++    }
++
++    /// Current signed offset parameters, including any applied restrictions.
++    pub const fn parameter_domain(&self) -> &IntervalVector<I, N> {
++        &self.parameters
++    }
++
++    /// Whether this exact translated set is empty.
++    pub const fn is_empty(&self) -> bool {
++        self.parameters.is_empty()
++    }
++
++    /// Intersects the signed offsets, retaining the exact center. This is not
++    /// an intersection with a box in absolute image coordinates.
++    pub fn restrict_parameters(
++        &self,
++        restriction: &IntervalVector<I, N>,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        let parameters = self.parameters.intersection(restriction, context)?;
++        let center = match &self.center {
++            Some(center) => Some(center.hull(&IntervalVector::empty()?, context)?),
++            None => None,
++        };
++        Self::new(center, parameters)
++    }
++
++    /// Explicit outward projection of the translated set. Failure leaves the
++    /// exact definition intact; subsequent maps can still consume it.
++    pub fn enclosure(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
++        match &self.center {
++            Some(center) => center.add(&self.parameters, context),
++            None => IntervalVector::empty(),
++        }
++    }
++}
++
++impl<I: IntervalArithmetic, const N: usize> AffineSource<I, N> for TranslatedBox<I, N> {
++    type Parameters = IntervalVector<I, N>;
++    fn parameter_domain(&self) -> &Self::Parameters {
++        self.parameter_domain()
++    }
++    fn is_empty(&self) -> bool {
++        self.is_empty()
++    }
++    fn enclosure(
++        &self,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, N>, IntervalLatticeError> {
++        self.enclosure(context)
++    }
++    fn restrict_parameters(
++        &self,
++        restriction: &Self::Parameters,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        self.restrict_parameters(restriction, context)
++    }
++}
++
++impl<I: IntervalArithmetic, const N: usize> sealed::Pullback<I, N> for TranslatedBox<I, N> {
++    fn enclose_affine<const R: usize>(
++        &self,
++        linear: &IntervalMatrix<I, R, N>,
++        translation: &IntervalVector<I, R>,
++        context: &mut I::Context,
++    ) -> Result<IntervalVector<I, R>, IntervalLatticeError> {
++        if self.is_empty() {
++            return IntervalVector::empty();
++        }
++        let center = self.center.as_ref().expect("nonempty translated source");
++        let shifted = linear.affine_enclosure(center, translation, context)?;
++        linear.affine_enclosure(&self.parameters, &shifted, context)
++    }
++}
++
++#[cfg(feature = "serde")]
++mod serialization {
++    use super::*;
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++    impl<I: IntervalArithmetic + Serialize, const N: usize> Serialize for TranslatedBox<I, N> {
++        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++            (&self.center, &self.parameters).serialize(serializer)
++        }
++    }
++    impl<'de, I: IntervalArithmetic + Deserialize<'de>, const N: usize> Deserialize<'de>
++        for TranslatedBox<I, N>
++    {
++        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++            let (center, parameters) = Deserialize::deserialize(deserializer)?;
++            Self::new(center, parameters).map_err(serde::de::Error::custom)
++        }
++    }
++}
+diff --git a/crates/hyperlattice-interval/src/backend.rs b/crates/hyperlattice-interval/src/backend.rs
+index f42573c0b..76c5b5222 100644
+--- a/crates/hyperlattice-interval/src/backend.rs
++++ b/crates/hyperlattice-interval/src/backend.rs
+@@ -44,6 +44,8 @@ pub trait IntervalArithmetic: sealed::Sealed + FiniteRealInterval + Clone {
+     fn sub(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
+     /// Scalar product enclosure.
+     fn mul(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError>;
++    /// Exact reflected set, using native negation without aligning a zero operand.
++    fn neg(&self, context: &mut Self::Context) -> Result<Self, IntervalError>;
+     /// Absolute-value image, including an interior minimum at zero.
+     fn abs(&self, context: &mut Self::Context) -> Result<Self, IntervalError>;
+     /// Image of the maximum of independently chosen operand members.
+@@ -131,6 +133,9 @@ macro_rules! fixed {
+             fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
+                 self.checked_mul(other)
+             }
++            fn neg(&self, _: &mut ()) -> Result<Self, IntervalError> {
++                self.checked_neg()
++            }
+             fn abs(&self, _: &mut ()) -> Result<Self, IntervalError> {
+                 Self::abs(self)
+             }
+@@ -193,6 +198,9 @@ impl IntervalArithmetic for hyperinterval::RationalInterval {
+     fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
+         Ok(Self::mul(self, other))
+     }
++    fn neg(&self, _: &mut ()) -> Result<Self, IntervalError> {
++        Ok(Self::neg(self))
++    }
+     fn abs(&self, _: &mut ()) -> Result<Self, IntervalError> {
+         Ok(Self::abs(self))
+     }
+@@ -246,6 +254,9 @@ impl IntervalArithmetic for hyperinterval::DyadicInterval {
+     fn mul(&self, other: &Self, context: &mut Self::Context) -> Result<Self, IntervalError> {
+         Self::mul(self, other, context)
+     }
++    fn neg(&self, context: &mut Self::Context) -> Result<Self, IntervalError> {
++        Self::neg(self, context)
++    }
+     fn abs(&self, context: &mut Self::Context) -> Result<Self, IntervalError> {
+         Self::abs(self, context)
+     }
+@@ -315,6 +326,9 @@ macro_rules! float {
+             fn mul(&self, other: &Self, _: &mut ()) -> Result<Self, IntervalError> {
+                 Self::mul(self, other)
+             }
++            fn neg(&self, _: &mut ()) -> Result<Self, IntervalError> {
++                Ok(Self::neg(self))
++            }
+             fn abs(&self, _: &mut ()) -> Result<Self, IntervalError> {
+                 Ok(Self::abs(self))
+             }
+diff --git a/crates/hyperlattice-interval/src/centered.rs b/crates/hyperlattice-interval/src/centered.rs
+index 21c48622d..a8ed71c87 100644
+--- a/crates/hyperlattice-interval/src/centered.rs
++++ b/crates/hyperlattice-interval/src/centered.rs
+@@ -29,8 +29,9 @@ macro_rules! centered {
+         /// This differs from the existing midpoint/radius decomposition, which
+         /// retains source bounds. Structural equality compares the authored
+         /// components; serde validates them again, without trusting cached flags.
+-        /// This form is not an affine source. An explicitly requested enclosure
+-        /// can enter existing box operations without replacing this definition.
++        /// Vector forms can convert to an exact translated affine source with
++        /// [`CenteredVector::affine_source`]. An explicit enclosure can also
++        /// enter box operations without replacing this definition.
+         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+         pub struct $name<I: IntervalArithmetic, $(const $dimension: usize),+> {
+             components: Option<Components<$product<I, $($dimension),+>>>,
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+index d6ecb0521..8ba6c01d5 100644
+--- a/crates/hyperlattice-interval/src/lib.rs
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -28,7 +28,7 @@ mod serde;
+ mod vector;
+ mod widths;
+ 
+-pub use affine::{AffineBox, AffineChain, AffineImage, AffineMap, AffineSource};
++pub use affine::{AffineBox, AffineChain, AffineImage, AffineMap, AffineSource, TranslatedBox};
+ pub use backend::IntervalArithmetic;
+ pub use centered::{CenteredMatrix, CenteredVector};
+ pub use hyperinterval;
+diff --git a/crates/hyperlattice-interval/tests/centered_affine.rs b/crates/hyperlattice-interval/tests/centered_affine.rs
+new file mode 100644
+index 000000000..998af906d
+--- /dev/null
++++ b/crates/hyperlattice-interval/tests/centered_affine.rs
+@@ -0,0 +1,370 @@
++#![cfg(any(
++    feature = "fixed",
++    feature = "rational",
++    feature = "dyadic",
++    feature = "float-enclosure"
++))]
++use hyperlattice_interval::{
++    AffineChain, AffineMap, CenteredVector, IntervalArithmetic, IntervalLatticeError,
++    IntervalMatrix, IntervalVector,
++};
++
++#[cfg(all(feature = "fixed", feature = "serde"))]
++#[test]
++fn translated_replay_revalidates_and_preserves_cancellation() {
++    use hyperlattice_interval::{TranslatedBox, hyperinterval::FixedInterval};
++    type I = FixedInterval<i64, 0>;
++    const KEY: &str = "HYPERLATTICE_TRANSLATED_REPLAY";
++    let p = |v| I::point(v).unwrap();
++    if let Ok(text) = std::env::var(KEY) {
++        let source: TranslatedBox<I, 1> = serde_json::from_str(&text).unwrap();
++        assert_eq!(serde_json::to_string(&source).unwrap(), text);
++        assert!(source.enclosure(&mut ()).is_err());
++        let image = AffineMap::new(
++            IntervalMatrix::new([[p(1)], [p(1)]]).unwrap(),
++            IntervalVector::new([p(0), p(0)]).unwrap(),
++        )
++        .unwrap()
++        .image(source);
++        let image = AffineMap::new(
++            IntervalMatrix::new([[p(1), p(-1)]]).unwrap(),
++            IntervalVector::new([p(0)]).unwrap(),
++        )
++        .unwrap()
++        .image(image);
++        let encoded = serde_json::to_string(&image).unwrap();
++        let replayed: hyperlattice_interval::AffineImage<
++            I,
++            hyperlattice_interval::AffineImage<I, TranslatedBox<I, 1>, 2, 1>,
++            1,
++            2,
++        > = serde_json::from_str(&encoded).unwrap();
++        assert_eq!(
++            replayed.enclosure(&mut ()).unwrap(),
++            IntervalVector::new([p(0)]).unwrap()
++        );
++        return;
++    }
++    let source = CenteredVector::new(
++        IntervalVector::new([p(i64::MAX)]).unwrap(),
++        IntervalVector::new([p(1)]).unwrap(),
++    )
++    .unwrap()
++    .affine_source(&mut ())
++    .unwrap();
++    let output = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "translated_replay_revalidates_and_preserves_cancellation",
++            "--nocapture",
++        ])
++        .env(KEY, serde_json::to_string(&source).unwrap())
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    for text in [
++        "[null,[[0,0]]]",
++        "[[[0,1]],null]",
++        "[[[0,1]],[[-1,1]]]",
++        "[[[0,0]],[[1,-1]]]",
++        "[[[0,0]],[]]",
++    ] {
++        assert!(
++            serde_json::from_str::<TranslatedBox<I, 1>>(text).is_err(),
++            "{text}"
++        );
++    }
++    let empty: TranslatedBox<I, 1> = serde_json::from_str("[null,null]").unwrap();
++    assert!(empty.is_empty());
++    let retained: TranslatedBox<I, 1> = serde_json::from_str("[[[9,9]],null]").unwrap();
++    assert!(retained.is_empty() && retained.center().is_some());
++    let unit: TranslatedBox<I, 0> = serde_json::from_str("[[],[]]").unwrap();
++    assert!(unit.enclosure(&mut ()).unwrap().is_singleton());
++    assert!(
++        serde_json::from_str::<TranslatedBox<FixedInterval<i32, 32>, 0>>("[null,null]").is_err()
++    );
++}
++
++fn corpus<I: IntervalArithmetic + PartialEq + core::fmt::Debug>(
++    scalar: impl Fn(i32, i32) -> I,
++    mut context: impl FnMut() -> I::Context,
++) {
++    for c in -8..=8 {
++        for r in 0..=8 {
++            let form = CenteredVector::new(
++                IntervalVector::new([scalar(c, c)]).unwrap(),
++                IntervalVector::new([scalar(r, r)]).unwrap(),
++            )
++            .unwrap();
++            let source = form.affine_source(&mut context()).unwrap();
++            assert_eq!(source.center(), form.center());
++            assert_eq!(
++                source.parameter_domain(),
++                &IntervalVector::new([scalar(-r, r)]).unwrap()
++            );
++            assert_eq!(
++                source.enclosure(&mut context()).unwrap(),
++                IntervalVector::new([scalar(c - r, c + r)]).unwrap()
++            );
++            let restriction = IntervalVector::new([scalar(0, 1)]).unwrap();
++            let selected = source
++                .restrict_parameters(&restriction, &mut context())
++                .unwrap();
++            assert_eq!(
++                selected.enclosure(&mut context()).unwrap(),
++                IntervalVector::new([scalar(c, c + r.min(1))]).unwrap()
++            );
++            let duplicate = AffineMap::new(
++                IntervalMatrix::new([[scalar(1, 1)], [scalar(1, 1)]]).unwrap(),
++                IntervalVector::new([scalar(1, 1), scalar(0, 0)]).unwrap(),
++            )
++            .unwrap();
++            let difference = AffineMap::new(
++                IntervalMatrix::new([[scalar(1, 1), scalar(-1, -1)]]).unwrap(),
++                IntervalVector::new([scalar(0, 0)]).unwrap(),
++            )
++            .unwrap();
++            let image = difference.image(duplicate.image(source));
++            assert_eq!(
++                image.enclosure(&mut context()).unwrap(),
++                IntervalVector::new([scalar(1, 1)]).unwrap()
++            );
++            let mut chain = AffineChain::<_, _, 1, 3>::new(image);
++            for _ in 0..3 {
++                chain
++                    .push(
++                        AffineMap::new(
++                            IntervalMatrix::new([[scalar(2, 2)]]).unwrap(),
++                            IntervalVector::new([scalar(1, 1)]).unwrap(),
++                        )
++                        .unwrap(),
++                    )
++                    .unwrap();
++            }
++            assert_eq!(
++                chain.enclosure(&mut context()).unwrap(),
++                IntervalVector::new([scalar(15, 15)]).unwrap()
++            );
++            assert_eq!(
++                chain
++                    .restrict_parameters(&restriction, &mut context())
++                    .unwrap()
++                    .enclosure(&mut context())
++                    .unwrap(),
++                IntervalVector::new([scalar(15, 15)]).unwrap()
++            );
++            let empty = chain
++                .restrict_parameters(&IntervalVector::empty().unwrap(), &mut context())
++                .unwrap();
++            assert!(empty.is_empty());
++            assert!(empty.enclosure(&mut context()).unwrap().is_empty());
++        }
++    }
++    let empty = CenteredVector::<I, 1>::empty()
++        .unwrap()
++        .affine_source(&mut context())
++        .unwrap();
++    assert!(empty.is_empty() && empty.center().is_none());
++    assert!(empty.enclosure(&mut context()).unwrap().is_empty());
++    assert!(
++        empty
++            .restrict_parameters(
++                &IntervalVector::new([scalar(0, 0)]).unwrap(),
++                &mut context()
++            )
++            .unwrap()
++            .is_empty()
++    );
++    let unit = CenteredVector::new(
++        IntervalVector::<I, 0>::new([]).unwrap(),
++        IntervalVector::new([]).unwrap(),
++    )
++    .unwrap()
++    .affine_source(&mut context())
++    .unwrap();
++    assert!(!unit.is_empty());
++    assert!(unit.enclosure(&mut context()).unwrap().is_singleton());
++    let image = AffineMap::new(
++        IntervalMatrix::<I, 2, 0>::new([[], []]).unwrap(),
++        IntervalVector::new([scalar(3, 3), scalar(5, 5)]).unwrap(),
++    )
++    .unwrap()
++    .image(unit);
++    assert_eq!(
++        image.enclosure(&mut context()).unwrap(),
++        IntervalVector::new([scalar(3, 3), scalar(5, 5)]).unwrap()
++    );
++}
++
++#[cfg(feature = "fixed")]
++#[test]
++fn fixed_sources_and_overflowing_original_bounds() {
++    use hyperlattice_interval::hyperinterval::{FixedInterval, IntervalError};
++    corpus(
++        |a, b| FixedInterval::<i32, 8>::new(a << 8, b << 8).unwrap(),
++        || (),
++    );
++    corpus(
++        |a, b| FixedInterval::<i64, 32>::new(i64::from(a) << 32, i64::from(b) << 32).unwrap(),
++        || (),
++    );
++    macro_rules! narrow {
++        ($int:ty,$frac:literal) => {{
++            type I = FixedInterval<$int, $frac>;
++            let half = 1 << ($frac - 1);
++            let form = CenteredVector::new(
++                IntervalVector::new([I::point(half).unwrap()]).unwrap(),
++                IntervalVector::new([I::point(half).unwrap()]).unwrap(),
++            )
++            .unwrap();
++            assert_eq!(
++                form.enclosure(&mut ()),
++                Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++            );
++            assert!(I::one().is_err());
++            let source = form.affine_source(&mut ()).unwrap();
++            assert!(source.enclosure(&mut ()).is_err());
++            let image = AffineMap::new(
++                IntervalMatrix::new([[I::point(half).unwrap()]]).unwrap(),
++                IntervalVector::new([I::point(0).unwrap()]).unwrap(),
++            )
++            .unwrap()
++            .image(source);
++            assert_eq!(
++                image.enclosure(&mut ()).unwrap().lanes().unwrap()[0].bounds(),
++                Some((0, half))
++            );
++        }};
++    }
++    narrow!(i32, 31);
++    narrow!(i64, 63);
++}
++
++#[cfg(feature = "rational")]
++#[test]
++fn rational_sources() {
++    use hyperlattice_interval::hyperinterval::RationalInterval;
++    corpus(
++        |a, b| RationalInterval::new(a.into(), b.into()).unwrap(),
++        || (),
++    );
++}
++
++#[cfg(feature = "float-enclosure")]
++#[test]
++fn ieee_sources_and_cancelled_overflow() {
++    use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure};
++    corpus(|a, b| F32Enclosure::new(a as f32, b as f32).unwrap(), || ());
++    corpus(
++        |a, b| F64Enclosure::new(f64::from(a), f64::from(b)).unwrap(),
++        || (),
++    );
++    type I = F64Enclosure;
++    let p = |x| I::point(x).unwrap();
++    let form = CenteredVector::new(
++        IntervalVector::new([p(f64::MAX)]).unwrap(),
++        IntervalVector::new([p(f64::MAX)]).unwrap(),
++    )
++    .unwrap();
++    assert!(form.enclosure(&mut ()).is_err());
++    let source = form.affine_source(&mut ()).unwrap();
++    let duplicate = AffineMap::new(
++        IntervalMatrix::new([[p(1.0)], [p(1.0)]]).unwrap(),
++        IntervalVector::new([p(0.0), p(0.0)]).unwrap(),
++    )
++    .unwrap()
++    .image(source);
++    assert!(duplicate.enclosure(&mut ()).is_err());
++    let difference = AffineMap::new(
++        IntervalMatrix::new([[p(1.0), p(-1.0)]]).unwrap(),
++        IntervalVector::new([p(0.0)]).unwrap(),
++    )
++    .unwrap()
++    .image(duplicate);
++    assert_eq!(
++        difference.enclosure(&mut ()).unwrap().lanes().unwrap()[0],
++        p(0.0)
++    );
++}
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn dyadic_sources_and_shared_retry() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I, IntervalError};
++    corpus(
++        |a, b| I::new(a.into(), b.into(), 0).unwrap(),
++        || DyadicBudget::new(128, 1_000_000),
++    );
++    let form = CenteredVector::new(
++        IntervalVector::new([I::point(1.into(), i32::MIN).unwrap()]).unwrap(),
++        IntervalVector::new([I::point(1.into(), i32::MIN).unwrap()]).unwrap(),
++    )
++    .unwrap();
++    let before = form.clone();
++    let mut ample = DyadicBudget::new(128, 10000);
++    let source = form.affine_source(&mut ample).unwrap();
++    let cost = 10000 - ample.remaining_work();
++    assert!(cost > 0);
++    for work in 0..cost {
++        assert_eq!(
++            form.affine_source(&mut DyadicBudget::new(128, work)),
++            Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++        );
++        assert_eq!(form, before);
++    }
++    assert_eq!(
++        form.affine_source(&mut DyadicBudget::new(128, cost))
++            .unwrap(),
++        source
++    );
++    assert_eq!(
++        source.parameter_domain().lanes().unwrap()[0],
++        I::new((-1).into(), 1.into(), i32::MIN).unwrap()
++    );
++    assert_eq!(
++        source
++            .enclosure(&mut DyadicBudget::new(128, 10000))
++            .unwrap()
++            .lanes()
++            .unwrap()[0],
++        I::new(0.into(), 2.into(), i32::MIN).unwrap()
++    );
++    let point = |x: i32| I::point(x.into(), 0).unwrap();
++    let form = CenteredVector::new(
++        IntervalVector::new([point(1)]).unwrap(),
++        IntervalVector::new([point(1)]).unwrap(),
++    )
++    .unwrap();
++    let source = form
++        .affine_source(&mut DyadicBudget::new(128, 10000))
++        .unwrap();
++    let image = AffineMap::new(
++        IntervalMatrix::new([[point(2)]]).unwrap(),
++        IntervalVector::new([point(1)]).unwrap(),
++    )
++    .unwrap()
++    .image(source);
++    let before = image.clone();
++    let mut ample = DyadicBudget::new(128, 10000);
++    let result = image.enclosure(&mut ample).unwrap();
++    let cost = 10000 - ample.remaining_work();
++    assert_eq!(
++        result,
++        IntervalVector::new([I::new(1.into(), 5.into(), 0).unwrap()]).unwrap()
++    );
++    for work in 0..cost {
++        assert_eq!(
++            image.enclosure(&mut DyadicBudget::new(128, work)),
++            Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++        );
++        assert_eq!(image, before);
++    }
++    assert_eq!(
++        image.enclosure(&mut DyadicBudget::new(128, cost)).unwrap(),
++        result
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/centered_no_alloc.rs b/crates/hyperlattice-interval/tests/centered_no_alloc.rs
+index ccaa55d0f..7871d79e0 100644
+--- a/crates/hyperlattice-interval/tests/centered_no_alloc.rs
++++ b/crates/hyperlattice-interval/tests/centered_no_alloc.rs
+@@ -9,6 +9,8 @@ fn check<I: IntervalArithmetic<Context = ()> + Copy>(point: I, negative: I) {
+     let center = IntervalVector::new([point; 64]).unwrap();
+     let form = CenteredVector::new(center, center).unwrap();
+     std::hint::black_box(form.enclosure(&mut ()).unwrap());
++    let source = form.affine_source(&mut ()).unwrap();
++    std::hint::black_box(source.enclosure(&mut ()).unwrap());
+     std::hint::black_box(form.into_parts());
+     let m = IntervalMatrix::new([[point; 3]; 2]).unwrap();
+     let form = CenteredMatrix::new(m, m).unwrap();
+diff --git a/crates/hyperlattice/CHANGELOG.md b/crates/hyperlattice/CHANGELOG.md
+index 8d5c85dc6..90e9c8932 100644
+--- a/crates/hyperlattice/CHANGELOG.md
++++ b/crates/hyperlattice/CHANGELOG.md
+@@ -52,6 +52,9 @@
+ 
+ ### Added
+ 
++- Add exact translated parameter boxes for authored center/radius vectors,
++  with affine composition, offset restrictions and validated native replay.
++
+ - Re-export independently authored `CenteredVector` and `CenteredMatrix`
+   definitions through the interval feature, with validated component replay.
+ 
+diff --git a/crates/hyperlattice/src/lib.rs b/crates/hyperlattice/src/lib.rs
+index 7e3b65660..a8f3993d7 100644
+--- a/crates/hyperlattice/src/lib.rs
++++ b/crates/hyperlattice/src/lib.rs
+@@ -44,7 +44,7 @@ pub use hyperlattice_interval as interval;
+ pub use hyperlattice_interval::{
+     AffineBox, AffineChain, AffineImage, AffineMap, AffineSource, BoxN, CenteredMatrix,
+     CenteredVector, IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector,
+-    MidpointRadiusMatrix, MidpointRadiusVector,
++    MidpointRadiusMatrix, MidpointRadiusVector, TranslatedBox,
+ };
+ 
+ pub use hyperreal::{
