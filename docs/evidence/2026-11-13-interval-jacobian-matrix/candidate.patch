@@ -1,0 +1,110 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index fb96d849c..0f9c1a24c 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in fixed-size Jacobian projections retaining source/domain evidence,
++  checked rectangular shapes and shared graph/native copy budgets.
++
+ - Add opt-in exact coordinate programs with STRICT inverse proofs, shared graph substitution and replayable source association.
+ - Add source-bound affine Taylor forms with exact coefficient combination, retained original residual coordinates, subdomain reuse and composed-map replay.
+ - Add optional demanded sparse normalized partials and exact-coefficient Taylor
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 0644c62db..aa3991087 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -48,6 +48,7 @@ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
+ float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 887d565a0..e267def10 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -69,6 +69,16 @@ accounting. This is an interval expression evaluator, not a validated ODE solver
+ Run `cargo run -p hypersolve --features interval-program --example enclosed_program`
+ for an oscillator image and source-bound symbolic-Jacobian enclosure.
+ 
++`interval-lattice` adds `RegularJacobianEnclosure::matrix::<R, C>()`. It checks
++source output and selected-variable counts, then copies partials into the same
++row-major `IntervalMatrix` used by Hyperlattice. The returned `JacobianMatrix`
++borrows the original regularity evidence, retaining source, arguments and grid.
++Its `intervals()` supplies numerical products and norms; `into_intervals()`
++explicitly extracts only the numerical matrix. Copies share caller-owned graph
++and dyadic budgets. Empty domains stay empty even with zero matrix dimensions;
++nonempty zero-dimensional products remain distinct. Replay rebuilds the original
++evidence through `enclose_regular`; no serialized proof flag is accepted.
++
+ `taylor-model` adds demanded normalized mixed partials through
+ `ExpressionProgram::coefficients` and centered exact-coefficient models through
+ `taylor_model`. Supply an exact singleton dyadic center, a finite box, total
+@@ -512,6 +522,7 @@ their use case.
+ | `dispatch-trace` | no | Hyperreal/Hyperlattice/Hyperlimit exact-dispatch instrumentation |
+ | `expression-program` | no | Experimental owned flat expression definitions and exact scalar evaluation |
+ | `interval-program` | no | Experimental dyadic expression images with complete-domain checks |
++| `interval-lattice` | no | Fixed-size Jacobian matrix projections retaining source/domain evidence |
+ | `serde` | no | Symbol and expression-definition serialization using validated Hyperreal scalar replay |
+ 
+ ## Validation and performance
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 80109d5f4..9de8fd874 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -19,6 +19,8 @@ use crate::{Expr, SymbolId, SymbolRef, work_budget::CancellationToken};
+ 
+ #[cfg(feature = "interval-program")]
+ mod dyadic;
++#[cfg(feature = "interval-lattice")]
++pub use dyadic::JacobianMatrix;
+ #[cfg(feature = "interval-program")]
+ pub use dyadic::RegularJacobianEnclosure;
+ mod affine;
+@@ -195,6 +197,17 @@ pub enum ExpressionError {
+     InvalidOutput { output: usize, node: usize },
+     /// Evaluation arguments do not match the explicit binding table.
+     BindingCount { expected: usize, actual: usize },
++    /// Requested fixed matrix dimensions differ from the source Jacobian.
++    #[cfg(feature = "interval-lattice")]
++    JacobianShape {
++        /// Requested rows and columns.
++        expected: (usize, usize),
++        /// Source output count and selected variable count.
++        actual: (usize, usize),
++    },
++    /// Native matrix construction failure, preserving the lattice diagnostic.
++    #[cfg(feature = "interval-lattice")]
++    Lattice(hyperlattice::IntervalLatticeError),
+     /// The configured definition-entry limit was exceeded.
+     SizeExhausted,
+     /// The next graph work charge could not be admitted.
+@@ -236,6 +249,8 @@ impl fmt::Display for ExpressionError {
+ impl std::error::Error for ExpressionError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+         match self {
++            #[cfg(feature = "interval-lattice")]
++            Self::Lattice(source) => Some(source),
+             Self::Scalar { source, .. } => Some(source),
+             #[cfg(feature = "interval-program")]
+             Self::Enclosure { source, .. } => Some(source),
+diff --git a/crates/hypersolve/src/expression_program/dyadic.rs b/crates/hypersolve/src/expression_program/dyadic.rs
+index b064d4a78..1440fd6ef 100644
+--- a/crates/hypersolve/src/expression_program/dyadic.rs
++++ b/crates/hypersolve/src/expression_program/dyadic.rs
+@@ -8,6 +8,10 @@ use super::{
+ 
+ mod regularity;
+ pub use regularity::RegularJacobianEnclosure;
++#[cfg(feature = "interval-lattice")]
++mod matrix;
++#[cfg(feature = "interval-lattice")]
++pub use matrix::JacobianMatrix;
+ 
+ impl ExpressionProgram {
+     /// Enclose every output over the Cartesian product of the input intervals.

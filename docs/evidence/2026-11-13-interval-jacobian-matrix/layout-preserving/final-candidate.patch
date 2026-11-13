@@ -1,0 +1,786 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index fb96d849c..0f9c1a24c 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in fixed-size Jacobian projections retaining source/domain evidence,
++  checked rectangular shapes and shared graph/native copy budgets.
++
+ - Add opt-in exact coordinate programs with STRICT inverse proofs, shared graph substitution and replayable source association.
+ - Add source-bound affine Taylor forms with exact coefficient combination, retained original residual coordinates, subdomain reuse and composed-map replay.
+ - Add optional demanded sparse normalized partials and exact-coefficient Taylor
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 0644c62db..aa3991087 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -48,6 +48,7 @@ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
+ float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 887d565a0..e267def10 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -69,6 +69,16 @@ accounting. This is an interval expression evaluator, not a validated ODE solver
+ Run `cargo run -p hypersolve --features interval-program --example enclosed_program`
+ for an oscillator image and source-bound symbolic-Jacobian enclosure.
+ 
++`interval-lattice` adds `RegularJacobianEnclosure::matrix::<R, C>()`. It checks
++source output and selected-variable counts, then copies partials into the same
++row-major `IntervalMatrix` used by Hyperlattice. The returned `JacobianMatrix`
++borrows the original regularity evidence, retaining source, arguments and grid.
++Its `intervals()` supplies numerical products and norms; `into_intervals()`
++explicitly extracts only the numerical matrix. Copies share caller-owned graph
++and dyadic budgets. Empty domains stay empty even with zero matrix dimensions;
++nonempty zero-dimensional products remain distinct. Replay rebuilds the original
++evidence through `enclose_regular`; no serialized proof flag is accepted.
++
+ `taylor-model` adds demanded normalized mixed partials through
+ `ExpressionProgram::coefficients` and centered exact-coefficient models through
+ `taylor_model`. Supply an exact singleton dyadic center, a finite box, total
+@@ -512,6 +522,7 @@ their use case.
+ | `dispatch-trace` | no | Hyperreal/Hyperlattice/Hyperlimit exact-dispatch instrumentation |
+ | `expression-program` | no | Experimental owned flat expression definitions and exact scalar evaluation |
+ | `interval-program` | no | Experimental dyadic expression images with complete-domain checks |
++| `interval-lattice` | no | Fixed-size Jacobian matrix projections retaining source/domain evidence |
+ | `serde` | no | Symbol and expression-definition serialization using validated Hyperreal scalar replay |
+ 
+ ## Validation and performance
+diff --git a/crates/hypersolve/fuzz/Cargo.lock b/crates/hypersolve/fuzz/Cargo.lock
+index 56ae59280..93ec4d879 100644
+--- a/crates/hypersolve/fuzz/Cargo.lock
++++ b/crates/hypersolve/fuzz/Cargo.lock
+@@ -50,13 +50,31 @@ dependencies = [
+  "wasip2",
+ ]
+ 
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "hyperlattice"
+ version = "0.7.0"
+ dependencies = [
++ "hyperlattice-interval",
+  "hyperreal",
+ ]
+ 
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
+ [[package]]
+ name = "hyperlimit"
+ version = "0.5.0"
+@@ -76,6 +94,7 @@ dependencies = [
+ name = "hypersolve"
+ version = "0.4.0"
+ dependencies = [
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
+@@ -86,6 +105,7 @@ dependencies = [
+ name = "hypersolve-fuzz"
+ version = "0.0.0"
+ dependencies = [
++ "hyperinterval",
+  "hyperlimit",
+  "hyperreal",
+  "hypersolve",
+diff --git a/crates/hypersolve/fuzz/Cargo.toml b/crates/hypersolve/fuzz/Cargo.toml
+index 27fe2ea24..aabf8f4fd 100644
+--- a/crates/hypersolve/fuzz/Cargo.toml
++++ b/crates/hypersolve/fuzz/Cargo.toml
+@@ -12,6 +12,10 @@ libfuzzer-sys = "0.4"
+ hyperlimit = { path = "../../hyperlimit", default-features = false }
+ hyperreal = { path = "../../hyperreal", default-features = false }
+ hypersolve = { path = "..", default-features = false }
++hyperinterval = { path = "../../hyperinterval", default-features = false, features = ["dyadic"], optional = true }
++
++[features]
++jacobian-matrix = ["hypersolve/interval-lattice", "dep:hyperinterval"]
+ 
+ [[bin]]
+ name = "sketch_projected_distance"
+@@ -488,3 +492,11 @@ path = "fuzz_targets/bivariate_vertical_components.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "jacobian_matrix"
++path = "fuzz_targets/jacobian_matrix.rs"
++test = false
++doc = false
++bench = false
++required-features = ["jacobian-matrix"]
+diff --git a/crates/hypersolve/fuzz/fuzz_targets/jacobian_matrix.rs b/crates/hypersolve/fuzz/fuzz_targets/jacobian_matrix.rs
+new file mode 100644
+index 000000000..1b796bfc5
+--- /dev/null
++++ b/crates/hypersolve/fuzz/fuzz_targets/jacobian_matrix.rs
+@@ -0,0 +1,129 @@
++//! Source-bound projection with independent affine derivative ranges.
++#![no_main]
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionError, ExpressionProgram},
++    work_budget::CancellationToken,
++};
++use libfuzzer_sys::fuzz_target;
++
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 1_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(4096, 1_000_000)
++}
++fn interval(lo: i64, hi: i64) -> DyadicInterval {
++    DyadicInterval::new(lo.into(), hi.into(), 0).unwrap()
++}
++fn product(k: i64, lo: i64, hi: i64) -> DyadicInterval {
++    interval((k * lo).min(k * hi), (k * lo).max(k * hi))
++}
++
++fuzz_target!(|data: &[u8]| {
++    let byte = |i| data.get(i).copied().unwrap_or(0);
++    let coefficient = |i| i64::from(byte(i) as i8);
++    let (a, b, c) = (coefficient(0), coefficient(1), coefficient(2));
++    let xlo = coefficient(3);
++    let xhi = xlo + i64::from(byte(4));
++    let ylo = coefficient(5);
++    let yhi = ylo + i64::from(byte(6));
++    let empty = byte(7) & 1 != 0;
++    let reversed = byte(7) & 2 != 0;
++    let x = || Expr::anonymous_symbol(SymbolId(0));
++    let y = || Expr::anonymous_symbol(SymbolId(1));
++    let source = ExpressionProgram::compile(
++        &[
++            Expr::int(a) * x().powi(2) + Expr::int(b) * y(),
++            Expr::int(c) * x() * y() + Expr::int(3),
++        ],
++        &[SymbolId(1), SymbolId(0)],
++        &mut graph(),
++    )
++    .unwrap();
++    let variables = if reversed {
++        [SymbolId(1), SymbolId(0)]
++    } else {
++        [SymbolId(0), SymbolId(1)]
++    };
++    let arguments = [
++        if empty {
++            DyadicInterval::empty()
++        } else {
++            interval(ylo, yhi)
++        },
++        interval(xlo, xhi),
++    ];
++    let evidence = source
++        .jacobian(&variables, &mut graph())
++        .unwrap()
++        .enclose_regular(&arguments, -32, &mut graph(), &mut arithmetic())
++        .unwrap();
++    let projection = evidence
++        .matrix::<2, 2>(&mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(
++        projection.evidence().program().source().definition(),
++        source.definition()
++    );
++    assert_eq!(projection.evidence().arguments(), &arguments);
++    if empty {
++        assert!(projection.intervals().is_empty());
++    } else {
++        let mut expected = [
++            [product(2 * a, xlo, xhi), interval(b, b)],
++            [product(c, ylo, yhi), product(c, xlo, xhi)],
++        ];
++        if reversed {
++            for row in &mut expected {
++                row.swap(0, 1);
++            }
++        }
++        assert_eq!(projection.intervals().rows(), Some(&expected));
++        for row in 0..2 {
++            for column in 0..2 {
++                let index = evidence.program().partial_output(row, column).unwrap();
++                assert_eq!(
++                    projection.intervals().rows().unwrap()[row][column].bounds(),
++                    evidence.values()[index].bounds()
++                );
++            }
++        }
++    }
++    assert!(matches!(
++        evidence.matrix::<2, 1>(&mut graph(), &mut arithmetic()),
++        Err(ExpressionError::JacobianColumns {
++            expected: 1,
++            actual: 2
++        })
++    ));
++    let mut small_graph = ExpressionBudget::new(100_000, usize::from(byte(8) % 24));
++    let mut small_arithmetic = DyadicBudget::new(4096, u64::from(byte(9) % 64));
++    match evidence.matrix::<2, 2>(&mut small_graph, &mut small_arithmetic) {
++        Ok(value) => assert_eq!(value.intervals(), projection.intervals()),
++        Err(
++            ExpressionError::WorkExhausted
++            | ExpressionError::Enclosure {
++                source: IntervalError::WorkExhausted,
++                ..
++            },
++        ) => {}
++        Err(error) => panic!("unexpected failure: {error}"),
++    }
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        evidence.matrix::<2, 2>(&mut cancelled, &mut arithmetic()),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert_eq!(
++        evidence
++            .matrix::<2, 2>(&mut graph(), &mut arithmetic())
++            .unwrap()
++            .intervals(),
++        projection.intervals()
++    );
++});
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 80109d5f4..56387454b 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -19,6 +19,8 @@ use crate::{Expr, SymbolId, SymbolRef, work_budget::CancellationToken};
+ 
+ #[cfg(feature = "interval-program")]
+ mod dyadic;
++#[cfg(feature = "interval-lattice")]
++pub use dyadic::JacobianMatrix;
+ #[cfg(feature = "interval-program")]
+ pub use dyadic::RegularJacobianEnclosure;
+ mod affine;
+@@ -195,6 +197,15 @@ pub enum ExpressionError {
+     InvalidOutput { output: usize, node: usize },
+     /// Evaluation arguments do not match the explicit binding table.
+     BindingCount { expected: usize, actual: usize },
++    /// Requested matrix rows differ from the source output count.
++    #[cfg(feature = "interval-lattice")]
++    JacobianRows { expected: usize, actual: usize },
++    /// Requested matrix columns differ from the selected variable count.
++    #[cfg(feature = "interval-lattice")]
++    JacobianColumns { expected: usize, actual: usize },
++    /// Native matrix construction failure, preserving the lattice diagnostic.
++    #[cfg(feature = "interval-lattice")]
++    Lattice(hyperlattice::IntervalLatticeError),
+     /// The configured definition-entry limit was exceeded.
+     SizeExhausted,
+     /// The next graph work charge could not be admitted.
+@@ -236,6 +247,8 @@ impl fmt::Display for ExpressionError {
+ impl std::error::Error for ExpressionError {
+     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+         match self {
++            #[cfg(feature = "interval-lattice")]
++            Self::Lattice(source) => Some(source),
+             Self::Scalar { source, .. } => Some(source),
+             #[cfg(feature = "interval-program")]
+             Self::Enclosure { source, .. } => Some(source),
+diff --git a/crates/hypersolve/src/expression_program/dyadic.rs b/crates/hypersolve/src/expression_program/dyadic.rs
+index b064d4a78..1440fd6ef 100644
+--- a/crates/hypersolve/src/expression_program/dyadic.rs
++++ b/crates/hypersolve/src/expression_program/dyadic.rs
+@@ -8,6 +8,10 @@ use super::{
+ 
+ mod regularity;
+ pub use regularity::RegularJacobianEnclosure;
++#[cfg(feature = "interval-lattice")]
++mod matrix;
++#[cfg(feature = "interval-lattice")]
++pub use matrix::JacobianMatrix;
+ 
+ impl ExpressionProgram {
+     /// Enclose every output over the Cartesian product of the input intervals.
+diff --git a/crates/hypersolve/src/expression_program/dyadic/matrix.rs b/crates/hypersolve/src/expression_program/dyadic/matrix.rs
+new file mode 100644
+index 000000000..df3280679
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/dyadic/matrix.rs
+@@ -0,0 +1,109 @@
++//! Fixed-size numerical projection without discarding source-domain evidence.
++use super::{
++    DyadicBudget, DyadicInterval, ExpressionBudget, ExpressionError, RegularJacobianEnclosure,
++};
++use hyperlattice::IntervalMatrix;
++
++/// Row-major partial enclosures retaining their original regularity evidence.
++///
++/// Rows follow source output order; columns follow the selected differentiation
++/// variables, which need not match input binding order. The borrowed evidence
++/// retains source, domain and precision. Matrix arithmetic remains Hyperlattice's
++/// responsibility; a numerical product alone is not a new regularity certificate.
++#[derive(Debug)]
++pub struct JacobianMatrix<'a, const R: usize, const C: usize> {
++    evidence: &'a RegularJacobianEnclosure,
++    intervals: IntervalMatrix<DyadicInterval, R, C>,
++}
++
++impl<'a, const R: usize, const C: usize> JacobianMatrix<'a, R, C> {
++    /// Original immutable source, domain and selected-variable association.
++    pub fn evidence(&self) -> &'a RegularJacobianEnclosure {
++        self.evidence
++    }
++
++    /// Numerical matrix for subsequent lattice operations, without copying.
++    pub fn intervals(&self) -> &IntervalMatrix<DyadicInterval, R, C> {
++        &self.intervals
++    }
++
++    /// Explicitly discard this projection's evidence reference and move its matrix.
++    /// The original borrowed evidence remains usable.
++    pub fn into_intervals(self) -> IntervalMatrix<DyadicInterval, R, C> {
++        self.intervals
++    }
++}
++
++impl RegularJacobianEnclosure {
++    /// Project selected partials into a fixed-size matrix with retained evidence.
++    ///
++    /// Row count, then column count, are checked before handling an empty domain.
++    /// An empty domain
++    /// yields an empty matrix even when a matrix dimension is zero; otherwise a
++    /// zero dimension denotes the nonempty unit product. Scalar copies preserve
++    /// the stored exact bounds and grid, including the original enclosure width.
++    ///
++    /// Graph charges cover domain scanning, entry initialization, row-major copies
++    /// and final assembly. All native coefficient copies share `arithmetic`.
++    /// Cancellation is checked on entry and before publication; failures publish
++    /// no partial matrix and do not mutate evidence. Inline temporary/output
++    /// storage grows with R*C; these budgets are not a total stack/heap bound.
++    pub fn matrix<const R: usize, const C: usize>(
++        &self,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<JacobianMatrix<'_, R, C>, ExpressionError> {
++        graph.charge(0)?;
++        let program = self.program();
++        let actual = (
++            program.source().definition().outputs.len(),
++            program.variables().len(),
++        );
++        if actual.0 != R {
++            return Err(ExpressionError::JacobianRows {
++                expected: R,
++                actual: actual.0,
++            });
++        }
++        if actual.1 != C {
++            return Err(ExpressionError::JacobianColumns {
++                expected: C,
++                actual: actual.1,
++            });
++        }
++        let entries = R.checked_mul(C).ok_or(ExpressionError::SizeExhausted)?;
++        graph.check_entries(&[R, C, entries, self.arguments().len()])?;
++        graph.charge(self.arguments().len())?;
++        let intervals = if self.arguments().iter().any(DyadicInterval::is_empty) {
++            IntervalMatrix::empty().map_err(ExpressionError::Lattice)?
++        } else {
++            graph.charge(R + entries)?;
++            let mut rows: [[Option<DyadicInterval>; C]; R] =
++                core::array::from_fn(|_| core::array::from_fn(|_| None));
++            for (row, slots) in rows.iter_mut().enumerate() {
++                for (column, slot) in slots.iter_mut().enumerate() {
++                    graph.charge(1)?;
++                    let index = program
++                        .partial_output(row, column)
++                        .expect("validated shape");
++                    *slot = Some(self.values()[index].checked_pow(1, arithmetic).map_err(
++                        |source| ExpressionError::Enclosure {
++                            node: program.program().definition().outputs[index],
++                            source,
++                        },
++                    )?);
++                }
++            }
++            graph.charge(R + entries)?;
++            IntervalMatrix::new(
++                rows.map(|row| row.map(|entry| entry.expect("all entries initialized"))),
++            )
++            .map_err(ExpressionError::Lattice)?
++        };
++        graph.charge(0)?;
++        Ok(JacobianMatrix {
++            evidence: self,
++            intervals,
++        })
++    }
++}
+diff --git a/crates/hypersolve/tests/jacobian_matrix.rs b/crates/hypersolve/tests/jacobian_matrix.rs
+new file mode 100644
+index 000000000..828ab020a
+--- /dev/null
++++ b/crates/hypersolve/tests/jacobian_matrix.rs
+@@ -0,0 +1,343 @@
++#![cfg(feature = "interval-lattice")]
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hyperlattice::{IntervalMatrix, IntervalVector};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionError, ExpressionProgram, RegularJacobianEnclosure,
++    },
++    work_budget::CancellationToken,
++};
++
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 10_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(4096, 10_000_000)
++}
++fn d(a: i64, b: i64) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), 0).unwrap()
++}
++fn source() -> ExpressionProgram {
++    let x = || Expr::anonymous_symbol(SymbolId(0));
++    let y = || Expr::anonymous_symbol(SymbolId(1));
++    ExpressionProgram::compile(
++        &[
++            x().powi(2) + Expr::int(3) * y(),
++            x() * y(),
++            y().powi(2) - x(),
++        ],
++        &[SymbolId(0), SymbolId(1)],
++        &mut graph(),
++    )
++    .unwrap()
++}
++fn evidence(arguments: &[DyadicInterval]) -> RegularJacobianEnclosure {
++    source()
++        .jacobian(&[SymbolId(1), SymbolId(0)], &mut graph())
++        .unwrap()
++        .enclose_regular(arguments, -16, &mut graph(), &mut arithmetic())
++        .unwrap()
++}
++
++#[test]
++fn rectangular_projection_retains_source_and_has_independent_derivatives() {
++    for x in -4..=4 {
++        for y in -4..=4 {
++            let evidence = evidence(&[d(x, x), d(y, y)]);
++            let projection = evidence
++                .matrix::<3, 2>(&mut graph(), &mut arithmetic())
++                .unwrap();
++            assert!(core::ptr::eq(projection.evidence(), &evidence));
++            assert_eq!(
++                projection.evidence().program().source().definition(),
++                source().definition()
++            );
++            assert_eq!(
++                projection.evidence().program().variables(),
++                &[SymbolId(1), SymbolId(0)]
++            );
++            assert_eq!(projection.evidence().arguments(), &[d(x, x), d(y, y)]);
++            assert_eq!(projection.evidence().precision(), -16);
++            let expected = [[3, 2 * x], [x, y], [2 * y, -1]].map(|row| row.map(|v| d(v, v)));
++            assert_eq!(projection.intervals().rows(), Some(&expected));
++            let vector = IntervalVector::new([d(2, 2), d(-1, -1)]).unwrap();
++            let image = projection
++                .intervals()
++                .mul_vector(&vector, &mut arithmetic())
++                .unwrap();
++            assert_eq!(
++                image.lanes(),
++                Some(&[
++                    d(6 - 2 * x, 6 - 2 * x),
++                    d(2 * x - y, 2 * x - y),
++                    d(4 * y + 1, 4 * y + 1)
++                ])
++            );
++            assert_eq!(projection.into_intervals().rows(), Some(&expected));
++        }
++    }
++}
++
++#[test]
++fn box_projection_composes_with_products_and_norms() {
++    let evidence = evidence(&[d(-2, 4), d(-3, 2)]);
++    let projection = evidence
++        .matrix::<3, 2>(&mut graph(), &mut arithmetic())
++        .unwrap();
++    let matrix = projection.intervals();
++    assert_eq!(
++        matrix.rows(),
++        Some(&[
++            [d(3, 3), d(-4, 8)],
++            [d(-2, 4), d(-3, 2)],
++            [d(-6, 4), d(-1, -1)]
++        ])
++    );
++    assert_eq!(matrix.norm_one(&mut arithmetic()).unwrap(), d(3, 13));
++    assert_eq!(matrix.norm_infinity(&mut arithmetic()).unwrap(), d(3, 11));
++    let vector = IntervalVector::new([d(2, 2), d(-1, -1)]).unwrap();
++    assert_eq!(
++        matrix
++            .mul_vector(&vector, &mut arithmetic())
++            .unwrap()
++            .lanes(),
++        Some(&[d(-2, 10), d(-6, 11), d(-11, 9)])
++    );
++    let swap = IntervalMatrix::new([[d(0, 0), d(1, 1)], [d(1, 1), d(0, 0)]]).unwrap();
++    let switched = matrix.mul_matrix(&swap, &mut arithmetic()).unwrap();
++    assert_eq!(
++        switched.rows(),
++        Some(&[
++            [d(-4, 8), d(3, 3)],
++            [d(-3, 2), d(-2, 4)],
++            [d(-1, -1), d(-6, 4)]
++        ])
++    );
++}
++
++#[test]
++fn shapes_empty_domains_and_unit_products_remain_distinct() {
++    let evidence = evidence(&[DyadicInterval::empty(), d(0, 1)]);
++    assert!(
++        evidence
++            .matrix::<3, 2>(&mut graph(), &mut arithmetic())
++            .unwrap()
++            .intervals()
++            .is_empty()
++    );
++    assert!(matches!(
++        evidence.matrix::<2, 3>(&mut graph(), &mut arithmetic()),
++        Err(ExpressionError::JacobianRows {
++            expected: 2,
++            actual: 3
++        })
++    ));
++    assert!(matches!(
++        evidence.matrix::<3, 1>(&mut graph(), &mut arithmetic()),
++        Err(ExpressionError::JacobianColumns {
++            expected: 1,
++            actual: 2
++        })
++    ));
++    fn zero<const R: usize, const C: usize>(
++        outputs: &[Expr],
++        selected: &[SymbolId],
++        arguments: &[DyadicInterval],
++        empty: bool,
++    ) {
++        let bindings = if arguments.is_empty() {
++            vec![]
++        } else {
++            vec![SymbolId(0)]
++        };
++        let source = ExpressionProgram::compile(outputs, &bindings, &mut graph()).unwrap();
++        let evidence = source
++            .jacobian(selected, &mut graph())
++            .unwrap()
++            .enclose_regular(arguments, -16, &mut graph(), &mut arithmetic())
++            .unwrap();
++        let projection = evidence
++            .matrix::<R, C>(&mut graph(), &mut arithmetic())
++            .unwrap();
++        assert_eq!(projection.intervals().is_empty(), empty);
++        assert_eq!(projection.intervals().is_singleton(), !empty);
++        let rhs =
++            IntervalVector::<DyadicInterval, C>::new(core::array::from_fn(|_| d(0, 0))).unwrap();
++        assert_eq!(
++            projection
++                .intervals()
++                .mul_vector(&rhs, &mut arithmetic())
++                .unwrap()
++                .is_empty(),
++            empty
++        );
++    }
++    for empty in [false, true] {
++        let args = [if empty {
++            DyadicInterval::empty()
++        } else {
++            d(-1, 1)
++        }];
++        zero::<0, 1>(&[], &[SymbolId(0)], &args, empty);
++        zero::<1, 0>(&[Expr::int(7)], &[], &args, empty);
++        zero::<0, 0>(&[], &[], &args, empty);
++    }
++    zero::<0, 0>(&[], &[], &[], false);
++    zero::<1, 0>(&[Expr::int(7)], &[], &[], false);
++}
++
++#[test]
++fn resource_failure_and_cancellation_preserve_source_and_retry() {
++    let evidence = evidence(&[d(-2, 4), d(-3, 2)]);
++    let before = evidence.values().to_vec();
++    assert!(matches!(
++        evidence.matrix::<3, 2>(&mut ExpressionBudget::new(0, 1000), &mut arithmetic()),
++        Err(ExpressionError::SizeExhausted)
++    ));
++    assert!(matches!(
++        evidence.matrix::<3, 2>(&mut ExpressionBudget::new(1000, 0), &mut arithmetic()),
++        Err(ExpressionError::WorkExhausted)
++    ));
++    let error = evidence
++        .matrix::<3, 2>(&mut graph(), &mut DyadicBudget::new(4096, 0))
++        .unwrap_err();
++    assert!(matches!(
++        error,
++        ExpressionError::Enclosure {
++            source: IntervalError::WorkExhausted,
++            ..
++        }
++    ));
++    assert!(std::error::Error::source(&error).is_some());
++    assert!(matches!(
++        evidence.matrix::<3, 2>(&mut graph(), &mut DyadicBudget::new(0, 1000000)),
++        Err(ExpressionError::Enclosure {
++            source: IntervalError::SizeExhausted,
++            ..
++        })
++    ));
++    let token = CancellationToken::new();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token.clone());
++    token.cancel();
++    assert!(matches!(
++        evidence.matrix::<2, 3>(&mut cancelled, &mut arithmetic()),
++        Err(ExpressionError::Cancelled)
++    ));
++    let mut budget = graph();
++    let initial = budget.remaining_work();
++    let expected = evidence
++        .matrix::<3, 2>(&mut budget, &mut arithmetic())
++        .unwrap()
++        .into_intervals();
++    let work = initial - budget.remaining_work();
++    assert_eq!(work, 2 + 2 * (3 + 6) + 6);
++    for limit in 0..work {
++        assert!(matches!(
++            evidence.matrix::<3, 2>(&mut ExpressionBudget::new(1000, limit), &mut arithmetic()),
++            Err(ExpressionError::WorkExhausted)
++        ));
++    }
++    assert_eq!(
++        evidence
++            .matrix::<3, 2>(&mut ExpressionBudget::new(1000, work), &mut arithmetic())
++            .unwrap()
++            .into_intervals(),
++        expected
++    );
++    assert_eq!(evidence.values(), before);
++}
++
++#[test]
++fn native_replay_rebuilds_source_association_before_projection() {
++    let original = source();
++    let replay =
++        ExpressionProgram::from_definition(original.definition().clone(), &mut graph()).unwrap();
++    let jacobian = replay
++        .jacobian(&[SymbolId(1), SymbolId(0)], &mut graph())
++        .unwrap();
++    let evidence = jacobian
++        .enclose_regular(&[d(-2, 4), d(-3, 2)], -16, &mut graph(), &mut arithmetic())
++        .unwrap();
++    let projection = evidence
++        .matrix::<3, 2>(&mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(
++        projection.evidence().program().source().definition(),
++        original.definition()
++    );
++    assert_eq!(
++        projection.intervals().rows().unwrap()[1],
++        [d(-2, 4), d(-3, 2)]
++    );
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn native_projection_adds_no_scalar_predicates_or_rational_reductions() {
++    use hyperreal::dispatch_trace;
++    let evidence = evidence(&[d(-2, 4), d(-3, 2)]);
++    for _ in 0..2 {
++        dispatch_trace::reset();
++        let projection = dispatch_trace::with_recording(|| {
++            evidence
++                .matrix::<3, 2>(&mut graph(), &mut arithmetic())
++                .unwrap()
++        });
++        let trace = dispatch_trace::take_trace();
++        assert!(trace.dispatch.is_empty(), "{trace:?}");
++        assert_eq!(trace.rational, Default::default());
++        for row in 0..3 {
++            for column in 0..2 {
++                let index = evidence.program().partial_output(row, column).unwrap();
++                assert_eq!(
++                    projection.intervals().rows().unwrap()[row][column].bounds(),
++                    evidence.values()[index].bounds()
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn nonselected_parameter_domains_survive_native_projection() {
++    let x = Expr::anonymous_symbol(SymbolId(0));
++    let time = Expr::anonymous_symbol(SymbolId(1));
++    // State partials are respectively t^2 and sqrt(t). The latter is continuous
++    // at t=0 and smooth in x, without claiming differentiability in time.
++    for (coefficient, expected) in [(time.clone().powi(2), d(0, 16)), (time.sqrt(), d(0, 2))] {
++        let source = ExpressionProgram::compile(
++            &[x.clone() * coefficient],
++            &[SymbolId(1), SymbolId(0)],
++            &mut graph(),
++        )
++        .unwrap();
++        let arguments = [d(0, 4), d(-2, 3)];
++        let evidence = source
++            .jacobian(&[SymbolId(0)], &mut graph())
++            .unwrap()
++            .enclose_regular(&arguments, -16, &mut graph(), &mut arithmetic())
++            .unwrap();
++        let projection = evidence
++            .matrix::<1, 1>(&mut graph(), &mut arithmetic())
++            .unwrap();
++        assert_eq!(projection.evidence().arguments(), &arguments);
++        assert_eq!(projection.evidence().program().variables(), &[SymbolId(0)]);
++        assert_eq!(projection.intervals().rows(), Some(&[[expected.clone()]]));
++        assert_eq!(
++            projection
++                .intervals()
++                .norm_infinity(&mut arithmetic())
++                .unwrap(),
++            expected
++        );
++        assert!(matches!(
++            evidence.matrix::<1, 2>(&mut graph(), &mut arithmetic()),
++            Err(ExpressionError::JacobianColumns {
++                expected: 2,
++                actual: 1
++            })
++        ));
++    }
++}
