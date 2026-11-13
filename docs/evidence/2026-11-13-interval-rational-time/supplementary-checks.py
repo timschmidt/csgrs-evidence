@@ -1,0 +1,11 @@
+from pathlib import Path
+import subprocess,json,time,os
+s=Path(__file__).parent;root='/mnt/development/csgrs'
+commands=[('successive', 'cargo +1.95.0 bench --locked --bench successive_operations --features curve,stl-io,obj-io -- --test', {}, '/mnt/development/csgrs'), ('owner-bench', 'cargo +1.95.0 bench --locked -p hypersolve --bench certification -- --test', {}, '/mnt/development/csgrs'), ('point-bench', 'cargo bench --locked -p hypersolve --features expression-program --bench expression_program -- --test', {}, '/mnt/development/csgrs'), ('path-bench', 'cargo +1.95.0 bench --locked -p hyperpath --bench path_predicates -- --test', {}, '/mnt/development/csgrs'), ('interface', 'cargo +1.95.0 test --locked -p alumina-interface-core', {}, '/mnt/development/alumina-interface'), ('native-asan', 'cargo +nightly test --locked --target x86_64-unknown-linux-gnu -p hyperinterval --all-features --test rational_admission', {'RUSTFLAGS': '-Zsanitizer=address', 'CARGO_TARGET_DIR': '/tmp/interval-refactor/dyadic-evolution-asan'}, '/mnt/development/csgrs'), ('program-asan', 'cargo +nightly test --locked --target x86_64-unknown-linux-gnu -p hypersolve --all-features --test program_affine', {'RUSTFLAGS': '-Zsanitizer=address', 'CARGO_TARGET_DIR': '/tmp/interval-refactor/dyadic-evolution-asan'}, '/mnt/development/csgrs'), ('clock-cost-build', 'cargo build --release --locked --manifest-path /tmp/interval-refactor/rational-time/rational-clock-cost-project/Cargo.toml', {'CARGO_TARGET_DIR': '/tmp/interval-refactor/rational-time-target'}, '/mnt/development/csgrs')]
+rows=json.loads((s/'supplementary-checks.json').read_text()) if (s/'supplementary-checks.json').exists() else []
+for name,command,extra,cwd in commands:
+ if any(r['name']==name and r['exit']==0 for r in rows):continue
+ start=time.monotonic();cmd=command.split()
+ with (s/(name+'-final.log')).open('w') as f:r=subprocess.run(cmd,cwd=cwd,env={**os.environ,**extra},stdout=f,stderr=subprocess.STDOUT)
+ row=dict(name=name,command=cmd,cwd=cwd,environment=extra,exit=r.returncode,seconds=time.monotonic()-start);rows.append(row);(s/'supplementary-checks.json').write_text(json.dumps(rows,indent=2)+'\n');print(name,r.returncode,round(row['seconds'],2),flush=True)
+ if r.returncode:break

@@ -1,0 +1,99 @@
+--- direct/crates/hyperdynamics/src/field.rs
++++ macro/crates/hyperdynamics/src/field.rs
+@@ -266,6 +266,44 @@
+ pub struct ExpressionField<const N: usize> {
+     data: Arc<FieldData>,
+ }
++// Keep the original constructor's ownership/drop scopes while sharing the
++// validated-source assembly with affine clocks. Predicate and charge order are
++// deliberately unchanged; this is assembly, not another validation authority.
++macro_rules! assemble_field {
++    ($source:ident, $time:expr, $state:expr, $inputs:expr, $budget:ident) => {{
++        let mut bindings = Vec::new();
++        for id in &$source.definition().variables {
++            $budget.graph.charge($inputs)?;
++            bindings.push(if *id == $time {
++                Input::Time
++            } else {
++                Input::State(
++                    ($state)
++                        .iter()
++                        .position(|state| state == id)
++                        .ok_or(FieldError::UnexpectedBinding(*id))?,
++                )
++            });
++        }
++        let jacobian = $source.jacobian(&$state, &mut $budget.graph)?;
++        $budget.graph.charge(2)?;
++        let identity = FieldIdentity(Arc::new(IdentityData {
++            source: $source,
++            time: $time,
++            state: $state,
++        }));
++        let field = Self {
++            data: Arc::new(FieldData {
++                identity,
++                jacobian,
++                inputs: bindings,
++            }),
++        };
++        $budget.graph.charge(0)?;
++        Ok(field)
++    }};
++}
++
+ impl<const N: usize> ExpressionField<N> {
+     /// Validate shape, all source references and bindings, then regenerate partials.
+     /// Scalar ingress/payload and graph-budget exclusions remain explicit.
+@@ -310,12 +348,11 @@
+             }
+         }
+         let source = ExpressionProgram::from_definition(definition.source, &mut budget.graph)?;
+-        Self::from_validated_source(source, definition.time, definition.state, inputs, budget)
++        assemble_field!(source, definition.time, definition.state, inputs, budget)
+     }
+ 
+     // Shape, time/state separation and the source graph are already validated.
+     // Reparameterization preserves those invariants and can share the owned DAG.
+-    // Keep the same constructor effects/order when called from from_definition.
+     #[inline(always)]
+     fn from_validated_source(
+         source: ExpressionProgram,
+@@ -324,36 +361,7 @@
+         inputs: usize,
+         budget: &mut EnclosureBudget,
+     ) -> Result<Self, FieldError> {
+-        let mut bindings = Vec::new();
+-        for id in &source.definition().variables {
+-            budget.graph.charge(inputs)?;
+-            bindings.push(if *id == time {
+-                Input::Time
+-            } else {
+-                Input::State(
+-                    state
+-                        .iter()
+-                        .position(|state| state == id)
+-                        .ok_or(FieldError::UnexpectedBinding(*id))?,
+-                )
+-            });
+-        }
+-        let jacobian = source.jacobian(&state, &mut budget.graph)?;
+-        budget.graph.charge(2)?;
+-        let identity = FieldIdentity(Arc::new(IdentityData {
+-            source,
+-            time,
+-            state,
+-        }));
+-        let field = Self {
+-            data: Arc::new(FieldData {
+-                identity,
+-                jacobian,
+-                inputs: bindings,
+-            }),
+-        };
+-        budget.graph.charge(0)?;
+-        Ok(field)
++        assemble_field!(source, time, state, inputs, budget)
+     }
+ 
+     fn arguments(
