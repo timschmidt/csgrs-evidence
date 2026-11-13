@@ -1,0 +1,1421 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 6039036bb..ec78bcf11 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add experimental `expression-program` support for immutable flat symbolic
++  definitions, explicit ordered bindings, validated DAG replay, and exact scalar
++  evaluation. Preserve source guards and typed scalar failures. Structural work
++  and entry limits include cancellation and retry; they do not bound scalar
++  arithmetic or heap bytes. Optional `serde` retains validated Hyperreal scalar
++  definitions. This is not an interval field or validated ODE implementation.
++
+ - Preserve the exact integer-power derivative at `i64::MIN` using a quotient
+   whose exponent remains representable, including repeated differentiation and
+   the nonzero-base domain. Report an unavailable dense symbolic-Jacobian
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 741e1f566..38d29e783 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -24,6 +24,7 @@ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = fals
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features = false }
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
++serde = { version = "1.0", features = ["derive"], optional = true }
+ [dev-dependencies]
+ # Test-only interval migration candidates; production remains gated by cost.
+ hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
+@@ -39,6 +40,9 @@ serde_json = "1.0.149"
+ 
+ [features]
+ default = []
++# Owned expression graphs; validated dynamics integration remains experimental.
++expression-program = []
++serde = ["dep:serde", "hyperreal/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+@@ -72,3 +76,12 @@ harness = false
+ 
+ [[example]]
+ name = "allocation_profile"
++
++[[example]]
++name = "owned_program"
++required-features = ["expression-program"]
++
++[[bench]]
++name = "expression_program"
++harness = false
++required-features = ["expression-program"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 6fdbf86e1..da138e384 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -15,7 +15,7 @@ dense floating-point proposal loop a source of topology truth.
+ Domain geometry remains owned by Hyperlimit, Hypercurve, Hypertri, and their
+ consumers. Hypersolve owns reusable equation structure and certification.
+ 
+-This README describes crate version `0.3.1`.
++This README describes crate version `0.4.0`.
+ 
+ ## Primary types
+ 
+@@ -45,6 +45,19 @@ cargo run -p hypersolve --example basic
+ Hypersolve has no default features. `dispatch-trace` is for exact-dispatch
+ instrumentation and does not change the mathematical API.
+ 
++The experimental `expression-program` feature adds owned flat expression
++graphs with ordered bindings and validated replay. It retains the existing
++`Expr` grammar and exact scalar definitions. Enable `serde` to serialize its
++unvalidated definitions; load them through `ExpressionProgram::from_definition`
++before evaluation. Graph budgets cover structural work and entry counts, not
++scalar arithmetic or heap bytes. Interval images, bounded derivative
++construction and validated evolution remain separate work. Run the source and
++symbolic-Jacobian example with:
++
++```sh
++cargo run -p hypersolve --features expression-program --example owned_program
++```
++
+ `work_budget::with_budget` bounds instrumented root-subdivision and tensor-image
+ promotion attempts across nested synchronous operations. Exhaustion is a typed
+ resource failure and never authorizes approximation. The counters do not yet
+@@ -465,6 +478,8 @@ their use case.
+ | Feature | Default | Purpose |
+ | --- | --- | --- |
+ | `dispatch-trace` | no | Hyperreal/Hyperlattice/Hyperlimit exact-dispatch instrumentation |
++| `expression-program` | no | Experimental owned flat expression definitions and exact scalar evaluation |
++| `serde` | no | Symbol and expression-definition serialization using validated Hyperreal scalar replay |
+ 
+ ## Validation and performance
+ 
+diff --git a/crates/hypersolve/benches/expression_program.rs b/crates/hypersolve/benches/expression_program.rs
+new file mode 100644
+index 000000000..b91d6c92a
+--- /dev/null
++++ b/crates/hypersolve/benches/expression_program.rs
+@@ -0,0 +1,70 @@
++//! Absolute costs of completed graph operations, not validated-field timings.
++//! Scalar inputs are exact small integers. Compile includes payload cloning;
++//! replay includes definition cloning; evaluation includes full output/drop.
++
++use std::hint::black_box;
++
++use criterion::{Criterion, criterion_group, criterion_main};
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 1_000_000)
++}
++
++fn benchmarks(c: &mut Criterion) {
++    let x = SymbolId(0);
++    let variable = Expr::anonymous_symbol(x);
++    for degree in [1, 8, 32, 128] {
++        let mut source = Expr::int(1);
++        for _ in 0..degree {
++            // Explicit constructors retain authored tree structure.
++            source = Expr::Add(
++                Box::new(Expr::Mul(Box::new(source), Box::new(variable.clone()))),
++                Box::new(Expr::int(1)),
++            );
++        }
++        let sources = [source];
++        let program = ExpressionProgram::compile(&sources, &[x], &mut budget()).unwrap();
++        let values = [Real::one()];
++        assert_eq!(
++            program.eval_real(&values, &mut budget()).unwrap(),
++            [Real::from(degree + 1)]
++        );
++        let mut group = c.benchmark_group(format!("expression_program/degree_{degree}"));
++        group.bench_function("compile", |b| {
++            b.iter(|| {
++                black_box(
++                    ExpressionProgram::compile(black_box(&sources), &[x], &mut budget()).unwrap(),
++                );
++            })
++        });
++        group.bench_function("replay", |b| {
++            b.iter(|| {
++                black_box(
++                    ExpressionProgram::from_definition(
++                        black_box(program.definition()).clone(),
++                        &mut budget(),
++                    )
++                    .unwrap(),
++                );
++            })
++        });
++        group.bench_function("evaluate", |b| {
++            b.iter(|| {
++                let result = program
++                    .eval_real(black_box(&values), &mut budget())
++                    .unwrap();
++                assert_eq!(result, [Real::from(degree + 1)]);
++                black_box(result);
++            })
++        });
++        group.finish();
++    }
++}
++
++criterion_group!(benches, benchmarks);
++criterion_main!(benches);
+diff --git a/crates/hypersolve/examples/owned_program.rs b/crates/hypersolve/examples/owned_program.rs
+new file mode 100644
+index 000000000..ad9867f9a
+--- /dev/null
++++ b/crates/hypersolve/examples/owned_program.rs
+@@ -0,0 +1,35 @@
++//! Own and replay an oscillator's source and symbolic Jacobian definitions.
++//! This evaluates exact points; it does not certify a trajectory or interval.
++
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let time = SymbolId(0);
++    let position = SymbolId(1);
++    let velocity = SymbolId(2);
++    let field = [
++        Expr::anonymous_symbol(velocity),
++        -Expr::anonymous_symbol(position),
++    ];
++    let mut outputs = field.to_vec();
++    for component in &field {
++        for variable in [position, velocity] {
++            // Existing symbolic authority; derivative construction is outside
++            // the program's structural graph budget.
++            outputs.push(component.derivative(variable));
++        }
++    }
++    let mut budget = ExpressionBudget::new(100, 1_000);
++    let program = ExpressionProgram::compile(&outputs, &[time, position, velocity], &mut budget)?;
++    drop(outputs);
++    let replay = ExpressionProgram::from_definition(program.definition().clone(), &mut budget)?;
++    assert_eq!(program.definition(), replay.definition());
++    let values = replay.eval_real(&[Real::zero(), Real::from(2), Real::from(3)], &mut budget)?;
++    assert_eq!(values, [3, -2, 0, 1, -1, 0].map(Real::from));
++    println!("exact field: (3, -2); Jacobian: [[0, 1], [-1, 0]]");
++    Ok(())
++}
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+new file mode 100644
+index 000000000..dfcb4b733
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -0,0 +1,542 @@
++//! Owned, flat symbolic definitions with explicit ordered bindings.
++//!
++//! This experimental prerequisite for enclosed vector fields preserves every
++//! [`Expr`] operation and its domain guards. It does not certify an interval
++//! image, derivative, Jacobian, or trajectory. Existing expression consumers
++//! are unchanged. Graph limits are distinct from scalar arithmetic limits.
++//!
++//! Definitions are data, not evidence. After deserialization, call
++//! [`ExpressionProgram::from_definition`] to validate references and bindings.
++//! Scalar deserialization uses Hyperreal's validation; it is outside the graph
++//! budget, as are scalar cloning, arithmetic, equality and destruction.
++
++use std::{collections::BTreeMap, fmt, sync::Arc};
++
++use hyperreal::{Problem, Real};
++
++use crate::{Expr, SymbolId, SymbolRef, work_budget::CancellationToken};
++
++/// An operation on two expressions, preserving left-to-right evaluation.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum BinaryOperation {
++    /// Addition.
++    Add,
++    /// Subtraction.
++    Sub,
++    /// Multiplication.
++    Mul,
++    /// Division, including its nonzero-denominator obligation.
++    Div,
++}
++
++/// An operation on one expression, including the original domain obligation.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum UnaryOperation {
++    /// Negation.
++    Neg,
++    /// Integer power; even exponent zero retains evaluation of its operand.
++    PowI(i64),
++    /// Principal square root.
++    Sqrt,
++    /// Sine.
++    Sin,
++    /// Cosine.
++    Cos,
++    /// Natural logarithm.
++    Ln,
++    /// Base-ten logarithm.
++    Log10,
++    /// Principal inverse sine.
++    Asin,
++    /// Principal inverse cosine.
++    Acos,
++    /// Principal inverse hyperbolic cosine.
++    Acosh,
++    /// Inverse hyperbolic tangent.
++    Atanh,
++}
++
++/// A flat expression node. Child indices must be strictly less than its index.
++#[derive(Clone, Debug, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum ExpressionNode {
++    /// An authoritative exact scalar definition.
++    Constant(Real),
++    /// A variable whose identifier occurs in the ordered binding table.
++    Variable(SymbolRef),
++    /// A unary operation on an earlier node.
++    Unary {
++        /// Operation to evaluate.
++        operation: UnaryOperation,
++        /// Earlier operand index.
++        input: usize,
++    },
++    /// A binary operation on earlier nodes.
++    Binary {
++        /// Operation to evaluate.
++        operation: BinaryOperation,
++        /// Earlier left operand index.
++        left: usize,
++        /// Earlier right operand index.
++        right: usize,
++    },
++}
++
++/// Unvalidated replay data, including the full source and binding order.
++///
++/// Equality is structural, using Hyperreal's structural scalar equality. It
++/// includes node order, sharing, names and output order; it neither proves
++/// equality of functions nor assigns an allocation-based identity. The serde
++/// form is experimental and not yet a versioned interchange format.
++#[derive(Clone, Debug, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct ExpressionDefinition {
++    /// Distinct variable identifiers, in evaluation argument order.
++    pub variables: Vec<SymbolId>,
++    /// Flat source graph, in dependency order. Unused nodes are permitted.
++    pub nodes: Vec<ExpressionNode>,
++    /// Output node indices, in result order. Repeated outputs are permitted.
++    pub outputs: Vec<usize>,
++}
++
++/// Structural limits shared across compilation, validation and evaluation.
++///
++/// One work unit admits one visited input, emitted node, validated record,
++/// traversal task, or initialized cache entry. `max_entries` bounds the sum of
++/// definition variables, nodes and outputs; temporary graph storage is linear
++/// in that sum. Neither limit bounds heap bytes, scalar arithmetic, coefficient
++/// growth, scalar cloning/destruction, serialization, or elapsed time. Map
++/// lookups have logarithmic cost; a unit is not a CPU instruction.
++///
++/// Cancellation is checked before each charge and before publication.
++/// It cannot interrupt scalar operations. Failed charges spend no work; work
++/// already done is not refunded. There is no global cache to poison on retry.
++#[derive(Clone, Debug)]
++pub struct ExpressionBudget {
++    max_entries: usize,
++    remaining_work: usize,
++    /// Optional shared cooperative cancellation request.
++    pub cancellation: Option<CancellationToken>,
++}
++
++impl ExpressionBudget {
++    /// Configure graph entry and work limits; cancellation is initially absent.
++    pub const fn new(max_entries: usize, work: usize) -> Self {
++        Self {
++            max_entries,
++            remaining_work: work,
++            cancellation: None,
++        }
++    }
++
++    /// Work units not yet consumed.
++    pub const fn remaining_work(&self) -> usize {
++        self.remaining_work
++    }
++
++    fn charge(&mut self, amount: usize) -> Result<(), ExpressionError> {
++        if self
++            .cancellation
++            .as_ref()
++            .is_some_and(CancellationToken::is_cancelled)
++        {
++            return Err(ExpressionError::Cancelled);
++        }
++        if amount > self.remaining_work {
++            return Err(ExpressionError::WorkExhausted);
++        }
++        self.remaining_work -= amount;
++        Ok(())
++    }
++
++    fn entries(&self, counts: &[usize]) -> Result<(), ExpressionError> {
++        let total = counts
++            .iter()
++            .try_fold(0_usize, |sum, count| sum.checked_add(*count));
++        if total.is_none_or(|total| total > self.max_entries) {
++            return Err(ExpressionError::SizeExhausted);
++        }
++        Ok(())
++    }
++}
++
++/// Validation, graph resource, or scalar evaluation failure.
++#[derive(Clone, Debug)]
++pub enum ExpressionError {
++    /// Two binding slots name the same variable.
++    DuplicateVariable(SymbolId),
++    /// A source variable has no binding slot.
++    UnboundVariable(SymbolId),
++    /// An operand is not an earlier node (including cycles and forward edges).
++    InvalidReference { node: usize, input: usize },
++    /// An output index is outside the node table.
++    InvalidOutput { output: usize, node: usize },
++    /// Evaluation arguments do not match the explicit binding table.
++    BindingCount { expected: usize, actual: usize },
++    /// The configured definition-entry limit was exceeded.
++    SizeExhausted,
++    /// The next graph work charge could not be admitted.
++    WorkExhausted,
++    /// Cooperative cancellation was observed.
++    Cancelled,
++    /// Scalar failure, retaining its source node and original diagnostic.
++    Scalar { node: usize, source: Problem },
++}
++
++impl fmt::Display for ExpressionError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "expression program: {self:?}")
++    }
++}
++
++impl std::error::Error for ExpressionError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Scalar { source, .. } => Some(source),
++            _ => None,
++        }
++    }
++}
++
++/// Immutable validated definition, cheaply shared without cloning its scalars.
++///
++/// The definition itself is the replayable source identity. No externally
++/// mutable evaluation context or serialized validity flag is trusted.
++#[derive(Clone, Debug)]
++pub struct ExpressionProgram {
++    definition: Arc<ExpressionDefinition>,
++    slots: Arc<[Option<usize>]>,
++}
++
++impl ExpressionProgram {
++    /// Validate a flat definition before owning it as an executable program.
++    /// Unused nodes are validated too, but are not evaluated.
++    pub fn from_definition(
++        definition: ExpressionDefinition,
++        budget: &mut ExpressionBudget,
++    ) -> Result<Self, ExpressionError> {
++        budget.charge(0)?;
++        budget.entries(&[
++            definition.variables.len(),
++            definition.nodes.len(),
++            definition.outputs.len(),
++        ])?;
++        let mut variables = BTreeMap::new();
++        for (slot, id) in definition.variables.iter().enumerate() {
++            budget.charge(1)?;
++            if variables.insert(*id, slot).is_some() {
++                return Err(ExpressionError::DuplicateVariable(*id));
++            }
++        }
++        let mut slots = Vec::new();
++        for (index, node) in definition.nodes.iter().enumerate() {
++            budget.charge(1)?;
++            let slot = match node {
++                ExpressionNode::Variable(reference) => Some(
++                    *variables
++                        .get(&reference.id)
++                        .ok_or(ExpressionError::UnboundVariable(reference.id))?,
++                ),
++                _ => None,
++            };
++            for input in node.inputs().into_iter().flatten() {
++                if input >= index {
++                    return Err(ExpressionError::InvalidReference { node: index, input });
++                }
++            }
++            slots.push(slot);
++        }
++        for (output, &node) in definition.outputs.iter().enumerate() {
++            budget.charge(1)?;
++            if node >= definition.nodes.len() {
++                return Err(ExpressionError::InvalidOutput { output, node });
++            }
++        }
++        budget.charge(0)?;
++        Ok(Self {
++            definition: Arc::new(definition),
++            slots: slots.into(),
++        })
++    }
++
++    /// Import borrowed trees without recursive traversal or simplification.
++    ///
++    /// Every tree occurrence is retained; this import does not infer common
++    /// subexpressions. Constants and symbol names are cloned once. Their byte
++    /// sizes and cloning costs are outside the structural graph budget.
++    pub fn compile(
++        sources: &[Expr],
++        variables: &[SymbolId],
++        budget: &mut ExpressionBudget,
++    ) -> Result<Self, ExpressionError> {
++        budget.charge(0)?;
++        budget.entries(&[variables.len(), sources.len()])?;
++        budget.charge(variables.len())?;
++        let mut definition = ExpressionDefinition {
++            variables: variables.to_vec(),
++            nodes: Vec::new(),
++            outputs: Vec::new(),
++        };
++        let mut visited = 0_usize;
++        for source in sources {
++            budget.charge(1)?;
++            let mut tasks = vec![(source, false)];
++            let mut results = Vec::new();
++            while let Some((expression, ready)) = tasks.pop() {
++                budget.charge(1)?;
++                if !ready {
++                    // Bound before growing stacks or cloning source payloads.
++                    budget.entries(&[variables.len(), sources.len(), visited, 1])?;
++                    visited += 1;
++                    tasks.push((expression, true));
++                    let (left, right) = expression_inputs(expression);
++                    if let Some(right) = right {
++                        tasks.push((right, false));
++                    }
++                    if let Some(left) = left {
++                        tasks.push((left, false));
++                    }
++                } else {
++                    let node = import_node(expression, &mut results);
++                    results.push(definition.nodes.len());
++                    definition.nodes.push(node);
++                }
++            }
++            definition
++                .outputs
++                .push(results.pop().expect("one root per imported tree"));
++        }
++        Self::from_definition(definition, budget)
++    }
++
++    /// Full immutable source identity; cheap program clones share this data.
++    pub fn definition(&self) -> &ExpressionDefinition {
++        &self.definition
++    }
++
++    /// Evaluate selected outputs in order, with left operands before right.
++    ///
++    /// Each reached DAG node is evaluated at most once per call. The program
++    /// keeps no additional evaluation cache between calls; Hyperreal constants
++    /// retain their own scalar caches. Unreached nodes cannot cause domain
++    /// errors. Argument values correspond exactly to `variables`.
++    /// Successful values are exact Hyperreal definitions, not interval proofs.
++    pub fn eval_real(
++        &self,
++        values: &[Real],
++        budget: &mut ExpressionBudget,
++    ) -> Result<Vec<Real>, ExpressionError> {
++        budget.charge(0)?;
++        let source = &self.definition;
++        if values.len() != source.variables.len() {
++            return Err(ExpressionError::BindingCount {
++                expected: source.variables.len(),
++                actual: values.len(),
++            });
++        }
++        budget.entries(&[
++            source.variables.len(),
++            source.nodes.len(),
++            source.outputs.len(),
++        ])?;
++        let mut uses = self.operand_uses(budget)?;
++        budget.charge(source.nodes.len())?;
++        let mut cache: Vec<Option<Real>> = vec![None; source.nodes.len()];
++        let mut outputs = Vec::new();
++        for &root in &source.outputs {
++            budget.charge(1)?;
++            let mut tasks = vec![(root, false)];
++            while let Some((index, ready)) = tasks.pop() {
++                budget.charge(1)?;
++                if cache[index].is_some() {
++                    continue;
++                }
++                let node = &source.nodes[index];
++                if !ready {
++                    tasks.push((index, true));
++                    let [left, right] = node.inputs();
++                    if let Some(right) = right {
++                        tasks.push((right, false));
++                    }
++                    if let Some(left) = left {
++                        tasks.push((left, false));
++                    }
++                    continue;
++                }
++                let value = match node {
++                    ExpressionNode::Constant(value) => value.clone(),
++                    ExpressionNode::Variable(_) => {
++                        values[self.slots[index].expect("validated binding")].clone()
++                    }
++                    ExpressionNode::Unary { operation, input } => operation
++                        .eval(consume_operand(&mut cache, &mut uses, *input))
++                        .map_err(|source| ExpressionError::Scalar {
++                            node: index,
++                            source,
++                        })?,
++                    ExpressionNode::Binary {
++                        operation,
++                        left,
++                        right,
++                    } => operation
++                        .eval(
++                            consume_operand(&mut cache, &mut uses, *left),
++                            consume_operand(&mut cache, &mut uses, *right),
++                        )
++                        .map_err(|source| ExpressionError::Scalar {
++                            node: index,
++                            source,
++                        })?,
++                };
++                cache[index] = Some(value);
++            }
++            outputs.push(consume_operand(&mut cache, &mut uses, root));
++        }
++        budget.charge(0)?;
++        Ok(outputs)
++    }
++
++    // Count only demanded graph edges. Moving an operand at its final use
++    // avoids retaining an unnecessary scalar clone across an operation, which
++    // can change Hyperreal's unique-ownership dispatch even on a plain tree.
++    fn operand_uses(&self, budget: &mut ExpressionBudget) -> Result<Vec<usize>, ExpressionError> {
++        let source = &self.definition;
++        budget.charge(source.nodes.len())?;
++        let mut uses = vec![0_usize; source.nodes.len()];
++        budget.charge(source.nodes.len())?;
++        let mut expanded = vec![false; source.nodes.len()];
++        for &root in &source.outputs {
++            budget.charge(1)?;
++            uses[root] = uses[root]
++                .checked_add(1)
++                .ok_or(ExpressionError::SizeExhausted)?;
++            let mut tasks = vec![root];
++            while let Some(index) = tasks.pop() {
++                budget.charge(1)?;
++                if expanded[index] {
++                    continue;
++                }
++                expanded[index] = true;
++                for input in source.nodes[index].inputs().into_iter().flatten() {
++                    uses[input] = uses[input]
++                        .checked_add(1)
++                        .ok_or(ExpressionError::SizeExhausted)?;
++                    tasks.push(input);
++                }
++            }
++        }
++        Ok(uses)
++    }
++}
++
++fn consume_operand(cache: &mut [Option<Real>], uses: &mut [usize], index: usize) -> Real {
++    uses[index] -= 1;
++    if uses[index] == 0 {
++        cache[index].take().expect("last use of evaluated operand")
++    } else {
++        cache[index]
++            .as_ref()
++            .expect("shared evaluated operand")
++            .clone()
++    }
++}
++
++impl ExpressionNode {
++    fn inputs(&self) -> [Option<usize>; 2] {
++        match self {
++            Self::Constant(_) | Self::Variable(_) => [None, None],
++            Self::Unary { input, .. } => [Some(*input), None],
++            Self::Binary { left, right, .. } => [Some(*left), Some(*right)],
++        }
++    }
++}
++
++fn expression_inputs(expression: &Expr) -> (Option<&Expr>, Option<&Expr>) {
++    match expression {
++        Expr::Constant(_) | Expr::Symbol(_) => (None, None),
++        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => (Some(a), Some(b)),
++        Expr::Neg(a)
++        | Expr::PowI(a, _)
++        | Expr::Sqrt(a)
++        | Expr::Sin(a)
++        | Expr::Cos(a)
++        | Expr::Ln(a)
++        | Expr::Log10(a)
++        | Expr::Asin(a)
++        | Expr::Acos(a)
++        | Expr::Acosh(a)
++        | Expr::Atanh(a) => (Some(a), None),
++    }
++}
++
++fn import_node(expression: &Expr, results: &mut Vec<usize>) -> ExpressionNode {
++    match expression {
++        Expr::Constant(value) => return ExpressionNode::Constant(value.clone()),
++        Expr::Symbol(reference) => return ExpressionNode::Variable(reference.clone()),
++        _ => {}
++    }
++    let last = results.pop().expect("postorder operand");
++    let binary = match expression {
++        Expr::Add(..) => Some(BinaryOperation::Add),
++        Expr::Sub(..) => Some(BinaryOperation::Sub),
++        Expr::Mul(..) => Some(BinaryOperation::Mul),
++        Expr::Div(..) => Some(BinaryOperation::Div),
++        _ => None,
++    };
++    if let Some(operation) = binary {
++        return ExpressionNode::Binary {
++            operation,
++            left: results.pop().expect("left postorder operand"),
++            right: last,
++        };
++    }
++    let operation = match expression {
++        Expr::Neg(_) => UnaryOperation::Neg,
++        Expr::PowI(_, exponent) => UnaryOperation::PowI(*exponent),
++        Expr::Sqrt(_) => UnaryOperation::Sqrt,
++        Expr::Sin(_) => UnaryOperation::Sin,
++        Expr::Cos(_) => UnaryOperation::Cos,
++        Expr::Ln(_) => UnaryOperation::Ln,
++        Expr::Log10(_) => UnaryOperation::Log10,
++        Expr::Asin(_) => UnaryOperation::Asin,
++        Expr::Acos(_) => UnaryOperation::Acos,
++        Expr::Acosh(_) => UnaryOperation::Acosh,
++        Expr::Atanh(_) => UnaryOperation::Atanh,
++        _ => unreachable!("leaves and binary operators handled above"),
++    };
++    ExpressionNode::Unary {
++        operation,
++        input: last,
++    }
++}
++
++impl BinaryOperation {
++    fn eval(self, left: Real, right: Real) -> Result<Real, Problem> {
++        match self {
++            Self::Add => Ok(left + right),
++            Self::Sub => Ok(left - right),
++            Self::Mul => Ok(left * right),
++            Self::Div => left / right,
++        }
++    }
++}
++
++impl UnaryOperation {
++    fn eval(self, value: Real) -> Result<Real, Problem> {
++        match self {
++            Self::Neg => Ok(-value),
++            Self::PowI(exponent) => value.powi(exponent.into()),
++            Self::Sqrt => value.sqrt(),
++            Self::Sin => Ok(value.sin()),
++            Self::Cos => Ok(value.cos()),
++            Self::Ln => value.ln(),
++            Self::Log10 => value.log10(),
++            Self::Asin => value.asin(),
++            Self::Acos => value.acos(),
++            Self::Acosh => value.acosh(),
++            Self::Atanh => value.atanh(),
++        }
++    }
++}
+diff --git a/crates/hypersolve/src/lib.rs b/crates/hypersolve/src/lib.rs
+index bb250054e..af1707acd 100644
+--- a/crates/hypersolve/src/lib.rs
++++ b/crates/hypersolve/src/lib.rs
+@@ -32,6 +32,8 @@ pub mod domain;
+ pub mod domain_certification;
+ pub mod eval;
+ pub mod exact_factor;
++#[cfg(feature = "expression-program")]
++pub mod expression_program;
+ pub mod failed_constraints;
+ mod integer_interpolation;
+ pub mod interval;
+diff --git a/crates/hypersolve/src/symbolic.rs b/crates/hypersolve/src/symbolic.rs
+index cc9dc56eb..1c5393e70 100644
+--- a/crates/hypersolve/src/symbolic.rs
++++ b/crates/hypersolve/src/symbolic.rs
+@@ -5,10 +5,12 @@ use hyperreal::{Problem as HyperProblem, Rational, Real, SymbolicDependencyMask}
+ 
+ /// Stable identifier for a solve variable.
+ #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct SymbolId(pub u32);
+ 
+ /// Metadata attached to a symbolic variable reference.
+ #[derive(Clone, Debug, Eq, PartialEq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct SymbolRef {
+     pub id: SymbolId,
+     pub name: Option<String>,
+diff --git a/crates/hypersolve/tests/expression_program.rs b/crates/hypersolve/tests/expression_program.rs
+new file mode 100644
+index 000000000..404f1ed32
+--- /dev/null
++++ b/crates/hypersolve/tests/expression_program.rs
+@@ -0,0 +1,625 @@
++#![cfg(feature = "expression-program")]
++
++use std::collections::HashMap;
++
++use hyperreal::{Problem, Real};
++use hypersolve::{
++    Expr, ExprEvalError, SymbolId, SymbolRef,
++    expression_program::{
++        BinaryOperation, ExpressionBudget, ExpressionDefinition, ExpressionError, ExpressionNode,
++        ExpressionProgram, UnaryOperation,
++    },
++    work_budget::CancellationToken,
++};
++
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 1_000_000)
++}
++
++fn variable(id: u32) -> Expr {
++    Expr::anonymous_symbol(SymbolId(id))
++}
++
++#[test]
++fn all_operators_preserve_exact_values_and_extreme_exponents() {
++    // Independent exact expectations, not just agreement between evaluators.
++    let cases = vec![
++        (Expr::int(7), 7),
++        (variable(0), 4),
++        (Expr::Add(Box::new(variable(0)), Box::new(Expr::int(3))), 7),
++        (Expr::Sub(Box::new(variable(0)), Box::new(Expr::int(3))), 1),
++        (Expr::Mul(Box::new(variable(0)), Box::new(Expr::int(3))), 12),
++        (Expr::Div(Box::new(variable(0)), Box::new(Expr::int(2))), 2),
++        (Expr::Neg(Box::new(variable(0))), -4),
++        (variable(0).powi(3), 64),
++        (variable(0).sqrt(), 2),
++        (Expr::int(0).sin(), 0),
++        (Expr::int(0).cos(), 1),
++        (Expr::int(1).ln(), 0),
++        (Expr::int(100).log10(), 2),
++        (Expr::int(0).asin(), 0),
++        (Expr::int(1).acos(), 0),
++        (Expr::int(1).acosh(), 0),
++        (Expr::int(0).atanh(), 0),
++        (Expr::int(-1).powi(i64::MIN), 1),
++        (Expr::int(-1).powi(i64::MAX), -1),
++    ];
++    let sources: Vec<_> = cases.iter().map(|(source, _)| source.clone()).collect();
++    let expected: Vec<_> = cases.iter().map(|(_, value)| Real::from(*value)).collect();
++    let program = ExpressionProgram::compile(&sources, &[SymbolId(0)], &mut budget()).unwrap();
++    assert_eq!(
++        program.eval_real(&[Real::from(4)], &mut budget()).unwrap(),
++        expected
++    );
++    let bindings = HashMap::from([(SymbolId(0), Real::from(4))]);
++    assert_eq!(
++        sources
++            .iter()
++            .map(|expr| expr.eval_real(&bindings).unwrap())
++            .collect::<Vec<_>>(),
++        expected
++    );
++    // Rebuild independently from the complete definition, not a validity flag.
++    let replay =
++        ExpressionProgram::from_definition(program.definition().clone(), &mut budget()).unwrap();
++    assert_eq!(replay.definition(), program.definition());
++    assert_eq!(
++        replay.eval_real(&[Real::from(4)], &mut budget()).unwrap(),
++        expected
++    );
++}
++
++#[test]
++fn generated_polynomials_and_existing_symbolic_derivatives_are_consumable() {
++    let x = SymbolId(9);
++    for degree in 0..=12_i64 {
++        let source = Expr::int(3) * Expr::anonymous_symbol(x).powi(degree) + Expr::int(7);
++        let derivative = source.derivative(x);
++        let program =
++            ExpressionProgram::compile(&[source, derivative], &[x], &mut budget()).unwrap();
++        for integer in [-3_i64, -1, 1, 2, 3] {
++            let expected_source = 3_i64 * integer.pow(degree as u32) + 7;
++            let expected_derivative = if degree == 0 {
++                0
++            } else {
++                3 * degree * integer.pow((degree - 1) as u32)
++            };
++            assert_eq!(
++                program
++                    .eval_real(&[Real::from(integer)], &mut budget())
++                    .unwrap(),
++                [Real::from(expected_source), Real::from(expected_derivative)]
++            );
++        }
++    }
++    // Preserve the repaired boundary derivative and its original nonzero guard.
++    let source = Expr::anonymous_symbol(x).powi(i64::MIN);
++    let program =
++        ExpressionProgram::compile(&[source.clone(), source.derivative(x)], &[x], &mut budget())
++            .unwrap();
++    assert_eq!(
++        program.eval_real(&[Real::one()], &mut budget()).unwrap(),
++        [Real::one(), Real::from(i64::MIN)]
++    );
++    assert!(matches!(
++        program.eval_real(&[Real::zero()], &mut budget()),
++        Err(ExpressionError::Scalar {
++            source: Problem::NotANumber,
++            ..
++        })
++    ));
++}
++
++#[test]
++fn domain_failures_and_zero_factors_retain_original_guards() {
++    let failures = vec![
++        Expr::Div(Box::new(Expr::int(1)), Box::new(Expr::int(0))),
++        Expr::int(-1).sqrt(),
++        Expr::int(0).ln(),
++        Expr::int(-1).log10(),
++        Expr::int(2).asin(),
++        Expr::int(2).acos(),
++        Expr::int(0).acosh(),
++        Expr::int(2).atanh(),
++        Expr::int(0).powi(0),
++        Expr::int(0).powi(-1),
++    ];
++    for failure in failures {
++        for source in [
++            failure.clone(),
++            Expr::Mul(Box::new(Expr::int(0)), Box::new(failure.clone())),
++            failure.powi(0),
++        ] {
++            let Err(ExprEvalError::Hyperreal(expected)) = source.eval_real(&HashMap::new()) else {
++                panic!("invalid oracle fixture: {source:?}");
++            };
++            let program = ExpressionProgram::compile(&[source], &[], &mut budget()).unwrap();
++            let error = program.eval_real(&[], &mut budget()).unwrap_err();
++            let ExpressionError::Scalar { source, .. } = &error else {
++                panic!("lost scalar error: {error}");
++            };
++            assert_eq!(source, &expected);
++            assert!(std::error::Error::source(&error).is_some());
++        }
++    }
++}
++
++#[test]
++fn binding_order_ownership_and_structural_identity_remain_explicit() {
++    let mut sources = [Expr::Sub(Box::new(variable(7)), Box::new(variable(2)))];
++    let program =
++        ExpressionProgram::compile(&sources, &[SymbolId(2), SymbolId(7)], &mut budget()).unwrap();
++    sources[0] = Expr::int(99);
++    assert_eq!(
++        program
++            .eval_real(&[Real::from(3), Real::from(8)], &mut budget())
++            .unwrap(),
++        [Real::from(5)]
++    );
++    assert!(std::ptr::eq(
++        program.definition(),
++        program.clone().definition()
++    ));
++    let replay =
++        ExpressionProgram::from_definition(program.definition().clone(), &mut budget()).unwrap();
++    assert!(!std::ptr::eq(program.definition(), replay.definition()));
++    assert_eq!(program.definition(), replay.definition());
++    let mut swapped = program.definition().clone();
++    swapped.variables.swap(0, 1);
++    let swapped = ExpressionProgram::from_definition(swapped, &mut budget()).unwrap();
++    assert_ne!(program.definition(), swapped.definition());
++    assert_eq!(
++        swapped
++            .eval_real(&[Real::from(3), Real::from(8)], &mut budget())
++            .unwrap(),
++        [Real::from(-5)]
++    );
++    for values in [vec![], vec![Real::one()], vec![Real::one(); 3]] {
++        assert!(matches!(
++            program.eval_real(&values, &mut budget()),
++            Err(ExpressionError::BindingCount { expected: 2, .. })
++        ));
++    }
++}
++
++#[test]
++fn replay_rejects_bad_references_and_bindings_even_without_outputs() {
++    let definition = |nodes, variables, outputs| ExpressionDefinition {
++        nodes,
++        variables,
++        outputs,
++    };
++    for input in [0, 1, usize::MAX] {
++        let result = ExpressionProgram::from_definition(
++            definition(
++                vec![ExpressionNode::Unary {
++                    operation: UnaryOperation::Neg,
++                    input,
++                }],
++                vec![],
++                vec![],
++            ),
++            &mut budget(),
++        );
++        assert!(
++            matches!(result, Err(ExpressionError::InvalidReference { node: 0, input: found }) if found == input)
++        );
++    }
++    assert!(matches!(
++        ExpressionProgram::from_definition(
++            definition(vec![], vec![SymbolId(0); 2], vec![]),
++            &mut budget()
++        ),
++        Err(ExpressionError::DuplicateVariable(SymbolId(0)))
++    ));
++    assert!(matches!(
++        ExpressionProgram::compile(&[variable(1)], &[], &mut budget()),
++        Err(ExpressionError::UnboundVariable(SymbolId(1)))
++    ));
++    assert!(matches!(
++        ExpressionProgram::from_definition(definition(vec![], vec![], vec![0]), &mut budget()),
++        Err(ExpressionError::InvalidOutput { output: 0, node: 0 })
++    ));
++    // The right reference must be checked as well as the left.
++    let nodes = vec![
++        ExpressionNode::Constant(Real::one()),
++        ExpressionNode::Binary {
++            operation: BinaryOperation::Add,
++            left: 0,
++            right: 2,
++        },
++    ];
++    assert!(matches!(
++        ExpressionProgram::from_definition(definition(nodes, vec![], vec![0]), &mut budget()),
++        Err(ExpressionError::InvalidReference { node: 1, input: 2 })
++    ));
++}
++
++#[test]
++fn demand_order_reuse_and_unused_nodes_do_not_change_domain() {
++    let definition = ExpressionDefinition {
++        variables: vec![],
++        nodes: vec![
++            ExpressionNode::Constant(Real::from(-1)),
++            ExpressionNode::Unary {
++                operation: UnaryOperation::Sqrt,
++                input: 0,
++            },
++            ExpressionNode::Constant(Real::zero()),
++            ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                left: 0,
++                right: 2,
++            },
++            // Node-index order would fail at sqrt; demand order must fail at Div.
++            ExpressionNode::Binary {
++                operation: BinaryOperation::Add,
++                left: 3,
++                right: 1,
++            },
++            ExpressionNode::Binary {
++                operation: BinaryOperation::Add,
++                left: 0,
++                right: 0,
++            },
++        ],
++        outputs: vec![5, 5, 2],
++    };
++    let program = ExpressionProgram::from_definition(definition.clone(), &mut budget()).unwrap();
++    assert_eq!(
++        program.eval_real(&[], &mut budget()).unwrap(),
++        [Real::from(-2), Real::from(-2), Real::zero()]
++    );
++    let mut invalid = definition.clone();
++    invalid.outputs = vec![4, 1];
++    let program = ExpressionProgram::from_definition(invalid, &mut budget()).unwrap();
++    assert!(matches!(
++        program.eval_real(&[], &mut budget()),
++        Err(ExpressionError::Scalar { node: 3, .. })
++    ));
++    let mut invalid = definition;
++    invalid.outputs = vec![1, 4];
++    let program = ExpressionProgram::from_definition(invalid, &mut budget()).unwrap();
++    assert!(matches!(
++        program.eval_real(&[], &mut budget()),
++        Err(ExpressionError::Scalar { node: 1, .. })
++    ));
++}
++
++#[test]
++fn structural_limits_cancellation_and_retry_publish_no_partial_value() {
++    let source = [Expr::Add(Box::new(variable(0)), Box::new(Expr::int(2)))];
++    // Three nodes, one binding, one output; 3N + 2V + 2O compile units.
++    let mut exact = ExpressionBudget::new(5, 13);
++    let program = ExpressionProgram::compile(&source, &[SymbolId(0)], &mut exact).unwrap();
++    assert_eq!(exact.remaining_work(), 0);
++    assert!(matches!(
++        ExpressionProgram::compile(&source, &[SymbolId(0)], &mut ExpressionBudget::new(4, 100)),
++        Err(ExpressionError::SizeExhausted)
++    ));
++    for work in 0..13 {
++        assert!(matches!(
++            ExpressionProgram::compile(
++                &source,
++                &[SymbolId(0)],
++                &mut ExpressionBudget::new(5, work)
++            ),
++            Err(ExpressionError::WorkExhausted)
++        ));
++    }
++    for work in 0..20 {
++        assert!(matches!(
++            program.eval_real(&[Real::from(3)], &mut ExpressionBudget::new(5, work)),
++            Err(ExpressionError::WorkExhausted)
++        ));
++    }
++    let token = CancellationToken::new();
++    let mut cancelled = budget();
++    cancelled.cancellation = Some(token.clone());
++    token.cancel();
++    let before = cancelled.remaining_work();
++    assert!(matches!(
++        program.eval_real(&[Real::from(3)], &mut cancelled),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert!(matches!(
++        ExpressionProgram::compile(&source, &[SymbolId(0)], &mut cancelled),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert!(matches!(
++        ExpressionProgram::from_definition(program.definition().clone(), &mut cancelled),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert_eq!(cancelled.remaining_work(), before);
++    assert_eq!(
++        program
++            .eval_real(&[Real::from(3)], &mut ExpressionBudget::new(5, 20))
++            .unwrap(),
++        [Real::from(5)]
++    );
++}
++
++#[test]
++fn empty_outputs_are_valid_and_still_validate_argument_count() {
++    let program = ExpressionProgram::compile(&[], &[SymbolId(0)], &mut budget()).unwrap();
++    assert!(
++        program
++            .eval_real(&[Real::one()], &mut budget())
++            .unwrap()
++            .is_empty()
++    );
++    assert!(matches!(
++        program.eval_real(&[], &mut budget()),
++        Err(ExpressionError::BindingCount { .. })
++    ));
++    let empty = ExpressionProgram::compile(&[], &[], &mut ExpressionBudget::new(0, 0)).unwrap();
++    assert!(
++        empty
++            .eval_real(&[], &mut ExpressionBudget::new(0, 0))
++            .unwrap()
++            .is_empty()
++    );
++}
++
++#[test]
++fn deep_source_compiles_evaluates_and_drops_on_a_small_stack() {
++    std::thread::Builder::new()
++        .stack_size(128 * 1024)
++        .spawn(|| {
++            let mut source = variable(0);
++            for _ in 0..20_000 {
++                source = Expr::Neg(Box::new(source));
++            }
++            let rejected = ExpressionProgram::compile(
++                std::slice::from_ref(&source),
++                &[SymbolId(0)],
++                &mut ExpressionBudget::new(20, 100),
++            );
++            let result = ExpressionProgram::compile(
++                std::slice::from_ref(&source),
++                &[SymbolId(0)],
++                &mut budget(),
++            );
++            // Caller-owned Expr has recursive drop. Dismantle it iteratively before
++            // assertions, including if import fails; graph cleanup is already flat.
++            while let Expr::Neg(inner) = source {
++                source = *inner;
++            }
++            assert!(matches!(rejected, Err(ExpressionError::SizeExhausted)));
++            let program = result.unwrap();
++            assert_eq!(program.definition().nodes.len(), 20_001);
++            assert_eq!(
++                program.eval_real(&[Real::from(17)], &mut budget()).unwrap(),
++                [Real::from(17)]
++            );
++        })
++        .unwrap()
++        .join()
++        .unwrap();
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replay_retains_symbolic_constants_and_revalidates_edges() {
++    use std::process::Command;
++    let source = Expr::Add(
++        Box::new(variable(3)),
++        Box::new(Expr::real(Real::from(2).sqrt().unwrap())),
++    );
++    let program = ExpressionProgram::compile(&[source], &[SymbolId(3)], &mut budget()).unwrap();
++    let path = std::env::temp_dir().join(format!(
++        "hypersolve-program-replay-{}.json",
++        std::process::id()
++    ));
++    struct Remove(std::path::PathBuf);
++    impl Drop for Remove {
++        fn drop(&mut self) {
++            let _ = std::fs::remove_file(&self.0);
++        }
++    }
++    let _remove = Remove(path.clone());
++    std::fs::write(&path, serde_json::to_vec(program.definition()).unwrap()).unwrap();
++    let run = || {
++        Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", "replay_child", "--nocapture"])
++            .env("HYPERSOLVE_PROGRAM_REPLAY", &path)
++            .output()
++            .unwrap()
++    };
++    let child = run();
++    assert!(
++        child.status.success(),
++        "{}",
++        String::from_utf8_lossy(&child.stderr)
++    );
++    let stdout = String::from_utf8(child.stdout).unwrap();
++    let encoded = stdout
++        .lines()
++        .find_map(|line| line.strip_prefix("REPLAY="))
++        .unwrap();
++    let replayed: Vec<Real> = serde_json::from_str(encoded).unwrap();
++    assert_eq!(replayed, [Real::from(5) + Real::from(2).sqrt().unwrap()]);
++    let mut bad = program.definition().clone();
++    bad.nodes[2] = ExpressionNode::Unary {
++        operation: UnaryOperation::Neg,
++        input: 2,
++    };
++    std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
++    let child = run();
++    assert!(child.status.success());
++    assert!(
++        String::from_utf8(child.stdout)
++            .unwrap()
++            .contains("INVALID_REFERENCE")
++    );
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn replay_child() {
++    let Some(path) = std::env::var_os("HYPERSOLVE_PROGRAM_REPLAY") else {
++        return;
++    };
++    let definition: ExpressionDefinition =
++        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
++    match ExpressionProgram::from_definition(definition, &mut budget()) {
++        Ok(program) => println!(
++            "REPLAY={}",
++            serde_json::to_string(&program.eval_real(&[Real::from(5)], &mut budget()).unwrap())
++                .unwrap()
++        ),
++        Err(ExpressionError::InvalidReference { .. }) => println!("INVALID_REFERENCE"),
++        Err(error) => panic!("unexpected replay failure: {error}"),
++    }
++}
++
++#[test]
++fn symbol_metadata_is_retained_without_aliasing_bindings() {
++    let source = Expr::Symbol(SymbolRef::new(SymbolId(5), Some("time".into())));
++    let program = ExpressionProgram::compile(&[source], &[SymbolId(5)], &mut budget()).unwrap();
++    assert!(
++        matches!(&program.definition().nodes[0], ExpressionNode::Variable(reference) if reference.name.as_deref() == Some("time"))
++    );
++    assert_eq!(
++        program.eval_real(&[Real::from(7)], &mut budget()).unwrap(),
++        [Real::from(7)]
++    );
++}
++
++#[test]
++fn shared_generated_graphs_match_independent_integer_expectations() {
++    let mut seed = 0x83a7_b209_11de_45ff_u64;
++    for case in 0..400 {
++        let point = i128::from(case % 5) - 2;
++        let mut nodes = vec![
++            ExpressionNode::Constant(Real::from(-3)),
++            ExpressionNode::Constant(Real::from(2)),
++            ExpressionNode::Variable(SymbolRef::new(SymbolId(7), None)),
++        ];
++        let mut expected = vec![-3_i128, 2, point];
++        for index in 3..32 {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            let left = seed as usize % index;
++            let right = (seed >> 32) as usize % index;
++            let (node, value) = match seed % 4 {
++                0 => (
++                    ExpressionNode::Binary {
++                        operation: BinaryOperation::Add,
++                        left,
++                        right,
++                    },
++                    expected[left] + expected[right],
++                ),
++                1 => (
++                    ExpressionNode::Binary {
++                        operation: BinaryOperation::Sub,
++                        left,
++                        right,
++                    },
++                    expected[left] - expected[right],
++                ),
++                // A small constant multiplier keeps this independent oracle
++                // within i128; the graph still includes arbitrary shared edges.
++                2 => (
++                    ExpressionNode::Binary {
++                        operation: BinaryOperation::Mul,
++                        left,
++                        right: right % 2,
++                    },
++                    expected[left] * expected[right % 2],
++                ),
++                _ => (
++                    ExpressionNode::Unary {
++                        operation: UnaryOperation::Neg,
++                        input: left,
++                    },
++                    -expected[left],
++                ),
++            };
++            nodes.push(node);
++            expected.push(value);
++        }
++        let mut outputs = vec![31, 2, 15, 31, 0, 30, 15];
++        if case % 2 == 0 {
++            outputs.reverse();
++        }
++        let expected: Vec<_> = outputs
++            .iter()
++            .map(|&index| Real::from(expected[index]))
++            .collect();
++        let definition = ExpressionDefinition {
++            variables: vec![SymbolId(7)],
++            nodes,
++            outputs,
++        };
++        let program = ExpressionProgram::from_definition(definition, &mut budget()).unwrap();
++        assert_eq!(
++            program
++                .eval_real(&[Real::from(point)], &mut budget())
++                .unwrap(),
++            expected,
++            "graph {case}"
++        );
++    }
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn tree_import_preserves_warm_scalar_dispatch_on_the_polynomial_fixture() {
++    // Small scalar constants share caches across tests. Isolate the measured
++    // fixture so another test cannot alter its count while it is recording.
++    if std::env::var_os("HYPERSOLVE_PROGRAM_TRACE_CHILD").is_none() {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "tree_import_preserves_warm_scalar_dispatch_on_the_polynomial_fixture",
++                "--nocapture",
++            ])
++            .env("HYPERSOLVE_PROGRAM_TRACE_CHILD", "1")
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        return;
++    }
++    use hyperreal::dispatch_trace;
++    let source = Expr::int(3) * variable(0).powi(3) - Expr::int(7);
++    dispatch_trace::reset();
++    let program = dispatch_trace::with_recording(|| {
++        ExpressionProgram::compile(std::slice::from_ref(&source), &[SymbolId(0)], &mut budget())
++            .unwrap()
++    });
++    let import_trace = dispatch_trace::take_trace();
++    assert!(import_trace.dispatch.is_empty());
++    assert_eq!(import_trace.rational, Default::default());
++    let bindings = HashMap::from([(SymbolId(0), Real::from(2))]);
++    let values = [Real::from(2)];
++    // Match cache state; comparing the first scalar observation against a
++    // later observation of retained input constants is not a matched trace.
++    for _ in 0..8 {
++        source.eval_real(&bindings).unwrap();
++        program.eval_real(&values, &mut budget()).unwrap();
++    }
++    dispatch_trace::reset();
++    let expected = dispatch_trace::with_recording(|| source.eval_real(&bindings).unwrap());
++    let expected_trace = dispatch_trace::take_trace();
++    dispatch_trace::reset();
++    let actual =
++        dispatch_trace::with_recording(|| program.eval_real(&values, &mut budget()).unwrap());
++    let actual_trace = dispatch_trace::take_trace();
++    assert_eq!(actual, [Real::from(17)]);
++    assert_eq!(actual, [expected]);
++    assert_eq!(actual_trace, expected_trace);
++    let counts = actual_trace.correlation_summary();
++    println!("polynomial trace: {counts:?}");
++    assert_eq!(counts.dispatch_events, 11);
++    assert_eq!(counts.rational_temporaries, 0);
++    assert_eq!(counts.rational_gcds, 0);
++    assert_eq!(counts.sign_or_zero_query_events, 0);
++}
