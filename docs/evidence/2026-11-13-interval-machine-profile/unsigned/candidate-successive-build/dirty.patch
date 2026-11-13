@@ -1,0 +1,55 @@
+diff --git a/crates/hyperinterval/src/rational.rs b/crates/hyperinterval/src/rational.rs
+index 03bb89ea3..60ab9a666 100644
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -40,7 +40,26 @@ impl RationalInterval {
+         if uncertainty.is_negative() {
+             return Err(IntervalError::NegativeRadius);
+         }
+-        Ok(Self::ordered(nominal - uncertainty, nominal + uncertainty))
++        Ok(Self::centered(nominal, uncertainty))
++    }
++
++    /// The exact set `nominal ± numerator/denominator` with nonnegative uncertainty.
++    ///
++    /// The input types establish nonnegativity and exclude division by zero.
++    /// The nominal may be any finite rational; no sign predicate is repeated
++    /// on the converted uncertainty.
++    pub fn from_nominal_unsigned_uncertainty(
++        nominal: &Rational,
++        numerator: u64,
++        denominator: core::num::NonZeroU64,
++    ) -> Self {
++        let uncertainty = Rational::unsigned_fraction(numerator, denominator);
++        Self::centered(nominal, &uncertainty)
++    }
++
++    // Both callers establish nonnegative uncertainty before endpoint arithmetic.
++    fn centered(nominal: &Rational, uncertainty: &Rational) -> Self {
++        Self::ordered(nominal - uncertainty, nominal + uncertainty)
+     }
+ 
+     // Every caller proves ordering from already ordered inputs.
+diff --git a/crates/hyperreal/src/rational/arithmetic/construction.rs b/crates/hyperreal/src/rational/arithmetic/construction.rs
+index 5a0b43e5c..a7aaf69c0 100644
+--- a/crates/hyperreal/src/rational/arithmetic/construction.rs
++++ b/crates/hyperreal/src/rational/arithmetic/construction.rs
+@@ -334,6 +334,18 @@ impl Rational {
+         ))
+     }
+ 
++    /// The exact nonnegative fraction with a nonzero denominator.
++    ///
++    /// The input types establish the sign and exclude division by zero. The
++    /// fraction is reduced using the same representation as [`Self::fraction`].
++    pub fn unsigned_fraction(numerator: u64, denominator: core::num::NonZeroU64) -> Self {
++        Self::from_fraction_parts_reduced(
++            Plus,
++            BigUint::from(numerator),
++            BigUint::from(denominator.get()),
++        )
++    }
++
+     /// The Rational corresponding to the provided [`BigInt`]
+     /// numerator and [`BigUint`] denominator as a fraction.
+     pub fn from_bigint_fraction(n: BigInt, denominator: BigUint) -> Result<Self, Problem> {

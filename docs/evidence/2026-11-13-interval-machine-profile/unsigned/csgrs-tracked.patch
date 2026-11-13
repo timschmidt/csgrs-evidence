@@ -1,0 +1,99 @@
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 35d227cb4..23c89aceb 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add `RationalInterval::from_nominal_unsigned_uncertainty` for exact closed
++  nominal-plus/minus intervals with a `u64` radius numerator and a
++  `NonZeroU64` denominator. These input types establish a valid radius before
++  scalar conversion and endpoint arithmetic.
++
+ - Add budgeted `DyadicInterval::from_rational` and use it for structurally
+   rational `from_real` inputs. Stored coefficient sizes are admitted before
+   copying, normalization or division, including lazy unreduced ratios. Exact
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index a49b7e2c7..9772c917c 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -150,6 +150,9 @@ initial encoding, not a migration of any domain's canonical evidence.
+ The `rational` feature adds `RationalInterval` over Hyperreal's exact rationals
+ and requires Rust 1.95. It supplies exact sum, difference, product hull,
+ square, strict quotient, affine images and positive arithmetic helpers. The
++`from_nominal_unsigned_uncertainty` constructor accepts an exact rational
++nominal, a `u64` uncertainty numerator and a `NonZeroU64` denominator, producing
++the closed nominal-plus/minus interval without another rational sign query. The
+ `checked_pow(i64)` operation gives exact signed-integer images, rejecting zero
+ in a negative-power domain. It inherits Hyperreal's eager-growth guard; scalar
+ refusals retain the typed `Problem` in `IntervalError::Scalar` and `source()`.
+diff --git a/crates/hyperinterval/src/rational.rs b/crates/hyperinterval/src/rational.rs
+index 03bb89ea3..60ab9a666 100644
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -40,7 +40,26 @@ impl RationalInterval {
+         if uncertainty.is_negative() {
+             return Err(IntervalError::NegativeRadius);
+         }
+-        Ok(Self::ordered(nominal - uncertainty, nominal + uncertainty))
++        Ok(Self::centered(nominal, uncertainty))
++    }
++
++    /// The exact set `nominal ± numerator/denominator` with nonnegative uncertainty.
++    ///
++    /// The input types establish nonnegativity and exclude division by zero.
++    /// The nominal may be any finite rational; no sign predicate is repeated
++    /// on the converted uncertainty.
++    pub fn from_nominal_unsigned_uncertainty(
++        nominal: &Rational,
++        numerator: u64,
++        denominator: core::num::NonZeroU64,
++    ) -> Self {
++        let uncertainty = Rational::unsigned_fraction(numerator, denominator);
++        Self::centered(nominal, &uncertainty)
++    }
++
++    // Both callers establish nonnegative uncertainty before endpoint arithmetic.
++    fn centered(nominal: &Rational, uncertainty: &Rational) -> Self {
++        Self::ordered(nominal - uncertainty, nominal + uncertainty)
+     }
+ 
+     // Every caller proves ordering from already ordered inputs.
+diff --git a/crates/hyperreal/CHANGELOG.md b/crates/hyperreal/CHANGELOG.md
+index 3f373997b..305f597f4 100644
+--- a/crates/hyperreal/CHANGELOG.md
++++ b/crates/hyperreal/CHANGELOG.md
+@@ -30,6 +30,9 @@
+ 
+ ### Added
+ 
++- Add `Rational::unsigned_fraction(u64, NonZeroU64)` for exact nonnegative
++  fractions whose input types exclude division by zero.
++
+ - Add `Rational::ratio_parts`, a borrowed exact, potentially unreduced ratio
+   view for resource admission before coefficient copying or canonicalization.
+   Existing canonical numerator/denominator getters retain their behavior.
+diff --git a/crates/hyperreal/src/rational/arithmetic/construction.rs b/crates/hyperreal/src/rational/arithmetic/construction.rs
+index 5a0b43e5c..a7aaf69c0 100644
+--- a/crates/hyperreal/src/rational/arithmetic/construction.rs
++++ b/crates/hyperreal/src/rational/arithmetic/construction.rs
+@@ -334,6 +334,18 @@ impl Rational {
+         ))
+     }
+ 
++    /// The exact nonnegative fraction with a nonzero denominator.
++    ///
++    /// The input types establish the sign and exclude division by zero. The
++    /// fraction is reduced using the same representation as [`Self::fraction`].
++    pub fn unsigned_fraction(numerator: u64, denominator: core::num::NonZeroU64) -> Self {
++        Self::from_fraction_parts_reduced(
++            Plus,
++            BigUint::from(numerator),
++            BigUint::from(denominator.get()),
++        )
++    }
++
+     /// The Rational corresponding to the provided [`BigInt`]
+     /// numerator and [`BigUint`] denominator as a fraction.
+     pub fn from_bigint_fraction(n: BigInt, denominator: BigUint) -> Result<Self, Problem> {

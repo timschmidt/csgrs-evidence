@@ -1,0 +1,78 @@
+diff --git a/crates/alumina-interface-core/Cargo.toml b/crates/alumina-interface-core/Cargo.toml
+index 25dde24..ca39e26 100644
+--- a/crates/alumina-interface-core/Cargo.toml
++++ b/crates/alumina-interface-core/Cargo.toml
+@@ -8,6 +8,9 @@ license.workspace = true
+ repository.workspace = true
+ publish.workspace = true
+ 
++[features]
++dispatch-trace = ["hyperreal/dispatch-trace", "hyperlimit/dispatch-trace"]
++
+ [dependencies]
+ alumina-board.workspace = true
+ alumina-capability.workspace = true
+diff --git a/crates/alumina-interface-core/src/machine_profile.rs b/crates/alumina-interface-core/src/machine_profile.rs
+index a43b4f4..a42e7e4 100644
+--- a/crates/alumina-interface-core/src/machine_profile.rs
++++ b/crates/alumina-interface-core/src/machine_profile.rs
+@@ -16,6 +16,7 @@ use alumina_config::{
+ };
+ use alumina_motion::{AxisTiming, StepperTiming};
+ use alumina_protocol::Digest;
++use hyperinterval::RationalInterval;
+ use hyperlimit::{PredicatePolicy, compare_reals};
+ use hyperreal::{Problem, Rational, Real};
+ 
+@@ -33,10 +34,18 @@ pub struct ExactInterval {
+ impl ExactInterval {
+     fn from_scalar(scalar: ExactScalar) -> MachineProfileResult<Self> {
+         let nominal = convert_rational(scalar.value)?;
+-        let uncertainty = convert_rational(scalar.uncertainty)?;
++        let denominator = core::num::NonZeroU64::new(scalar.uncertainty.denominator)
++            .ok_or(MachineProfileError::Arithmetic(Problem::DivideByZero))?;
++        let numerator = u64::try_from(scalar.uncertainty.numerator)
++            .map_err(|_| MachineProfileError::Configuration(ConfigurationError::Scalar))?;
++        let interval =
++            RationalInterval::from_nominal_unsigned_uncertainty(&nominal, numerator, denominator);
++        let (lower, upper) = interval
++            .into_bounds()
++            .expect("a nominal uncertainty interval is nonempty");
+         Ok(Self {
+-            lower: &nominal - &uncertainty,
+-            upper: &nominal + &uncertainty,
++            lower,
++            upper,
+             nominal,
+         })
+     }
+@@ -892,6 +901,7 @@ impl From<Problem> for MachineProfileError {
+ 
+ #[cfg(test)]
+ mod tests {
++    mod interval_migration;
+     use super::*;
+     use crate::boundary::CanonicalStep;
+     use crate::compiler::{
+diff --git a/docs/INTERVAL-MIGRATION.md b/docs/INTERVAL-MIGRATION.md
+index d783a4f..ad7465a 100644
+--- a/docs/INTERVAL-MIGRATION.md
++++ b/docs/INTERVAL-MIGRATION.md
+@@ -23,7 +23,13 @@ native cost/size probes and a Wasm replay consumer. Qualification and adoption
+ measurements are recorded in CSGRS's `INTERVAL_REFACTOR_PROGRESS.md` and its
+ referenced evidence archive.
+ 
+-Machine-profile `ExactInterval`, positive products/quotients, named error-budget
+-composition and full application browser/schedule qualification remain separate
+-parts of the migration. Their implementations and canonical encodings are not
+-changed by this constructor delegation.
++Machine-profile `ExactInterval::from_scalar` delegates endpoint construction to
++`RationalInterval::from_nominal_unsigned_uncertainty`. After converting the
++nominal, it validates the uncertainty denominator and numerator into `NonZeroU64`
++and `u64`. Hyperreal owns exact fraction reduction; Hyperinterval owns the closed
++nominal-plus/minus set. The profile retains its nominal, endpoint storage,
++constant accessors, configuration identity and existing error variants.
++
++Positive products/quotients, integer scaling, named error-budget composition
++and full application browser/schedule qualification remain separate parts of
++the migration. The constructor change preserves canonical encodings.
