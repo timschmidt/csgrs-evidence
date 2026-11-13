@@ -1,0 +1,216 @@
+--- 
++++ 
+@@ -23,7 +23,7 @@
+     context_from_problem,
+ };
+ 
+-use super::RouteCertificationError;
++use crate::DynamicsError;
+ 
+ /// Exact positive dynamic limits for one dense machine axis.
+ #[derive(Clone, Debug, PartialEq)]
+@@ -133,7 +133,7 @@
+     projections: &[AffineSpanAxisProjection],
+     axis_limits: &[AxisMotionLimits],
+     policy: PredicatePolicy,
+-) -> Result<PlannedAxisProjectedMotionLimits, RouteCertificationError> {
++) -> Result<PlannedAxisProjectedMotionLimits, DynamicsError> {
+     validate_projection_inputs(projections, axis_limits, policy)?;
+ 
+     let mut feed: Option<(Real, AxisProjectionBottleneck)> = None;
+@@ -151,21 +151,21 @@
+             feed = select_minimum(
+                 feed,
+                 (&axis_limits[axis_index].maximum_velocity / derivative)
+-                    .map_err(|_| RouteCertificationError::UnsupportedDivision)?,
++                    .map_err(|_| DynamicsError::UnsupportedDivision)?,
+                 location,
+                 policy,
+             )?;
+             acceleration = select_minimum(
+                 acceleration,
+                 (&axis_limits[axis_index].maximum_acceleration / derivative)
+-                    .map_err(|_| RouteCertificationError::UnsupportedDivision)?,
++                    .map_err(|_| DynamicsError::UnsupportedDivision)?,
+                 location,
+                 policy,
+             )?;
+             jerk = select_minimum(
+                 jerk,
+                 (&axis_limits[axis_index].maximum_jerk / derivative)
+-                    .map_err(|_| RouteCertificationError::UnsupportedDivision)?,
++                    .map_err(|_| DynamicsError::UnsupportedDivision)?,
+                 location,
+                 policy,
+             )?;
+@@ -173,11 +173,11 @@
+     }
+ 
+     let (maximum_path_feed, feed_bottleneck) =
+-        feed.ok_or(RouteCertificationError::DegenerateAxisProjection)?;
++        feed.ok_or(DynamicsError::DegenerateAxisProjection)?;
+     let (maximum_path_acceleration, acceleration_bottleneck) =
+-        acceleration.ok_or(RouteCertificationError::DegenerateAxisProjection)?;
++        acceleration.ok_or(DynamicsError::DegenerateAxisProjection)?;
+     let (maximum_path_jerk, jerk_bottleneck) =
+-        jerk.ok_or(RouteCertificationError::DegenerateAxisProjection)?;
++        jerk.ok_or(DynamicsError::DegenerateAxisProjection)?;
+     let certification = certify_axis_projected_motion_limits(
+         projections,
+         axis_limits,
+@@ -197,7 +197,7 @@
+         jerk_bottleneck,
+     );
+     if !certification.all_satisfied() || !bottleneck_certification.all_satisfied() {
+-        return Err(RouteCertificationError::AxisProjectionProposalUncertified);
++        return Err(DynamicsError::AxisProjectionProposalUncertified);
+     }
+ 
+     Ok(PlannedAxisProjectedMotionLimits {
+@@ -224,24 +224,24 @@
+     maximum_path_acceleration: Real,
+     maximum_path_jerk: Real,
+     policy: PredicatePolicy,
+-) -> Result<AxisProjectedMotionLimitsReport, RouteCertificationError> {
++) -> Result<AxisProjectedMotionLimitsReport, DynamicsError> {
+     validate_projection_inputs(projections, axis_limits, policy)?;
+     require_positive(
+         &maximum_path_feed,
+-        RouteCertificationError::NegativeFeedRate,
+-        RouteCertificationError::ZeroFeedRate,
++        DynamicsError::NegativeFeedRate,
++        DynamicsError::ZeroFeedRate,
+         policy,
+     )?;
+     require_positive(
+         &maximum_path_acceleration,
+-        RouteCertificationError::NegativeAcceleration,
+-        RouteCertificationError::ZeroAcceleration,
++        DynamicsError::NegativeAcceleration,
++        DynamicsError::ZeroAcceleration,
+         policy,
+     )?;
+     require_positive(
+         &maximum_path_jerk,
+-        RouteCertificationError::NegativeJerk,
+-        RouteCertificationError::ZeroJerk,
++        DynamicsError::NegativeJerk,
++        DynamicsError::ZeroJerk,
+         policy,
+     )?;
+ 
+@@ -275,47 +275,47 @@
+     projections: &[AffineSpanAxisProjection],
+     axis_limits: &[AxisMotionLimits],
+     policy: PredicatePolicy,
+-) -> Result<(), RouteCertificationError> {
++) -> Result<(), DynamicsError> {
+     if projections.is_empty() || axis_limits.is_empty() {
+-        return Err(RouteCertificationError::EmptyAxisProjection);
++        return Err(DynamicsError::EmptyAxisProjection);
+     }
+     for limits in axis_limits {
+         require_positive(
+             &limits.maximum_velocity,
+-            RouteCertificationError::NegativeFeedRate,
+-            RouteCertificationError::ZeroFeedRate,
++            DynamicsError::NegativeFeedRate,
++            DynamicsError::ZeroFeedRate,
+             policy,
+         )?;
+         require_positive(
+             &limits.maximum_acceleration,
+-            RouteCertificationError::NegativeAcceleration,
+-            RouteCertificationError::ZeroAcceleration,
++            DynamicsError::NegativeAcceleration,
++            DynamicsError::ZeroAcceleration,
+             policy,
+         )?;
+         require_positive(
+             &limits.maximum_jerk,
+-            RouteCertificationError::NegativeJerk,
+-            RouteCertificationError::ZeroJerk,
++            DynamicsError::NegativeJerk,
++            DynamicsError::ZeroJerk,
+             policy,
+         )?;
+     }
+     for projection in projections {
+         if projection.absolute_axis_derivatives.len() != axis_limits.len() {
+-            return Err(RouteCertificationError::AxisProjectionShapeMismatch);
++            return Err(DynamicsError::AxisProjectionShapeMismatch);
+         }
+         let mut has_positive = false;
+         for derivative in &projection.absolute_axis_derivatives {
+             match classify_real_sign(derivative, policy).value() {
+                 Some(Sign::Negative) => {
+-                    return Err(RouteCertificationError::NegativeAxisProjection);
++                    return Err(DynamicsError::NegativeAxisProjection);
+                 }
+                 Some(Sign::Zero) => {}
+                 Some(Sign::Positive) => has_positive = true,
+-                None => return Err(RouteCertificationError::PredicateUnresolved),
++                None => return Err(DynamicsError::PredicateUnresolved),
+             }
+         }
+         if !has_positive {
+-            return Err(RouteCertificationError::DegenerateAxisProjection);
++            return Err(DynamicsError::DegenerateAxisProjection);
+         }
+     }
+     Ok(())
+@@ -323,27 +323,24 @@
+ 
+ fn require_positive(
+     value: &Real,
+-    negative: RouteCertificationError,
+-    zero: RouteCertificationError,
++    negative: DynamicsError,
++    zero: DynamicsError,
+     policy: PredicatePolicy,
+-) -> Result<(), RouteCertificationError> {
++) -> Result<(), DynamicsError> {
+     match classify_real_sign(value, policy).value() {
+         Some(Sign::Negative) => Err(negative),
+         Some(Sign::Zero) => Err(zero),
+         Some(Sign::Positive) => Ok(()),
+-        None => Err(RouteCertificationError::PredicateUnresolved),
+-    }
+-}
+-
+-fn is_positive_projection(
+-    value: &Real,
+-    policy: PredicatePolicy,
+-) -> Result<bool, RouteCertificationError> {
++        None => Err(DynamicsError::PredicateUnresolved),
++    }
++}
++
++fn is_positive_projection(value: &Real, policy: PredicatePolicy) -> Result<bool, DynamicsError> {
+     match classify_real_sign(value, policy).value() {
+-        Some(Sign::Negative) => Err(RouteCertificationError::NegativeAxisProjection),
++        Some(Sign::Negative) => Err(DynamicsError::NegativeAxisProjection),
+         Some(Sign::Zero) => Ok(false),
+         Some(Sign::Positive) => Ok(true),
+-        None => Err(RouteCertificationError::PredicateUnresolved),
++        None => Err(DynamicsError::PredicateUnresolved),
+     }
+ }
+ 
+@@ -352,14 +349,14 @@
+     candidate: Real,
+     location: AxisProjectionBottleneck,
+     policy: PredicatePolicy,
+-) -> Result<Option<(Real, AxisProjectionBottleneck)>, RouteCertificationError> {
++) -> Result<Option<(Real, AxisProjectionBottleneck)>, DynamicsError> {
+     let Some((selected, selected_location)) = current else {
+         return Ok(Some((candidate, location)));
+     };
+     match compare_reals(&candidate, &selected, policy).value() {
+         Some(Ordering::Less) => Ok(Some((candidate, location))),
+         Some(Ordering::Equal | Ordering::Greater) => Ok(Some((selected, selected_location))),
+-        None => Err(RouteCertificationError::PredicateUnresolved),
++        None => Err(DynamicsError::PredicateUnresolved),
+     }
+ }
+ 

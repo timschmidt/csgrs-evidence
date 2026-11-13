@@ -1,0 +1,135 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5d3b9da..1059df0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -193,6 +193,7 @@ dependencies = [
+  "critical-section",
+  "csgrs",
+  "hypercurve",
++ "hyperdynamics",
+  "hypergraphics",
+  "hyperinterval",
+  "hyperlimit",
+@@ -1532,6 +1533,15 @@ dependencies = [
+  "num",
+ ]
+ 
++[[package]]
++name = "hyperdynamics"
++version = "0.1.0"
++dependencies = [
++ "hyperlimit",
++ "hyperreal",
++ "hypersolve",
++]
++
+ [[package]]
+ name = "hypergraphics"
+ version = "0.1.0"
+@@ -1583,6 +1593,7 @@ dependencies = [
+ name = "hyperpath"
+ version = "0.3.0"
+ dependencies = [
++ "hyperdynamics",
+  "hyperlimit",
+  "hyperreal",
+  "hypersolve",
+diff --git a/Cargo.toml b/Cargo.toml
+index 2d198e8..8572785 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,6 +41,7 @@ hypergraphics = { path = "../csgrs/crates/hypergraphics" }
+ hyperinterval = { path = "../csgrs/crates/hyperinterval", default-features = false, features = ["rational"] }
+ hyperlimit = { path = "../csgrs/crates/hyperlimit", default-features = false }
+ hyperpath = { path = "../csgrs/crates/hyperpath", default-features = false }
++hyperdynamics = { path = "../csgrs/crates/hyperdynamics", default-features = false }
+ hyperreal = { path = "../csgrs/crates/hyperreal", default-features = false, features = ["serde"] }
+ hypersolve = { path = "../csgrs/crates/hypersolve", default-features = false }
+ image = { version = "0.25.6", default-features = false, features = ["png"] }
+@@ -146,6 +147,7 @@ hyperlattice = { path = "../csgrs/crates/hyperlattice" }
+ hyperlimit = { path = "../csgrs/crates/hyperlimit" }
+ hypermesh = { path = "../csgrs/crates/hypermesh" }
+ hyperpath = { path = "../csgrs/crates/hyperpath" }
++hyperdynamics = { path = "../csgrs/crates/hyperdynamics" }
+ hyperphysics = { path = "../csgrs/crates/hyperphysics" }
+ hyperreal = { path = "../csgrs/crates/hyperreal" }
+ hypersolve = { path = "../csgrs/crates/hypersolve" }
+diff --git a/crates/alumina-interface-core/Cargo.toml b/crates/alumina-interface-core/Cargo.toml
+index 25dde24..c52aa82 100644
+--- a/crates/alumina-interface-core/Cargo.toml
++++ b/crates/alumina-interface-core/Cargo.toml
+@@ -26,6 +26,7 @@ hypergraphics.workspace = true
+ hyperinterval.workspace = true
+ hyperlimit.workspace = true
+ hyperpath.workspace = true
++hyperdynamics.workspace = true
+ hyperreal.workspace = true
+ hypersolve.workspace = true
+ serde_json.workspace = true
+diff --git a/crates/alumina-interface-core/src/machine_profile.rs b/crates/alumina-interface-core/src/machine_profile.rs
+index a43b4f4..8c76250 100644
+--- a/crates/alumina-interface-core/src/machine_profile.rs
++++ b/crates/alumina-interface-core/src/machine_profile.rs
+@@ -2110,6 +2110,19 @@ mod tests {
+         assert_eq!(projection.acceleration_bottleneck.axis_index, 1);
+         assert_eq!(projection.jerk_bottleneck.axis_index, 1);
+         assert!(projection.all_satisfied());
++        // Frozen from the pre-Hyperdynamics projection implementation. The
++        // transcript binds exact axis limits, bottlenecks and solver replay.
++        let transcript =
++            crate::schedule_evidence::build_canonical_planner_digests(&schedule).unwrap();
++        assert_eq!(transcript.planner_transcript_byte_len, 41795);
++        assert_eq!(
++            transcript.planner_transcript_digest.0,
++            [
++                223, 137, 61, 248, 62, 144, 230, 181, 52, 82, 225, 133, 134, 255, 202, 162, 82, 74,
++                2, 22, 49, 163, 149, 212, 166, 82, 59, 225, 98, 99, 102, 156
++            ]
++        );
++
+         assert_ne!(schedule.lookahead().corner_feeds[0], Real::zero());
+         assert!(schedule.lookahead_plan().all_satisfied());
+         assert!(schedule.jerk_report().all_satisfied());
+diff --git a/crates/alumina-interface-core/src/motion_schedule.rs b/crates/alumina-interface-core/src/motion_schedule.rs
+index 6e1e783..97b5c2e 100644
+--- a/crates/alumina-interface-core/src/motion_schedule.rs
++++ b/crates/alumina-interface-core/src/motion_schedule.rs
+@@ -20,14 +20,16 @@ use alumina_machine_ir::ExecutionSegment;
+ use alumina_motion::{MotionError, StepperPreflightSummary, preflight_stepper_segments};
+ use alumina_protocol::{DeviceId, Digest};
+ use hypercurve::{CurveError, CurveGeometry2, CurvePath2, ExactCurveError, Point2 as CurvePoint2};
++use hyperdynamics::{
++    AffineSpanAxisProjection, AxisMotionLimits, PlannedAxisProjectedMotionLimits,
++    plan_axis_projected_motion_limits,
++};
+ use hyperlimit::{PredicatePolicy, Sign, classify_real_sign, compare_reals};
+ use hyperpath::{
+-    AffineSpanAxisProjection, AxisMotionLimits, FeedPathElement, JerkRampPhaseProposal,
+-    JerkRampSpanProposal, LookaheadFeedPlanningLimits, LookaheadFeedSchedule,
+-    LookaheadFeedScheduleReport, MultiPhaseJerkRampFeedScheduleReport,
+-    PlannedAxisProjectedMotionLimits, PlannedJerkFeasibleLookaheadSchedule,
+-    PlannedLookaheadFeedSchedule, RouteCertificationError, TangentSpan,
+-    certify_multi_phase_jerk_ramp_feed_schedule, plan_axis_projected_motion_limits,
++    FeedPathElement, JerkRampPhaseProposal, JerkRampSpanProposal, LookaheadFeedPlanningLimits,
++    LookaheadFeedSchedule, LookaheadFeedScheduleReport, MultiPhaseJerkRampFeedScheduleReport,
++    PlannedJerkFeasibleLookaheadSchedule, PlannedLookaheadFeedSchedule, RouteCertificationError,
++    TangentSpan, certify_multi_phase_jerk_ramp_feed_schedule,
+     plan_jerk_feasible_lookahead_schedule,
+ };
+ use hyperreal::{Problem, Rational, Real};
+@@ -332,11 +334,10 @@ fn affine_line_axis_projection(
+             })
+         })
+         .collect::<MotionScheduleResult<Vec<_>>>()?;
+-    Ok(Some(plan_axis_projected_motion_limits(
+-        &projections,
+-        axis_limits,
+-        PredicatePolicy::STRICT,
+-    )?))
++    Ok(Some(
++        plan_axis_projected_motion_limits(&projections, axis_limits, PredicatePolicy::STRICT)
++            .map_err(RouteCertificationError::from)?,
++    ))
+ }
+ 
+ fn absolute_real(value: &Real, domain: &'static str) -> MotionScheduleResult<Real> {
