@@ -1,0 +1,342 @@
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index d110a6d96..01d775d92 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -15,6 +15,7 @@ all-features = true
+ 
+ [features]
+ default = []
++rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+ field = ["dep:hyperreal", "dep:hyperinterval", "dep:hyperlattice-interval", "dep:hypersolve", "hypersolve/interval-program"]
+ serde = ["dep:serde", "hypersolve?/serde", "hyperlattice-interval?/serde"]
+ dispatch-trace = ["hypersolve?/dispatch-trace", "hyperinterval?/dispatch-trace"]
+@@ -33,3 +34,7 @@ serde_json = "1.0"
+ [[example]]
+ name = "expression_field"
+ required-features = ["field"]
++
++[[example]]
++name = "rk_proposal"
++required-features = ["rk-proposal"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 85a2b0f9c..ca6c35258 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -46,14 +46,24 @@ With `serde`, serialize a `RationalTimeField` and deserialize into
+ `RationalTimeDefinition`, then rebuild with `RationalTimeField::from_definition`.
+ Replay revalidates the original source and regenerates the clock, transformation
+ and derivatives. Generated proof flags are never trusted as certificates.
+-RK proposals, wrapping control, broader reachability and whole-resource bounds
+-remain open.
++
++Enable `rk-proposal` for `field.rk4_proposer(budget)`. Its reusable primitive view
++retains the exact source. `propose(request, options, budget)` records four RK4
++stages and a padded candidate box; padding is a search heuristic without an error
++bound. Consume the candidate with `certify(budget)` and inspect `proof().status()`:
++only the existing exact Picard verifier can certify a tube or endpoint. Failed
++proposals retain the original request and partial stage trace. Rebuild from the
++field definition, request and options for replay; numerical traces are not proof.
++The native horizon integrator remains available independently. Automatic RK step
++selection, wrapping control, broader reachability and whole-resource bounds remain
++open.
+ 
+ Build on Rust 1.95 and run the time-dependent oscillator example:
+ 
+ ```sh
+ cargo test -p hyperdynamics --all-features
+ cargo run -p hyperdynamics --features field --example expression_field
++cargo run -p hyperdynamics --features rk-proposal --example rk_proposal
+ ```
+ 
+ The default feature set is empty. `dispatch-trace` enables underlying exact
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 714b90a0f..26eadbdc1 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -7,6 +7,9 @@ pub mod clock;
+ pub mod evolution;
+ /// Source-bound Picard self-map and contraction verification for dyadic steps.
+ pub mod picard;
++/// Source-bound primitive RK4 estimates consumed only through exact verification.
++#[cfg(feature = "rk-proposal")]
++pub mod proposal;
+ use std::{collections::BTreeSet, fmt, sync::Arc};
+ 
+ use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 87cd6f359..a49b7e2c7 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -6,6 +6,13 @@ budgeted common-scale dyadic arithmetic, symbolic Real balls, and finite IEEE
+ enclosures on x86_64. Empty sets, sign sets, and set relations are explicit.
+ Elementary function enclosures remain under development.
+ 
++With `dyadic` and either float feature, `DyadicInterval::from_f64(value, budget)`
++adopts a finite IEEE value exactly, including subnormals. It rejects NaN and
++infinity and reserves significand work before allocation. This conversion needs
++no strict-float platform qualification or Hyperreal dependency. `0.1_f64` remains
++its binary value, not 1/10; importing numerical estimates does not certify their
++relationship to an earlier source.
++
+ Finite integer, fixed, rational, dyadic and qualified IEEE carriers provide
+ exact `abs`, `min_image` and `max_image`. Min/max are images over independently
+ chosen operand members, so either empty operand gives empty. Absolute value
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 50abd14f1..a496d8fec 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -163,6 +163,19 @@ impl DyadicInterval {
+         Self::new(mantissa.clone(), mantissa, exponent)
+     }
+ 
++    /// Import exactly the finite IEEE binary64 value, independent of the native
++    /// arithmetic environment. NaN and infinity are typed validation errors.
++    ///
++    /// This adopts the supplied bits as a number; it certifies no relation to an
++    /// earlier exact source or trajectory. In particular, `0.1_f64` is not 1/10.
++    /// Bit validation/decoding precede native budget reservation, and reservation
++    /// precedes mantissa allocation. No large power-of-two denominator is built.
++    #[cfg(any(feature = "float-proposal", feature = "float-enclosure"))]
++    pub fn from_f64(value: f64, budget: &mut DyadicBudget) -> Result<Self, IntervalError> {
++        let bits = crate::ieee::BINARY64.finite(value.to_bits())?;
++        crate::ieee::BINARY64.dyadic_point(bits, budget)
++    }
++
+     /// Whether this set is empty.
+     pub fn is_empty(&self) -> bool {
+         self.bounds.is_none()
+diff --git a/crates/hyperinterval/src/float.rs b/crates/hyperinterval/src/float.rs
+index 37c1d474e..34515db2e 100644
+--- a/crates/hyperinterval/src/float.rs
++++ b/crates/hyperinterval/src/float.rs
+@@ -543,16 +543,9 @@ let enclosure: F64Enclosure = proposal.into();
+                 let Some((a, b)) = self.bits() else {
+                     return Ok(crate::DyadicInterval::empty());
+                 };
+-                let point = |bits, budget: &mut crate::DyadicBudget| {
+-                    let (mantissa, exponent) = $format.exact_parts(bits);
+-                    budget.reserve(
+-                        u64::from(i64::BITS - mantissa.unsigned_abs().leading_zeros()),
+-                        2,
+-                        false,
+-                    )?;
+-                    crate::DyadicInterval::point(mantissa.into(), exponent)
+-                };
+-                point(a, budget)?.hull(&point(b, budget)?, budget)
++                $format
++                    .dyadic_point(a, budget)?
++                    .hull(&$format.dyadic_point(b, budget)?, budget)
+             }
+         }
+ 
+diff --git a/crates/hyperinterval/src/ieee.rs b/crates/hyperinterval/src/ieee.rs
+index 7bf974ce3..fce6d9a70 100644
+--- a/crates/hyperinterval/src/ieee.rs
++++ b/crates/hyperinterval/src/ieee.rs
+@@ -47,7 +47,7 @@ impl Format {
+     }
+ }
+ 
+-#[cfg(feature = "float-enclosure")]
++#[cfg(any(feature = "float-enclosure", feature = "dyadic"))]
+ #[derive(Clone, Copy)]
+ struct Dyadic {
+     negative: bool,
+@@ -55,7 +55,7 @@ struct Dyadic {
+     exponent: i32,
+ }
+ 
+-#[cfg(feature = "float-enclosure")]
++#[cfg(any(feature = "float-enclosure", feature = "dyadic"))]
+ impl Format {
+     fn fraction(self) -> u32 {
+         self.infinity.trailing_zeros()
+@@ -67,28 +67,6 @@ impl Format {
+         1 - self.bias() - self.fraction() as i32
+     }
+ 
+-    pub(crate) fn one(self) -> u64 {
+-        (self.bias() as u64) << self.fraction()
+-    }
+-
+-    pub(crate) fn negate(self, bits: u64) -> u64 {
+-        if bits == 0 { 0 } else { bits ^ self.sign }
+-    }
+-
+-    pub(crate) fn next_up(self, bits: u64) -> Result<u64, IntervalError> {
+-        let next = if bits & self.sign != 0 {
+-            bits - 1
+-        } else {
+-            bits + 1
+-        };
+-        self.finite(next).map_err(|_| IntervalError::Overflow)
+-    }
+-
+-    pub(crate) fn next_down(self, bits: u64) -> Result<u64, IntervalError> {
+-        self.next_up(self.negate(bits))
+-            .map(|next| self.negate(next))
+-    }
+-
+     fn decode(self, bits: u64) -> Dyadic {
+         let f = self.fraction();
+         let field = (bits & self.infinity) >> f;
+@@ -119,6 +97,49 @@ impl Format {
+         )
+     }
+ 
++    // The caller has already validated finite bits. Keep this allocation and
++    // admission authority shared by enclosure conversion and exact scalar ingress.
++    #[cfg(feature = "dyadic")]
++    #[inline(always)]
++    pub(crate) fn dyadic_point(
++        self,
++        bits: u64,
++        budget: &mut crate::DyadicBudget,
++    ) -> Result<crate::DyadicInterval, IntervalError> {
++        let (mantissa, exponent) = self.exact_parts(bits);
++        budget.reserve(
++            u64::from(i64::BITS - mantissa.unsigned_abs().leading_zeros()),
++            2,
++            false,
++        )?;
++        crate::DyadicInterval::point(mantissa.into(), exponent)
++    }
++}
++
++#[cfg(feature = "float-enclosure")]
++impl Format {
++    pub(crate) fn one(self) -> u64 {
++        (self.bias() as u64) << self.fraction()
++    }
++
++    pub(crate) fn negate(self, bits: u64) -> u64 {
++        if bits == 0 { 0 } else { bits ^ self.sign }
++    }
++
++    pub(crate) fn next_up(self, bits: u64) -> Result<u64, IntervalError> {
++        let next = if bits & self.sign != 0 {
++            bits - 1
++        } else {
++            bits + 1
++        };
++        self.finite(next).map_err(|_| IntervalError::Overflow)
++    }
++
++    pub(crate) fn next_down(self, bits: u64) -> Result<u64, IntervalError> {
++        self.next_up(self.negate(bits))
++            .map(|next| self.negate(next))
++    }
++
+     // Compare (b-a) with (d-c) via b+c-a-d. Each finite endpoint is an
+     // integer on the format's minimum grid. Four binary64 magnitudes sum to
+     // fewer than 2^2100 grid units (33 u64 limbs); binary32 needs 279 bits
+diff --git a/crates/hyperinterval/tests/float.rs b/crates/hyperinterval/tests/float.rs
+index 50c6d0d15..1409f997a 100644
+--- a/crates/hyperinterval/tests/float.rs
++++ b/crates/hyperinterval/tests/float.rs
+@@ -745,6 +745,58 @@ fn with_mxcsr<T>(mode: u32, work: impl FnOnce() -> T) -> T {
+     std::hint::black_box(work)()
+ }
+ 
++#[cfg(all(feature = "dyadic", target_arch = "x86_64", not(target_env = "msvc")))]
++#[test]
++fn exact_scalar_ingress_ignores_native_modes() {
++    const KEY: &str = "HYPERINTERVAL_INGRESS_MXCSR";
++    if let Ok(mode) = std::env::var(KEY) {
++        with_mxcsr(mode.parse().unwrap(), || {
++            use hyperinterval::{DyadicBudget, DyadicInterval};
++            for (bits, mantissa, exponent) in [
++                (0u64, 0i64, 0),
++                (1, 1, -1074),
++                (0x8000_0000_0000_0001, -1, -1074),
++                (0x8000_0000_0000_0000, 0, 0),
++                (0x0010_0000_0000_0000, 1, -1022),
++                (0x3ff0_0000_0000_0001, (1 << 52) + 1, -52),
++                (0x7fef_ffff_ffff_ffff, (1 << 53) - 1, 971),
++            ] {
++                let input = std::hint::black_box(f64::from_bits(bits));
++                assert_eq!(
++                    DyadicInterval::from_f64(input, &mut DyadicBudget::new(53, 106)).unwrap(),
++                    DyadicInterval::point(mantissa.into(), exponent).unwrap()
++                );
++            }
++            assert_eq!(
++                DyadicInterval::from_f64(
++                    f64::from_bits(0x7ff0_0000_0000_0001),
++                    &mut DyadicBudget::new(0, 0)
++                ),
++                Err(IntervalError::NonFiniteEndpoint)
++            );
++        });
++        return;
++    }
++    for mode in 0..16 {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "exact_scalar_ingress_ignores_native_modes",
++                "--nocapture",
++            ])
++            .env(KEY, mode.to_string())
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "mode={mode}: {} {}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        eprint!("{}", String::from_utf8_lossy(&output.stderr));
++    }
++}
++
+ #[cfg(all(feature = "rational", feature = "dyadic", target_arch = "x86_64"))]
+ #[test]
+ fn exact_bridges_preserve_ieee_values_and_generated_enclosures() {
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 46a4e94b4..5890d281a 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -43,6 +43,7 @@ serde_json = "1.0.149"
+ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
++float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
+ dispatch-trace = [
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 0939e1292..2d7daa8b5 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -69,6 +69,15 @@ accounting. This is an interval expression evaluator, not a validated ODE solver
+ Run `cargo run -p hypersolve --features interval-program --example enclosed_program`
+ for an oscillator image and source-bound symbolic-Jacobian enclosure.
+ 
++`float-proposal-program` adds `ExpressionProgram::float_proposal` and a prepared
++`FloatProposalProgram::estimate` view. Demanded constants are projected once;
++ordered bindings, original domain guards and shared nodes remain in the schedule.
++Native results are finite point estimates, without enclosure or exact-source
++claims. Numerical domain/overflow errors do not prove failure of the exact source.
++Recompute consumed evidence from the retained original program. Graph budgets
++cover preparation and evaluation bookkeeping; scalar projection and native math
++library internals remain outside whole-work accounting.
++
+ `work_budget::with_budget` bounds instrumented root-subdivision and tensor-image
+ promotion attempts across nested synchronous operations. Exhaustion is a typed
+ resource failure and never authorizes approximation. The counters do not yet
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index e004ac51f..0c15d4df4 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -23,6 +23,10 @@ mod dyadic;
+ pub use dyadic::RegularJacobianEnclosure;
+ mod affine;
+ pub use affine::{AffineParameterization, AffineProgram};
++#[cfg(feature = "float-proposal-program")]
++mod proposal;
++#[cfg(feature = "float-proposal-program")]
++pub use proposal::{FloatProposalError, FloatProposalProgram};
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
+ 
