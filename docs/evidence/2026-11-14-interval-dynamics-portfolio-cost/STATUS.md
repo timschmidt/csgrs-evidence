@@ -1,0 +1,1 @@
+Existing regridded reachability is qualified in the completed dynamics comparison, with default-budget growth and cap-quality regressions. No production algorithm or policy changes. Full goal remains active; automatic selection, general performance/resource closure and release remain open.
