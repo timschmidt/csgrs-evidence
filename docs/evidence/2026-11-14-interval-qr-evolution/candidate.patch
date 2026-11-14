@@ -1,0 +1,2135 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 5694ce094..07029eca8 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add opt-in automatic finite-window QR evolution with exact frame/transport proofs,
++  explicit Picard or trajectory Taylor endpoints, retained attempts and typed failure.
++
+ - Add opt-in bounded adaptive trajectory Taylor order/step selection, with exact
+   local remainder limits and retained native searches, rejected quality and proofs.
+ 
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 539312390..76389b669 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ coordinates = ["field", "hypersolve/coordinate-program"]
++qr-evolution = ["qr-coordinates", "reachability", "taylor-evolution"]
+ qr-coordinates = ["coordinate-transition", "hypersolve/qr-coordinates"]
+ coordinate-transition = ["coordinates", "hypersolve/coordinate-transition"]
+ taylor-model = ["field", "hypersolve/taylor-model"]
+@@ -90,3 +91,8 @@ required-features = ["taylor-evolution", "reachability"]
+ name = "adaptive_taylor"
+ harness = false
+ required-features = ["adaptive-taylor", "taylor-evolution"]
++
++[[bench]]
++name = "qr_evolution"
++harness = false
++required-features = ["qr-evolution"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 806a410e8..b35c49a28 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -155,6 +155,26 @@ With `coordinate-transition`, `CoordinateField::transition_to` prepares direct e
+ 
+ With `qr-coordinates`, `ExpressionField::in_qr_coordinates` constructs an exact orthonormal state chart from a basis and origin without a supplied inverse. The retained factorization and chart support existing Picard, Taylor, finite-horizon and direct endpoint-transport APIs. Frame selection remains caller-controlled.
+ 
++With `qr-evolution`, `CoordinateField::integrate_qr` selects and certifies a new
++frame proposal for each bounded window. For the incoming map `x=c+A*y`, it proposes
++`A*(I+h*M)` from midpoint Jacobian data and recenters at `c+A*midpoint(initial)`.
++The midpoint is only a proposal: existing exact QR, direct chart transport and
++trajectory verification establish every consumed result. `QrEvolutionOptions`
++chooses window/native limits and an optional trajectory Taylor order (default3).
++Taylor windows retain the existing analytic-domain and full-remainder contract;
++`None` selects Picard endpoints. No failed frame or Taylor proof silently falls
++back to a weaker success. Original source, selections, relations, native attempts,
++coefficients and projections remain inspectable. Both the proposed and retained charts must complete. An exact comparison of their
++source-coordinate maximum diameters selects the smaller result (ties select the
++recentered proposal); both proofs and the comparison remain available. This local
++criterion is not a whole-horizon optimality claim. Only whole-request success
++exposes `source_end_enclosure`; stopped windows and certified prefixes are separate.
++Replay the original chart, request, options and policy. Frame changes can increase
++cost or enclosure width, and a singular Euler-basis proposal stops explicitly.
++Exact scalar payload/refinement, nested proof graphs and total heap remain outside
++the shared structural/native-arithmetic resource bounds.
++
++
+ The optional `taylor-evolution` feature composes validated trajectory Taylor endpoints over a finite dyadic horizon. It retains each bounded Picard search and the full Taylor remainder, feeds refined endpoints into subsequent steps, and distinguishes a certified prefix from whole-horizon completion.
+ 
+ The optional `adaptive-taylor` feature adds
+diff --git a/crates/hyperdynamics/benches/qr_evolution.rs b/crates/hyperdynamics/benches/qr_evolution.rs
+new file mode 100644
+index 000000000..9477488ab
+--- /dev/null
++++ b/crates/hyperdynamics/benches/qr_evolution.rs
+@@ -0,0 +1,276 @@
++//! Complete fixed-chart and automatic QR flows, including preparation and source projections.
++use criterion::{Criterion, black_box, criterion_group, criterion_main};
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    coordinates::{
++        CoordinateField,
++        qr_evolution::{QrEvolution, QrEvolutionOptions, QrEvolutionStatus},
++    },
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::evolution::{FlowTaylorEvolution, FlowTaylorEvolutionStatus},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperreal::{Rational, Real};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{CoordinateChange, ExpressionBudget, ExpressionProgram},
++};
++#[path = "../tests/support/flow_oracles.rs"]
++mod flow_oracles;
++const X: SymbolId = SymbolId(0);
++const Y: SymbolId = SymbolId(1);
++const T: SymbolId = SymbolId(2);
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++struct Fixture {
++    name: &'static str,
++    chart: CoordinateField<2>,
++    request: EvolutionRequest<2>,
++    options: QrEvolutionOptions,
++    expected: [(Rational, Rational); 2],
++    width_limit: Rational,
++}
++fn fixture(
++    name: &'static str,
++    outputs: Vec<Expr>,
++    initial: [DyadicInterval; 2],
++    expected: [(Rational, Rational); 2],
++    width_limit: Rational,
++) -> Fixture {
++    let source = ExpressionProgram::compile(
++        &outputs,
++        &[Y, T, X],
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    let field = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time: T,
++            state: vec![X, Y],
++        },
++        &mut budget(),
++    )
++    .unwrap();
++    let a = vec![
++        vec![Real::one(), Real::zero()],
++        vec![Real::zero(), Real::one()],
++    ];
++    let chart = field
++        .in_coordinates(
++            CoordinateChange {
++                variables: vec![X, Y],
++                to_source: a.clone(),
++                from_source: a,
++                origin: vec![Real::zero(); 2],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    Fixture {
++        name,
++        chart,
++        request: EvolutionRequest {
++            start: d(0, 0, 0),
++            end: d(3, 3, -1),
++            initial: BoxN::new(initial).unwrap(),
++        },
++        options: QrEvolutionOptions {
++            window: d(3, 3, -2),
++            maximum_windows: 2,
++            taylor_order: Some(3),
++            native: EvolutionOptions {
++                maximum_step: Some(d(1, 1, -4)),
++                ..Default::default()
++            },
++        },
++        expected,
++        width_limit,
++    }
++}
++fn fixtures() -> Vec<Fixture> {
++    let p = |a: i64, b: i64| (Rational::from(a), Rational::from(b));
++    let t = Rational::from(3) / Rational::from(2);
++    let cos = flow_oracles::alternating_trig(&t, false);
++    let sin = flow_oracles::alternating_trig(&t, true);
++    assert!(cos.0.is_positive() && sin.0.is_positive());
++    let mut result = vec![
++        fixture(
++            "constant",
++            vec![Expr::int(2), Expr::int(1)],
++            [d(-1, 1, 0), d(0, 0, 0)],
++            [
++                p(2, 4),
++                (
++                    Rational::from(3) / Rational::from(2),
++                    Rational::from(3) / Rational::from(2),
++                ),
++            ],
++            Rational::from(3),
++        ),
++        // For initial x in [-1,1], y=0, exact solution is (x*cos(t),x*sin(t)).
++        // Independent exact alternating-series outer bounds cover both extremal
++        // source points and therefore the complete line-segment input image.
++        fixture(
++            "rotation_uncertainty",
++            vec![-Expr::anonymous_symbol(Y), Expr::anonymous_symbol(X)],
++            [d(-1, 1, 0), d(0, 0, 0)],
++            [(-&cos.1, cos.1), (-&sin.1, sin.1)],
++            Rational::from(10),
++        ),
++    ];
++    let q = |n: i64| Expr::real(Real::from(Rational::from(n) / Rational::from(25)));
++    let x = Expr::anonymous_symbol(X);
++    let y = Expr::anonymous_symbol(Y);
++    // Zero is the exact equilibrium. The tilted Jacobian has a larger infinity
++    // norm in the original frame; selected QR frames certify longer Picard steps.
++    let mut tilted = fixture(
++        "tilted_equilibrium",
++        vec![q(7) * x.clone() + q(24) * y.clone(), q(24) * x + q(-7) * y],
++        [d(0, 0, 0), d(0, 0, 0)],
++        [p(0, 0), p(0, 0)],
++        Rational::from(1) / Rational::from(1_i64 << 48),
++    );
++    tilted.request.end = d(7, 7, -2);
++    tilted.options.window = d(7, 7, -3);
++    tilted.options.native.maximum_step = Some(d(7, 7, -3));
++    result.push(tilted);
++    result
++}
++struct FixedRun {
++    native: FlowTaylorEvolution<2>,
++    initial: BoxN<DyadicInterval, 2>,
++    source: Vec<(BoxN<DyadicInterval, 2>, BoxN<DyadicInterval, 2>)>,
++}
++fn fixed(f: &Fixture) -> FixedRun {
++    let mut b = budget();
++    let initial = f
++        .chart
++        .source_enclosure(&f.request.initial, &mut b)
++        .unwrap();
++    let p = f.chart.transformed_field().flow_taylor(3, &mut b).unwrap();
++    let native = p.integrate(f.request.clone(), f.options.native.clone(), &mut b);
++    assert!(
++        matches!(native.status(), FlowTaylorEvolutionStatus::Completed),
++        "{:?}",
++        native.status()
++    );
++    let source = native
++        .segments()
++        .map(|s| {
++            (
++                f.chart.source_enclosure(s.tube(), &mut b).unwrap(),
++                f.chart.source_enclosure(s.end_enclosure(), &mut b).unwrap(),
++            )
++        })
++        .collect();
++    FixedRun {
++        native,
++        initial,
++        source,
++    }
++}
++fn selected(f: &Fixture) -> QrEvolution<2> {
++    let r = f
++        .chart
++        .integrate_qr(f.request.clone(), f.options.clone(), &mut budget());
++    assert!(
++        matches!(r.status(), QrEvolutionStatus::Completed),
++        "{:?}",
++        r.status()
++    );
++    r
++}
++fn check(f: &Fixture, end: &BoxN<DyadicInterval, 2>) -> Vec<Rational> {
++    end.lanes()
++        .unwrap()
++        .iter()
++        .zip(&f.expected)
++        .map(|(x, (lo, hi))| {
++            let q = x.to_rational(&mut arithmetic()).unwrap();
++            assert!(q.contains_point(lo));
++            assert!(q.contains_point(hi));
++            let width = q.width().unwrap();
++            assert!(width < f.width_limit);
++            width
++        })
++        .collect()
++}
++fn run(c: &mut Criterion) {
++    for f in fixtures() {
++        let a = fixed(&f);
++        let b = selected(&f);
++        assert_eq!(a.native.reached_time(), &f.request.end);
++        assert_eq!(b.reached_time(), &f.request.end);
++        assert_eq!(a.initial, f.request.initial);
++        assert_eq!(b.windows().len(), 2);
++        let aw = check(&f, &a.source.last().unwrap().1);
++        let bw = check(&f, b.source_end_enclosure().unwrap());
++        eprintln!(
++            "COMPLETED {} fixed_widths={:?} qr_widths={:?}",
++            f.name,
++            aw.iter()
++                .map(Rational::to_f64_enclosure)
++                .collect::<Vec<_>>(),
++            bw.iter()
++                .map(Rational::to_f64_enclosure)
++                .collect::<Vec<_>>()
++        );
++        if let Ok(iterations) = std::env::var("QR_EVOLUTION_ITERATIONS") {
++            let iterations: usize = iterations.parse().unwrap();
++            for mode in ["fixed", "qr"] {
++                for _ in 0..4 {
++                    if mode == "fixed" {
++                        drop(black_box(fixed(&f)));
++                    } else {
++                        drop(black_box(selected(&f)));
++                    }
++                }
++                let start = std::time::Instant::now();
++                for _ in 0..iterations {
++                    if mode == "fixed" {
++                        let r = fixed(&f);
++                        check(&f, &r.source.last().unwrap().1);
++                        drop(black_box(r));
++                    } else {
++                        let r = selected(&f);
++                        check(&f, r.source_end_enclosure().unwrap());
++                        drop(black_box(r));
++                    }
++                }
++                println!(
++                    "TIME {} {mode} iterations={iterations} ns_per_operation={}",
++                    f.name,
++                    start.elapsed().as_nanos() / iterations as u128
++                );
++            }
++        } else {
++            let mut g = c.benchmark_group(f.name);
++            g.bench_function("fixed", |b| {
++                b.iter(|| {
++                    let r = fixed(black_box(&f));
++                    check(&f, &r.source.last().unwrap().1);
++                    drop(black_box(r));
++                })
++            });
++            g.bench_function("qr", |b| {
++                b.iter(|| {
++                    let r = selected(black_box(&f));
++                    check(&f, r.source_end_enclosure().unwrap());
++                    drop(black_box(r));
++                })
++            });
++            g.finish();
++        }
++    }
++}
++criterion_group!(benches, run);
++criterion_main!(benches);
+diff --git a/crates/hyperdynamics/src/field/coordinates.rs b/crates/hyperdynamics/src/field/coordinates.rs
+index 866d496d5..19cacd04b 100644
+--- a/crates/hyperdynamics/src/field/coordinates.rs
++++ b/crates/hyperdynamics/src/field/coordinates.rs
+@@ -77,7 +77,7 @@ struct CoordinateData<const N: usize> {
+ /// A box of new coordinates represents the exact correlated original set c+A*Y.
+ /// `source_enclosure` explicitly projects it to a Cartesian outer enclosure;
+ /// that box never replaces the authoritative chart in this object or its proofs.
+-/// Time is unchanged. This supplies fixed coordinates, not adaptive QR selection.
++/// Time is unchanged. This carrier retains one chart; frame evolution is a separate operation.
+ #[derive(Clone, Debug)]
+ pub struct CoordinateField<const N: usize> {
+     data: Arc<CoordinateData<N>>,
+@@ -304,3 +304,7 @@ pub use transition::{CoordinateFieldTransition, CoordinateTransport, CoordinateT
+ mod qr;
+ #[cfg(feature = "qr-coordinates")]
+ pub use qr::{QrCoordinateField, QrFieldError};
++
++/// Finite-window automatic QR selection with retained transport and native proofs.
++#[cfg(feature = "qr-evolution")]
++pub mod qr_evolution;
+diff --git a/crates/hyperdynamics/src/field/coordinates/qr_evolution.rs b/crates/hyperdynamics/src/field/coordinates/qr_evolution.rs
+new file mode 100644
+index 000000000..ba2d88462
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/coordinates/qr_evolution.rs
+@@ -0,0 +1,946 @@
++//! Automatic frame proposals composed with independent QR and trajectory proofs.
++use super::{
++    CoordinateField, CoordinateFieldError, CoordinateFieldTransition, CoordinateTransport,
++    CoordinateTransportError, QrCoordinateField, QrFieldError,
++};
++use crate::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, FieldError,
++    evolution::{
++        EvolutionFailure, EvolutionOptions, EvolutionReport, EvolutionRequest, EvolutionStatus,
++        copy_state,
++    },
++    taylor_flow::{
++        FlowTaylorError, FlowTaylorProgram,
++        evolution::{FlowTaylorEvolution, FlowTaylorEvolutionFailure, FlowTaylorEvolutionStatus},
++    },
++};
++use hyperinterval::{DyadicInterval, IntervalError, SignSet};
++use hyperlattice_interval::{BoxN, IntervalLatticeError, IntervalMatrix};
++use hyperreal::Real;
++use hypersolve::expression_program::ExpressionError;
++use std::{cmp::Ordering, fmt};
++
++/// Explicit finite window search contract; native step controls apply per window.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct QrEvolutionOptions {
++    /// Positive singleton dyadic duration, capped by the exact remaining horizon.
++    pub window: DyadicInterval,
++    /// Maximum complete windows; zero permits only empty or identity requests.
++    pub maximum_windows: usize,
++    /// Optional trajectory Taylor order. None uses native Picard endpoints;
++    /// Some(order) requires the existing whole-tube analytic Taylor contract.
++    pub taylor_order: Option<usize>,
++    /// Existing native search controls within each selected frame.
++    pub native: EvolutionOptions,
++}
++impl Default for QrEvolutionOptions {
++    fn default() -> Self {
++        Self {
++            window: DyadicInterval::point(1.into(), -4).expect("finite duration"),
++            maximum_windows: 256,
++            taylor_order: Some(3),
++            native: EvolutionOptions::default(),
++        }
++    }
++}
++
++/// A selection, construction, transport or original native failure.
++#[derive(Clone, Debug)]
++pub enum QrEvolutionFailure {
++    /// Window duration is not a positive singleton.
++    InvalidWindow,
++    /// The configured number of complete windows was reached before the horizon.
++    WindowLimit {
++        /// Configured maximum.
++        limit: usize,
++    },
++    /// Original time, native existence search, resource or cancellation failure.
++    Native(EvolutionFailure),
++    /// Original QR rank, undecided predicate, reconstruction or resource failure.
++    Qr(QrFieldError),
++    /// Original direct chart transport failure.
++    Transport(CoordinateTransportError),
++    /// Original trajectory coefficient or analytic-domain construction failure.
++    Taylor(FlowTaylorError),
++    /// Original trajectory evolution failure; no lower-order fallback.
++    Flow(FlowTaylorEvolutionFailure),
++    /// Original source-coordinate materialization failure.
++    Coordinate(CoordinateFieldError),
++}
++impl fmt::Display for QrEvolutionFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "QR evolution: {self:?}")
++    }
++}
++impl std::error::Error for QrEvolutionFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Native(e) => Some(e),
++            Self::Qr(e) => Some(e),
++            Self::Transport(e) => Some(e),
++            Self::Coordinate(e) => Some(e),
++            Self::Taylor(e) => Some(e),
++            Self::Flow(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<EvolutionFailure> for QrEvolutionFailure {
++    fn from(e: EvolutionFailure) -> Self {
++        Self::Native(e)
++    }
++}
++impl From<FieldError> for QrEvolutionFailure {
++    fn from(e: FieldError) -> Self {
++        Self::Native(e.into())
++    }
++}
++impl From<ExpressionError> for QrEvolutionFailure {
++    fn from(e: ExpressionError) -> Self {
++        Self::Native(e.into())
++    }
++}
++impl From<IntervalError> for QrEvolutionFailure {
++    fn from(e: IntervalError) -> Self {
++        Self::Native(e.into())
++    }
++}
++impl From<IntervalLatticeError> for QrEvolutionFailure {
++    fn from(e: IntervalLatticeError) -> Self {
++        Self::Native(e.into())
++    }
++}
++
++/// Whole-request outcome; no partial prefix is returned as a completed horizon.
++#[derive(Clone, Debug)]
++pub enum QrEvolutionStatus {
++    /// Both frame branches, exact selection, native steps and source projections completed.
++    Completed,
++    /// Zero-duration identity; no ODE existence claim.
++    Identity,
++    /// Validated empty initial product.
++    Empty,
++    /// Only the explicitly exposed completed-window prefix is certified.
++    Stopped(QrEvolutionFailure),
++}
++
++/// Replayable frame proposal, not an ODE or variational-flow certificate.
++///
++/// For the incoming chart x=c+A*y and midpoint m of its initial box, form
++/// M=midpoint(J(t,m)), B=A*(I+h*M), origin=c+A*m. Entries of M are exact rational
++/// midpoints of certified Jacobian enclosures; they need not equal the derivative.
++/// The subsequent QR algorithm independently verifies the exact proposed B.
++#[derive(Clone, Debug)]
++pub struct QrFrameSelection<const N: usize> {
++    chart: CoordinateField<N>,
++    time: DyadicInterval,
++    duration: DyadicInterval,
++    initial: BoxN<DyadicInterval, N>,
++    midpoint: BoxN<DyadicInterval, N>,
++    jacobian: IntervalMatrix<DyadicInterval, N, N>,
++    basis: Vec<Vec<Real>>,
++    origin: Vec<Real>,
++}
++impl<const N: usize> QrFrameSelection<N> {
++    /// Original incoming chart and its retained field identity.
++    pub fn chart(&self) -> &CoordinateField<N> {
++        &self.chart
++    }
++    /// Exact start of the proposed window.
++    pub fn time(&self) -> &DyadicInterval {
++        &self.time
++    }
++    /// Exact horizon-capped duration used only to propose the frame.
++    pub fn duration(&self) -> &DyadicInterval {
++        &self.duration
++    }
++    /// Incoming native enclosure in this chart.
++    pub fn initial(&self) -> &BoxN<DyadicInterval, N> {
++        &self.initial
++    }
++    /// Exact midpoint used for the Jacobian query.
++    pub fn midpoint(&self) -> &BoxN<DyadicInterval, N> {
++        &self.midpoint
++    }
++    /// Certified local Jacobian enclosure; midpoint selection does not preserve it as a set.
++    pub fn jacobian(&self) -> &IntervalMatrix<DyadicInterval, N, N> {
++        &self.jacobian
++    }
++    /// Exact proposed source-coordinate basis, later checked by QR.
++    pub fn basis(&self) -> &[Vec<Real>] {
++        &self.basis
++    }
++    /// Exact recentered source-coordinate origin.
++    pub fn origin(&self) -> &[Real] {
++        &self.origin
++    }
++}
++
++/// One staged window attempt, retaining every successfully constructed relation.
++/// A missing later stage records an interrupted attempt, never successful geometry.
++#[derive(Clone, Debug)]
++pub struct QrEvolutionWindow<const N: usize> {
++    selection: QrFrameSelection<N>,
++    frame: Option<QrCoordinateField<N>>,
++    transition: Option<CoordinateFieldTransition<N>>,
++    transport: Option<CoordinateTransport<N>>,
++    proposed: Option<QrEvolutionBranch<N>>,
++    retained: Option<QrEvolutionBranch<N>>,
++    comparison: Option<QrFrameComparison<N>>,
++}
++/// A fully verified frame choice; ties choose the recentered proposed frame.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum QrFrameChoice {
++    /// Consume the independently certified QR chart.
++    Proposed,
++    /// Continue in the incoming chart because its certified source diameter is smaller.
++    Retained,
++}
++/// Exact comparison of the two completed source-coordinate endpoint enclosures.
++/// This is a local maximum-coordinate-diameter criterion, not a global optimum.
++#[derive(Clone, Debug)]
++pub struct QrFrameComparison<const N: usize> {
++    proposed_widths: [DyadicInterval; N],
++    retained_widths: [DyadicInterval; N],
++    proposed_diameter: DyadicInterval,
++    retained_diameter: DyadicInterval,
++    ordering: Ordering,
++    choice: QrFrameChoice,
++}
++impl<const N: usize> QrFrameComparison<N> {
++    /// Exact source-coordinate widths of the proposed-frame result.
++    pub fn proposed_widths(&self) -> &[DyadicInterval; N] {
++        &self.proposed_widths
++    }
++    /// Exact source-coordinate widths of the retained-frame result.
++    pub fn retained_widths(&self) -> &[DyadicInterval; N] {
++        &self.retained_widths
++    }
++    /// Largest proposed width, zero for the zero-dimensional unit product.
++    pub fn proposed_diameter(&self) -> &DyadicInterval {
++        &self.proposed_diameter
++    }
++    /// Largest retained width, zero for the zero-dimensional unit product.
++    pub fn retained_diameter(&self) -> &DyadicInterval {
++        &self.retained_diameter
++    }
++    /// Exact comparison, proposed versus retained.
++    pub fn ordering(&self) -> Ordering {
++        self.ordering
++    }
++    /// Selected branch; both complete proofs remain retained.
++    pub fn choice(&self) -> QrFrameChoice {
++        self.choice
++    }
++}
++/// One source-bound native branch and all of its materialized original-coordinate output.
++#[derive(Clone, Debug)]
++pub struct QrEvolutionBranch<const N: usize> {
++    chart: CoordinateField<N>,
++    program: Option<FlowTaylorProgram<N>>,
++    evolution: Option<QrWindowEvolution<N>>,
++    source_segments: Vec<(BoxN<DyadicInterval, N>, BoxN<DyadicInterval, N>)>,
++}
++impl<const N: usize> QrEvolutionBranch<N> {
++    fn new(chart: CoordinateField<N>) -> Self {
++        Self {
++            chart,
++            program: None,
++            evolution: None,
++            source_segments: Vec::new(),
++        }
++    }
++    /// Exact chart in which this branch's native proof is interpreted.
++    pub fn chart(&self) -> &CoordinateField<N> {
++        &self.chart
++    }
++    /// Prepared trajectory coefficient/source evidence, if selected and prepared.
++    pub fn program(&self) -> Option<&FlowTaylorProgram<N>> {
++        self.program.as_ref()
++    }
++    /// All native attempts, including any explicitly failed native prefix.
++    pub fn evolution(&self) -> Option<&QrWindowEvolution<N>> {
++        self.evolution.as_ref()
++    }
++    /// Source-coordinate projections, including a provisional prefix if materialization fails.
++    pub fn source_segments(&self) -> &[(BoxN<DyadicInterval, N>, BoxN<DyadicInterval, N>)] {
++        &self.source_segments
++    }
++    /// Last materialized endpoint; branch presence alone does not imply complete-window success.
++    pub fn source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.source_segments.last().map(|x| &x.1)
++    }
++}
++impl<const N: usize> QrEvolutionWindow<N> {
++    /// Exact inputs and proposal construction data.
++    pub fn selection(&self) -> &QrFrameSelection<N> {
++        &self.selection
++    }
++    /// Proposed certified QR and inverse, even if the retained chart is selected.
++    pub fn frame(&self) -> Option<&QrCoordinateField<N>> {
++        self.frame.as_ref()
++    }
++    /// Certified exact relation from incoming to proposed chart.
++    pub fn transition(&self) -> Option<&CoordinateFieldTransition<N>> {
++        self.transition.as_ref()
++    }
++    /// Retained outer projection of the exact input into the proposed chart.
++    pub fn transport(&self) -> Option<&CoordinateTransport<N>> {
++        self.transport.as_ref()
++    }
++    /// Proposed-frame native proof, including any failed stage.
++    pub fn proposed(&self) -> Option<&QrEvolutionBranch<N>> {
++        self.proposed.as_ref()
++    }
++    /// Incumbent-chart native proof, including any failed stage.
++    pub fn retained(&self) -> Option<&QrEvolutionBranch<N>> {
++        self.retained.as_ref()
++    }
++    /// Exact selection receipt, only after both branches complete.
++    pub fn comparison(&self) -> Option<&QrFrameComparison<N>> {
++        self.comparison.as_ref()
++    }
++    /// Chosen complete branch. No branch is silently chosen after another fails.
++    pub fn chosen(&self) -> Option<&QrEvolutionBranch<N>> {
++        match self.comparison.as_ref()?.choice {
++            QrFrameChoice::Proposed => self.proposed.as_ref(),
++            QrFrameChoice::Retained => self.retained.as_ref(),
++        }
++    }
++    /// Native proof from the chosen branch, after complete comparison.
++    pub fn evolution(&self) -> Option<&QrWindowEvolution<N>> {
++        self.chosen()?.evolution()
++    }
++    /// Coefficient evidence of the chosen branch, when Taylor refinement is selected.
++    pub fn program(&self) -> Option<&FlowTaylorProgram<N>> {
++        self.chosen()?.program()
++    }
++    /// Chosen source-coordinate projections in segment order.
++    pub fn source_segments(&self) -> &[(BoxN<DyadicInterval, N>, BoxN<DyadicInterval, N>)] {
++        self.chosen()
++            .map_or(&[], QrEvolutionBranch::source_segments)
++    }
++    /// Chosen source endpoint; overall publication still requires completed_windows.
++    pub fn source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.chosen()?.source_end_enclosure()
++    }
++}
++
++/// Native proof strategy, retaining all attempts, coefficients and remainder evidence.
++#[derive(Clone, Debug)]
++pub enum QrWindowEvolution<const N: usize> {
++    /// Picard existence/contraction proofs with displacement-based candidate search.
++    Picard(EvolutionReport<N>),
++    /// Certified trajectory Taylor composition over original Picard proofs.
++    Taylor(FlowTaylorEvolution<N>),
++}
++impl<const N: usize> QrWindowEvolution<N> {
++    /// Original native request in the selected chart.
++    pub fn request(&self) -> &EvolutionRequest<N> {
++        match self {
++            Self::Picard(r) => r.request(),
++            Self::Taylor(r) => r.request(),
++        }
++    }
++    /// Native time reached; not necessarily a whole-window success.
++    pub fn reached_time(&self) -> &DyadicInterval {
++        match self {
++            Self::Picard(r) => r.reached_time(),
++            Self::Taylor(r) => r.reached_time(),
++        }
++    }
++    /// Selected-chart endpoint only after native whole-window success.
++    pub fn end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        match self {
++            Self::Picard(r) => r.end_enclosure(),
++            Self::Taylor(r) => r.end_enclosure(),
++        }
++    }
++    fn record_count(&self, budget: &mut EnclosureBudget) -> Result<usize, ExpressionError> {
++        match self {
++            Self::Picard(r) => r
++                .attempts()
++                .len()
++                .checked_add(r.segments().len())
++                .ok_or(ExpressionError::SizeExhausted),
++            Self::Taylor(r) => {
++                budget.graph.charge(r.attempts().len())?;
++                let mut count = r
++                    .attempts()
++                    .len()
++                    .checked_add(r.segments().len())
++                    .ok_or(ExpressionError::SizeExhausted)?;
++                for a in r.attempts() {
++                    count = count
++                        .checked_add(a.search().attempts().len())
++                        .and_then(|v| v.checked_add(a.search().segments().len()))
++                        .ok_or(ExpressionError::SizeExhausted)?;
++                }
++                Ok(count)
++            }
++        }
++    }
++}
++
++/// Source-bound whole-horizon run with explicit staged and completed-window prefixes.
++///
++/// Replay the original chart definition, request, options and policy. Serialized
++/// flags/enclosures are not proof. New native boxes are outer projections of exact
++/// chart images; dependency loss and interval wrapping remain explicit. No exact
++/// reachable-set equality, optimal frame, width improvement or speedup is promised.
++/// Shared budgets cover nested native work and aggregate retained record counts;
++/// exact scalar refinement/payload, retained transformed graphs, vector capacity,
++/// heap bytes and within-scalar cancellation retain their existing exclusions.
++#[derive(Clone, Debug)]
++pub struct QrEvolution<const N: usize> {
++    chart: CoordinateField<N>,
++    request: EvolutionRequest<N>,
++    options: QrEvolutionOptions,
++    policy: EnclosurePolicy,
++    windows: Vec<QrEvolutionWindow<N>>,
++    completed: usize,
++    initial_projection: Option<BoxN<DyadicInterval, N>>,
++    status: QrEvolutionStatus,
++}
++impl<const N: usize> QrEvolution<N> {
++    /// Original exact source-bound chart.
++    pub fn chart(&self) -> &CoordinateField<N> {
++        &self.chart
++    }
++    /// Original input set and time horizon.
++    pub fn request(&self) -> &EvolutionRequest<N> {
++        &self.request
++    }
++    /// Immutable finite selection and native-search configuration.
++    pub fn options(&self) -> &QrEvolutionOptions {
++        &self.options
++    }
++    /// Shared enclosure policy used throughout the run.
++    pub fn policy(&self) -> EnclosurePolicy {
++        self.policy
++    }
++    /// All frame attempts, including the final staged failure if present.
++    pub fn windows(&self) -> &[QrEvolutionWindow<N>] {
++        &self.windows
++    }
++    /// Windows whose native proofs and source materialization were published completely.
++    pub fn completed_windows(&self) -> &[QrEvolutionWindow<N>] {
++        &self.windows[..self.completed]
++    }
++    /// Whole-horizon status, separate from the completed prefix.
++    pub fn status(&self) -> &QrEvolutionStatus {
++        &self.status
++    }
++    /// End of successful empty evolution or of complete windows; a stopped native
++    /// sub-prefix is separately inspectable.
++    pub fn reached_time(&self) -> &DyadicInterval {
++        if matches!(self.status, QrEvolutionStatus::Empty) {
++            return &self.request.end;
++        }
++        self.completed_windows()
++            .last()
++            .map_or(&self.request.start, |w| {
++                w.evolution().expect("completed window").reached_time()
++            })
++    }
++    /// Source-coordinate outer enclosure after the complete-window prefix.
++    /// Absent when validation or initial projection did not complete.
++    pub fn prefix_source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.completed_windows()
++            .last()
++            .map_or(self.initial_projection.as_ref(), |w| {
++                w.source_end_enclosure()
++            })
++    }
++    /// Endpoint only after whole-request success, never after a stopped run.
++    pub fn source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        if matches!(self.status, QrEvolutionStatus::Stopped(_)) {
++            None
++        } else {
++            self.prefix_source_end_enclosure()
++        }
++    }
++
++    fn run(
++        &mut self,
++        budget: &mut EnclosureBudget,
++    ) -> Result<QrEvolutionStatus, QrEvolutionFailure> {
++        budget.graph.charge(2)?;
++        if !self.request.start.is_singleton() || !self.request.end.is_singleton() {
++            return Err(EvolutionFailure::NonPointTime.into());
++        }
++        let order = self
++            .request
++            .start
++            .compare_singleton(&self.request.end, &mut budget.arithmetic)?;
++        if order == Ordering::Greater {
++            return Err(EvolutionFailure::ReversedTime.into());
++        }
++        if !self.options.window.is_singleton() || self.options.window.signs() != SignSet::Positive {
++            return Err(QrEvolutionFailure::InvalidWindow);
++        }
++        if let Some(cap) = &self.options.native.maximum_step
++            && (!cap.is_singleton() || cap.signs() != SignSet::Positive)
++        {
++            return Err(EvolutionFailure::InvalidMaximumStep.into());
++        }
++        if self.options.taylor_order == Some(usize::MAX) {
++            return Err(QrEvolutionFailure::Taylor(FlowTaylorError::OrderOverflow));
++        }
++        let projected = self
++            .chart
++            .source_enclosure(&self.request.initial, budget)
++            .map_err(QrEvolutionFailure::Coordinate)?;
++        budget.graph.charge(1)?;
++        self.initial_projection = Some(projected);
++        if self.request.initial.is_empty() {
++            return Ok(QrEvolutionStatus::Empty);
++        }
++        if order == Ordering::Equal {
++            return Ok(QrEvolutionStatus::Identity);
++        }
++        loop {
++            budget.graph.charge(0)?;
++            if self.completed == self.options.maximum_windows {
++                return Err(QrEvolutionFailure::WindowLimit {
++                    limit: self.options.maximum_windows,
++                });
++            }
++            let time = self.reached_time().checked_pow(1, &mut budget.arithmetic)?;
++            let remaining = self.request.end.sub(&time, &mut budget.arithmetic)?;
++            let duration = remaining.min_image(&self.options.window, &mut budget.arithmetic)?;
++            let end = time.add(&duration, &mut budget.arithmetic)?;
++            if time.compare_singleton(&end, &mut budget.arithmetic)? != Ordering::Less {
++                return Err(EvolutionFailure::NonProgress.into());
++            }
++            self.check_records(1, budget)?;
++            let (chart, initial) = if let Some(last) = self.completed_windows().last() {
++                (
++                    last.chosen().expect("complete selection").chart().clone(),
++                    copy_state(
++                        last.evolution()
++                            .expect("complete window")
++                            .end_enclosure()
++                            .expect("completed native endpoint"),
++                        budget,
++                    )?,
++                )
++            } else {
++                (
++                    self.chart.clone(),
++                    copy_state(&self.request.initial, budget)?,
++                )
++            };
++            let selection = select_frame(chart, time, duration, initial, budget)?;
++            budget.graph.charge(1)?;
++            self.windows.push(QrEvolutionWindow {
++                selection,
++                frame: None,
++                transition: None,
++                transport: None,
++                proposed: None,
++                retained: None,
++                comparison: None,
++            });
++            let window = self.windows.last_mut().expect("published proposal");
++            window.run(
++                end,
++                self.options.native.clone(),
++                self.options.taylor_order,
++                budget,
++            )?;
++            self.check_records(0, budget)?;
++            budget.graph.charge(1)?;
++            self.completed += 1;
++            if self
++                .reached_time()
++                .compare_singleton(&self.request.end, &mut budget.arithmetic)?
++                == Ordering::Equal
++            {
++                budget.graph.charge(0)?;
++                return Ok(QrEvolutionStatus::Completed);
++            }
++        }
++    }
++    fn check_records(
++        &self,
++        extra: usize,
++        budget: &mut EnclosureBudget,
++    ) -> Result<(), QrEvolutionFailure> {
++        let count = self
++            .windows
++            .len()
++            .checked_add(extra)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        let square = N.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
++        let per = square
++            .checked_mul(3)
++            .and_then(|v| v.checked_add(N.checked_mul(10)?))
++            .and_then(|v| v.checked_add(8))
++            .ok_or(ExpressionError::SizeExhausted)?;
++        let retained = count
++            .checked_mul(per)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        let mut native = 0usize;
++        budget.graph.charge(self.windows.len())?;
++        for w in &self.windows {
++            for branch in [w.proposed.as_ref(), w.retained.as_ref()]
++                .into_iter()
++                .flatten()
++            {
++                if let Some(e) = &branch.evolution {
++                    native = native
++                        .checked_add(e.record_count(budget)?)
++                        .ok_or(ExpressionError::SizeExhausted)?;
++                    native = native
++                        .checked_add(
++                            branch
++                                .source_segments
++                                .len()
++                                .checked_mul(
++                                    N.checked_mul(2).ok_or(ExpressionError::SizeExhausted)?,
++                                )
++                                .ok_or(ExpressionError::SizeExhausted)?,
++                        )
++                        .ok_or(ExpressionError::SizeExhausted)?;
++                }
++            }
++        }
++        budget.graph.check_entries(&[retained, native])?;
++        Ok(())
++    }
++}
++impl<const N: usize> CoordinateField<N> {
++    /// Integrate finite windows in automatically proposed, independently certified QR frames.
++    ///
++    /// Each window recomputes a Jacobian-midpoint Euler basis and exact recentering,
++    /// certifies QR, directly transports the current native endpoint, and invokes
++    /// existing native integration, with trajectory Taylor refinement when selected.
++    /// Both the incoming and proposed charts must complete; their maximum source
++    /// endpoint diameters are compared exactly, with ties choosing the proposal.
++    /// The selected native chart endpoint continues, and both proofs remain available.
++    /// Singular or undecided frame proposals stop with
++    /// their original diagnostic; there is no silent identity-frame fallback.
++    /// This opt-in strategy can be slower or wider than fixed-chart integration.
++    pub fn integrate_qr(
++        &self,
++        request: EvolutionRequest<N>,
++        options: QrEvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> QrEvolution<N> {
++        let mut result = QrEvolution {
++            chart: self.clone(),
++            request,
++            options,
++            policy: budget.policy(),
++            windows: Vec::new(),
++            completed: 0,
++            initial_projection: None,
++            status: QrEvolutionStatus::Identity,
++        };
++        result.status = match result.run(budget) {
++            Ok(status) => status,
++            Err(error) => QrEvolutionStatus::Stopped(error),
++        };
++        result
++    }
++}
++impl<const N: usize> QrEvolutionWindow<N> {
++    fn run(
++        &mut self,
++        end: DyadicInterval,
++        options: EvolutionOptions,
++        taylor_order: Option<usize>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<(), QrEvolutionFailure> {
++        let s = &self.selection;
++        budget.graph.charge(
++            N.checked_mul(N)
++                .and_then(|v| v.checked_add(N))
++                .ok_or(ExpressionError::SizeExhausted)?,
++        )?;
++        self.frame = Some(
++            s.chart
++                .original_field()
++                .in_qr_coordinates(s.basis.clone(), s.origin.clone(), budget)
++                .map_err(QrEvolutionFailure::Qr)?,
++        );
++        let frame = self.frame.as_ref().expect("certified frame");
++        self.transition = Some(
++            s.chart
++                .transition_to(frame.chart(), budget)
++                .map_err(QrEvolutionFailure::Transport)?,
++        );
++        self.transport = Some(
++            self.transition
++                .as_ref()
++                .expect("certified relation")
++                .enclose(copy_state(&s.initial, budget)?, budget)
++                .map_err(QrEvolutionFailure::Transport)?,
++        );
++        let request = EvolutionRequest {
++            start: s.time.checked_pow(1, &mut budget.arithmetic)?,
++            end,
++            initial: copy_state(
++                self.transport
++                    .as_ref()
++                    .expect("certified transport")
++                    .enclosure(),
++                budget,
++            )?,
++        };
++        self.proposed = Some(QrEvolutionBranch::new(frame.chart().clone()));
++        self.proposed.as_mut().expect("proposed branch").run(
++            request,
++            options.clone(),
++            taylor_order,
++            budget,
++        )?;
++        let retained_request = EvolutionRequest {
++            start: s.time.checked_pow(1, &mut budget.arithmetic)?,
++            end: self
++                .proposed
++                .as_ref()
++                .expect("complete proposed branch")
++                .evolution
++                .as_ref()
++                .expect("complete native proof")
++                .request()
++                .end
++                .checked_pow(1, &mut budget.arithmetic)?,
++            initial: copy_state(&s.initial, budget)?,
++        };
++        self.retained = Some(QrEvolutionBranch::new(s.chart.clone()));
++        self.retained.as_mut().expect("retained branch").run(
++            retained_request,
++            options,
++            taylor_order,
++            budget,
++        )?;
++        budget.graph.check_entries(&[N, N, 2])?;
++        budget.graph.charge(
++            N.checked_mul(2)
++                .and_then(|n| n.checked_add(1))
++                .ok_or(ExpressionError::SizeExhausted)?,
++        )?;
++        let proposed_widths = self
++            .proposed
++            .as_ref()
++            .expect("complete proposed branch")
++            .source_end_enclosure()
++            .expect("materialized endpoint")
++            .widths(&mut budget.arithmetic)?
++            .expect("nonempty endpoint");
++        let retained_widths = self
++            .retained
++            .as_ref()
++            .expect("complete retained branch")
++            .source_end_enclosure()
++            .expect("materialized endpoint")
++            .widths(&mut budget.arithmetic)?
++            .expect("nonempty endpoint");
++        let mut proposed_diameter = DyadicInterval::point(0.into(), 0)?;
++        let mut retained_diameter = DyadicInterval::point(0.into(), 0)?;
++        for (a, b) in proposed_widths.iter().zip(&retained_widths) {
++            proposed_diameter = proposed_diameter.max_image(a, &mut budget.arithmetic)?;
++            retained_diameter = retained_diameter.max_image(b, &mut budget.arithmetic)?;
++        }
++        let ordering =
++            proposed_diameter.compare_singleton(&retained_diameter, &mut budget.arithmetic)?;
++        let choice = if ordering == Ordering::Greater {
++            QrFrameChoice::Retained
++        } else {
++            QrFrameChoice::Proposed
++        };
++        budget.graph.charge(1)?;
++        self.comparison = Some(QrFrameComparison {
++            proposed_widths,
++            retained_widths,
++            proposed_diameter,
++            retained_diameter,
++            ordering,
++            choice,
++        });
++        Ok(())
++    }
++}
++impl<const N: usize> QrEvolutionBranch<N> {
++    fn run(
++        &mut self,
++        request: EvolutionRequest<N>,
++        options: EvolutionOptions,
++        taylor_order: Option<usize>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<(), QrEvolutionFailure> {
++        if let Some(order) = taylor_order {
++            self.program = Some(
++                self.chart
++                    .transformed_field()
++                    .flow_taylor(order, budget)
++                    .map_err(QrEvolutionFailure::Taylor)?,
++            );
++            let proof = self
++                .program
++                .as_ref()
++                .expect("prepared coefficients")
++                .integrate(request, options, budget);
++            let status = proof.status().clone();
++            self.evolution = Some(QrWindowEvolution::Taylor(proof));
++            match status {
++                FlowTaylorEvolutionStatus::Completed => {}
++                FlowTaylorEvolutionStatus::Stopped(e) => return Err(QrEvolutionFailure::Flow(e)),
++                _ => return Err(EvolutionFailure::NonProgress.into()),
++            }
++        } else {
++            let proof = self
++                .chart
++                .transformed_field()
++                .integrate_displacement(request, options, budget);
++            let status = proof.status().clone();
++            self.evolution = Some(QrWindowEvolution::Picard(proof));
++            match status {
++                EvolutionStatus::Completed => {}
++                EvolutionStatus::Stopped(e) => return Err(QrEvolutionFailure::Native(e)),
++                _ => return Err(EvolutionFailure::NonProgress.into()),
++            }
++        }
++        let proof = self.evolution.as_ref().expect("retained evolution");
++        let proof_records = proof.record_count(budget)?;
++        let mut project = |tube: &BoxN<DyadicInterval, N>,
++                           end: &BoxN<DyadicInterval, N>|
++         -> Result<(), QrEvolutionFailure> {
++            let count = self
++                .source_segments
++                .len()
++                .checked_add(1)
++                .ok_or(ExpressionError::SizeExhausted)?;
++            let lanes = count
++                .checked_mul(N)
++                .and_then(|v| v.checked_mul(2))
++                .ok_or(ExpressionError::SizeExhausted)?;
++            budget.graph.check_entries(&[count, lanes, proof_records])?;
++            let tube = self
++                .chart
++                .source_enclosure(tube, budget)
++                .map_err(QrEvolutionFailure::Coordinate)?;
++            let end = self
++                .chart
++                .source_enclosure(end, budget)
++                .map_err(QrEvolutionFailure::Coordinate)?;
++            budget.graph.charge(1)?;
++            self.source_segments.push((tube, end));
++            Ok(())
++        };
++        match proof {
++            QrWindowEvolution::Picard(r) => {
++                for segment in r.segments() {
++                    project(
++                        segment.tube().expect("certified tube"),
++                        segment.end_enclosure().expect("certified endpoint"),
++                    )?;
++                }
++            }
++            QrWindowEvolution::Taylor(r) => {
++                for segment in r.segments() {
++                    project(segment.tube(), segment.end_enclosure())?;
++                }
++            }
++        }
++        budget.graph.charge(0)?;
++        Ok(())
++    }
++}
++
++fn midpoint_real(
++    value: &DyadicInterval,
++    budget: &mut EnclosureBudget,
++) -> Result<Real, QrEvolutionFailure> {
++    let point = value.midpoint(&mut budget.arithmetic)?;
++    let (lower, _) = point
++        .to_rational(&mut budget.arithmetic)?
++        .into_bounds()
++        .expect("nonempty midpoint");
++    Ok(Real::from(lower))
++}
++fn select_frame<const N: usize>(
++    chart: CoordinateField<N>,
++    time: DyadicInterval,
++    duration: DyadicInterval,
++    initial: BoxN<DyadicInterval, N>,
++    budget: &mut EnclosureBudget,
++) -> Result<QrFrameSelection<N>, QrEvolutionFailure> {
++    let square = N.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
++    let cubic = square
++        .checked_mul(N)
++        .ok_or(ExpressionError::SizeExhausted)?;
++    budget
++        .graph
++        .check_entries(&[square, square, square, N, N, N])?;
++    budget.graph.charge(N)?;
++    let mut midpoints = Vec::with_capacity(N);
++    for lane in initial.lanes().expect("nonempty initial product") {
++        midpoints.push(lane.midpoint(&mut budget.arithmetic)?);
++    }
++    let midpoint = BoxN::new(midpoints.try_into().expect("fixed dimension"))?;
++    let jacobian = chart
++        .transformed_field()
++        .jacobian(&time, &midpoint, budget)?;
++    budget.graph.charge(square)?;
++    let h = midpoint_real(&duration, budget)?;
++    let mut local = Vec::with_capacity(N);
++    for (i, row) in jacobian
++        .rows()
++        .expect("nonempty Jacobian")
++        .iter()
++        .enumerate()
++    {
++        let mut values = Vec::with_capacity(N);
++        for (j, value) in row.iter().enumerate() {
++            values.push(Real::from(u8::from(i == j)) + h.clone() * midpoint_real(value, budget)?);
++        }
++        local.push(values);
++    }
++    budget.graph.charge(N)?;
++    let mut center = Vec::with_capacity(N);
++    for lane in midpoint.lanes().expect("nonempty midpoint") {
++        center.push(midpoint_real(lane, budget)?);
++    }
++    // These exact proposal sums do not implement QR or certify a flow map.
++    // Existing QR and transition kernels independently establish usable geometry.
++    budget.graph.charge(
++        cubic
++            .checked_add(square)
++            .ok_or(ExpressionError::SizeExhausted)?,
++    )?;
++    let change = chart.transformation().change();
++    let mut basis = Vec::with_capacity(N);
++    let mut origin = Vec::with_capacity(N);
++    for (i, a) in change.to_source.iter().enumerate() {
++        let mut row = Vec::with_capacity(N);
++        for j in 0..N {
++            row.push(
++                a.iter()
++                    .zip(&local)
++                    .fold(Real::zero(), |sum, (a, b)| sum + a * &b[j]),
++            );
++        }
++        basis.push(row);
++        origin.push(
++            a.iter()
++                .zip(&center)
++                .fold(change.origin[i].clone(), |sum, (a, c)| sum + a * c),
++        );
++    }
++    budget.graph.charge(1)?;
++    Ok(QrFrameSelection {
++        chart,
++        time,
++        duration,
++        initial,
++        midpoint,
++        jacobian,
++        basis,
++        origin,
++    })
++}
+diff --git a/crates/hyperdynamics/tests/qr_evolution.rs b/crates/hyperdynamics/tests/qr_evolution.rs
+new file mode 100644
+index 000000000..9f8eac8ce
+--- /dev/null
++++ b/crates/hyperdynamics/tests/qr_evolution.rs
+@@ -0,0 +1,786 @@
++#![cfg(feature = "qr-evolution")]
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    coordinates::{
++        CoordinateField, QrFieldError,
++        qr_evolution::{
++            QrEvolution, QrEvolutionFailure as Failure, QrEvolutionOptions,
++            QrEvolutionStatus as Status,
++        },
++    },
++    evolution::{EvolutionFailure, EvolutionOptions, EvolutionRequest},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperreal::{Rational, Real};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        CoordinateChange, ExpressionBudget, ExpressionProgram, QrCoordinateError,
++    },
++};
++#[path = "support/flow_oracles.rs"]
++mod flow_oracles;
++use flow_oracles::alternating_trig;
++const T: SymbolId = SymbolId(9);
++const X: SymbolId = SymbolId(0);
++const Y: SymbolId = SymbolId(1);
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn field<const N: usize>(outputs: &[Expr], state: &[SymbolId]) -> ExpressionField<N> {
++    let mut bindings = state.to_vec();
++    bindings.reverse();
++    bindings.push(T);
++    let source = ExpressionProgram::compile(
++        outputs,
++        &bindings,
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    ExpressionField::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time: T,
++            state: state.to_vec(),
++        },
++        &mut budget(),
++    )
++    .unwrap()
++}
++fn identity<const N: usize>(f: &ExpressionField<N>) -> CoordinateField<N> {
++    let a: Vec<Vec<Real>> = (0..N)
++        .map(|i| (0..N).map(|j| u8::from(i == j).into()).collect())
++        .collect();
++    f.in_coordinates(
++        CoordinateChange {
++            variables: f.identity().state().to_vec(),
++            to_source: a.clone(),
++            from_source: a,
++            origin: vec![Real::zero(); N],
++        },
++        &mut budget(),
++    )
++    .unwrap()
++}
++fn request<const N: usize>(
++    initial: [DyadicInterval; N],
++    end: DyadicInterval,
++) -> EvolutionRequest<N> {
++    EvolutionRequest {
++        start: d(0, 0, 0),
++        end,
++        initial: BoxN::new(initial).unwrap(),
++    }
++}
++fn options(window: DyadicInterval) -> QrEvolutionOptions {
++    QrEvolutionOptions {
++        window,
++        maximum_windows: 8,
++        taylor_order: Some(3),
++        native: EvolutionOptions {
++            maximum_step: Some(d(1, 1, -4)),
++            ..Default::default()
++        },
++    }
++}
++fn completed<const N: usize>(r: &QrEvolution<N>) {
++    assert!(matches!(r.status(), Status::Completed), "{:?}", r.status());
++    assert_eq!(r.reached_time(), &r.request().end);
++    assert_eq!(r.completed_windows().len(), r.windows().len());
++    assert!(r.source_end_enclosure().is_some());
++    for w in r.completed_windows() {
++        let comparison = w.comparison().unwrap();
++        let proposed = w.proposed().unwrap().source_end_enclosure().unwrap();
++        let retained = w.retained().unwrap().source_end_enclosure().unwrap();
++        let width = |b: &BoxN<DyadicInterval, N>| {
++            b.lanes()
++                .unwrap()
++                .iter()
++                .map(|x| x.to_rational(&mut arithmetic()).unwrap().width().unwrap())
++                .fold(Rational::zero(), |a, b| if b > a { b } else { a })
++        };
++        let ordering = width(proposed)
++            .partial_cmp(&width(retained))
++            .expect("finite rational widths");
++        assert_eq!(comparison.ordering(), ordering);
++        let choice = if ordering == std::cmp::Ordering::Greater {
++            hyperdynamics::field::coordinates::qr_evolution::QrFrameChoice::Retained
++        } else {
++            hyperdynamics::field::coordinates::qr_evolution::QrFrameChoice::Proposed
++        };
++        assert_eq!(comparison.choice(), choice);
++        for branch in [w.proposed().unwrap(), w.retained().unwrap()] {
++            assert_eq!(
++                branch.evolution().unwrap().request().end,
++                *w.evolution().unwrap().reached_time()
++            );
++            assert!(branch.evolution().unwrap().end_enclosure().is_some());
++        }
++        assert_eq!(
++            w.frame().unwrap().chart().original_field().identity(),
++            r.chart().original_field().identity()
++        );
++        assert_eq!(w.transport().unwrap().initial(), w.selection().initial());
++        assert_eq!(
++            &w.proposed().unwrap().evolution().unwrap().request().initial,
++            w.transport().unwrap().enclosure()
++        );
++        assert_eq!(
++            w.frame().unwrap().factorization().request().basis,
++            w.selection().basis()
++        );
++        assert_eq!(
++            w.frame().unwrap().factorization().request().origin,
++            w.selection().origin()
++        );
++    }
++    for pair in r.completed_windows().windows(2) {
++        assert_eq!(
++            pair[1].selection().initial(),
++            pair[0].evolution().unwrap().end_enclosure().unwrap()
++        );
++        let a = pair[1].selection().chart().transformation().change();
++        let b = pair[0].chosen().unwrap().chart().transformation().change();
++        assert_eq!(a.variables, b.variables);
++        assert_eq!(a.to_source, b.to_source);
++        assert_eq!(a.from_source, b.from_source);
++        assert_eq!(a.origin, b.origin);
++    }
++}
++#[test]
++fn constant_flow_recenters_and_caps_final_window_then_consumes_output() {
++    let f = field::<1>(&[Expr::int(2)], &[X]);
++    let chart = identity(&f);
++    let r = chart.integrate_qr(
++        request([d(-1, 1, 0)], d(5, 5, -2)),
++        options(d(1, 1, -1)),
++        &mut budget(),
++    );
++    completed(&r);
++    assert_eq!(r.windows().len(), 3);
++    assert_eq!(
++        r.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(3, 7, -1)])
++    );
++    for (w, (origin, duration)) in
++        r.windows()
++            .iter()
++            .zip([(0, d(1, 1, -1)), (1, d(1, 1, -1)), (2, d(1, 1, -2))])
++    {
++        assert_eq!(w.selection().basis(), &[vec![Real::one()]]);
++        assert_eq!(w.selection().origin(), &[Real::from(origin)]);
++        assert_eq!(w.selection().duration(), &duration);
++    }
++    let last = r.windows().last().unwrap();
++    let second = last.chosen().unwrap().chart().integrate_qr(
++        EvolutionRequest {
++            start: r.reached_time().clone(),
++            end: d(3, 3, -1),
++            initial: last.evolution().unwrap().end_enclosure().unwrap().clone(),
++        },
++        options(d(1, 1, -2)),
++        &mut budget(),
++    );
++    completed(&second);
++    assert_eq!(
++        second.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(2, 4, 0)])
++    );
++}
++#[test]
++fn correlated_authored_chart_keeps_original_image_and_transport_proof() {
++    let f = field::<2>(&[Expr::int(2), Expr::int(1)], &[X, Y]);
++    let chart = f
++        .in_coordinates(
++            CoordinateChange {
++                variables: vec![X, Y],
++                to_source: vec![vec![1.into(), 1.into()], vec![0.into(), 1.into()]],
++                from_source: vec![vec![1.into(), (-1).into()], vec![0.into(), 1.into()]],
++                origin: vec![10.into(), (-3).into()],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let r = chart.integrate_qr(
++        request([d(0, 0, 0), d(-1, 1, 0)], d(1, 1, 0)),
++        options(d(1, 1, -1)),
++        &mut budget(),
++    );
++    completed(&r);
++    // Original correlated source is (10+b,-3+b), -1<=b<=1; flow is (2t,t).
++    assert_eq!(
++        r.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(11, 13, 0), d(-3, -1, 0)])
++    );
++    assert_eq!(
++        r.windows()[0].selection().basis(),
++        &[
++            vec![Real::one(), Real::one()],
++            vec![Real::zero(), Real::one()]
++        ]
++    );
++    assert_ne!(
++        r.windows()[0].transport().unwrap().initial(),
++        r.windows()[0].transport().unwrap().enclosure()
++    );
++}
++#[test]
++fn rotation_frames_follow_exact_basis_relations_and_independent_trigonometric_bounds() {
++    let f = field::<2>(
++        &[-Expr::anonymous_symbol(Y), Expr::anonymous_symbol(X)],
++        &[X, Y],
++    );
++    let chart = identity(&f);
++    for (horizon, window, expect) in [
++        (d(3, 3, -1), d(3, 3, -2), [(7073, 7074), (99749, 99750)]),
++        (d(1, 1, -1), d(1, 1, -2), [(87758, 87759), (47942, 47943)]),
++    ] {
++        let t = horizon
++            .to_rational(&mut arithmetic())
++            .unwrap()
++            .lower()
++            .unwrap()
++            .clone();
++        let oracle = [alternating_trig(&t, false), alternating_trig(&t, true)];
++        let r = chart.integrate_qr(
++            request([d(1, 1, 0), d(0, 0, 0)], horizon),
++            options(window),
++            &mut budget(),
++        );
++        completed(&r);
++        // Alternating Taylor series give these independent rational brackets for cos/sin.
++        for ((lane, (l, u)), (analytic_lower, analytic_upper)) in r
++            .source_end_enclosure()
++            .unwrap()
++            .lanes()
++            .unwrap()
++            .iter()
++            .zip(expect)
++            .zip(oracle)
++        {
++            let interval = lane.to_rational(&mut arithmetic()).unwrap();
++            // A certified endpoint can be narrower than the displayed decimal bracket.
++            // Verify that bracket independently, then consume the tighter series oracle.
++            assert!(analytic_lower >= Rational::from(l) / Rational::from(100000));
++            assert!(analytic_upper <= Rational::from(u) / Rational::from(100000));
++            assert!(
++                interval.contains_point(&analytic_lower),
++                "lower {:?} oracle {:?}",
++                interval.lower().unwrap().to_f64_enclosure(),
++                analytic_lower.to_f64_enclosure()
++            );
++            assert!(interval.contains_point(&analytic_upper));
++            eprintln!(
++                "ROTATION width {:?} steps {:?}",
++                interval.width().unwrap().to_f64_enclosure(),
++                r.windows()
++                    .iter()
++                    .map(|w| w.source_segments().len())
++                    .collect::<Vec<_>>()
++            );
++            assert!(interval.width().unwrap() < Rational::one());
++        }
++        assert_eq!(r.windows().len(), 2);
++        let first = r.windows()[0].selection();
++        let h = first
++            .duration()
++            .to_rational(&mut arithmetic())
++            .unwrap()
++            .lower()
++            .unwrap()
++            .clone();
++        assert_eq!(
++            first.basis(),
++            &[
++                vec![Real::one(), Real::from(-&h)],
++                vec![Real::from(h), Real::one()]
++            ]
++        );
++    }
++}
++#[test]
++fn singular_frame_and_original_domain_failure_are_not_identity_fallbacks() {
++    let f = field::<1>(&[-Expr::anonymous_symbol(X)], &[X]);
++    let r = identity(&f).integrate_qr(
++        request([d(1, 1, 0)], d(1, 1, 0)),
++        options(d(1, 1, 0)),
++        &mut budget(),
++    );
++    assert!(matches!(
++        r.status(),
++        Status::Stopped(Failure::Qr(QrFieldError::Qr(
++            QrCoordinateError::DependentColumn { .. }
++        )))
++    ));
++    assert_eq!(r.windows().len(), 1);
++    assert_eq!(r.windows()[0].selection().basis(), &[vec![Real::zero()]]);
++    assert!(r.windows()[0].frame().is_none());
++    assert!(r.source_end_enclosure().is_none());
++    let f = field::<1>(&[Expr::int(1) / Expr::anonymous_symbol(X)], &[X]);
++    let r = identity(&f).integrate_qr(
++        request([d(-1, 1, 0)], d(1, 1, 0)),
++        options(d(1, 1, -2)),
++        &mut budget(),
++    );
++    assert!(matches!(
++        r.status(),
++        Status::Stopped(Failure::Native(EvolutionFailure::Field(_)))
++    ));
++    assert!(r.windows().is_empty());
++    assert!(r.source_end_enclosure().is_none());
++}
++#[test]
++fn empty_unit_identity_invalid_inputs_and_limits_stay_distinct() {
++    let f = field::<1>(&[Expr::int(2)], &[X]);
++    let chart = identity(&f);
++    let o = options(d(1, 1, -1));
++    let mut input = request([d(0, 0, 0)], d(1, 1, 0));
++    input.initial = BoxN::empty().unwrap();
++    let r = chart.integrate_qr(input.clone(), o.clone(), &mut budget());
++    assert!(matches!(r.status(), Status::Empty));
++    assert_eq!(r.reached_time(), &d(1, 1, 0));
++    assert!(r.source_end_enclosure().unwrap().is_empty());
++    let mut bad = o.clone();
++    bad.window = d(0, 0, 0);
++    assert!(matches!(
++        chart
++            .integrate_qr(input.clone(), bad, &mut budget())
++            .status(),
++        Status::Stopped(Failure::InvalidWindow)
++    ));
++    input.start = d(2, 2, 0);
++    assert!(matches!(
++        chart.integrate_qr(input, o.clone(), &mut budget()).status(),
++        Status::Stopped(Failure::Native(EvolutionFailure::ReversedTime))
++    ));
++    let r = chart.integrate_qr(request([d(-1, 1, 0)], d(0, 0, 0)), o.clone(), &mut budget());
++    assert!(matches!(r.status(), Status::Identity));
++    assert_eq!(
++        r.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(-1, 1, 0)])
++    );
++    let f = field::<0>(&[], &[]);
++    let r = identity(&f).integrate_qr(request([], d(1, 1, 0)), o.clone(), &mut budget());
++    completed(&r);
++    assert!(
++        r.source_end_enclosure()
++            .unwrap()
++            .lanes()
++            .unwrap()
++            .is_empty()
++    );
++    let mut limited = o.clone();
++    limited.maximum_windows = 1;
++    let r = chart.integrate_qr(request([d(0, 0, 0)], d(1, 1, 0)), limited, &mut budget());
++    assert!(matches!(
++        r.status(),
++        Status::Stopped(Failure::WindowLimit { limit: 1 })
++    ));
++    assert_eq!(r.completed_windows().len(), 1);
++    assert_eq!(r.reached_time(), &d(1, 1, -1));
++    assert_eq!(
++        r.prefix_source_end_enclosure().unwrap().lanes(),
++        Some(&[d(1, 1, 0)])
++    );
++    assert!(r.source_end_enclosure().is_none());
++    let mut limited = o;
++    limited.taylor_order = None;
++    limited.native.maximum_steps = 0;
++    let r = chart.integrate_qr(request([d(0, 0, 0)], d(1, 1, 0)), limited, &mut budget());
++    assert!(matches!(
++        r.status(),
++        Status::Stopped(Failure::Native(EvolutionFailure::StepLimit { limit: 0 }))
++    ));
++    assert!(r.windows()[0].proposed().unwrap().evolution().is_some());
++    assert!(r.completed_windows().is_empty());
++    assert!(r.source_end_enclosure().is_none());
++}
++
++#[test]
++fn native_and_taylor_choices_keep_the_same_exact_constant_flow() {
++    let f = field::<1>(&[Expr::int(2)], &[X]);
++    let chart = identity(&f);
++    for order in [None, Some(0), Some(3)] {
++        let mut o = options(d(1, 1, -2));
++        o.taylor_order = order;
++        let r = chart.integrate_qr(request([d(-1, 1, 0)], d(1, 1, -1)), o, &mut budget());
++        completed(&r);
++        assert_eq!(
++            r.source_end_enclosure().unwrap().lanes(),
++            Some(&[d(0, 2, 0)])
++        );
++        for window in r.windows() {
++            assert_eq!(window.program().map(|p| p.order()), order);
++        }
++    }
++}
++#[test]
++fn small_budgets_final_publication_cancellation_and_retry_preserve_typed_failures() {
++    use hyperdynamics::field::FieldError;
++    use hypersolve::expression_program::ExpressionError;
++    let chart = identity(&field::<1>(&[Expr::int(2)], &[X]));
++    let input = request([d(0, 0, 0)], d(1, 1, -2));
++    let o = options(d(1, 1, -2));
++    let mut b = budget();
++    let result = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++    completed(&result);
++    let used = b.policy().graph_work - b.remaining_graph_work();
++    let scalar = b.policy().scalar_work - b.remaining_scalar_work();
++    assert!(used > 1 && scalar > 1);
++    // Exhaust every early structural-work cutoff and the complete-path boundary.
++    for work in (0..used.min(512)).chain([used / 2, used - 1]) {
++        let mut b = EnclosureBudget::new(EnclosurePolicy {
++            graph_work: work,
++            ..EnclosurePolicy::default()
++        });
++        let r = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++        assert!(
++            matches!(r.status(), Status::Stopped(_)),
++            "work={work} {:?}",
++            r.status()
++        );
++        assert!(
++            format!("{:?}", r.status()).contains("WorkExhausted"),
++            "{:?}",
++            r.status()
++        );
++        assert!(r.source_end_enclosure().is_none());
++    }
++    let mut b = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: used,
++        scalar_work: scalar,
++        ..EnclosurePolicy::default()
++    });
++    let r = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++    completed(&r);
++    assert_eq!(b.remaining_graph_work(), 0);
++    assert_eq!(b.remaining_scalar_work(), 0);
++    let mut b = EnclosureBudget::new(EnclosurePolicy {
++        scalar_work: scalar - 1,
++        ..EnclosurePolicy::default()
++    });
++    let r = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++    assert!(matches!(r.status(), Status::Stopped(_)));
++    assert!(r.source_end_enclosure().is_none());
++    for entries in 0..8 {
++        let mut b = EnclosureBudget::new(EnclosurePolicy {
++            graph_entries: entries,
++            ..EnclosurePolicy::default()
++        });
++        let r = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++        assert!(matches!(r.status(), Status::Stopped(_)));
++        assert!(r.source_end_enclosure().is_none());
++    }
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut b = budget();
++    b.set_cancellation(Some(token));
++    let r = chart.integrate_qr(input.clone(), o.clone(), &mut b);
++    assert!(matches!(
++        r.status(),
++        Status::Stopped(Failure::Native(EvolutionFailure::Field(
++            FieldError::Expression(ExpressionError::Cancelled)
++        )))
++    ));
++    assert!(r.windows().is_empty());
++    assert!(r.source_end_enclosure().is_none());
++    let retried = chart.integrate_qr(input, o, &mut budget());
++    completed(&retried);
++    assert_eq!(
++        retried.source_end_enclosure(),
++        result.source_end_enclosure()
++    );
++}
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replays_original_chart_request_options_and_all_source_outputs() {
++    use hyperdynamics::field::coordinates::CoordinateFieldDefinition;
++    const KEY: &str = "HYPERDYNAMICS_QR_EVOLUTION_REPLAY";
++    if let Ok(data) = std::env::var(KEY) {
++        let (definition, input, o): (
++            CoordinateFieldDefinition,
++            EvolutionRequest<1>,
++            QrEvolutionOptions,
++        ) = serde_json::from_str(&data).unwrap();
++        let chart = CoordinateField::from_definition(definition, &mut budget()).unwrap();
++        let result = chart.integrate_qr(input, o, &mut budget());
++        completed(&result);
++        assert_eq!(
++            result.source_end_enclosure().unwrap().lanes(),
++            Some(&[d(0, 2, 0)])
++        );
++        let rows: Vec<_> = result
++            .windows()
++            .iter()
++            .map(|w| {
++                (
++                    w.selection().basis(),
++                    w.selection().origin(),
++                    w.source_segments(),
++                )
++            })
++            .collect();
++        println!(
++            "QR_EVOLUTION {}",
++            serde_json::to_string(&(result.source_end_enclosure(), rows)).unwrap()
++        );
++        return;
++    }
++    let chart = identity(&field::<1>(&[Expr::int(2)], &[X]));
++    let id = chart.original_field().identity();
++    let definition = CoordinateFieldDefinition {
++        source: FieldDefinition {
++            source: id.source().clone(),
++            time: id.time(),
++            state: id.state().to_vec(),
++        },
++        change: chart.transformation().change().clone(),
++    };
++    let data = serde_json::to_string(&(
++        definition,
++        request([d(-1, 1, 0)], d(1, 1, -1)),
++        options(d(1, 1, -2)),
++    ))
++    .unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "fresh_process_replays_original_chart_request_options_and_all_source_outputs",
++                "--nocapture",
++            ])
++            .env(KEY, &data)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{} {}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let text = String::from_utf8(child.stdout).unwrap();
++        let row = text
++            .lines()
++            .find(|x| x.starts_with("QR_EVOLUTION "))
++            .unwrap()
++            .to_owned();
++        if let Some(expected) = previous {
++            assert_eq!(row, expected);
++        }
++        previous = Some(row);
++    }
++}
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn evidence_getters_do_not_repeat_decisions_or_scalar_work() {
++    use hyperreal::dispatch_trace;
++    let chart = identity(&field::<1>(&[Expr::int(2)], &[X]));
++    let r = chart.integrate_qr(
++        request([d(0, 0, 0)], d(1, 1, -2)),
++        options(d(1, 1, -2)),
++        &mut budget(),
++    );
++    completed(&r);
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| {
++        std::hint::black_box((
++            r.chart(),
++            r.request(),
++            r.options(),
++            r.policy(),
++            r.status(),
++            r.reached_time(),
++            r.source_end_enclosure(),
++            r.prefix_source_end_enclosure(),
++        ));
++        for w in r.windows() {
++            let s = w.selection();
++            std::hint::black_box((
++                s.chart(),
++                s.time(),
++                s.duration(),
++                s.initial(),
++                s.midpoint(),
++                s.jacobian(),
++                s.basis(),
++                s.origin(),
++            ));
++            std::hint::black_box((
++                w.frame(),
++                w.transition(),
++                w.transport(),
++                w.program(),
++                w.source_segments(),
++                w.source_end_enclosure(),
++            ));
++            let c = w.comparison().unwrap();
++            std::hint::black_box((
++                c.proposed_widths(),
++                c.retained_widths(),
++                c.proposed_diameter(),
++                c.retained_diameter(),
++                c.ordering(),
++                c.choice(),
++            ));
++            for branch in [w.proposed().unwrap(), w.retained().unwrap()] {
++                std::hint::black_box((
++                    branch.chart(),
++                    branch.program(),
++                    branch.evolution(),
++                    branch.source_segments(),
++                    branch.source_end_enclosure(),
++                ));
++            }
++            let e = w.evolution().unwrap();
++            std::hint::black_box((e.request(), e.reached_time(), e.end_enclosure()));
++        }
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
++#[test]
++fn uncertain_rotating_line_contains_the_entire_independent_analytic_image() {
++    let f = field::<2>(
++        &[-Expr::anonymous_symbol(Y), Expr::anonymous_symbol(X)],
++        &[X, Y],
++    );
++    let chart = identity(&f);
++    let r = chart.integrate_qr(
++        request([d(-1, 1, 0), d(0, 0, 0)], d(3, 3, -1)),
++        options(d(3, 3, -2)),
++        &mut budget(),
++    );
++    completed(&r);
++    assert!(r.windows().iter().any(|w| w.comparison().unwrap().choice()
++        == hyperdynamics::field::coordinates::qr_evolution::QrFrameChoice::Retained));
++    let t = Rational::from(3) / Rational::from(2);
++    for (lane, sine) in r
++        .source_end_enclosure()
++        .unwrap()
++        .lanes()
++        .unwrap()
++        .iter()
++        .zip([false, true])
++    {
++        let (lower, upper) = alternating_trig(&t, sine);
++        assert!(lower.is_positive());
++        let q = lane.to_rational(&mut arithmetic()).unwrap();
++        assert!(q.contains_point(&(-&upper)));
++        assert!(q.contains_point(&upper));
++        eprintln!(
++            "UNCERTAIN width {:?} choices {:?}",
++            q.width().unwrap().to_f64_enclosure(),
++            r.windows()
++                .iter()
++                .map(|w| w.comparison().unwrap().choice())
++                .collect::<Vec<_>>()
++        );
++        assert!(q.width().unwrap() < Rational::from(10));
++    }
++}
++#[test]
++fn all_invalid_controls_are_checked_before_empty_identity_shortcuts() {
++    let chart = identity(&field::<1>(&[Expr::int(2)], &[X]));
++    let mut input = request([d(0, 0, 0)], d(1, 1, 0));
++    input.initial = BoxN::empty().unwrap();
++    for bad in [
++        DyadicInterval::empty(),
++        d(-1, -1, 0),
++        d(0, 1, 0),
++        d(0, 0, 0),
++    ] {
++        let mut o = options(d(1, 1, -1));
++        o.window = bad.clone();
++        let r = chart.integrate_qr(input.clone(), o, &mut budget());
++        assert!(matches!(
++            r.status(),
++            Status::Stopped(Failure::InvalidWindow)
++        ));
++        assert!(r.source_end_enclosure().is_none());
++        let mut o = options(d(1, 1, -1));
++        o.native.maximum_step = Some(bad);
++        let r = chart.integrate_qr(input.clone(), o, &mut budget());
++        assert!(matches!(
++            r.status(),
++            Status::Stopped(Failure::Native(EvolutionFailure::InvalidMaximumStep))
++        ));
++        assert!(r.source_end_enclosure().is_none());
++    }
++    let mut bad = input.clone();
++    bad.start = d(0, 1, 0);
++    assert!(matches!(
++        chart
++            .integrate_qr(bad, options(d(1, 1, -1)), &mut budget())
++            .status(),
++        Status::Stopped(Failure::Native(EvolutionFailure::NonPointTime))
++    ));
++    let mut o = options(d(1, 1, -1));
++    o.taylor_order = Some(usize::MAX);
++    assert!(matches!(
++        chart.integrate_qr(input, o, &mut budget()).status(),
++        Status::Stopped(Failure::Taylor(
++            hyperdynamics::field::taylor_flow::FlowTaylorError::OrderOverflow
++        ))
++    ));
++}
++#[test]
++fn selected_frame_certifies_longer_steps_with_exact_equilibrium_output() {
++    use hyperdynamics::field::coordinates::qr_evolution::{QrFrameChoice, QrWindowEvolution};
++    let q = |n: i64| Expr::real(Real::from(Rational::from(n) / Rational::from(25)));
++    let x = Expr::anonymous_symbol(X);
++    let y = Expr::anonymous_symbol(Y);
++    let chart = identity(&field::<2>(
++        &[q(7) * x.clone() + q(24) * y.clone(), q(24) * x + q(-7) * y],
++        &[X, Y],
++    ));
++    let mut o = options(d(7, 7, -3));
++    o.native.maximum_step = Some(d(7, 7, -3));
++    let input = request([d(0, 0, 0), d(0, 0, 0)], d(7, 7, -2));
++    let fixed = chart
++        .transformed_field()
++        .flow_taylor(3, &mut budget())
++        .unwrap()
++        .integrate(input.clone(), o.native.clone(), &mut budget());
++    assert!(matches!(
++        fixed.status(),
++        hyperdynamics::field::taylor_flow::evolution::FlowTaylorEvolutionStatus::Completed
++    ));
++    assert_eq!(fixed.segments().len(), 4);
++    let r = chart.integrate_qr(input, o, &mut budget());
++    completed(&r);
++    assert_eq!(
++        r.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(0, 0, 0), d(0, 0, 0)])
++    );
++    for w in r.windows() {
++        assert_eq!(w.comparison().unwrap().choice(), QrFrameChoice::Proposed);
++        let QrWindowEvolution::Taylor(flow) = w.evolution().unwrap() else {
++            panic!("Taylor strategy")
++        };
++        assert_eq!(flow.segments().len(), 1);
++        assert_eq!(
++            flow.segments()
++                .next()
++                .unwrap()
++                .picard()
++                .evidence()
++                .duration(),
++            Some(&d(7, 7, -3))
++        );
++    }
++    let QrWindowEvolution::Taylor(first_retained) =
++        r.windows()[0].retained().unwrap().evolution().unwrap()
++    else {
++        panic!("Taylor strategy")
++    };
++    assert_eq!(first_retained.segments().len(), 2);
++}
+diff --git a/crates/hyperdynamics/tests/support/flow_oracles.rs b/crates/hyperdynamics/tests/support/flow_oracles.rs
+new file mode 100644
+index 000000000..699e8611f
+--- /dev/null
++++ b/crates/hyperdynamics/tests/support/flow_oracles.rs
+@@ -0,0 +1,16 @@
++use hyperreal::Rational;
++
++// For 0<=t<=3/2, terms decrease from degree two onward. After twelve terms the
++// next (positive) term bounds the alternating tail; all operations here are rational.
++pub fn alternating_trig(t: &Rational, sine: bool) -> (Rational, Rational) {
++    assert!(*t >= Rational::zero() && *t <= Rational::from(3) / Rational::from(2));
++    let mut term = if sine { t.clone() } else { Rational::one() };
++    let mut sum = Rational::zero();
++    for k in 0..12 {
++        sum = sum + &term;
++        let a = 2 * k + if sine { 2 } else { 1 };
++        term = -term * t * t / Rational::from(a * (a + 1));
++    }
++    assert!(!term.is_negative());
++    (sum.clone(), sum + term)
++}
