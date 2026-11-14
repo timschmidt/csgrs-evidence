@@ -1,0 +1,559 @@
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 35d227cb4..c59dc206a 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add allocation-free signed integer quotient bounds and exact scalar images of
++  primitive integer ranges, including signed extremes and typed overflow. Share
++  directed quotient arithmetic with fixed-point operations.
++
+ - Add budgeted `DyadicInterval::from_rational` and use it for structurally
+   rational `from_real` inputs. Stored coefficient sizes are admitted before
+   copying, normalization or division, including lazy unreduced ratios. Exact
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index a49b7e2c7..cb9edc8ee 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -130,6 +130,10 @@ square and nonnegative integer powers. Integer multiplication can have gaps;
+ the result is the smallest containing integer range. Division is not silently
+ interpreted as truncated real arithmetic. Exact width/radius and explicitly
+ rounded midpoints support every primitive integer width, including i128/u128.
++`scale` returns the smallest integer hull of multiplication by one exact
++scalar. With either `integer` or `fixed`, `integer_quotient_bounds` returns the
++integer floor and ceiling of an i128 ratio, with typed zero-denominator and
++overflow errors; it does not replace the ratio by a discrete integer set.
+ 
+ Fixed arithmetic widens intermediates to i128. Products, quotients, reciprocals,
+ squares, ratio ingress and fused affine images round outward; representational
+diff --git a/crates/hyperinterval/src/bounds.rs b/crates/hyperinterval/src/bounds.rs
+index fa126f8bd..5a7eac7e7 100644
+--- a/crates/hyperinterval/src/bounds.rs
++++ b/crates/hyperinterval/src/bounds.rs
+@@ -65,6 +65,7 @@ impl<T: PartialOrd> Bounds<T> {
+     // Callers must establish order algebraically before using this private
+     // constructor. Public ingress always uses new().
+     #[cfg(any(
++        feature = "integer",
+         feature = "rational",
+         feature = "float-proposal",
+         feature = "float-enclosure"
+@@ -194,7 +195,7 @@ impl<T: Copy + PartialOrd> Bounds<T> {
+ // decisions. All constructors and serialization remain family-specific.
+ #[cfg(any(feature = "integer", feature = "fixed"))]
+ macro_rules! set_relations {
+-    () => {
++    ($(#[$intersection_attribute:meta])*) => {
+         /// Whether this set is empty.
+         pub fn is_empty(&self) -> bool {
+             self.bounds.is_none()
+@@ -300,6 +301,7 @@ macro_rules! set_relations {
+         }
+ 
+         /// Exact intersection; disjoint intervals produce explicit empty.
++        $(#[$intersection_attribute])*
+         pub fn intersection(&self, other: &Self) -> Self {
+             Self {
+                 bounds: match (self.bounds, other.bounds) {
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index 5a3a9f049..1c536b975 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -1,17 +1,8 @@
+ //! Widened arithmetic for the sealed i32/i64 fixed-point families.
+ 
++use crate::integer_quotient::positive_quotient_bounds as quotient_bounds;
+ use crate::{DomainCoverage, FixedInterval, IntervalError, MidpointRounding, RangeEnclosure};
+ 
+-// Every caller supplies a positive denominator. Numerators here are products
+-// of signed 64-bit values and a scale at most 2^63, so division cannot meet
+-// i128::MIN / -1 and the ceiling increment cannot overflow.
+-#[inline]
+-fn quotient_bounds(numerator: i128, denominator: i128) -> (i128, i128) {
+-    let lower = numerator.div_euclid(denominator);
+-    let upper = lower + i128::from(numerator.rem_euclid(denominator) != 0);
+-    (lower, upper)
+-}
+-
+ #[inline]
+ fn scaled_ratio(numerator: i128, denominator: i128, scale: i128) -> (i128, i128) {
+     if denominator < 0 {
+diff --git a/crates/hyperinterval/src/integer.rs b/crates/hyperinterval/src/integer.rs
+index 873d3fc86..99f40b0c6 100644
+--- a/crates/hyperinterval/src/integer.rs
++++ b/crates/hyperinterval/src/integer.rs
+@@ -57,6 +57,12 @@ pub struct IntegerRange<I: IntegerEndpoint> {
+ }
+ 
+ impl<I: IntegerEndpoint> IntegerRange<I> {
++    pub(crate) fn from_bounds(bounds: Bounds<I>) -> Self {
++        Self {
++            bounds: Some(bounds),
++        }
++    }
++
+     /// Constructs an exact nonempty range, rejecting reversed endpoints.
+     pub fn new(lower: I, upper: I) -> Result<Self, IntervalError> {
+         Ok(Self {
+@@ -76,7 +82,7 @@ impl<I: IntegerEndpoint> IntegerRange<I> {
+         }
+     }
+ 
+-    set_relations!();
++    set_relations!(#[inline(always)]);
+ 
+     /// Converts endpoints exactly to another primitive width or signedness.
+     ///
+diff --git a/crates/hyperinterval/src/integer_arithmetic.rs b/crates/hyperinterval/src/integer_arithmetic.rs
+index 1622dda11..4663b2aaa 100644
+--- a/crates/hyperinterval/src/integer_arithmetic.rs
++++ b/crates/hyperinterval/src/integer_arithmetic.rs
+@@ -1,3 +1,4 @@
++use crate::bounds::Bounds;
+ use crate::{IntegerRange, IntervalError, MidpointRounding};
+ 
+ macro_rules! arithmetic {
+@@ -27,19 +28,19 @@ macro_rules! arithmetic {
+             }
+ 
+             /// Midpoint with explicit integer rounding; empty returns `None`.
++            #[inline(always)]
+             pub fn midpoint(&self, rounding: MidpointRounding) -> Option<$endpoint> {
+-                self.bounds().map(|(lower, upper)| {
+-                    let width = upper.abs_diff(lower);
+-                    // Half of the maximum unsigned distance fits the signed
+-                    // endpoint, and the sum is between lower and upper.
+-                    let floor = lower + (width / 2) as $endpoint;
+-                    let increment = width % 2 != 0 && match rounding {
+-                        MidpointRounding::Floor => false,
+-                        MidpointRounding::Ceiling => true,
+-                        MidpointRounding::NearestTiesEven => floor % 2 != 0,
+-                    };
+-                    floor + <$endpoint>::from(increment)
+-                })
++                let (lower, upper) = self.bounds()?;
++                let width = upper.abs_diff(lower);
++                // Half of the maximum unsigned distance fits the signed
++                // endpoint, and the sum is between lower and upper.
++                let floor = lower + (width / 2) as $endpoint;
++                let increment = width % 2 != 0 && match rounding {
++                    MidpointRounding::Floor => false,
++                    MidpointRounding::Ceiling => true,
++                    MidpointRounding::NearestTiesEven => floor % 2 != 0,
++                };
++                Some(floor + <$endpoint>::from(increment))
+             }
+ 
+             /// Outward integer radius around any supported rounded midpoint.
+@@ -50,9 +51,13 @@ macro_rules! arithmetic {
+             /// Exact discrete Minkowski sum, with checked endpoint arithmetic.
+             pub fn checked_add(&self, other: &Self) -> Result<Self, IntervalError> {
+                 match (self.bounds(), other.bounds()) {
+-                    (Some((a, b)), Some((c, d))) => Self::new(
+-                        a.checked_add(c).ok_or(IntervalError::Overflow)?,
+-                        b.checked_add(d).ok_or(IntervalError::Overflow)?),
++                    (Some((a, b)), Some((c, d))) => {
++                        let lower = a.checked_add(c).ok_or(IntervalError::Overflow)?;
++                        let upper = b.checked_add(d).ok_or(IntervalError::Overflow)?;
++                        // Addition is monotone in each operand. Once both
++                        // checked sums succeed, a <= b and c <= d prove order.
++                        Ok(Self::from_bounds(Bounds::ordered(lower, upper)))
++                    }
+                     _ => Ok(Self::empty()),
+                 }
+             }
+@@ -94,6 +99,23 @@ macro_rules! arithmetic {
+                 }
+             }
+ 
++            /// Smallest integer hull after multiplication by one exact scalar.
++            ///
++            /// Scaling can leave gaps between attained integers. A negative
++            /// factor reverses endpoint order; zero maps every nonempty range
++            /// to zero, and empty stays empty. Unrepresentable products return
++            /// `Overflow`. Known scalar sign avoids a general four-corner product.
++            #[inline]
++            pub fn scale(&self, factor: $endpoint) -> Result<Self, IntervalError> {
++                let Some((a, b)) = self.bounds() else { return Ok(Self::empty()); };
++                let a = a.checked_mul(factor).ok_or(IntervalError::Overflow)?;
++                let b = b.checked_mul(factor).ok_or(IntervalError::Overflow)?;
++                let (lower, upper) = if factor.cmp(&0).is_lt() { (b, a) } else { (a, b) };
++                // Multiplication by a nonnegative scalar is monotone; a
++                // negative scalar reverses order. Checked products remain exact.
++                Ok(Self::from_bounds(Bounds::ordered(lower, upper)))
++            }
++
+             /// Smallest integer hull of pointwise squares, with zero-aware bounds.
+             pub fn square(&self) -> Result<Self, IntervalError> {
+                 self.checked_pow(2)
+diff --git a/crates/hyperinterval/src/integer_quotient.rs b/crates/hyperinterval/src/integer_quotient.rs
+new file mode 100644
+index 000000000..7bbfc257f
+--- /dev/null
++++ b/crates/hyperinterval/src/integer_quotient.rs
+@@ -0,0 +1,57 @@
++use crate::IntervalError;
++
++// Every caller establishes a positive denominator. Division cannot meet
++// i128::MIN / -1. A nonzero remainder implies the quotient is below i128::MAX,
++// so the ceiling increment cannot overflow, even for full-width numerators.
++#[inline]
++pub(crate) fn positive_quotient_bounds(numerator: i128, denominator: i128) -> (i128, i128) {
++    let quotient = numerator / denominator;
++    let remainder = numerator % denominator;
++    // A negative remainder requires a downward correction; a positive one an
++    // upward correction. At either signed limit the remainder must be zero,
++    // so neither correction can wrap. This also lets callers discard an
++    // unused endpoint without retaining an impossible overflow panic path.
++    (
++        quotient.wrapping_sub(i128::from(remainder < 0)),
++        quotient.wrapping_add(i128::from(remainder > 0)),
++    )
++}
++
++/// Exact integer floor and ceiling of the rational value `numerator / denominator`.
++///
++/// Returns `(floor, ceiling)`, equal precisely for an integral quotient. These
++/// are numerical bounds on the rational value, not a claim that a discrete
++/// integer set contains a noninteger value. Neither endpoint is selected as a
++/// replacement for the exact ratio.
++///
++/// A zero denominator returns [`IntervalError::ContainsZero`]. The sole
++/// unrepresentable quotient, `i128::MIN / -1`, returns [`IntervalError::Overflow`].
++/// Both denominator signs and signed extremes are supported without allocating,
++/// changing rounding state or requiring arbitrary precision.
++///
++/// ```
++/// use hyperinterval::integer_quotient_bounds;
++/// assert_eq!(integer_quotient_bounds(-7, 3).unwrap(), (-3, -2));
++/// assert_eq!(integer_quotient_bounds(-7, -3).unwrap(), (2, 3));
++/// ```
++#[inline]
++pub fn integer_quotient_bounds(
++    numerator: i128,
++    denominator: i128,
++) -> Result<(i128, i128), IntervalError> {
++    if denominator > 0 {
++        return Ok(positive_quotient_bounds(numerator, denominator));
++    }
++    if denominator == 0 {
++        return Err(IntervalError::ContainsZero);
++    }
++    // Do not negate a signed minimum merely to normalize the denominator.
++    let quotient = numerator
++        .checked_div(denominator)
++        .ok_or(IntervalError::Overflow)?;
++    let inexact = numerator % denominator != 0;
++    Ok((
++        quotient - i128::from(inexact && numerator > 0),
++        quotient + i128::from(inexact && numerator < 0),
++    ))
++}
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 9f1a56ca1..1296048ff 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -47,6 +47,8 @@ mod ieee;
+ mod integer;
+ #[cfg(feature = "integer")]
+ mod integer_arithmetic;
++#[cfg(any(feature = "integer", feature = "fixed"))]
++mod integer_quotient;
+ #[cfg(feature = "dyadic")]
+ mod inverse_functions;
+ #[cfg(feature = "dyadic")]
+@@ -76,6 +78,8 @@ pub use dyadic::{DyadicBudget, DyadicInterval};
+ pub use fixed::{FixedEndpoint, FixedInterval, FixedWidth};
+ #[cfg(feature = "integer")]
+ pub use integer::{IntegerEndpoint, IntegerRange};
++#[cfg(any(feature = "integer", feature = "fixed"))]
++pub use integer_quotient::integer_quotient_bounds;
+ #[cfg(feature = "float-proposal")]
+ pub use proposal::{F32ProposalInterval, F64ProposalInterval};
+ #[cfg(feature = "rational")]
+diff --git a/crates/hyperinterval/tests/integer_quotient.rs b/crates/hyperinterval/tests/integer_quotient.rs
+new file mode 100644
+index 000000000..fd875dd50
+--- /dev/null
++++ b/crates/hyperinterval/tests/integer_quotient.rs
+@@ -0,0 +1,134 @@
++#![cfg(any(feature = "integer", feature = "fixed"))]
++use hyperinterval::{IntervalError, integer_quotient_bounds};
++
++#[cfg(all(
++    feature = "integer",
++    feature = "fixed",
++    feature = "hyperreal",
++    feature = "dispatch-trace"
++))]
++#[test]
++fn native_clock_arithmetic_has_no_real_dispatch_or_reductions() {
++    use hyperinterval::{FixedInterval, IntegerRange, MidpointRounding};
++    use hyperreal::dispatch_trace;
++    dispatch_trace::reset();
++    let (image, midpoint, radius, fixed, quotient) = dispatch_trace::with_recording(|| {
++        let retained = IntegerRange::new(-7_i128, 9).unwrap();
++        let sample = IntegerRange::new(-3_i128, 12).unwrap();
++        let image = retained.intersection(&sample).scale(-2).unwrap();
++        let midpoint = image.midpoint(MidpointRounding::Floor);
++        let radius = image.radius();
++        let fixed = FixedInterval::<i64, 32>::from_ratio(-7, 3).unwrap();
++        (
++            image,
++            midpoint,
++            radius,
++            fixed,
++            integer_quotient_bounds(-7, 3),
++        )
++    });
++    assert_eq!(image.bounds(), Some((-18, 6)));
++    assert_eq!(midpoint, Some(-6));
++    assert_eq!(radius, Some(12));
++    assert_eq!(fixed.bounds(), Some((-10_021_590_358, -10_021_590_357)));
++    assert_eq!(quotient, Ok((-3, -2)));
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
++
++#[test]
++fn exhaustive_byte_ratios_have_tight_bounds() {
++    for n in -128_i128..=127 {
++        for d in -128_i128..=127 {
++            if d == 0 {
++                assert_eq!(
++                    integer_quotient_bounds(n, d),
++                    Err(IntervalError::ContainsZero)
++                );
++                continue;
++            }
++            let (lo, hi) = integer_quotient_bounds(n, d).unwrap();
++            // Independent cross-multiplication, including the adjacent lattice
++            // points, establishes both enclosure and tightness without division.
++            let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
++            assert!(lo * d <= n && n < (lo + 1) * d);
++            assert!((hi - 1) * d < n && n <= hi * d);
++            assert!(hi == lo || hi == lo + 1);
++        }
++    }
++}
++
++#[test]
++fn signed_extremes_and_error_precedence() {
++    for (n, d, expected) in [
++        (i128::MIN, 1, (i128::MIN, i128::MIN)),
++        (i128::MAX, 1, (i128::MAX, i128::MAX)),
++        (i128::MIN, i128::MIN, (1, 1)),
++        (i128::MAX, i128::MIN, (-1, 0)),
++        (1, i128::MIN, (-1, 0)),
++        (-1, i128::MIN, (0, 1)),
++        (i128::MIN + 1, -1, (i128::MAX, i128::MAX)),
++        (i128::MIN, i128::MAX, (-2, -1)),
++        (i128::MAX, -2, (-(i128::MAX / 2) - 1, -(i128::MAX / 2))),
++    ] {
++        assert_eq!(integer_quotient_bounds(n, d), Ok(expected));
++    }
++    assert_eq!(
++        integer_quotient_bounds(i128::MIN, -1),
++        Err(IntervalError::Overflow)
++    );
++    for n in [i128::MIN, 0, i128::MAX] {
++        assert_eq!(
++            integer_quotient_bounds(n, 0),
++            Err(IntervalError::ContainsZero)
++        );
++    }
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn full_width_gmp_inequalities_and_adjacent_lattice_points() {
++    use rug::{Integer, Rational};
++    fn check(n: i128, d: i128) {
++        if d == 0 || (n == i128::MIN && d == -1) {
++            return;
++        }
++        let exact = Rational::from((n, d));
++        let (lo, hi) = integer_quotient_bounds(n, d).unwrap();
++        assert!(lo <= exact && exact <= hi);
++        assert!(exact < Integer::from(lo) + 1);
++        assert!(Integer::from(hi) - 1 < exact);
++    }
++    let extremes = [
++        i128::MIN,
++        i128::MIN + 1,
++        -(1_i128 << 126) - 1,
++        -(1_i128 << 64),
++        -3,
++        -2,
++        -1,
++        0,
++        1,
++        2,
++        3,
++        (1_i128 << 64) + 1,
++        (1_i128 << 126) + 1,
++        i128::MAX - 1,
++        i128::MAX,
++    ];
++    for n in extremes {
++        for d in extremes {
++            check(n, d);
++        }
++    }
++    let mut state = 0x9e37_79b9_7f4a_7c15_243f_6a88_85a3_08d3_u128;
++    for _ in 0..4096 {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        let n = state as i128;
++        state = state.wrapping_mul(0xda94_2042_e4dd_58b5_9e37_79b9_7f4a_7c15);
++        check(n, state as i128);
++    }
++}
+diff --git a/crates/hyperinterval/tests/integer_scale.rs b/crates/hyperinterval/tests/integer_scale.rs
+new file mode 100644
+index 000000000..f4ba300d3
+--- /dev/null
++++ b/crates/hyperinterval/tests/integer_scale.rs
+@@ -0,0 +1,138 @@
++#![cfg(feature = "integer")]
++use hyperinterval::{IntegerRange, IntervalError};
++
++#[test]
++fn signed_byte_ranges_match_enumerated_integer_images() {
++    for a in -5_i8..=5 {
++        for b in a..=5 {
++            for factor in i8::MIN..=i8::MAX {
++                let range = IntegerRange::new(a, b).unwrap();
++                let actual = range.scale(factor);
++                let image: Vec<_> = (a..=b).map(|x| i32::from(x) * i32::from(factor)).collect();
++                let lo = *image.iter().min().unwrap();
++                let hi = *image.iter().max().unwrap();
++                match (i8::try_from(lo), i8::try_from(hi)) {
++                    (Ok(lo), Ok(hi)) => assert_eq!(actual.unwrap().bounds(), Some((lo, hi))),
++                    _ => assert_eq!(actual, Err(IntervalError::Overflow)),
++                }
++                assert_eq!(actual, range.checked_mul(&IntegerRange::point(factor)));
++            }
++        }
++    }
++}
++
++#[test]
++fn all_endpoint_families_preserve_identity_zero_empty_and_overflow() {
++    macro_rules! check {
++        ($($ty:ty),*) => {$(
++            let all = IntegerRange::<$ty>::new(<$ty>::MIN, <$ty>::MAX).unwrap();
++            assert_eq!(all.scale(1), Ok(all));
++            assert_eq!(all.scale(0), Ok(IntegerRange::point(0)));
++            assert_eq!(all.scale(2), Err(IntervalError::Overflow));
++            assert_eq!(IntegerRange::<$ty>::empty().scale(<$ty>::MAX), Ok(IntegerRange::empty()));
++            assert_eq!(IntegerRange::<$ty>::point(0).scale(<$ty>::MAX), Ok(IntegerRange::point(0)));
++            assert_eq!(IntegerRange::<$ty>::new(1, 3).unwrap().scale(2).unwrap().checked_add(&IntegerRange::point(1)).unwrap().bounds(), Some((3, 7)));
++        )*};
++    }
++    check!(
++        i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
++    );
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn full_width_signed_and_unsigned_images_match_gmp() {
++    use rug::Integer;
++    let signed = [
++        i128::MIN,
++        i128::MIN + 1,
++        -(1_i128 << 64),
++        -3,
++        -1,
++        0,
++        1,
++        3,
++        1_i128 << 64,
++        i128::MAX,
++    ];
++    for &a in &signed {
++        for &b in &signed {
++            if a > b {
++                continue;
++            }
++            for &factor in &signed {
++                let aa = Integer::from(a) * Integer::from(factor);
++                let bb = Integer::from(b) * Integer::from(factor);
++                let (lo, hi) = if aa <= bb { (aa, bb) } else { (bb, aa) };
++                let actual = IntegerRange::new(a, b).unwrap().scale(factor);
++                match (lo.to_i128(), hi.to_i128()) {
++                    (Some(lo), Some(hi)) => assert_eq!(actual.unwrap().bounds(), Some((lo, hi))),
++                    _ => assert_eq!(actual, Err(IntervalError::Overflow)),
++                }
++            }
++        }
++    }
++    let unsigned = [0, 1, 2, 3, 1_u128 << 64, (1_u128 << 127) + 1, u128::MAX];
++    for &a in &unsigned {
++        for &b in &unsigned {
++            if a > b {
++                continue;
++            }
++            for &factor in &unsigned {
++                let lo = Integer::from(a) * Integer::from(factor);
++                let hi = Integer::from(b) * Integer::from(factor);
++                let actual = IntegerRange::new(a, b).unwrap().scale(factor);
++                match (lo.to_u128(), hi.to_u128()) {
++                    (Some(lo), Some(hi)) => assert_eq!(actual.unwrap().bounds(), Some((lo, hi))),
++                    _ => assert_eq!(actual, Err(IntervalError::Overflow)),
++                }
++            }
++        }
++    }
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn ordered_sum_preserves_full_width_bounds_and_overflow() {
++    use rug::Integer;
++    let endpoints = [
++        i128::MIN,
++        i128::MIN + 1,
++        -3,
++        -1,
++        0,
++        1,
++        3,
++        i128::MAX - 1,
++        i128::MAX,
++    ];
++    for &a in &endpoints {
++        for &b in &endpoints {
++            if a > b {
++                continue;
++            }
++            let left = IntegerRange::new(a, b).unwrap();
++            assert_eq!(
++                left.checked_add(&IntegerRange::empty()),
++                Ok(IntegerRange::empty())
++            );
++            for &c in &endpoints {
++                for &d in &endpoints {
++                    if c > d {
++                        continue;
++                    }
++                    let right = IntegerRange::new(c, d).unwrap();
++                    let lower = Integer::from(a) + Integer::from(c);
++                    let upper = Integer::from(b) + Integer::from(d);
++                    let actual = left.checked_add(&right);
++                    match (lower.to_i128(), upper.to_i128()) {
++                        (Some(lower), Some(upper)) => {
++                            assert_eq!(actual.unwrap().bounds(), Some((lower, upper)))
++                        }
++                        _ => assert_eq!(actual, Err(IntervalError::Overflow)),
++                    }
++                }
++            }
++        }
++    }
++}
