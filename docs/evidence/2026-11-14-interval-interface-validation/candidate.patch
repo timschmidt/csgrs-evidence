@@ -1,0 +1,561 @@
+diff --git a/Trunk.toml b/Trunk.toml
+index 3b001ab..e927998 100644
+--- a/Trunk.toml
++++ b/Trunk.toml
+@@ -18,6 +18,10 @@ wasm-opt \
+   -o "$optimized_wasm"
+ mv "$optimized_wasm" "$TRUNK_STAGING_DIR/alumina-interface_bg.wasm"
+ 
++gzip -9 -n -c "$TRUNK_STAGING_DIR/index.html" > "$TRUNK_STAGING_DIR/index.html.gz"
++gzip -9 -n -c "$TRUNK_STAGING_DIR/alumina-interface.js" > "$TRUNK_STAGING_DIR/alumina-interface.js.gz"
++gzip -9 -n -c "$TRUNK_STAGING_DIR/alumina-interface_bg.wasm" > "$TRUNK_STAGING_DIR/alumina-interface_bg.wasm.gz"
++
+ brotli -q 11 -w 23 -n -f \
+   "$TRUNK_STAGING_DIR/index.html" \
+   -o "$TRUNK_STAGING_DIR/index.html.br"
+diff --git a/crates/alumina-interface-client/src/network.rs b/crates/alumina-interface-client/src/network.rs
+index 012b4e6..5f6760b 100644
+--- a/crates/alumina-interface-client/src/network.rs
++++ b/crates/alumina-interface-client/src/network.rs
+@@ -70,12 +70,13 @@ pub enum NetworkClientPhase {
+ }
+ 
+ /// Accepted state transition from one authenticated response.
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq)]
+ pub enum NetworkUpdate {
+     /// A credential-free current status was retained.
+     Status(NetworkStatus),
+-    /// A complete bounded scan was retained.
+-    Scan(NetworkScanResult),
++    /// A complete bounded scan was retained. The owned payload keeps common
++    /// status/mutation updates small; cloning this variant clones its allocation.
++    Scan(Box<NetworkScanResult>),
+     /// One mutation reached a proven terminal result.
+     Mutation {
+         /// Exact mutation operation.
+@@ -450,7 +451,7 @@ impl NetworkProvisioningMachine {
+             }
+         };
+         self.latest_scan = Some(result);
+-        Ok(NetworkUpdate::Scan(result))
++        Ok(NetworkUpdate::Scan(Box::new(result)))
+     }
+ 
+     fn accept_mutation_response(
+diff --git a/crates/alumina-interface-client/src/worker.rs b/crates/alumina-interface-client/src/worker.rs
+index ecd6ff8..f249a38 100644
+--- a/crates/alumina-interface-client/src/worker.rs
++++ b/crates/alumina-interface-client/src/worker.rs
+@@ -1473,8 +1473,7 @@ impl ConfigurationWorkerSnapshot {
+             && self.active_digest.iter().all(|byte| *byte == 0)
+             && self.active_bytes == 0
+             && self.summary.is_none();
+-        if (!active && !inactive)
+-            || (self.jobs_authorized && !active)
++        if (!inactive || self.jobs_authorized) && !active
+             || (self.phase == ConfigurationPhaseSnapshot::Active && !self.jobs_authorized)
+             || (self.phase == ConfigurationPhaseSnapshot::Empty && !inactive)
+         {
+diff --git a/crates/alumina-interface-client/tests/validation_contracts.rs b/crates/alumina-interface-client/tests/validation_contracts.rs
+new file mode 100644
+index 0000000..3c0d4a7
+--- /dev/null
++++ b/crates/alumina-interface-client/tests/validation_contracts.rs
+@@ -0,0 +1,213 @@
++use alumina_interface_client::{
++    Response,
++    network::{NetworkClientError, NetworkClientPhase, NetworkProvisioningMachine, NetworkUpdate},
++    worker::{
++        ConfigurationPhaseSnapshot as Phase, ConfigurationSummarySnapshot as Summary,
++        ConfigurationWorkerSnapshot as Snapshot, WorkerContractError, WorkerNetworkScanSnapshot,
++    },
++};
++use alumina_net::provisioning::{
++    MAX_NETWORK_SCAN_RESULTS, NetworkAuthentication, NetworkScanEntry, NetworkScanResult,
++};
++use alumina_protocol::{Operation, StatusCode};
++fn scan(transaction: u64) -> NetworkScanResult {
++    let entries: Vec<_> = (0..MAX_NETWORK_SCAN_RESULTS)
++        .map(|i| {
++            NetworkScanEntry::try_new(
++                &format!("Fixture-{i}"),
++                NetworkAuthentication::Wpa2Personal,
++                (i + 1) as u8,
++                -(30 + i as i8),
++                [2, 0, 0, 0, 0, (i + 1) as u8],
++            )
++            .unwrap()
++        })
++        .collect();
++    NetworkScanResult::try_new(transaction, 13, 17, 123456, &entries, true).unwrap()
++}
++#[test]
++fn owned_scan_preserves_full_canonical_payload_snapshot_and_independent_clones() {
++    let mut machine = NetworkProvisioningMachine::starting_at(42).unwrap();
++    let transaction = machine.request_scan().unwrap();
++    let request = machine.next_request().unwrap().unwrap();
++    assert_eq!(request.operation(), Operation::NetworkScan);
++    let expected = scan(transaction);
++    let encoded = expected.encode();
++    let expected_snapshot =
++        serde_json::to_string(&WorkerNetworkScanSnapshot::from_scan(expected)).unwrap();
++    let update = machine
++        .accept_response(&Response {
++            status: StatusCode::Ok,
++            body: encoded.to_vec(),
++        })
++        .unwrap();
++    assert_eq!(machine.phase(), NetworkClientPhase::Idle);
++    assert_eq!(machine.latest_scan(), Some(expected));
++    let mut cloned = update.clone();
++    assert_eq!(update, cloned);
++    assert_eq!(format!("{update:?}"), format!("Scan({expected:?})"));
++    machine.reset(99).unwrap();
++    assert!(machine.latest_scan().is_none());
++    let (NetworkUpdate::Scan(original), NetworkUpdate::Scan(other)) = (&update, &mut cloned) else {
++        panic!("expected scans")
++    };
++    assert!(!std::ptr::eq(original.as_ref(), other.as_ref()));
++    assert_eq!(original.encode(), encoded);
++    assert_eq!(original.entries().len(), MAX_NETWORK_SCAN_RESULTS);
++    assert!(original.truncated());
++    assert_eq!(
++        serde_json::to_string(&WorkerNetworkScanSnapshot::from_scan(**original)).unwrap(),
++        expected_snapshot
++    );
++    other.network_generation += 1;
++    assert_eq!(original.network_generation, 13);
++    assert_ne!(update, cloned);
++}
++#[test]
++fn rejected_scan_preserves_retry_identity_and_never_retains_invalid_payload() {
++    let mut machine = NetworkProvisioningMachine::starting_at(42).unwrap();
++    let transaction = machine.request_scan().unwrap();
++    let original_request = machine.next_request().unwrap().unwrap();
++    let mismatched = Response {
++        status: StatusCode::Ok,
++        body: scan(transaction + 1).encode().to_vec(),
++    };
++    assert_eq!(
++        machine.accept_response(&mismatched),
++        Err(NetworkClientError::TransactionMismatch)
++    );
++    assert!(machine.latest_scan().is_none());
++    assert_eq!(machine.phase(), NetworkClientPhase::Ready);
++    assert_eq!(machine.next_request().unwrap().unwrap(), original_request);
++    let mut invalid = scan(transaction).encode().to_vec();
++    invalid[0] = 0;
++    assert!(matches!(
++        machine.accept_response(&Response {
++            status: StatusCode::Ok,
++            body: invalid
++        }),
++        Err(NetworkClientError::Wire(_))
++    ));
++    assert!(machine.latest_scan().is_none());
++    assert_eq!(machine.next_request().unwrap().unwrap(), original_request);
++    let accepted = machine
++        .accept_response(&Response {
++            status: StatusCode::Ok,
++            body: scan(transaction).encode().to_vec(),
++        })
++        .unwrap();
++    assert!(matches!(accepted, NetworkUpdate::Scan(_)));
++    assert_eq!(machine.latest_scan(), Some(scan(transaction)));
++}
++fn summaries() -> [Option<Summary>; 7] {
++    let valid = Summary {
++        record_count: 8,
++        realtime_record_count: 5,
++        binding_count: 6,
++        stepper_axes: 3,
++        foc_axes: 2,
++        safety_binding: true,
++        flags: 0,
++    };
++    [
++        None,
++        Some(valid),
++        Some(Summary {
++            record_count: 0,
++            ..valid
++        }),
++        Some(Summary {
++            realtime_record_count: 9,
++            ..valid
++        }),
++        Some(Summary {
++            binding_count: 9,
++            ..valid
++        }),
++        Some(Summary {
++            stepper_axes: u8::MAX,
++            foc_axes: u8::MAX,
++            ..valid
++        }),
++        Some(Summary {
++            stepper_axes: 8,
++            foc_axes: 8,
++            ..valid
++        }),
++    ]
++}
++#[test]
++fn snapshot_identity_authorization_and_summary_truth_table() {
++    let phases = [
++        Phase::Empty,
++        Phase::Recovering,
++        Phase::Validating,
++        Phase::CandidateValid,
++        Phase::Preparing,
++        Phase::Activating,
++        Phase::Committing,
++        Phase::Authorizing,
++        Phase::Active,
++        Phase::Clearing,
++        Phase::Aborting,
++        Phase::Rejected,
++    ];
++    let mut count = 0;
++    for phase in phases {
++        for jobs_authorized in [false, true] {
++            for active_transaction_id in [0, 1, u64::MAX] {
++                for active_digest in [[0; 32], [1; 32], std::array::from_fn(|i| u8::from(i == 31))]
++                {
++                    for active_bytes in [0, 1, u32::MAX] {
++                        for summary in summaries() {
++                            let snapshot = Snapshot {
++                                phase,
++                                jobs_authorized,
++                                active_transaction_id,
++                                active_digest,
++                                active_bytes,
++                                summary,
++                            };
++                            let parts = [
++                                active_transaction_id != 0,
++                                active_digest != [0; 32],
++                                active_bytes != 0,
++                                summary.is_some(),
++                            ];
++                            let present = parts.into_iter().filter(|v| *v).count();
++                            let identity_ok = match present {
++                                0 => !jobs_authorized && phase != Phase::Active,
++                                4 => {
++                                    phase != Phase::Empty
++                                        && (phase != Phase::Active || jobs_authorized)
++                                }
++                                _ => false,
++                            };
++                            let summary_ok = summary.is_none_or(|s| {
++                                s.record_count > 0
++                                    && s.realtime_record_count <= s.record_count
++                                    && s.binding_count <= s.record_count
++                                    && u16::from(s.stepper_axes) + u16::from(s.foc_axes) <= 16
++                            });
++                            let expected = identity_ok && summary_ok;
++                            let actual = snapshot.validate();
++                            assert_eq!(actual.is_ok(), expected, "{snapshot:?}");
++                            if !expected {
++                                assert!(matches!(
++                                    actual,
++                                    Err(WorkerContractError::ConfigurationSnapshot)
++                                ));
++                            }
++                            let json = serde_json::to_string(&snapshot).unwrap();
++                            let decoded: Snapshot = serde_json::from_str(&json).unwrap();
++                            assert_eq!(snapshot, decoded);
++                            assert_eq!(decoded.validate().is_ok(), expected);
++                            count += 1;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    assert_eq!(count, 4536);
++}
+diff --git a/docs/CLIENT-MIGRATIONS.md b/docs/CLIENT-MIGRATIONS.md
+new file mode 100644
+index 0000000..f93deb3
+--- /dev/null
++++ b/docs/CLIENT-MIGRATIONS.md
+@@ -0,0 +1,22 @@
++# Internal client Rust API migrations
++
++## Owned network scan updates
++
++The unpublished `alumina-interface-client` crate now carries
++`NetworkUpdate::Scan(Box<NetworkScanResult>)` instead of an inline scan result.
++`NetworkUpdate` retains `Clone`, `Debug`, `Eq` and `PartialEq`, but no longer
++implements `Copy`. Move updates when transferring ownership or call `clone()`
++explicitly when an independent copy is required. For a matched scan payload,
++borrow through `as_ref()` or move the native value out with `*payload`.
++
++The largest payload no longer determines the stack size of every status,
++mutation and retry event. A successful scan update allocates one box; cloning
++that variant allocates an independent box. Other update variants do not add
++allocations. The client's retained latest scan remains an independent native
++value, so resetting the client cannot invalidate an already returned update.
++
++Native wire formats, scan bounds and canonical ordering, request/transaction
++validation, credential redaction, worker JSON snapshots and browser behavior
++are unchanged. This is an intentional internal Rust ownership/API change,
++not a wire-format migration or a source-compatibility claim for external code.
++The strict Clippy policy remains enabled without a lint exemption.
+diff --git a/src/browser_worker.rs b/src/browser_worker.rs
+index 3f1bda9..020544b 100644
+--- a/src/browser_worker.rs
++++ b/src/browser_worker.rs
+@@ -2599,7 +2599,7 @@ async fn drive_state_network(
+             Ok(Some(NetworkUpdate::RetryRequired)) => {
+                 state.record_network_success(now_ms);
+             }
+-            Ok(Some(_)) | Ok(None) => {
++            Ok(_) => {
+                 state.record_network_success(now_ms);
+                 break;
+             }
+@@ -3918,6 +3918,46 @@ impl MutableSupervisorView {
+         self.devices.insert(snapshot.connection_id, snapshot);
+     }
+ 
++    fn apply_capability_transfer(&mut self, capability: &WorkerCapabilityDocument) {
++        let connection_id = capability.connection_id;
++        let generation = capability.generation;
++        let matching_session = self
++            .devices
++            .get(&connection_id)
++            .is_some_and(|snapshot| snapshot.generation == generation);
++        if !matching_session {
++            self.push_diagnostic(format!(
++                "connection {connection_id}: stale capability generation {generation} ignored"
++            ));
++            return;
++        }
++        let Ok(identity) = capability.identity.identity() else {
++            self.push_diagnostic(format!(
++                "connection {connection_id}: capability identity projection failed"
++            ));
++            return;
++        };
++        match build_board_explorer_snapshot(
++            capability.document(),
++            identity,
++            BoardCapabilityLimits::interactive(),
++        ) {
++            Ok(board) => {
++                self.capabilities.insert(
++                    connection_id,
++                    ConnectedCapabilityView {
++                        connection_id,
++                        generation,
++                        board,
++                    },
++                );
++            }
++            Err(error) => self.push_diagnostic(format!(
++                "connection {connection_id}: capability explorer rejected: {error}"
++            )),
++        }
++    }
++
+     fn apply(&mut self, envelope: WorkerEventEnvelope) {
+         if let Err(error) = envelope.validate() {
+             if envelope.schema_version == WORKER_SCHEMA_VERSION {
+@@ -3950,43 +3990,7 @@ impl MutableSupervisorView {
+             }
+             WorkerEvent::JobSnapshot { snapshot } => self.job = Some(*snapshot),
+             WorkerEvent::CapabilityDocument { capability } => {
+-                let connection_id = capability.connection_id;
+-                let generation = capability.generation;
+-                let matching_session = self
+-                    .devices
+-                    .get(&connection_id)
+-                    .is_some_and(|snapshot| snapshot.generation == generation);
+-                if !matching_session {
+-                    self.push_diagnostic(format!(
+-                        "connection {connection_id}: stale capability generation {generation} ignored"
+-                    ));
+-                    return;
+-                }
+-                let Ok(identity) = capability.identity.identity() else {
+-                    self.push_diagnostic(format!(
+-                        "connection {connection_id}: capability identity projection failed"
+-                    ));
+-                    return;
+-                };
+-                match build_board_explorer_snapshot(
+-                    capability.document(),
+-                    identity,
+-                    BoardCapabilityLimits::interactive(),
+-                ) {
+-                    Ok(board) => {
+-                        self.capabilities.insert(
+-                            connection_id,
+-                            ConnectedCapabilityView {
+-                                connection_id,
+-                                generation,
+-                                board,
+-                            },
+-                        );
+-                    }
+-                    Err(error) => self.push_diagnostic(format!(
+-                        "connection {connection_id}: capability explorer rejected: {error}"
+-                    )),
+-                }
++                self.apply_capability_transfer(capability.as_ref());
+             }
+             WorkerEvent::VisualAssetDocument { visual } => {
+                 self.apply_visual_transfer(visual.as_ref());
+diff --git a/src/lib.rs b/src/lib.rs
+index fd48a00..52ef315 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1579,66 +1579,7 @@ fn show_live_network_status(
+     }
+ 
+     if let Some(scan) = &network.scan {
+-        ui.label(format!(
+-            "scan generation {} · {} result{}{}",
+-            scan.scan_generation,
+-            scan.entries.len(),
+-            if scan.entries.len() == 1 { "" } else { "s" },
+-            if scan.truncated { " · truncated" } else { "" }
+-        ));
+-        let protected = scan.entries.iter().any(|entry| {
+-            !matches!(
+-                entry.authentication,
+-                WorkerNetworkAuthenticationSnapshot::Open
+-                    | WorkerNetworkAuthenticationSnapshot::Unsupported
+-            )
+-        });
+-        if protected {
+-            ui.add(
+-                egui::TextEdit::singleline(passphrase)
+-                    .password(true)
+-                    .hint_text("WLAN passphrase (kept out of worker snapshots)"),
+-            );
+-        }
+-        for entry in &scan.entries {
+-            ui.horizontal(|ui| {
+-                ui.label(format!(
+-                    "{} · {:?} · ch {} · {} dBm · {}",
+-                    entry.ssid,
+-                    entry.authentication,
+-                    entry.channel,
+-                    entry.signal_dbm,
+-                    encode_hex(&entry.bssid)
+-                ));
+-                let passphrase_valid = match entry.authentication {
+-                    WorkerNetworkAuthenticationSnapshot::Open => true,
+-                    WorkerNetworkAuthenticationSnapshot::Wpa2Personal
+-                    | WorkerNetworkAuthenticationSnapshot::Wpa3Personal
+-                    | WorkerNetworkAuthenticationSnapshot::Wpa2Wpa3Personal => {
+-                        (8..=63).contains(&passphrase.len())
+-                    }
+-                    WorkerNetworkAuthenticationSnapshot::Unsupported => false,
+-                };
+-                if ui
+-                    .add_enabled(idle && passphrase_valid, egui::Button::new("Join"))
+-                    .clicked()
+-                {
+-                    let credential =
+-                        if entry.authentication == WorkerNetworkAuthenticationSnapshot::Open {
+-                            Vec::new()
+-                        } else {
+-                            passphrase.as_bytes().to_vec()
+-                        };
+-                    actions.push(LiveDeviceAction::NetworkJoin(WorkerNetworkJoinRequest {
+-                        connection_id,
+-                        scan_generation: scan.scan_generation,
+-                        bssid: entry.bssid,
+-                        passphrase: credential,
+-                    }));
+-                    erase_secret_text(passphrase);
+-                }
+-            });
+-        }
++        show_live_network_scan(ui, connection_id, scan, idle, passphrase, actions);
+     }
+     if network.consecutive_failures != 0 {
+         ui.label(format!(
+@@ -1651,6 +1592,77 @@ fn show_live_network_status(
+     }
+ }
+ 
++#[cfg(target_arch = "wasm32")]
++fn show_live_network_scan(
++    ui: &mut egui::Ui,
++    connection_id: u64,
++    scan: &alumina_interface_client::worker::WorkerNetworkScanSnapshot,
++    idle: bool,
++    passphrase: &mut String,
++    actions: &mut Vec<LiveDeviceAction>,
++) {
++    ui.label(format!(
++        "scan generation {} · {} result{}{}",
++        scan.scan_generation,
++        scan.entries.len(),
++        if scan.entries.len() == 1 { "" } else { "s" },
++        if scan.truncated { " · truncated" } else { "" }
++    ));
++    let protected = scan.entries.iter().any(|entry| {
++        !matches!(
++            entry.authentication,
++            WorkerNetworkAuthenticationSnapshot::Open
++                | WorkerNetworkAuthenticationSnapshot::Unsupported
++        )
++    });
++    if protected {
++        ui.add(
++            egui::TextEdit::singleline(passphrase)
++                .password(true)
++                .hint_text("WLAN passphrase (kept out of worker snapshots)"),
++        );
++    }
++    for entry in &scan.entries {
++        ui.horizontal(|ui| {
++            ui.label(format!(
++                "{} · {:?} · ch {} · {} dBm · {}",
++                entry.ssid,
++                entry.authentication,
++                entry.channel,
++                entry.signal_dbm,
++                encode_hex(&entry.bssid)
++            ));
++            let passphrase_valid = match entry.authentication {
++                WorkerNetworkAuthenticationSnapshot::Open => true,
++                WorkerNetworkAuthenticationSnapshot::Wpa2Personal
++                | WorkerNetworkAuthenticationSnapshot::Wpa3Personal
++                | WorkerNetworkAuthenticationSnapshot::Wpa2Wpa3Personal => {
++                    (8..=63).contains(&passphrase.len())
++                }
++                WorkerNetworkAuthenticationSnapshot::Unsupported => false,
++            };
++            if ui
++                .add_enabled(idle && passphrase_valid, egui::Button::new("Join"))
++                .clicked()
++            {
++                let credential =
++                    if entry.authentication == WorkerNetworkAuthenticationSnapshot::Open {
++                        Vec::new()
++                    } else {
++                        passphrase.as_bytes().to_vec()
++                    };
++                actions.push(LiveDeviceAction::NetworkJoin(WorkerNetworkJoinRequest {
++                    connection_id,
++                    scan_generation: scan.scan_generation,
++                    bssid: entry.bssid,
++                    passphrase: credential,
++                }));
++                erase_secret_text(passphrase);
++            }
++        });
++    }
++}
++
+ #[cfg(target_arch = "wasm32")]
+ fn erase_secret_text(secret: &mut String) {
+     let zeros = "\0".repeat(secret.len());
