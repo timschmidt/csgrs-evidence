@@ -1,0 +1,749 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 148f5fa8d..fadbacb04 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2476,6 +2476,7 @@ name = "hyperbrep"
+ version = "0.2.0"
+ dependencies = [
+  "hypercurve",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
+diff --git a/crates/hyperbrep/Cargo.toml b/crates/hyperbrep/Cargo.toml
+index 741601ee6..a51fda11b 100644
+--- a/crates/hyperbrep/Cargo.toml
++++ b/crates/hyperbrep/Cargo.toml
+@@ -13,8 +13,10 @@ categories = ["mathematics", "graphics", "data-structures"]
+ [features]
+ default = []
+ tessellation = ["dep:hypertri"]
++interval-ranges = ["dep:hyperinterval", "hyperlattice/interval-dyadic", "hypersolve/interval-lattice"]
+ 
+ [dependencies]
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["hyperreal"], optional = true }
+ hypercurve = { version = "0.4.0", path = "../hypercurve", features = ["svg"] }
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice" }
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit" }
+diff --git a/crates/hyperbrep/src/geometry.rs b/crates/hyperbrep/src/geometry.rs
+index 1ac59d9d1..251870f26 100644
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -26,6 +26,8 @@ mod curve_revolution;
+ mod curve_tensor_image;
+ mod cylinder_atlas;
+ mod implicit_tensor;
++#[cfg(feature = "interval-ranges")]
++pub mod interval_ranges;
+ mod line_tensor;
+ mod location;
+ mod parameter_components;
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges.rs b/crates/hyperbrep/src/geometry/interval_ranges.rs
+new file mode 100644
+index 000000000..a99baf862
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges.rs
+@@ -0,0 +1,304 @@
++//! Native tensor-surface ranges with retained chart and derivative evidence.
++use std::{fmt, sync::OnceLock};
++
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hyperlattice::{Aabb, BoxN, IntervalLatticeError, Point2, Point3, Real};
++use hypersolve::{
++    SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionError, ExpressionProgram, JacobianProgram,
++        RegularJacobianEnclosure,
++    },
++};
++
++use super::{
++    RationalBezierSurface, Surface, SurfaceGeometry, SurfaceKind, surface_point,
++    validate_surface_parameter,
++};
++use crate::GeometryError;
++
++/// Original native, graph or interval diagnostic from a surface-range query.
++#[derive(Debug)]
++pub enum SurfaceRangeError {
++    /// This native surface family has no adapter in this implementation.
++    UnsupportedSurface(SurfaceKind),
++    /// Original native chart or geometry diagnostic.
++    Geometry(GeometryError),
++    /// Original expression, differentiation or graph-resource diagnostic.
++    Expression(ExpressionError),
++    /// Original interval arithmetic, precision or work diagnostic.
++    Interval(IntervalError),
++    /// Original Cartesian interval construction diagnostic.
++    Lattice(IntervalLatticeError),
++}
++impl fmt::Display for SurfaceRangeError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "surface range: {self:?}")
++    }
++}
++impl std::error::Error for SurfaceRangeError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::UnsupportedSurface(_) => None,
++            Self::Geometry(error) => Some(error),
++            Self::Expression(error) => Some(error),
++            Self::Interval(error) => Some(error),
++            Self::Lattice(error) => Some(error),
++        }
++    }
++}
++impl From<GeometryError> for SurfaceRangeError {
++    fn from(error: GeometryError) -> Self {
++        Self::Geometry(error)
++    }
++}
++impl From<ExpressionError> for SurfaceRangeError {
++    fn from(error: ExpressionError) -> Self {
++        Self::Expression(error)
++    }
++}
++impl From<IntervalError> for SurfaceRangeError {
++    fn from(error: IntervalError) -> Self {
++        Self::Interval(error)
++    }
++}
++impl From<IntervalLatticeError> for SurfaceRangeError {
++    fn from(error: IntervalLatticeError) -> Self {
++        Self::Lattice(error)
++    }
++}
++
++/// Native exact source with a reusable coordinate and two-partial program.
++/// This is a prepared definition, not a range or regularity certificate.
++#[derive(Clone, Debug)]
++pub struct PreparedRationalBezierSurfaceRanges {
++    source: Surface,
++    jacobian: JacobianProgram,
++}
++
++/// Source-bound coordinate and local UV-partial enclosures on a retained box.
++///
++/// C1 evidence does not imply full rank, an injective chart or valid face/solid
++/// topology. The box bounds the supporting surface image, not trimmed-face
++/// membership. Empty Cartesian domains yield empty numerical ranges.
++#[derive(Clone, Debug)]
++pub struct SurfaceRangeEnclosure {
++    source: Surface,
++    parameters: BoxN<DyadicInterval, 2>,
++    evidence: RegularJacobianEnclosure,
++}
++
++/// Existing spatial Aabb with borrowed evidence for its outward bounds.
++/// Non-overlap is sufficient exclusion; overlap is not incidence evidence.
++#[derive(Debug)]
++pub struct SurfaceRangeBox<'a> {
++    evidence: &'a SurfaceRangeEnclosure,
++    bounds: Option<Aabb>,
++}
++impl SurfaceRangeBox<'_> {
++    /// Source, selected parameter box and coordinate/partial evidence.
++    pub fn evidence(&self) -> &SurfaceRangeEnclosure {
++        self.evidence
++    }
++    /// Exact outward native box, or None for an empty parameter set.
++    pub fn bounds(&self) -> Option<&Aabb> {
++        self.bounds.as_ref()
++    }
++}
++
++/// Prepare range queries for an admitted native rational Bézier tensor surface.
++///
++/// Existing native coefficient conversion and the Hypersolve graph compiler
++/// retain exact coefficients and the original denominator guard. The source's
++/// homogeneous-control cache is never populated by this operation: a cold source
++/// uses an owned temporary native carrier; an existing cache may be borrowed.
++/// Other families return an explicit unsupported-representation diagnostic.
++///
++/// For U columns, V rows and N=U*V, graph limits check 64*N preparation slots and
++/// reserve 32*N*(U*U+V*V+1) structural conversion units before native conversion.
++/// Graph emission, validation, differentiation and publication are also charged.
++/// These conservative structural reservations are not scalar-operation or heap
++/// bounds. Scalar refinement, coefficient growth, payload cloning/destruction and
++/// total memory remain excluded. Cancellation cannot interrupt native conversion
++/// or scalar work; it is checked around conversion and before publication.
++pub fn prepare_rational_bezier_surface_ranges(
++    source: &Surface,
++    graph: &mut ExpressionBudget,
++) -> Result<PreparedRationalBezierSurfaceRanges, SurfaceRangeError> {
++    graph.charge(0)?;
++    let SurfaceGeometry::RationalBezier(surface) = &source.data.geometry else {
++        return Err(SurfaceRangeError::UnsupportedSurface(source.kind()));
++    };
++    let v = surface.control_points.len();
++    let u = surface.control_points[0].len();
++    let n = u.checked_mul(v).ok_or(ExpressionError::SizeExhausted)?;
++    let entries = n.checked_mul(64).ok_or(ExpressionError::SizeExhausted)?;
++    graph.check_entries(&[entries, 2])?;
++    let axes = u
++        .checked_mul(u)
++        .and_then(|a| v.checked_mul(v).and_then(|b| a.checked_add(b)))
++        .and_then(|x| x.checked_add(1))
++        .ok_or(ExpressionError::SizeExhausted)?;
++    let work = n
++        .checked_mul(axes)
++        .and_then(|x| x.checked_mul(32))
++        .ok_or(ExpressionError::SizeExhausted)?;
++    graph.charge(work)?;
++    let temporary = surface
++        .homogeneous_controls
++        .get()
++        .is_none()
++        .then(|| RationalBezierSurface {
++            control_points: surface.control_points.clone(),
++            weights: surface.weights.clone(),
++            homogeneous_controls: OnceLock::new(),
++        });
++    let [x, y, z, weight] =
++        surface_point::tensor_coefficients(temporary.as_ref().unwrap_or(surface));
++    graph.charge(0)?;
++    let variables = [SymbolId(0), SymbolId(1)];
++    let program =
++        ExpressionProgram::from_bivariate_quotients(&[x, y, z], &weight, variables, graph)?;
++    let jacobian = program.jacobian(&variables, graph)?;
++    graph.charge(1)?;
++    let result = PreparedRationalBezierSurfaceRanges {
++        source: source.clone(),
++        jacobian,
++    };
++    graph.charge(0)?;
++    Ok(result)
++}
++
++impl PreparedRationalBezierSurfaceRanges {
++    /// Original immutable native surface and UV chart.
++    pub fn source(&self) -> &Surface {
++        &self.source
++    }
++    /// Shared source-coordinate and derivative association.
++    pub fn program(&self) -> &JacobianProgram {
++        &self.jacobian
++    }
++
++    /// Certify coordinates and both local partials over the complete UV box.
++    ///
++    /// Native strict chart comparisons validate finite box endpoints without
++    /// materializing the source domain's selected endpoints. Original predicate
++    /// failures and active native work scopes are preserved. A denominator range
++    /// containing zero refuses certification; it does not prove a pole. Precision
++    /// selects an enclosure grid, not a final-width guarantee. Empty queries are
++    /// successful empty ranges of this already-prepared valid source.
++    pub fn enclose(
++        &self,
++        parameters: &BoxN<DyadicInterval, 2>,
++        precision: i32,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SurfaceRangeEnclosure, SurfaceRangeError> {
++        graph.charge(0)?;
++        let empty = [DyadicInterval::empty(), DyadicInterval::empty()];
++        let arguments = parameters.lanes().unwrap_or(&empty);
++        if let Some([u, v]) = parameters.lanes() {
++            graph.charge(2)?;
++            let [(u_min, u_max), (v_min, v_max)] =
++                [u.to_rational(arithmetic)?, v.to_rational(arithmetic)?]
++                    .map(|q| q.into_bounds().expect("nonempty Cartesian parameter lane"));
++            crate::context::strict(|| {
++                validate_surface_parameter(
++                    self.source.domain(),
++                    &Point2::new(Real::new(u_min), Real::new(v_min)),
++                )?;
++                validate_surface_parameter(
++                    self.source.domain(),
++                    &Point2::new(Real::new(u_max), Real::new(v_max)),
++                )
++            })?;
++        }
++        let evidence = self
++            .jacobian
++            .enclose_regular(arguments, precision, graph, arithmetic)?;
++        graph.charge(2)?;
++        let parameters = BoxN::new([
++            evidence.arguments()[0].checked_pow(1, arithmetic)?,
++            evidence.arguments()[1].checked_pow(1, arithmetic)?,
++        ])?;
++        graph.charge(1)?;
++        let report = SurfaceRangeEnclosure {
++            source: self.source.clone(),
++            parameters,
++            evidence,
++        };
++        graph.charge(0)?;
++        Ok(report)
++    }
++}
++
++impl SurfaceRangeEnclosure {
++    /// Original exact surface; enclosures do not replace its geometry.
++    pub fn source(&self) -> &Surface {
++        &self.source
++    }
++    /// Canonical Cartesian parameter domain in original u,v order.
++    pub fn parameters(&self) -> &BoxN<DyadicInterval, 2> {
++        &self.parameters
++    }
++    /// Coordinate enclosures in x,y,z order.
++    pub fn coordinates(&self) -> [&DyadicInterval; 3] {
++        std::array::from_fn(|i| &self.evidence.values()[i])
++    }
++    /// Local partials: first u, then v; each vector is in x,y,z order.
++    pub fn partials(&self) -> [[&DyadicInterval; 3]; 2] {
++        std::array::from_fn(|axis| {
++            std::array::from_fn(|coordinate| {
++                &self.evidence.values()[self
++                    .evidence
++                    .program()
++                    .partial_output(coordinate, axis)
++                    .expect("prepared three-output two-parameter Jacobian")]
++            })
++        })
++    }
++    /// Original source-domain regularity and derivative evidence.
++    pub fn evidence(&self) -> &RegularJacobianEnclosure {
++        &self.evidence
++    }
++
++    /// Convert outward endpoints exactly for the existing spatial broad phase.
++    ///
++    /// Ordered dyadic bounds justify native Aabb endpoint ordering. Empty sets
++    /// have no finite box. Conversions share the supplied budgets; exact scalar
++    /// payload construction retains the documented resource exclusions.
++    pub fn native_bounds(
++        &self,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SurfaceRangeBox<'_>, SurfaceRangeError> {
++        graph.charge(0)?;
++        graph.check_entries(&[6])?;
++        graph.charge(1)?;
++        let bounds = if self.parameters.is_empty() {
++            None
++        } else {
++            graph.charge(3)?;
++            let [x, y, z] = self.coordinates();
++            let [(x_min, x_max), (y_min, y_max), (z_min, z_max)] = [
++                x.to_rational(arithmetic)?,
++                y.to_rational(arithmetic)?,
++                z.to_rational(arithmetic)?,
++            ]
++            .map(|q| {
++                q.into_bounds()
++                    .expect("nonempty regular coordinate enclosure")
++            });
++            graph.charge(6)?;
++            Some(Aabb::new(
++                Point3::new(Real::new(x_min), Real::new(y_min), Real::new(z_min)),
++                Point3::new(Real::new(x_max), Real::new(y_max), Real::new(z_max)),
++            ))
++        };
++        graph.charge(0)?;
++        Ok(SurfaceRangeBox {
++            evidence: self,
++            bounds,
++        })
++    }
++}
+diff --git a/crates/hyperbrep/src/lib.rs b/crates/hyperbrep/src/lib.rs
+index b4f4fc22b..5ace18993 100644
+--- a/crates/hyperbrep/src/lib.rs
++++ b/crates/hyperbrep/src/lib.rs
+@@ -17,6 +17,8 @@ mod cache;
+ mod context;
+ mod error;
+ mod geometry;
++#[cfg(feature = "interval-ranges")]
++pub use geometry::interval_ranges;
+ mod parameter;
+ mod persistence;
+ mod topology;
+diff --git a/crates/hyperbrep/tests/interval_ranges.rs b/crates/hyperbrep/tests/interval_ranges.rs
+new file mode 100644
+index 000000000..308910fba
+--- /dev/null
++++ b/crates/hyperbrep/tests/interval_ranges.rs
+@@ -0,0 +1,69 @@
++#![cfg(feature = "interval-ranges")]
++
++use hyperbrep::{Point3, Surface, interval_ranges::prepare_rational_bezier_surface_ranges};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::BoxN;
++use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy, ordered_aabb3s_intersect};
++use hypersolve::expression_program::ExpressionBudget;
++
++fn d(lower: i64, upper: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(lower.into(), upper.into(), exponent).unwrap()
++}
++
++#[test]
++fn native_asymmetric_patch_ranges_feed_certified_spatial_exclusion() {
++    // Rows increase v, columns increase u: S(u,v) = (u, 2v, uv).
++    let surface = Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(1.into(), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 2.into(), 0.into()),
++                Point3::new(1.into(), 2.into(), 1.into()),
++            ],
++        ],
++        vec![vec![1.into(), 1.into()]; 2],
++    )
++    .unwrap();
++    let mut graph = ExpressionBudget::new(1_000_000, 100_000_000);
++    let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000_000);
++    let prepared = prepare_rational_bezier_surface_ranges(&surface, &mut graph).unwrap();
++    let domain = BoxN::new([d(1, 2, -2), d(2, 3, -2)]).unwrap();
++    let report = prepared
++        .enclose(&domain, -64, &mut graph, &mut arithmetic)
++        .unwrap();
++    assert_eq!(report.parameters(), &domain);
++    assert_eq!(
++        report.coordinates(),
++        [&d(1, 2, -2), &d(2, 3, -1), &d(1, 3, -3)]
++    );
++    assert_eq!(
++        report.partials()[0],
++        [&d(1, 1, 0), &d(0, 0, 0), &d(2, 3, -2)]
++    );
++    assert_eq!(
++        report.partials()[1],
++        [&d(0, 0, 0), &d(2, 2, 0), &d(1, 2, -2)]
++    );
++    let projected = report.native_bounds(&mut graph, &mut arithmetic).unwrap();
++    assert!(std::ptr::eq(projected.evidence(), &report));
++    let bounds = projected.bounds().unwrap();
++    for policy in [PredicatePolicy::STRICT, PredicatePolicy::APPROXIMATE_512] {
++        assert!(matches!(
++            ordered_aabb3s_intersect(
++                &bounds.mins,
++                &bounds.maxs,
++                &Point3::new(2.into(), 2.into(), 2.into()),
++                &Point3::new(3.into(), 3.into(), 3.into()),
++                policy,
++            ),
++            PredicateOutcome::Decided {
++                value: false,
++                certainty: Certainty::Exact,
++                ..
++            }
++        ));
++    }
++}
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 2dfa68529..7ccc3f025 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -27,6 +27,7 @@ mod affine;
+ pub use affine::{AffineParameterization, AffineProgram};
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
++mod bivariate;
+ 
+ /// An operation on two expressions, preserving left-to-right evaluation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/hypersolve/src/expression_program/bivariate.rs b/crates/hypersolve/src/expression_program/bivariate.rs
+new file mode 100644
+index 000000000..90ef0b0d1
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/bivariate.rs
+@@ -0,0 +1,117 @@
++//! Native coefficient grids compiled through the shared expression builder.
++use super::{
++    BinaryOperation, ExpressionBudget, ExpressionDefinition, ExpressionError, ExpressionNode,
++    ExpressionProgram, jacobian::Builder,
++};
++use crate::{BivariatePolynomial, SymbolId, SymbolRef};
++use hyperreal::Real;
++
++impl ExpressionProgram {
++    /// Compile ordered bivariate numerators over one shared denominator.
++    ///
++    /// The binding order is the polynomial's first axis, then its second axis.
++    /// Coefficient rows may be ragged; empty rows and grids are zero. Exact
++    /// coefficients and explicit division guards are retained, including for a
++    /// zero numerator. No cancellation, sign test or scalar demotion is applied.
++    /// This constructs a definition, not evidence that the denominator is nonzero
++    /// on any domain. Evaluation and regularity certification remain separate.
++    ///
++    /// Graph limits charge visited rows, emitted nodes, binding/output records
++    /// and validation. Entry checks precede graph allocation; scalar payload
++    /// cloning/destruction, arithmetic, coefficient growth and total heap bytes
++    /// retain the expression budget's exclusions. Cancellation is checked during
++    /// construction and before publication. Failure stores no global state.
++    pub fn from_bivariate_quotients(
++        numerators: &[BivariatePolynomial],
++        denominator: &BivariatePolynomial,
++        variables: [SymbolId; 2],
++        budget: &mut ExpressionBudget,
++    ) -> Result<Self, ExpressionError> {
++        budget.charge(0)?;
++        budget.check_entries(&[2, 2, numerators.len()])?;
++        budget.charge(2)?;
++        if variables[0] == variables[1] {
++            return Err(ExpressionError::DuplicateVariable(variables[0]));
++        }
++        let mut builder = Builder {
++            definition: ExpressionDefinition {
++                variables: variables.to_vec(),
++                nodes: Vec::new(),
++                outputs: Vec::new(),
++            },
++            outputs: numerators.len(),
++            budget,
++        };
++        let u = builder.push(ExpressionNode::Variable(SymbolRef::new(variables[0], None)))?;
++        let v = builder.push(ExpressionNode::Variable(SymbolRef::new(variables[1], None)))?;
++        let weight = append_bivariate(&mut builder, denominator, [u, v])?;
++        for numerator in numerators {
++            let numerator = append_bivariate(&mut builder, numerator, [u, v])?;
++            let quotient = builder.push(ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                left: numerator,
++                right: weight,
++            })?;
++            builder.budget.charge(1)?;
++            builder.definition.outputs.push(quotient);
++        }
++        let program = Self::from_definition(builder.definition, builder.budget)?;
++        budget.charge(0)?;
++        Ok(program)
++    }
++}
++
++fn append_bivariate(
++    builder: &mut Builder<'_>,
++    polynomial: &BivariatePolynomial,
++    [u, v]: [usize; 2],
++) -> Result<usize, ExpressionError> {
++    let mut outer = None;
++    for row in polynomial.coefficients.iter().rev() {
++        builder.budget.charge(1)?;
++        let mut inner = None;
++        for coefficient in row.iter().rev() {
++            let product = inner
++                .map(|left| {
++                    builder.push(ExpressionNode::Binary {
++                        operation: BinaryOperation::Mul,
++                        left,
++                        right: v,
++                    })
++                })
++                .transpose()?;
++            let constant = builder.push(ExpressionNode::Constant(coefficient.clone()))?;
++            inner = Some(match product {
++                None => constant,
++                Some(left) => builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Add,
++                    left,
++                    right: constant,
++                })?,
++            });
++        }
++        let value = match inner {
++            Some(value) => value,
++            None => builder.push(ExpressionNode::Constant(Real::zero()))?,
++        };
++        outer = Some(match outer {
++            None => value,
++            Some(left) => {
++                let product = builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Mul,
++                    left,
++                    right: u,
++                })?;
++                builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Add,
++                    left: product,
++                    right: value,
++                })?
++            }
++        });
++    }
++    match outer {
++        Some(value) => Ok(value),
++        None => builder.push(ExpressionNode::Constant(Real::zero())),
++    }
++}
+diff --git a/crates/hypersolve/tests/bivariate_expression.rs b/crates/hypersolve/tests/bivariate_expression.rs
+new file mode 100644
+index 000000000..4228ec9e9
+--- /dev/null
++++ b/crates/hypersolve/tests/bivariate_expression.rs
+@@ -0,0 +1,170 @@
++#![cfg(feature = "expression-program")]
++
++use hyperreal::Real;
++use hypersolve::{
++    BivariatePolynomial, SymbolId,
++    expression_program::{
++        BinaryOperation, ExpressionBudget, ExpressionError, ExpressionNode, ExpressionProgram,
++    },
++    work_budget::CancellationToken,
++};
++
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 1_000_000)
++}
++
++#[test]
++fn empty_ragged_polynomials_keep_shared_original_denominator_guards() {
++    let zero = BivariatePolynomial::new(Vec::new());
++    let ragged = BivariatePolynomial::new(vec![vec![], vec![], vec![5.into()]]);
++    // W=v, so the second output is 5u²/v and the first remains 0/v.
++    let w = BivariatePolynomial::new(vec![vec![0.into(), 1.into()]]);
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[zero, ragged],
++        &w,
++        [SymbolId(0), SymbolId(1)],
++        &mut budget(),
++    )
++    .unwrap();
++    assert_eq!(
++        program
++            .eval_real(&[2.into(), 4.into()], &mut budget())
++            .unwrap(),
++        vec![Real::from(0), Real::from(5)]
++    );
++    let divisors: Vec<_> = program
++        .definition()
++        .outputs
++        .iter()
++        .map(|&output| {
++            let ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                right,
++                ..
++            } = program.definition().nodes[output]
++            else {
++                panic!("each output keeps its division guard")
++            };
++            right
++        })
++        .collect();
++    assert_eq!(divisors[0], divisors[1]);
++    let error = program
++        .eval_real(&[2.into(), 0.into()], &mut budget())
++        .unwrap_err();
++    assert!(matches!(error, ExpressionError::Scalar { .. }));
++    assert!(std::error::Error::source(&error).is_some());
++    let replay =
++        ExpressionProgram::from_definition(program.definition().clone(), &mut budget()).unwrap();
++    assert_eq!(replay.definition(), program.definition());
++    assert!(matches!(
++        replay.eval_real(&[2.into(), 0.into()], &mut budget()),
++        Err(ExpressionError::Scalar { .. })
++    ));
++}
++
++#[test]
++fn construction_budget_boundaries_cancellation_and_retry_are_explicit() {
++    let p = BivariatePolynomial::new(vec![vec![1.into(), 2.into()], vec![3.into()]]);
++    let w = BivariatePolynomial::new(vec![vec![1.into()]]);
++    let build = |budget: &mut ExpressionBudget| {
++        ExpressionProgram::from_bivariate_quotients(
++            std::slice::from_ref(&p),
++            &w,
++            [SymbolId(0), SymbolId(1)],
++            budget,
++        )
++    };
++    let mut ample = budget();
++    let program = build(&mut ample).unwrap();
++    let work = 1_000_000 - ample.remaining_work();
++    assert!(work > 0);
++    for limit in 0..work {
++        assert!(
++            matches!(
++                build(&mut ExpressionBudget::new(100_000, limit)),
++                Err(ExpressionError::WorkExhausted)
++            ),
++            "work limit {limit}"
++        );
++    }
++    assert_eq!(
++        build(&mut ExpressionBudget::new(100_000, work))
++            .unwrap()
++            .definition(),
++        program.definition()
++    );
++    let definition = program.definition();
++    let entries = definition.variables.len() + definition.nodes.len() + definition.outputs.len();
++    for limit in 0..entries {
++        assert!(
++            matches!(
++                build(&mut ExpressionBudget::new(limit, 1_000_000)),
++                Err(ExpressionError::SizeExhausted)
++            ),
++            "entry limit {limit}"
++        );
++    }
++    assert_eq!(
++        build(&mut ExpressionBudget::new(entries, work))
++            .unwrap()
++            .definition(),
++        definition
++    );
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        build(&mut cancelled),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert_eq!(cancelled.remaining_work(), 1_000_000);
++    assert_eq!(build(&mut budget()).unwrap().definition(), definition);
++    assert!(matches!(
++        ExpressionProgram::from_bivariate_quotients(&[], &w, [SymbolId(9); 2], &mut budget()),
++        Err(ExpressionError::DuplicateVariable(SymbolId(9)))
++    ));
++}
++
++#[test]
++fn bivariate_quotients_preserve_axis_order_and_independent_derivatives() {
++    // P(u,v) = 1 + 2v + 3u + 4u²v; W(u,v) = 1 + u.
++    // The ragged middle row and asymmetric coefficients expose transposition.
++    let p = BivariatePolynomial::new(vec![
++        vec![1.into(), 2.into()],
++        vec![3.into()],
++        vec![0.into(), 4.into()],
++    ]);
++    let w = BivariatePolynomial::new(vec![vec![1.into()], vec![1.into()]]);
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[p],
++        &w,
++        [SymbolId(7), SymbolId(2)],
++        &mut budget(),
++    )
++    .unwrap();
++    // P(1,2)=16, W=2. P_u=19, P_v=6, so Q_u=11/2, Q_v=3.
++    assert_eq!(
++        program
++            .eval_real(&[1.into(), 2.into()], &mut budget())
++            .unwrap(),
++        vec![Real::from(8)]
++    );
++    let jacobian = program
++        .jacobian(&[SymbolId(7), SymbolId(2)], &mut budget())
++        .unwrap();
++    let values = jacobian
++        .program()
++        .eval_real(&[1.into(), 2.into()], &mut budget())
++        .unwrap();
++    assert_eq!(values[0], Real::from(8));
++    assert_eq!(
++        values[jacobian.partial_output(0, 0).unwrap()],
++        (Real::from(11) / Real::from(2)).unwrap()
++    );
++    assert_eq!(
++        values[jacobian.partial_output(0, 1).unwrap()],
++        Real::from(3)
++    );
++}

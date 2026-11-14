@@ -1,0 +1,2538 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 148f5fa8d..fadbacb04 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2476,6 +2476,7 @@ name = "hyperbrep"
+ version = "0.2.0"
+ dependencies = [
+  "hypercurve",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
+diff --git a/crates/hyperbrep/Cargo.toml b/crates/hyperbrep/Cargo.toml
+index 741601ee6..e80b5d04f 100644
+--- a/crates/hyperbrep/Cargo.toml
++++ b/crates/hyperbrep/Cargo.toml
+@@ -10,11 +10,17 @@ readme = "README.md"
+ keywords = ["brep", "cad", "geometry", "exact", "topology"]
+ categories = ["mathematics", "graphics", "data-structures"]
+ 
++[package.metadata.docs.rs]
++all-features = true
++
+ [features]
+ default = []
+ tessellation = ["dep:hypertri"]
++interval-ranges = ["dep:hyperinterval", "hyperlattice/interval-dyadic", "hypersolve/interval-lattice"]
++dispatch-trace = ["hypercurve/dispatch-trace", "hypersolve/dispatch-trace"]
+ 
+ [dependencies]
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["hyperreal"], optional = true }
+ hypercurve = { version = "0.4.0", path = "../hypercurve", features = ["svg"] }
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice" }
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit" }
+@@ -29,6 +35,15 @@ stacker = "0.1.25"
+ [dev-dependencies]
+ proptest = "1.7.0"
+ 
++[[example]]
++name = "surface_ranges"
++required-features = ["interval-ranges"]
++
++[[bench]]
++name = "surface_ranges"
++harness = false
++required-features = ["interval-ranges"]
++
+ [[bench]]
+ name = "kernel"
+ harness = false
+diff --git a/crates/hyperbrep/PERFORMANCE.md b/crates/hyperbrep/PERFORMANCE.md
+index 75ad3cf14..17dd424cc 100644
+--- a/crates/hyperbrep/PERFORMANCE.md
++++ b/crates/hyperbrep/PERFORMANCE.md
+@@ -1415,3 +1415,74 @@ The [admission](https://github.com/timschmidt/csgrs-evidence/blob/b20000e377626a
+ Three alternating pairs per cohort cover 79 preceding semantic-workflow groups in 48 processes, retaining their full assertions, iterations and outcomes. One capability-migrated control is recorded separately without time ratios. Time ratios range 0.950832–3.131993; 3 of 79 groups exceed the 10% review marker and 63 increase allocation calls or requested bytes. Twelve new complete acceptance groups have absolute costs from three processes. Every slower and adverse observation is retained. Archive-version migration changes serialization work; these are the same complete semantic workflows, not identical encoded bytes. Candidate includes upstream dbe99e3cc and cannot isolate the feature effect. This finite shared-host comparison does not rerun the historical 192-case catalogue or establish a general speedup, significance or an internal resource bound.
+ 
+ [Complete costs](https://github.com/timschmidt/csgrs-evidence/blob/b20000e377626a41b6ff8e6f87aee2b20ebd7865/crates/hyperbrep/docs/evidence/2026-10-18-selected-procedural-profiles/costs.md) and [resource observations](https://github.com/timschmidt/csgrs-evidence/blob/b20000e377626a41b6ff8e6f87aee2b20ebd7865/crates/hyperbrep/docs/evidence/2026-10-18-selected-procedural-profiles/resource-review.json) retain every adverse result. The capability-migrated control has no ratio. Earlier adverse obligations and whole-operation resource gates remain open.
++## Native surface interval ranges
++
++The opt-in [surface range adapter](docs/SURFACE_INTERVAL_RANGES.md) has a
++measured sixteen-cell workload at source
++`2d2fc538b7cc8b3b76555878cf34064e4f4ee072`. The
++[checked-in benchmark](benches/surface_ranges.rs) compares preparing each cell
++independently with preparing one shared program inside each portfolio. Both
++paths retain all three coordinate and six partial enclosures, original source
++and domain evidence, native spatial exclusion, and output destruction. Exact
++analytic extrema and full output agreement are checked before ordinary timing.
++This compares two uses of the new API; it is not a comparison with the previous
++native surface or Boolean kernel.
++
++Measurements used Rust 1.95.0 release builds on an Intel Xeon E5-2680 v2,
++pinned to CPU 8, with no concurrent compiler/test workers. Warm measurements
++discard two samples and retain thirty alternating pairs of sixteen portfolios.
++Cold measurements retain thirty alternating fresh-process pairs, each with one
++portfolio. Original surface construction is excluded in both. Cold time sums
++query/materialization and destruction spans, with the independent oracle between
++them outside timing; cold refers to the process scalar-cache lifecycle, not OS
++or machine cache state. Ratios below are paired geometric speedups with 95%
++percentile bootstrap intervals (10,000 resamples, seed 20261114).
++
++| Source over [0,1]² | Warm independent/shared mean ms | Warm speedup | Cold speedup |
++| --- | --- | --- | --- |
++| (u,2v,uv) | 3.051 / 1.774 | 1.720 [1.710,1.727] | 1.815 [1.786,1.848] |
++| (u/(1+u),v,0) | 2.989 / 1.808 | 1.653 [1.652,1.654] | 1.712 [1.700,1.723] |
++| (u,v,u^8 v^3), degree 8×3 | 15.859 / 4.809 | 3.297 [3.296,3.299] | 3.298 [3.277,3.316] |
++
++Each workload completes all sixteen cells with certified C1 ranges and exact
++native exclusion. Graph limits are 1,000,000 entries and 1,000,000,000 work
++units; dyadic limits are 16,384 bits and 1,000,000,000,000 work units. Structural
++work units are not total CPU, coefficient-growth or heap bounds.
++
++Five identical warmed allocation observations per row use a separate executable
++with the same workload helper, dependency versions, features, profiles and
++compiler flags. Ownership headers distinguish measured allocations from earlier
++ones. Bytes count requested payload, excluding allocator overhead and RSS.
++
++| Source / preparation | Graph work | Dyadic work | Allocation + reallocation calls | Requested bytes | Peak live bytes | Output live bytes |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| Polynomial / independent | 53,936 | 5,589,900 | 35,998 | 1,869,560 | 229,784 | 221,256 |
++| Polynomial / shared | 15,731 | 5,589,900 | 19,213 | 481,325 | 50,384 | 41,856 |
++| Rational / independent | 53,936 | 7,466,146 | 37,828 | 1,920,344 | 229,392 | 220,864 |
++| Rational / shared | 15,731 | 7,466,146 | 21,043 | 532,109 | 49,992 | 41,464 |
++| Degree 8×3 / independent | 2,077,424 | 14,459,784 | 208,702 | 15,268,088 | 1,576,616 | 1,515,544 |
++| Degree 8×3 / shared | 217,079 | 14,459,784 | 43,552 | 2,415,413 | 183,776 | 122,704 |
++
++All warmed rows return tracked live storage to zero after destruction. Cold
++observations retain 888 bytes for polynomial and 584 bytes for rational sources
++after both source and output destruction. Degree 8×3 retains 20,032 bytes in
++independent mode and initially 15,632 in shared mode. A separate 32-query
++fresh-source diagnostic finds the first three values stable; shared degree 8×3
++grows through 18,936 and 19,760 to 20,032 bytes on its fourth query, then remains
++there. These observations are consistent with existing process-global small
++rational caches; they do not establish exact allocation attribution, leak
++freedom or a uniform retention bound.
++
++The benchmark executable is 18,147,672 bytes (text 14,633,175; data 341,832;
++bss 1,760); the allocation probe is 18,166,848 bytes. These distinct harnesses
++are absolute size observations, not an API binary-growth comparison.
++
++For raw warm/cold samples, allocation observations, retained-state diagnostics,
++build equivalence and original adverse attempts, consult the source-specific
++[interval refactor progress](../../INTERVAL_REFACTOR_PROGRESS.md). Full Rust 1.95
++owner/downstream release tests, strict lint/docs, stable compilation and WASM
++library checks pass. Nine archives and the unchanged native example are verified;
++the archived example also executes through a test-only WASM export. Packaged
++documentation exposes every feature after a metadata-only followup. These checks
++do not establish arbitrary-degree performance, general surface operation closure,
++public JS binding support, hosted execution or the full coordinated release.
+diff --git a/crates/hyperbrep/README.md b/crates/hyperbrep/README.md
+index b932bf63b..38cd16577 100644
+--- a/crates/hyperbrep/README.md
++++ b/crates/hyperbrep/README.md
+@@ -54,6 +54,12 @@ let exact_volume = bodies.bodies().next().expect("one cuboid").volume()?;
+ 
+ ## Current boundary
+ 
++The optional `interval-ranges` feature prepares native rational Bézier surfaces
++for source-bound coordinate and UV-partial enclosures over parameter boxes.
++Run `cargo run -p hyperbrep --features interval-ranges --example surface_ranges`.
++The [range-query contract](docs/SURFACE_INTERVAL_RANGES.md) explains evidence,
++resource limits and native spatial exclusion.
++
+ The [support matrix](docs/SUPPORT_MATRIX.md) describes completed native workflows
+ and explicit blockers. The [implementation ledger](docs/IMPLEMENTATION_STATUS.json)
+ records the same work; constructor or carrier inventories do not prove closure.
+diff --git a/crates/hyperbrep/benches/support/surface_ranges.rs b/crates/hyperbrep/benches/support/surface_ranges.rs
+new file mode 100644
+index 000000000..03532434c
+--- /dev/null
++++ b/crates/hyperbrep/benches/support/surface_ranges.rs
+@@ -0,0 +1,198 @@
++//! Shared complete workload for timing and external allocation observation.
++use hyperbrep::{
++    Point3, Surface,
++    interval_ranges::{SurfaceRangeEnclosure, prepare_rational_bezier_surface_ranges},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::BoxN;
++use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy, ordered_aabb3s_intersect};
++use hyperreal::{Rational, Real};
++use hypersolve::expression_program::ExpressionBudget;
++
++pub const GRAPH_WORK: usize = 1_000_000_000;
++pub const INTERVAL_WORK: u64 = 1_000_000_000_000;
++pub fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, GRAPH_WORK)
++}
++pub fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, INTERVAL_WORK)
++}
++
++pub fn source(case: usize) -> Surface {
++    match case {
++        0 => Surface::rational_bezier(
++            vec![
++                vec![
++                    Point3::new(0.into(), 0.into(), 0.into()),
++                    Point3::new(1.into(), 0.into(), 0.into()),
++                ],
++                vec![
++                    Point3::new(0.into(), 2.into(), 0.into()),
++                    Point3::new(1.into(), 2.into(), 1.into()),
++                ],
++            ],
++            vec![vec![1.into(); 2]; 2],
++        )
++        .unwrap(),
++        1 => Surface::rational_bezier(
++            vec![
++                vec![
++                    Point3::new(0.into(), 0.into(), 0.into()),
++                    Point3::new((Real::one() / Real::from(2)).unwrap(), 0.into(), 0.into()),
++                ],
++                vec![
++                    Point3::new(0.into(), 1.into(), 0.into()),
++                    Point3::new((Real::one() / Real::from(2)).unwrap(), 1.into(), 0.into()),
++                ],
++            ],
++            vec![vec![1.into(), 2.into()]; 2],
++        )
++        .unwrap(),
++        2 => Surface::rational_bezier(
++            (0..=3)
++                .map(|j| {
++                    (0..=8)
++                        .map(|i| {
++                            Point3::new(
++                                (Real::from(i) / Real::from(8)).unwrap(),
++                                (Real::from(j) / Real::from(3)).unwrap(),
++                                i32::from(i == 8 && j == 3).into(),
++                            )
++                        })
++                        .collect()
++                })
++                .collect(),
++            vec![vec![1.into(); 9]; 4],
++        )
++        .unwrap(),
++        _ => panic!("unknown surface workload"),
++    }
++}
++
++pub fn complete(
++    source: &Surface,
++    shared: bool,
++    graph: &mut ExpressionBudget,
++    arithmetic: &mut DyadicBudget,
++) -> Vec<SurfaceRangeEnclosure> {
++    let prepared = shared.then(|| prepare_rational_bezier_surface_ranges(source, graph).unwrap());
++    let mut reports = Vec::new();
++    for u in 0..4 {
++        for v in 0..4 {
++            let parameters = BoxN::new([
++                DyadicInterval::new(u.into(), (u + 1).into(), -2).unwrap(),
++                DyadicInterval::new(v.into(), (v + 1).into(), -2).unwrap(),
++            ])
++            .unwrap();
++            let report = match &prepared {
++                Some(p) => p.enclose(&parameters, -32, graph, arithmetic).unwrap(),
++                None => prepare_rational_bezier_surface_ranges(source, graph)
++                    .unwrap()
++                    .enclose(&parameters, -32, graph, arithmetic)
++                    .unwrap(),
++            };
++            assert_eq!(report.parameters(), &parameters);
++            let projected = report.native_bounds(graph, arithmetic).unwrap();
++            assert!(std::ptr::eq(projected.evidence(), &report));
++            let bounds = projected.bounds().unwrap();
++            assert!(matches!(
++                ordered_aabb3s_intersect(
++                    &bounds.mins,
++                    &bounds.maxs,
++                    &Point3::new(4.into(), 4.into(), 4.into()),
++                    &Point3::new(5.into(), 5.into(), 5.into()),
++                    PredicatePolicy::STRICT
++                ),
++                PredicateOutcome::Decided {
++                    value: false,
++                    certainty: Certainty::Exact,
++                    ..
++                }
++            ));
++            reports.push(report);
++        }
++    }
++    reports
++}
++
++/// Independent extrema for these monotone formulas on nonnegative UV boxes.
++pub fn validate(case: usize, reports: &[SurfaceRangeEnclosure]) {
++    assert_eq!(reports.len(), 16);
++    let power = |x: &Rational, n: i32| x.clone().powi(n.into()).unwrap();
++    for (cell, report) in reports.iter().enumerate() {
++        let cell = i32::try_from(cell).unwrap();
++        let u0 = Rational::from(cell / 4) / Rational::from(4);
++        let u1 = Rational::from(cell / 4 + 1) / Rational::from(4);
++        let v0 = Rational::from(cell % 4) / Rational::from(4);
++        let v1 = Rational::from(cell % 4 + 1) / Rational::from(4);
++        let expected = match case {
++            0 => vec![
++                (u0.clone(), u1.clone()),
++                (Rational::from(2) * &v0, Rational::from(2) * &v1),
++                (&u0 * &v0, &u1 * &v1),
++                (1.into(), 1.into()),
++                (0.into(), 0.into()),
++                (v0, v1),
++                (0.into(), 0.into()),
++                (2.into(), 2.into()),
++                (u0, u1),
++            ],
++            1 => vec![
++                (&u0 / (Rational::one() + &u0), &u1 / (Rational::one() + &u1)),
++                (v0, v1),
++                (0.into(), 0.into()),
++                (
++                    Rational::one() / power(&(Rational::one() + &u1), 2),
++                    Rational::one() / power(&(Rational::one() + &u0), 2),
++                ),
++                (0.into(), 0.into()),
++                (0.into(), 0.into()),
++                (0.into(), 0.into()),
++                (1.into(), 1.into()),
++                (0.into(), 0.into()),
++            ],
++            2 => vec![
++                (u0.clone(), u1.clone()),
++                (v0.clone(), v1.clone()),
++                (power(&u0, 8) * power(&v0, 3), power(&u1, 8) * power(&v1, 3)),
++                (1.into(), 1.into()),
++                (0.into(), 0.into()),
++                (
++                    Rational::from(8) * power(&u0, 7) * power(&v0, 3),
++                    Rational::from(8) * power(&u1, 7) * power(&v1, 3),
++                ),
++                (0.into(), 0.into()),
++                (1.into(), 1.into()),
++                (
++                    Rational::from(3) * power(&u0, 8) * power(&v0, 2),
++                    Rational::from(3) * power(&u1, 8) * power(&v1, 2),
++                ),
++            ],
++            _ => panic!("unknown surface workload"),
++        };
++        for (range, (lo, hi)) in report
++            .coordinates()
++            .into_iter()
++            .chain(report.partials().into_iter().flatten())
++            .zip(expected)
++        {
++            let range = range.to_rational(&mut arithmetic()).unwrap();
++            assert!(
++                range.contains_point(&lo) && range.contains_point(&hi),
++                "case {case}, cell {cell}, [{lo},{hi}] outside {range:?}"
++            );
++        }
++    }
++}
++
++pub fn compare(left: &[SurfaceRangeEnclosure], right: &[SurfaceRangeEnclosure]) {
++    assert_eq!(left.len(), right.len());
++    for (a, b) in left.iter().zip(right) {
++        assert_eq!(
++            a.evidence().program().program().definition(),
++            b.evidence().program().program().definition()
++        );
++        assert_eq!(a.parameters(), b.parameters());
++        assert_eq!(a.evidence().values(), b.evidence().values());
++    }
++}
+diff --git a/crates/hyperbrep/benches/surface_ranges.rs b/crates/hyperbrep/benches/surface_ranges.rs
+new file mode 100644
+index 000000000..9b172f9fa
+--- /dev/null
++++ b/crates/hyperbrep/benches/surface_ranges.rs
+@@ -0,0 +1,77 @@
++//! Repeated complete native surface-range queries with preparation included.
++#[path = "support/surface_ranges.rs"]
++mod workload;
++use std::{hint::black_box, time::Instant};
++use workload::{arithmetic, compare, complete, graph, source, validate};
++
++fn main() {
++    if let Ok(case) = std::env::var("SURFACE_RANGE_COLD_CASE") {
++        let case: usize = case.parse().unwrap();
++        let shared = match std::env::var("SURFACE_RANGE_COLD_SHARED").unwrap().as_str() {
++            "0" => false,
++            "1" => true,
++            _ => panic!("cold mode must be 0 or 1"),
++        };
++        let source = source(case);
++        let start = Instant::now();
++        let reports = complete(black_box(&source), shared, &mut graph(), &mut arithmetic());
++        let query_elapsed = start.elapsed();
++        // Independent oracle cost is excluded in both cold modes. Destruction
++        // remains measured; the two spans and intervening oracle are explicit.
++        validate(case, &reports);
++        let drop_start = Instant::now();
++        drop(black_box(reports));
++        let destruction_elapsed = drop_start.elapsed();
++        println!(
++            "cold case={case} shared={shared} query_ns={} destruction_ns={} total_ns={}",
++            query_elapsed.as_nanos(),
++            destruction_elapsed.as_nanos(),
++            (query_elapsed + destruction_elapsed).as_nanos()
++        );
++        return;
++    }
++    let iterations: u32 = std::env::var("SURFACE_RANGE_ITERATIONS")
++        .map(|s| s.parse().unwrap())
++        .unwrap_or(16);
++    let samples: u32 = std::env::var("SURFACE_RANGE_SAMPLES")
++        .map(|s| s.parse().unwrap())
++        .unwrap_or(30);
++    assert!(iterations > 0 && samples > 0);
++    for (case, name) in ["polynomial", "rational", "degree8x3"]
++        .into_iter()
++        .enumerate()
++    {
++        let source = source(case);
++        let expected = complete(&source, false, &mut graph(), &mut arithmetic());
++        let shared = complete(&source, true, &mut graph(), &mut arithmetic());
++        validate(case, &expected);
++        validate(case, &shared);
++        compare(&expected, &shared);
++        drop(shared);
++        for sample in 0..samples + 2 {
++            for shared in if sample % 2 == 0 {
++                [false, true]
++            } else {
++                [true, false]
++            } {
++                let start = Instant::now();
++                for _ in 0..iterations {
++                    let reports =
++                        complete(black_box(&source), shared, &mut graph(), &mut arithmetic());
++                    for (actual, expected) in reports.iter().zip(&expected) {
++                        assert_eq!(actual.evidence().values(), expected.evidence().values());
++                    }
++                    drop(black_box(reports));
++                }
++                if sample >= 2 {
++                    println!(
++                        "{name}/{} sample={} iterations={iterations} total_ns={}",
++                        if shared { "shared" } else { "independent" },
++                        sample - 2,
++                        start.elapsed().as_nanos()
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json b/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
+index c081cd866..6b8e1bc0e 100644
+--- a/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
++++ b/crates/hyperbrep/docs/IMPLEMENTATION_STATUS.json
+@@ -1,6 +1,6 @@
+ {
+   "schema_version": 1,
+-  "updated_on": "2026-11-07",
++  "updated_on": "2026-11-14",
+   "plan": "DEVELOPMENT_PLAN.md",
+   "research": "ALGORITHM_RESEARCH.md",
+   "property_ledger": "../../../docs/properties-status.json",
+@@ -5566,6 +5566,47 @@
+       "limits": "Scoped owner/downstream admission, not the separate827 main280-command matrix or a new native pre-push/release qualification. First prototype source identity failure, failed test-copy compiles and canceled prototype MSRV remain distinct. Original punctured sqrt image and shared/unselected component denominator census still block. General algebraic operation/continuous assembly, total work/heap/cancellation, runtime fuzz/coverage and BRep shipped consumers remain open. All work package statuses unchanged.",
+       "evidence_record": "docs/evidence/2026-11-07-native-nurbs-components",
+       "local_evidence_commit": "70daed6650e35274bbdec2b86ae286fa2a22f343"
++    },
++    {
++      "id": "native-surface-interval-ranges",
++      "work_packages": [
++        "WP04",
++        "WP17",
++        "WP18",
++        "WP21",
++        "WP23"
++      ],
++      "properties": [
++        "P4",
++        "P18",
++        "P19",
++        "P20",
++        "P35",
++        "P36",
++        "P37"
++      ],
++      "decision": "retained finite capability extension after source-specific owner/downstream, completed cost and archive-consumer qualification; general closure and coordinated release remain open",
++      "source_base_revision": "b0fde90b4d9eb51c51723fb6e24a9b6ab6938962",
++      "measured_source_revision": "2d2fc538b7cc8b3b76555878cf34064e4f4ee072",
++      "change": "Opt-in positive-weight native rational Bezier tensor interval coordinates and partials, retaining original Surface, UV domain, denominator guards and C1 evidence through native Aabb exclusion. Hypersolve owns exact bivariate quotient compilation; native conversion and existing interval authority are reused. Default features and old evaluator bodies are unchanged.",
++      "source": [
++        "../src/geometry/interval_ranges.rs",
++        "../../hypersolve/src/expression_program/bivariate.rs"
++      ],
++      "regressions": [
++        "../tests/interval_ranges.rs",
++        "../src/geometry/interval_ranges/tests.rs",
++        "../tests/surface_ranges_example.rs"
++      ],
++      "validation": "52 focused tests pass. Full Rust 1.95 release owner runs report 2399 passes across 147 harness summaries; HyperBrep IO reports 127 across 28. No failed tests; ignored reports: owner 0, downstream 0. Counts sum explicit test/doctest summaries, including any subprocess reports, not a unique coverage denominator. All-feature/all-target strict Clippy, strict docs, actual example, disabled-feature checks, WASM library check and stable all-target check pass. Nine archives verify; an archive-only unchanged native example builds/runs/passes strict Clippy. The same example executes three sixteen-cell portfolios through a zero-import/default-stack debug WASM test export. Metadata-only docs.rs configuration changes no Rust source/dependencies/default features; packaged strict docs and five rendered API pages pass. Complete new lifecycle trace snapshots pin actual scalar warming; the old solver trace assertion remains unchanged. Original failed fixture, artifact-comparison and Cargo CLI premises remain in evidence.",
++      "cost_evidence": "Three complete sixteen-cell portfolios, thirty alternating warm pairs and thirty fresh-process cold pairs per source; shared preparation warm speedups 1.653..3.297 and cold 1.712..3.298. Five repeated allocation observations retain all outputs/destruction. Cold retained scalar storage and 32-query plateau diagnostics remain explicit. See ../PERFORMANCE.md#native-surface-interval-ranges. These are same-API comparisons, not old-kernel nonregression or general performance claims.",
++      "evidence": "SURFACE_INTERVAL_RANGES.md",
++      "local_evidence": "/tmp/interval-refactor/surface-interval-ranges",
++      "limits": "Native rational Bezier tensors only; C1 is not rank, injectivity, trimmed-face or topology evidence. Denominator overestimation can refuse a box. Fully expanded algebraic scalar equality may remain undecided; test-only per-node exact quadratic oracle verifies maintained generated outputs. Structural resource budgets do not bound total scalar CPU, coefficient growth or heap. Other surface families, general closure, coverage/formal proof and full pre-push/coordinated release qualification remain open. All work package statuses remain unchanged.",
++      "evidence_published": false,
++      "qualification_source_revision": "014a082252da83d8d5d566253bcb598c7a456df3",
++      "documentation_metadata_revision": "d625de5b8e93dcb34e481a99253b1bb3cdd77592",
++      "delivery_evidence": "Nine verified archives; registry versions/checksums preserved. Archive comparison permits only revision receipts, docs metadata and dependent checksums individually matched to actual archive digests. Native/WASM implementation qualification and metadata-only documentation qualification retain distinct source revisions. No published release or hosted docs execution is claimed."
+     }
+   ],
+   "work_packages": [
+diff --git a/crates/hyperbrep/docs/SUPPORT_MATRIX.md b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+index a6e145152..395d54f99 100644
+--- a/crates/hyperbrep/docs/SUPPORT_MATRIX.md
++++ b/crates/hyperbrep/docs/SUPPORT_MATRIX.md
+@@ -354,6 +354,18 @@ interior. See the [finite qualification](https://github.com/timschmidt/csgrs-evi
+ 
+ ## Surface carriers
+ 
++With `interval-ranges`, positive-weight native rational Bézier tensors also
++admit source-bound coordinate and both-UV-partial enclosure attempts over
++finite dyadic parameter boxes. The retained C1 certificate can project to a
++native spatial `Aabb` for certified exclusion. Canonical empty boxes, generated
++algebraic subdivisions, reflected nonuniform affine images and checked native
++replay are exercised. This adds no rank, trimmed-face membership, intersection
++completeness or solid-topology claim. Other surface families return a typed
++unsupported diagnostic; denominator overestimation can refuse certification
++even for a valid positive-weight patch. See the
++[contract](SURFACE_INTERVAL_RANGES.md) and the existing
++[implementation record](IMPLEMENTATION_STATUS.json) for qualification scope.
++
+ | Family | Domain / evaluation / partials | Bounds | Supported topology image proof | Transform | Persistence |
+ | --- | --- | --- | --- | --- | --- |
+ | Plane | Exact | Unbounded | Line, circular arc, rational Bezier/NURBS and retained planar-image agreement | Affine | Exact |
+diff --git a/crates/hyperbrep/docs/SURFACE_INTERVAL_RANGES.md b/crates/hyperbrep/docs/SURFACE_INTERVAL_RANGES.md
+new file mode 100644
+index 000000000..11c96e93a
+--- /dev/null
++++ b/crates/hyperbrep/docs/SURFACE_INTERVAL_RANGES.md
+@@ -0,0 +1,122 @@
++# Native surface interval ranges
++
++Enable `hyperbrep/interval-ranges` to use
++`interval_ranges::prepare_rational_bezier_surface_ranges`. The constructor
++retains the immutable native `Surface` and prepares one shared coordinate and
++Jacobian program. Each `enclose` call consumes a `BoxN<DyadicInterval, 2>`, an
++explicit precision, an `ExpressionBudget` and a `DyadicBudget`. The runnable
++[surface example](../examples/surface_ranges.rs) evaluates sixteen adjoining
++UV cells and consumes their evidence through native spatial exclusion.
++
++## Domain and authority
++
++The current adapter accepts admitted positive-weight native rational Bézier
++tensor surfaces. Both control-net dimensions may be arbitrary finite sizes,
++subject to declared limits. Native exact coefficients remain authoritative;
++generated algebraic subdivisions and native affine transforms retain their
++definitions. NURBS, implicit and analytic-family adapters remain implementation
++gaps and return `UnsupportedSurface`; this does not narrow the general algebraic
++target. Existing native evaluators and default features are unchanged.
++
++The native tensor Bernstein conversion is reused. Hypersolve compiles its
++existing bivariate coefficient grids with ordered bindings and one shared
++original denominator, then differentiates and certifies the resulting program.
++No fitted surface, tessellation or rounded control net replaces the source.
++The source's homogeneous-control cache is not populated during preparation:
++cold sources use a temporary native carrier, and an existing cache is borrowed.
++Shared scalar facts may warm during these exact calculations.
++
++Queries accept a canonical empty Cartesian set or a finite dyadic box contained
++in the native UV chart. Native strict comparisons validate chart membership.
++The returned `SurfaceRangeEnclosure` retains the source, exact parameter box,
++three coordinate enclosures, six partial enclosures and original regularity
++evidence. `partials()[0]` is the u derivative and `partials()[1]` the v derivative;
++each vector is in x,y,z order. Precision chooses an enclosure grid, not a bound
++on the final width. Repeated queries can reuse the immutable prepared program
++with separate caller-owned budgets, including concurrent queries.
++
++## What the certificate establishes
++
++Successful C1 certification encloses the coordinates and both local partials
++throughout the retained parameter set. It does not imply full rank, an injective
++chart, trimmed-face membership or valid face/solid topology. Constant and
++rank-one patches can therefore have valid C1 range evidence while native normal
++construction reports a singular parameter.
++
++`native_bounds` converts outward endpoints exactly to the existing `Aabb` and
++returns a wrapper borrowing the range evidence. Empty parameter sets have no
++finite box. The native Hyperlimit `ordered_aabb3s_intersect` predicate can use
++non-overlap as an exact exclusion; overlap alone does not certify incidence.
++The example and corpus consume the certainty receipt rather than a guessed
++classification. Touching candidates and exact 2^-80 gaps remain distinct.
++
++The original denominator guard is retained. An interval containing zero refuses
++certification and does not prove a pole: dependency overestimation can occur
++even with positive native weights. Smaller subboxes can succeed on retry.
++Unsupported families, outside-domain inputs, scalar/predicate failures, graph
++exhaustion, interval exhaustion and cancellation retain typed diagnostics and
++their original error sources. Failed attempts publish no partial success.
++
++## Resources and lifetimes
++
++For U columns, V rows and N=U*V, preparation checks 64*N+2 structural slots and
++reserves 32*N*(U*U+V*V+1) conversion units before native conversion. Graph
++emission, validation, differentiation, evidence retention and native projection
++also charge their supplied budgets. Interval precision/size/work are accounted
++separately. Workers must receive explicit allowances; no implicit shared worker
++budget is provided.
++
++These are structural reservations, not total CPU or memory bounds. Scalar
++refinement, coefficient growth, payload cloning/destruction and total heap
++remain exclusions. Cancellation is checked around native conversion and before
++publication; it cannot interrupt an ongoing native conversion or scalar call.
++An exhausted or cancelled attempt does not become negative geometric evidence
++and does not poison a larger-budget retry.
++
++Native caches and shared source identity are checked independently of scalar
++cache warming. Complete trace snapshots cover cold/warm native caches, success,
++post-conversion exhaustion and pre-cancellation under both policies. Preparation
++changes one scalar first-observation count in the maintained cold lifecycle;
++no claim of invisible scalar-cache warming is made. Cold allocation observations
++retain storage after output/source destruction, and repeated fresh-source
++queries reach a plateau in the maintained corpus; see the
++[measured resource record](../PERFORMANCE.md#native-surface-interval-ranges).
++
++## Evidence and remaining qualification
++
++Focused tests cover asymmetric/ragged coefficient grids, arbitrary-degree
++examples, algebraic coefficients and subdivisions, independent exact derivative
++expectations, nonuniform weights, denominator overestimation, empty/outside
++domains, small budgets, cancellation/retry, precision changes, concurrent
++sharing, affine transport, reconstruction and fresh-process native archive
++replay. Native bytes and mathematical expectations are checked separately.
++
++An additional scalar oracle exposed a bounded-recognizer limitation: comparing
++one fully expanded algebraic partial against its closed form can remain
++undecided. The range certificate succeeds; an exact per-node quadratic-field
++oracle checks all nine outputs without modifying production normalization or
++claiming general scalar-decision closure.
++
++The [completed workload](../benches/surface_ranges.rs) compares independent and
++shared preparation with exact analytic extrema, all output evidence, native
++exclusion and destruction. Expanded acceptance records 52 focused passes. Full Rust 1.95 release owner
++and downstream runs report 2399 and 127 passes across
++147 and 28 harness summaries, respectively, with no failures.
++These are reported test/doctest results, not a unique coverage denominator.
++Strict all-feature/all-target Clippy, strict documentation, the actual example,
++disabled-feature checks, WASM library compilation and stable all-target checks
++also pass on the fixed implementation revision.
++
++Nine archives are verified. An external consumer builds, runs the unchanged
++example and passes strict Clippy using only extracted Hyper archives. The same
++archived example completes three sixteen-cell portfolios in WebAssembly with
++zero host imports and the default linker stack. This debug Rust test export does
++not qualify a public JavaScript binding. A metadata-only followup enables all
++features for docs.rs; strict packaged documentation and the rendered API pages
++are verified locally. Hosted docs.rs execution is not claimed.
++
++The [existing implementation ledger](IMPLEMENTATION_STATUS.json) and
++[interval refactor progress](../../../INTERVAL_REFACTOR_PROGRESS.md) identify
++source-specific evidence. Full pre-push workflows, stable runtime suites,
++hosted platforms, public bindings and universal algebraic closure remain open.
++Local archive qualification is not a published release.
+diff --git a/crates/hyperbrep/examples/surface_ranges.rs b/crates/hyperbrep/examples/surface_ranges.rs
+new file mode 100644
+index 000000000..458288328
+--- /dev/null
++++ b/crates/hyperbrep/examples/surface_ranges.rs
+@@ -0,0 +1,71 @@
++//! Certify a native patch's coordinate/partial ranges and spatial exclusion.
++use hyperbrep::{Point3, Surface, interval_ranges::prepare_rational_bezier_surface_ranges};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::BoxN;
++use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy, ordered_aabb3s_intersect};
++use hypersolve::expression_program::ExpressionBudget;
++
++pub fn run() -> Result<(), Box<dyn std::error::Error>> {
++    // S(u,v)=(u,2v,uv); native rows are v, columns are u.
++    let source = Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(1.into(), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 2.into(), 0.into()),
++                Point3::new(1.into(), 2.into(), 1.into()),
++            ],
++        ],
++        vec![vec![1.into(); 2]; 2],
++    )?;
++    let mut graph = ExpressionBudget::new(1_000_000, 100_000_000);
++    let mut arithmetic = DyadicBudget::new(4096, 1_000_000_000);
++    let prepared = prepare_rational_bezier_surface_ranges(&source, &mut graph)?;
++    for u in 0..4 {
++        for v in 0..4 {
++            let parameters = BoxN::new([
++                DyadicInterval::new(u.into(), (u + 1).into(), -2)?,
++                DyadicInterval::new(v.into(), (v + 1).into(), -2)?,
++            ])?;
++            let report = prepared.enclose(&parameters, -32, &mut graph, &mut arithmetic)?;
++            assert_eq!(report.parameters(), &parameters);
++            assert_eq!(
++                report.partials()[0][0],
++                &DyadicInterval::point(1.into(), 0)?
++            );
++            assert_eq!(
++                report.partials()[1][1],
++                &DyadicInterval::point(2.into(), 0)?
++            );
++            let projected = report.native_bounds(&mut graph, &mut arithmetic)?;
++            assert!(std::ptr::eq(projected.evidence(), &report));
++            let bounds = projected.bounds().expect("nonempty cell");
++            assert!(matches!(
++                ordered_aabb3s_intersect(
++                    &bounds.mins,
++                    &bounds.maxs,
++                    &Point3::new(3.into(), 3.into(), 3.into()),
++                    &Point3::new(4.into(), 4.into(), 4.into()),
++                    PredicatePolicy::STRICT,
++                ),
++                PredicateOutcome::Decided {
++                    value: false,
++                    certainty: Certainty::Exact,
++                    ..
++                }
++            ));
++            println!(
++                "cell=({u},{v}) coordinates={:?} partials={:?}",
++                report.coordinates(),
++                report.partials()
++            );
++        }
++    }
++    Ok(())
++}
++#[allow(dead_code)]
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    run()
++}
+diff --git a/crates/hyperbrep/src/geometry.rs b/crates/hyperbrep/src/geometry.rs
+index 1ac59d9d1..251870f26 100644
+--- a/crates/hyperbrep/src/geometry.rs
++++ b/crates/hyperbrep/src/geometry.rs
+@@ -26,6 +26,8 @@ mod curve_revolution;
+ mod curve_tensor_image;
+ mod cylinder_atlas;
+ mod implicit_tensor;
++#[cfg(feature = "interval-ranges")]
++pub mod interval_ranges;
+ mod line_tensor;
+ mod location;
+ mod parameter_components;
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges.rs b/crates/hyperbrep/src/geometry/interval_ranges.rs
+new file mode 100644
+index 000000000..2a41bf3db
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges.rs
+@@ -0,0 +1,307 @@
++//! Native tensor-surface ranges with retained chart and derivative evidence.
++#[cfg(test)]
++mod tests;
++
++use std::{fmt, sync::OnceLock};
++
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hyperlattice::{Aabb, BoxN, IntervalLatticeError, Point2, Point3, Real};
++use hypersolve::{
++    SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionError, ExpressionProgram, JacobianProgram,
++        RegularJacobianEnclosure,
++    },
++};
++
++use super::{
++    RationalBezierSurface, Surface, SurfaceGeometry, SurfaceKind, surface_point,
++    validate_surface_parameter,
++};
++use crate::GeometryError;
++
++/// Original native, graph or interval diagnostic from a surface-range query.
++#[derive(Debug)]
++pub enum SurfaceRangeError {
++    /// This native surface family has no adapter in this implementation.
++    UnsupportedSurface(SurfaceKind),
++    /// Original native chart or geometry diagnostic.
++    Geometry(GeometryError),
++    /// Original expression, differentiation or graph-resource diagnostic.
++    Expression(ExpressionError),
++    /// Original interval arithmetic, precision or work diagnostic.
++    Interval(IntervalError),
++    /// Original Cartesian interval construction diagnostic.
++    Lattice(IntervalLatticeError),
++}
++impl fmt::Display for SurfaceRangeError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "surface range: {self:?}")
++    }
++}
++impl std::error::Error for SurfaceRangeError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::UnsupportedSurface(_) => None,
++            Self::Geometry(error) => Some(error),
++            Self::Expression(error) => Some(error),
++            Self::Interval(error) => Some(error),
++            Self::Lattice(error) => Some(error),
++        }
++    }
++}
++impl From<GeometryError> for SurfaceRangeError {
++    fn from(error: GeometryError) -> Self {
++        Self::Geometry(error)
++    }
++}
++impl From<ExpressionError> for SurfaceRangeError {
++    fn from(error: ExpressionError) -> Self {
++        Self::Expression(error)
++    }
++}
++impl From<IntervalError> for SurfaceRangeError {
++    fn from(error: IntervalError) -> Self {
++        Self::Interval(error)
++    }
++}
++impl From<IntervalLatticeError> for SurfaceRangeError {
++    fn from(error: IntervalLatticeError) -> Self {
++        Self::Lattice(error)
++    }
++}
++
++/// Native exact source with a reusable coordinate and two-partial program.
++/// This is a prepared definition, not a range or regularity certificate.
++#[derive(Clone, Debug)]
++pub struct PreparedRationalBezierSurfaceRanges {
++    source: Surface,
++    jacobian: JacobianProgram,
++}
++
++/// Source-bound coordinate and local UV-partial enclosures on a retained box.
++///
++/// C1 evidence does not imply full rank, an injective chart or valid face/solid
++/// topology. The box bounds the supporting surface image, not trimmed-face
++/// membership. Empty Cartesian domains yield empty numerical ranges.
++#[derive(Clone, Debug)]
++pub struct SurfaceRangeEnclosure {
++    source: Surface,
++    parameters: BoxN<DyadicInterval, 2>,
++    evidence: RegularJacobianEnclosure,
++}
++
++/// Existing spatial Aabb with borrowed evidence for its outward bounds.
++/// Non-overlap is sufficient exclusion; overlap is not incidence evidence.
++#[derive(Debug)]
++pub struct SurfaceRangeBox<'a> {
++    evidence: &'a SurfaceRangeEnclosure,
++    bounds: Option<Aabb>,
++}
++impl SurfaceRangeBox<'_> {
++    /// Source, selected parameter box and coordinate/partial evidence.
++    pub fn evidence(&self) -> &SurfaceRangeEnclosure {
++        self.evidence
++    }
++    /// Exact outward native box, or None for an empty parameter set.
++    pub fn bounds(&self) -> Option<&Aabb> {
++        self.bounds.as_ref()
++    }
++}
++
++/// Prepare range queries for an admitted native rational Bézier tensor surface.
++///
++/// Existing native coefficient conversion and the Hypersolve graph compiler
++/// retain exact coefficients and the original denominator guard. The source's
++/// homogeneous-control cache is never populated by this operation: a cold source
++/// uses an owned temporary native carrier; an existing cache may be borrowed.
++/// Other families return an explicit unsupported-representation diagnostic.
++///
++/// For U columns, V rows and N=U*V, graph limits check 64*N preparation slots and
++/// reserve 32*N*(U*U+V*V+1) structural conversion units before native conversion.
++/// Graph emission, validation, differentiation and publication are also charged.
++/// These conservative structural reservations are not scalar-operation or heap
++/// bounds. Scalar refinement, coefficient growth, payload cloning/destruction and
++/// total memory remain excluded. Cancellation cannot interrupt native conversion
++/// or scalar work; it is checked around conversion and before publication.
++pub fn prepare_rational_bezier_surface_ranges(
++    source: &Surface,
++    graph: &mut ExpressionBudget,
++) -> Result<PreparedRationalBezierSurfaceRanges, SurfaceRangeError> {
++    graph.charge(0)?;
++    let SurfaceGeometry::RationalBezier(surface) = &source.data.geometry else {
++        return Err(SurfaceRangeError::UnsupportedSurface(source.kind()));
++    };
++    let v = surface.control_points.len();
++    let u = surface.control_points[0].len();
++    let n = u.checked_mul(v).ok_or(ExpressionError::SizeExhausted)?;
++    let entries = n.checked_mul(64).ok_or(ExpressionError::SizeExhausted)?;
++    graph.check_entries(&[entries, 2])?;
++    let axes = u
++        .checked_mul(u)
++        .and_then(|a| v.checked_mul(v).and_then(|b| a.checked_add(b)))
++        .and_then(|x| x.checked_add(1))
++        .ok_or(ExpressionError::SizeExhausted)?;
++    let work = n
++        .checked_mul(axes)
++        .and_then(|x| x.checked_mul(32))
++        .ok_or(ExpressionError::SizeExhausted)?;
++    graph.charge(work)?;
++    let temporary = surface
++        .homogeneous_controls
++        .get()
++        .is_none()
++        .then(|| RationalBezierSurface {
++            control_points: surface.control_points.clone(),
++            weights: surface.weights.clone(),
++            homogeneous_controls: OnceLock::new(),
++        });
++    let [x, y, z, weight] =
++        surface_point::tensor_coefficients(temporary.as_ref().unwrap_or(surface));
++    graph.charge(0)?;
++    let variables = [SymbolId(0), SymbolId(1)];
++    let program =
++        ExpressionProgram::from_bivariate_quotients(&[x, y, z], &weight, variables, graph)?;
++    let jacobian = program.jacobian(&variables, graph)?;
++    graph.charge(1)?;
++    let result = PreparedRationalBezierSurfaceRanges {
++        source: source.clone(),
++        jacobian,
++    };
++    graph.charge(0)?;
++    Ok(result)
++}
++
++impl PreparedRationalBezierSurfaceRanges {
++    /// Original immutable native surface and UV chart.
++    pub fn source(&self) -> &Surface {
++        &self.source
++    }
++    /// Shared source-coordinate and derivative association.
++    pub fn program(&self) -> &JacobianProgram {
++        &self.jacobian
++    }
++
++    /// Certify coordinates and both local partials over the complete UV box.
++    ///
++    /// Native strict chart comparisons validate finite box endpoints without
++    /// materializing the source domain's selected endpoints. Original predicate
++    /// failures and active native work scopes are preserved. A denominator range
++    /// containing zero refuses certification; it does not prove a pole. Precision
++    /// selects an enclosure grid, not a final-width guarantee. Empty queries are
++    /// successful empty ranges of this already-prepared valid source.
++    pub fn enclose(
++        &self,
++        parameters: &BoxN<DyadicInterval, 2>,
++        precision: i32,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SurfaceRangeEnclosure, SurfaceRangeError> {
++        graph.charge(0)?;
++        let empty = [DyadicInterval::empty(), DyadicInterval::empty()];
++        let arguments = parameters.lanes().unwrap_or(&empty);
++        if let Some([u, v]) = parameters.lanes() {
++            graph.charge(2)?;
++            let [(u_min, u_max), (v_min, v_max)] =
++                [u.to_rational(arithmetic)?, v.to_rational(arithmetic)?]
++                    .map(|q| q.into_bounds().expect("nonempty Cartesian parameter lane"));
++            crate::context::strict(|| {
++                validate_surface_parameter(
++                    self.source.domain(),
++                    &Point2::new(Real::new(u_min), Real::new(v_min)),
++                )?;
++                validate_surface_parameter(
++                    self.source.domain(),
++                    &Point2::new(Real::new(u_max), Real::new(v_max)),
++                )
++            })?;
++        }
++        let evidence = self
++            .jacobian
++            .enclose_regular(arguments, precision, graph, arithmetic)?;
++        graph.charge(2)?;
++        let parameters = BoxN::new([
++            evidence.arguments()[0].checked_pow(1, arithmetic)?,
++            evidence.arguments()[1].checked_pow(1, arithmetic)?,
++        ])?;
++        graph.charge(1)?;
++        let report = SurfaceRangeEnclosure {
++            source: self.source.clone(),
++            parameters,
++            evidence,
++        };
++        graph.charge(0)?;
++        Ok(report)
++    }
++}
++
++impl SurfaceRangeEnclosure {
++    /// Original exact surface; enclosures do not replace its geometry.
++    pub fn source(&self) -> &Surface {
++        &self.source
++    }
++    /// Canonical Cartesian parameter domain in original u,v order.
++    pub fn parameters(&self) -> &BoxN<DyadicInterval, 2> {
++        &self.parameters
++    }
++    /// Coordinate enclosures in x,y,z order.
++    pub fn coordinates(&self) -> [&DyadicInterval; 3] {
++        std::array::from_fn(|i| &self.evidence.values()[i])
++    }
++    /// Local partials: first u, then v; each vector is in x,y,z order.
++    pub fn partials(&self) -> [[&DyadicInterval; 3]; 2] {
++        std::array::from_fn(|axis| {
++            std::array::from_fn(|coordinate| {
++                &self.evidence.values()[self
++                    .evidence
++                    .program()
++                    .partial_output(coordinate, axis)
++                    .expect("prepared three-output two-parameter Jacobian")]
++            })
++        })
++    }
++    /// Original source-domain regularity and derivative evidence.
++    pub fn evidence(&self) -> &RegularJacobianEnclosure {
++        &self.evidence
++    }
++
++    /// Convert outward endpoints exactly for the existing spatial broad phase.
++    ///
++    /// Ordered dyadic bounds justify native Aabb endpoint ordering. Empty sets
++    /// have no finite box. Conversions share the supplied budgets; exact scalar
++    /// payload construction retains the documented resource exclusions.
++    pub fn native_bounds(
++        &self,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SurfaceRangeBox<'_>, SurfaceRangeError> {
++        graph.charge(0)?;
++        graph.check_entries(&[6])?;
++        graph.charge(1)?;
++        let bounds = if self.parameters.is_empty() {
++            None
++        } else {
++            graph.charge(3)?;
++            let [x, y, z] = self.coordinates();
++            let [(x_min, x_max), (y_min, y_max), (z_min, z_max)] = [
++                x.to_rational(arithmetic)?,
++                y.to_rational(arithmetic)?,
++                z.to_rational(arithmetic)?,
++            ]
++            .map(|q| {
++                q.into_bounds()
++                    .expect("nonempty regular coordinate enclosure")
++            });
++            graph.charge(6)?;
++            Some(Aabb::new(
++                Point3::new(Real::new(x_min), Real::new(y_min), Real::new(z_min)),
++                Point3::new(Real::new(x_max), Real::new(y_max), Real::new(z_max)),
++            ))
++        };
++        graph.charge(0)?;
++        Ok(SurfaceRangeBox {
++            evidence: self,
++            bounds,
++        })
++    }
++}
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges/tests.rs b/crates/hyperbrep/src/geometry/interval_ranges/tests.rs
+new file mode 100644
+index 000000000..86c541be3
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges/tests.rs
+@@ -0,0 +1,325 @@
++use super::*;
++use crate::{ArchiveLimits, ArenaModelBuilder, ImportedModel};
++use hyperlattice::Matrix4;
++use std::sync::Arc;
++
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(lo: i64, hi: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(lo.into(), hi.into(), exponent).unwrap()
++}
++fn patch() -> Surface {
++    Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(1.into(), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 2.into(), 0.into()),
++                Point3::new(1.into(), 2.into(), 1.into()),
++            ],
++        ],
++        vec![vec![1.into(); 2]; 2],
++    )
++    .unwrap()
++}
++fn native(source: &Surface) -> &RationalBezierSurface {
++    let SurfaceGeometry::RationalBezier(surface) = &source.data.geometry else {
++        panic!("tensor fixture")
++    };
++    surface
++}
++
++#[test]
++fn cold_warm_failed_and_cancelled_preparation_preserve_native_cache_identity() {
++    let source = patch();
++    assert!(native(&source).homogeneous_controls.get().is_none());
++    let cold = prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap();
++    assert!(native(&source).homogeneous_controls.get().is_none());
++    assert!(Arc::ptr_eq(&cold.source.data, &source.data));
++    // Fail after native coefficient conversion, while emitting the graph.
++    assert!(matches!(
++        prepare_rational_bezier_surface_ranges(
++            &source,
++            &mut ExpressionBudget::new(1_000_000, 1153)
++        ),
++        Err(SurfaceRangeError::Expression(
++            ExpressionError::WorkExhausted
++        ))
++    ));
++    assert!(native(&source).homogeneous_controls.get().is_none());
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        prepare_rational_bezier_surface_ranges(&source, &mut cancelled),
++        Err(SurfaceRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert!(native(&source).homogeneous_controls.get().is_none());
++    source
++        .evaluate_real(&Point2::new(0.into(), 0.into()))
++        .unwrap();
++    let cache = native(&source).homogeneous_controls.get().unwrap() as *const _;
++    let warm = prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap();
++    assert_eq!(
++        native(&source).homogeneous_controls.get().unwrap() as *const _,
++        cache
++    );
++    assert_eq!(
++        cold.program().program().definition(),
++        warm.program().program().definition()
++    );
++    let domain = BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap();
++    let first = cold
++        .enclose(&domain, -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    let second = warm
++        .enclose(&domain, -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert!(Arc::ptr_eq(&first.source.data, &source.data));
++    assert_eq!(first.evidence().values(), second.evidence().values());
++    assert_eq!(
++        native(&source).homogeneous_controls.get().unwrap() as *const _,
++        cache
++    );
++}
++
++#[test]
++fn affine_transform_reversal_and_exact_reconstruction_feed_the_next_range_query() {
++    // Anisotropic affine map (x,y,z)->(2x+3,-y+4,3z-1).
++    let transform = Matrix4::new([
++        [2.into(), 0.into(), 0.into(), 3.into()],
++        [0.into(), (-1).into(), 0.into(), 4.into()],
++        [0.into(), 0.into(), 3.into(), (-1).into()],
++        [0.into(), 0.into(), 0.into(), 1.into()],
++    ]);
++    let changed = patch()
++        .transformed(&super::super::TransformMetric::new(&transform), true)
++        .unwrap();
++    let rebuilt = Surface::from_exact_data(changed.exact_data()).unwrap();
++    for source in [&changed, &rebuilt] {
++        assert!(native(source).homogeneous_controls.get().is_none());
++        let prepared = prepare_rational_bezier_surface_ranges(source, &mut graph()).unwrap();
++        let report = prepared
++            .enclose(
++                &BoxN::new([d(1, 1, -2), d(1, 1, -1)]).unwrap(),
++                -64,
++                &mut graph(),
++                &mut arithmetic(),
++            )
++            .unwrap();
++        // u reflection: (5-2u,4-2v,3(1-u)v-1).
++        assert_eq!(
++            report.coordinates(),
++            [&d(9, 9, -1), &d(3, 3, 0), &d(1, 1, -3)]
++        );
++        assert_eq!(
++            report.partials()[0],
++            [&d(-2, -2, 0), &d(0, 0, 0), &d(-3, -3, -1)]
++        );
++        assert_eq!(
++            report.partials()[1],
++            [&d(0, 0, 0), &d(-2, -2, 0), &d(9, 9, -2)]
++        );
++        assert!(native(source).homogeneous_controls.get().is_none());
++        assert!(Arc::ptr_eq(&report.source.data, &source.data));
++    }
++}
++
++#[test]
++fn fresh_process_native_archive_replay_rebuilds_surface_and_range_authority() {
++    use std::io::{Read, Write};
++    const KEY: &str = "HYPERBREP_INTERVAL_SURFACE_REPLAY_CHILD";
++    if std::env::var_os(KEY).is_none() {
++        let half = (Real::one() / Real::from(2)).unwrap();
++        let (left, _) = patch().split_u_at(&half).unwrap();
++        let (lower, _) = left.split_v_at(&half).unwrap();
++        let mut builder = ArenaModelBuilder::new();
++        builder.surface(lower).unwrap();
++        let archive = builder.finish().unwrap().to_json().unwrap();
++        let mut child=std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact","geometry::interval_ranges::tests::fresh_process_native_archive_replay_rebuilds_surface_and_range_authority","--nocapture"])
++            .env(KEY,"1").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
++        child
++            .stdin
++            .take()
++            .unwrap()
++            .write_all(archive.as_bytes())
++            .unwrap();
++        let output = child.wait_with_output().unwrap();
++        assert!(
++            output.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        return;
++    }
++    let mut archive = String::new();
++    std::io::stdin().read_to_string(&mut archive).unwrap();
++    let model = ImportedModel::from_json(&archive, &ArchiveLimits::default())
++        .unwrap()
++        .validate()
++        .unwrap();
++    assert_eq!(model.to_json().unwrap(), archive);
++    let source = model.surfaces().next().unwrap().1;
++    assert!(native(source).homogeneous_controls.get().is_none());
++    let prepared = prepare_rational_bezier_surface_ranges(source, &mut graph()).unwrap();
++    let report = prepared
++        .enclose(
++            &BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap(),
++            -64,
++            &mut graph(),
++            &mut arithmetic(),
++        )
++        .unwrap();
++    assert_eq!(
++        report.coordinates(),
++        [&d(0, 1, -1), &d(0, 1, 0), &d(0, 1, -2)]
++    );
++    assert_eq!(
++        report.partials()[0],
++        [&d(1, 1, -1), &d(0, 0, 0), &d(0, 1, -2)]
++    );
++    assert_eq!(
++        report.partials()[1],
++        [&d(0, 0, 0), &d(1, 1, 0), &d(0, 1, -2)]
++    );
++    assert!(native(source).homogeneous_controls.get().is_none());
++    assert!(Arc::ptr_eq(&report.source.data, &source.data));
++    let projected = report
++        .native_bounds(&mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(
++        projected.bounds().unwrap().maxs,
++        Point3::new(
++            (Real::one() / Real::from(2)).unwrap(),
++            1.into(),
++            (Real::one() / Real::from(4)).unwrap()
++        )
++    );
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn native_dispatch_and_certainty_survive_preparation_in_fresh_processes() {
++    use hyperreal::dispatch_trace;
++    const KEY: &str = "HYPERBREP_INTERVAL_SURFACE_TRACE_CHILD";
++    let Ok(mode) = std::env::var(KEY) else {
++        for lifecycle in ["cold", "warm"] {
++            for action in ["baseline", "prepare", "fail", "cancel"] {
++                let output=std::process::Command::new(std::env::current_exe().unwrap())
++                    .args(["--exact","geometry::interval_ranges::tests::native_dispatch_and_certainty_survive_preparation_in_fresh_processes","--nocapture"])
++                    .env(KEY,format!("{lifecycle}-{action}")).output().unwrap();
++                assert!(
++                    output.status.success(),
++                    "{}\n{}",
++                    String::from_utf8_lossy(&output.stdout),
++                    String::from_utf8_lossy(&output.stderr)
++                );
++                let stdout = String::from_utf8(output.stdout).unwrap();
++                let snapshots = stdout
++                    .lines()
++                    .filter(|line| line.starts_with("NATIVE_TRACE "))
++                    .collect::<Vec<_>>()
++                    .join("\n");
++                assert_eq!(snapshots.lines().count(), 2);
++                // Preparation can warm a shared scalar's write-once arithmetic
++                // facts without populating the native homogeneous-control cache.
++                // Pin every count for each actual cache lifecycle, including
++                // the one first-observation difference; omit no trace fields.
++                let expected = match (lifecycle, action) {
++                    ("cold", "baseline" | "cancel") => include_str!("trace-cold-baseline.txt"),
++                    ("cold", "prepare" | "fail") => include_str!("trace-cold-prepare.txt"),
++                    ("warm", "baseline" | "cancel") => include_str!("trace-warm-baseline.txt"),
++                    ("warm", "prepare" | "fail") => include_str!("trace-warm-prepare.txt"),
++                    _ => unreachable!("enumerated lifecycle"),
++                };
++                assert_eq!(snapshots, expected.trim_end(), "{lifecycle}-{action}");
++            }
++        }
++        return;
++    };
++    for policy in [
++        hyperlimit::PredicatePolicy::STRICT,
++        hyperlimit::PredicatePolicy::APPROXIMATE_512,
++    ] {
++        let source = patch();
++        let half = (Real::one() / Real::from(2)).unwrap();
++        let parameter = Point2::new(half.clone(), half);
++        let uv = hypercurve::Point2::new(parameter.x.clone(), parameter.y.clone()).into();
++        if mode.starts_with("warm-") {
++            source.evaluate_real(&parameter).unwrap();
++        }
++        let prepared = if mode.ends_with("-prepare") {
++            Some(prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap())
++        } else if mode.ends_with("-fail") {
++            assert!(matches!(
++                prepare_rational_bezier_surface_ranges(
++                    &source,
++                    &mut ExpressionBudget::new(1_000_000, 1153)
++                ),
++                Err(SurfaceRangeError::Expression(
++                    ExpressionError::WorkExhausted
++                ))
++            ));
++            None
++        } else if mode.ends_with("-cancel") {
++            let token = hypersolve::work_budget::CancellationToken::new();
++            token.cancel();
++            let mut cancelled = graph();
++            cancelled.cancellation = Some(token);
++            assert!(matches!(
++                prepare_rational_bezier_surface_ranges(&source, &mut cancelled),
++                Err(SurfaceRangeError::Expression(ExpressionError::Cancelled))
++            ));
++            None
++        } else {
++            None
++        };
++        assert_eq!(
++            native(&source).homogeneous_controls.get().is_some(),
++            mode.starts_with("warm-")
++        );
++        dispatch_trace::reset();
++        let outcome = dispatch_trace::with_recording(|| {
++            hypercurve::evaluate_under(policy, || {
++                (
++                    source.evaluate_real(&parameter).unwrap(),
++                    source.partials_at(&uv).unwrap(),
++                )
++            })
++        });
++        let snapshot = dispatch_trace::take_trace();
++        let certainty = outcome.certainty();
++        assert_eq!(certainty, hypercurve::CurveCertainty::Certified);
++        let (point, partials) = outcome.certified().unwrap();
++        let u = Point3::from(partials.u().try_coordinates().unwrap().clone());
++        let v = Point3::from(partials.v().try_coordinates().unwrap().clone());
++        let values = [point.x, point.y, point.z, u.x, u.y, u.z, v.x, v.y, v.z]
++            .map(|value| value.exact_rational_normal_form().unwrap());
++        let half = hyperreal::Rational::from(1) / hyperreal::Rational::from(2);
++        assert_eq!(
++            values,
++            [
++                half.clone(),
++                1.into(),
++                hyperreal::Rational::from(1) / hyperreal::Rational::from(4),
++                1.into(),
++                0.into(),
++                half.clone(),
++                0.into(),
++                2.into(),
++                half
++            ]
++        );
++        println!("NATIVE_TRACE {policy:?} {certainty:?} {values:?} {snapshot:?}");
++        drop(prepared);
++    }
++}
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-baseline.txt b/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-baseline.txt
+new file mode 100644
+index 000000000..ac35f5f41
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-baseline.txt
+@@ -0,0 +1,2 @@
++NATIVE_TRACE PredicatePolicy(0) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 8 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 8 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 1 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 3 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 3 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 4 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 139 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 94 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 103, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++NATIVE_TRACE PredicatePolicy(1) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 5 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-difference", count: 1 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 139 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 94 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 100, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-prepare.txt b/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-prepare.txt
+new file mode 100644
+index 000000000..5d8857eef
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges/trace-cold-prepare.txt
+@@ -0,0 +1,2 @@
++NATIVE_TRACE PredicatePolicy(0) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 8 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 7 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 1 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 3 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 3 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 4 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 139 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 94 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 103, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++NATIVE_TRACE PredicatePolicy(1) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 5 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-difference", count: 1 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 139 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 94 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 100, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-baseline.txt b/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-baseline.txt
+new file mode 100644
+index 000000000..83e29c52b
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-baseline.txt
+@@ -0,0 +1,2 @@
++NATIVE_TRACE PredicatePolicy(0) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 6 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 127 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 82 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 94, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++NATIVE_TRACE PredicatePolicy(1) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 5 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-difference", count: 1 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 127 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 82 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 93, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
+diff --git a/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-prepare.txt b/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-prepare.txt
+new file mode 100644
+index 000000000..c1e8a2a17
+--- /dev/null
++++ b/crates/hyperbrep/src/geometry/interval_ranges/trace-warm-prepare.txt
+@@ -0,0 +1,2 @@
++NATIVE_TRACE PredicatePolicy(0) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 5 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 127 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 82 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 94, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++NATIVE_TRACE PredicatePolicy(1) Certified [Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 4 }, Rational { sign: Plus, numerator: 1, denominator: 1 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }, Rational { sign: NoSign, numerator: 0, denominator: 1 }, Rational { sign: Plus, numerator: 2, denominator: 1 }, Rational { sign: Plus, numerator: 1, denominator: 2 }] TraceSnapshot { dispatch: [DispatchCount { layer: "hyperlattice_vector", operation: "constructor", path: "new", count: 2 }, DispatchCount { layer: "hyperlimit", operation: "compare_reals", path: "exact-rational", count: 8 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 7 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 5 }, DispatchCount { layer: "rational", operation: "comparison", path: "dyadic-borrowed-digits", count: 4 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-difference", count: 1 }, DispatchCount { layer: "rational", operation: "linear", path: "retained-sum", count: 2 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 2 }, DispatchCount { layer: "rational", operation: "sub", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "unit", count: 7 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 10 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 127 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 17 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 7 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 2 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 82 }, DispatchCount { layer: "real", operation: "sub", path: "same-symbolic-basis", count: 25 }], rational: RationalTraceStats { temporary_rationals: 93, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
+diff --git a/crates/hyperbrep/src/lib.rs b/crates/hyperbrep/src/lib.rs
+index b4f4fc22b..5ace18993 100644
+--- a/crates/hyperbrep/src/lib.rs
++++ b/crates/hyperbrep/src/lib.rs
+@@ -17,6 +17,8 @@ mod cache;
+ mod context;
+ mod error;
+ mod geometry;
++#[cfg(feature = "interval-ranges")]
++pub use geometry::interval_ranges;
+ mod parameter;
+ mod persistence;
+ mod topology;
+diff --git a/crates/hyperbrep/tests/interval_ranges.rs b/crates/hyperbrep/tests/interval_ranges.rs
+new file mode 100644
+index 000000000..0302572b1
+--- /dev/null
++++ b/crates/hyperbrep/tests/interval_ranges.rs
+@@ -0,0 +1,662 @@
++#![cfg(feature = "interval-ranges")]
++
++use hyperbrep::{
++    GeometryError, Vector3,
++    interval_ranges::{SurfaceRangeEnclosure, SurfaceRangeError},
++};
++use hyperbrep::{Point3, Surface, interval_ranges::prepare_rational_bezier_surface_ranges};
++use hyperinterval::IntervalError;
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::BoxN;
++use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy, ordered_aabb3s_intersect};
++use hyperreal::{Rational, Real};
++use hypersolve::expression_program::ExpressionBudget;
++use hypersolve::{expression_program::ExpressionError, work_budget::CancellationToken};
++
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn q(n: i32, d: i32) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn patch() -> Surface {
++    Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(1.into(), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 2.into(), 0.into()),
++                Point3::new(1.into(), 2.into(), 1.into()),
++            ],
++        ],
++        vec![vec![1.into(); 2]; 2],
++    )
++    .unwrap()
++}
++fn enclose(surface: &Surface, domain: &BoxN<DyadicInterval, 2>) -> SurfaceRangeEnclosure {
++    prepare_rational_bezier_surface_ranges(surface, &mut graph())
++        .unwrap()
++        .enclose(domain, -128, &mut graph(), &mut arithmetic())
++        .unwrap()
++}
++fn contains(range: &DyadicInterval, lower: Rational, upper: Rational) {
++    let r = range.to_rational(&mut arithmetic()).unwrap();
++    assert!(r.contains_point(&lower), "{r:?} lacks {lower}");
++    assert!(r.contains_point(&upper), "{r:?} lacks {upper}");
++}
++fn encloses_rational_point(range: &DyadicInterval, expected: Rational) {
++    contains(range, expected.clone(), expected);
++    let bounds = range.to_rational(&mut arithmetic()).unwrap();
++    let (lo, hi) = bounds.bounds().unwrap();
++    let tolerance = d(1, 1, -100).to_rational(&mut arithmetic()).unwrap();
++    assert!(
++        hi - lo <= *tolerance.bounds().unwrap().0,
++        "excessive outward width: {range:?}"
++    );
++}
++fn exact_values(
++    prepared: &hyperbrep::interval_ranges::PreparedRationalBezierSurfaceRanges,
++    arguments: [Real; 2],
++    coordinates: [Real; 3],
++    partials: [[Real; 3]; 2],
++) {
++    let definition = prepared.program().program().definition();
++    // Independent exact oracle: normalize each arithmetic step through the
++    // existing scalar quadratic field before comparing against the closed form.
++    // Comparing the entire expanded native expression can exceed the scalar
++    // recognizer's bounded search; that is not a failed interval certificate.
++    use hypersolve::expression_program::{BinaryOperation, ExpressionNode, UnaryOperation};
++    let mut nodes: Vec<Real> = Vec::new();
++    for node in &definition.nodes {
++        let value = match node {
++            ExpressionNode::Constant(value) => value.clone(),
++            ExpressionNode::Variable(symbol) => arguments[definition
++                .variables
++                .iter()
++                .position(|id| *id == symbol.id)
++                .unwrap()]
++            .clone(),
++            ExpressionNode::Binary {
++                operation,
++                left,
++                right,
++            } => match operation {
++                BinaryOperation::Add => &nodes[*left] + &nodes[*right],
++                BinaryOperation::Sub => &nodes[*left] - &nodes[*right],
++                BinaryOperation::Mul => &nodes[*left] * &nodes[*right],
++                BinaryOperation::Div => (&nodes[*left] / &nodes[*right]).unwrap(),
++            },
++            ExpressionNode::Unary {
++                operation: UnaryOperation::Neg,
++                input,
++            } => -nodes[*input].clone(),
++            ExpressionNode::Unary {
++                operation: UnaryOperation::PowI(exponent),
++                input,
++            } => nodes[*input].clone().powi((*exponent).into()).unwrap(),
++            _ => panic!("unexpected operation in polynomial quotient oracle: {node:?}"),
++        };
++        let (a, b, d) = value
++            .exact_quadratic_normal_form()
++            .expect("quadratic fixture node");
++        nodes.push(Real::new(a) + Real::new(b) * Real::new(d).sqrt().unwrap());
++    }
++    let values: Vec<_> = definition
++        .outputs
++        .iter()
++        .map(|&id| nodes[id].clone())
++        .collect();
++    for (coordinate, expected) in coordinates.iter().enumerate() {
++        assert_eq!(
++            hyperlimit::compare_reals(&values[coordinate], expected, PredicatePolicy::STRICT)
++                .value(),
++            Some(std::cmp::Ordering::Equal)
++        );
++        for (axis, partial) in partials.iter().enumerate() {
++            let actual = &values[prepared.program().partial_output(coordinate, axis).unwrap()];
++            assert_eq!(
++                hyperlimit::compare_reals(actual, &partial[coordinate], PredicatePolicy::STRICT)
++                    .value(),
++                Some(std::cmp::Ordering::Equal),
++                "coordinate {coordinate} axis {axis}"
++            );
++        }
++    }
++}
++
++fn d(lower: i64, upper: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(lower.into(), upper.into(), exponent).unwrap()
++}
++
++#[test]
++fn nonuniform_weights_keep_independent_rational_values_and_partials() {
++    // S=(u/(1+u),v,0), with weights [1,2] in each row.
++    let source = Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(q(1, 2), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 1.into(), 0.into()),
++                Point3::new(q(1, 2), 1.into(), 0.into()),
++            ],
++        ],
++        vec![vec![1.into(), 2.into()]; 2],
++    )
++    .unwrap();
++    let full = enclose(&source, &BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap());
++    contains(
++        full.coordinates()[0],
++        0.into(),
++        Rational::from(1) / Rational::from(2),
++    );
++    contains(full.coordinates()[1], 0.into(), 1.into());
++    contains(
++        full.partials()[0][0],
++        Rational::from(1) / Rational::from(4),
++        1.into(),
++    );
++    let point = enclose(&source, &BoxN::new([d(1, 1, -1), d(1, 1, -2)]).unwrap());
++    contains(
++        point.coordinates()[0],
++        Rational::from(1) / Rational::from(3),
++        Rational::from(1) / Rational::from(3),
++    );
++    assert_eq!(point.coordinates()[1], &d(1, 1, -2));
++    contains(
++        point.partials()[0][0],
++        Rational::from(4) / Rational::from(9),
++        Rational::from(4) / Rational::from(9),
++    );
++    for (range, expected) in point.partials()[1].into_iter().zip([0, 1, 0]) {
++        encloses_rational_point(range, expected.into());
++    }
++    exact_values(
++        &prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap(),
++        [q(1, 2), q(1, 4)],
++        [q(1, 3), q(1, 4), 0.into()],
++        [
++            [q(4, 9), 0.into(), 0.into()],
++            [0.into(), 1.into(), 0.into()],
++        ],
++    );
++}
++
++#[test]
++fn positive_native_weights_do_not_turn_denominator_overestimation_into_a_pole() {
++    // W=1-3u/2+3u²/2 >=5/8. Its whole Horner enclosure crosses zero.
++    let source = Surface::rational_bezier(
++        (0..2)
++            .map(|v| {
++                (0..3)
++                    .map(|u| Point3::new(q(u, 2), v.into(), 0.into()))
++                    .collect()
++            })
++            .collect(),
++        vec![vec![1.into(), q(1, 4), 1.into()]; 2],
++    )
++    .unwrap();
++    let prepared = prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap();
++    let error = prepared
++        .enclose(
++            &BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap(),
++            -64,
++            &mut graph(),
++            &mut arithmetic(),
++        )
++        .unwrap_err();
++    assert!(matches!(
++        error,
++        SurfaceRangeError::Expression(ExpressionError::Enclosure {
++            source: IntervalError::ContainsZero,
++            ..
++        })
++    ));
++    assert!(std::error::Error::source(&error).is_some());
++    let narrow = prepared
++        .enclose(
++            &BoxN::new([d(0, 1, -4), d(0, 1, 0)]).unwrap(),
++            -64,
++            &mut graph(),
++            &mut arithmetic(),
++        )
++        .unwrap();
++    // X(1/16)=(u/4+3u²/4)/W=19/934; X is increasing here.
++    contains(
++        narrow.coordinates()[0],
++        0.into(),
++        Rational::from(19) / Rational::from(934),
++    );
++    let retry = prepared
++        .enclose(
++            &BoxN::new([d(0, 1, -4), d(0, 1, 0)]).unwrap(),
++            -64,
++            &mut graph(),
++            &mut arithmetic(),
++        )
++        .unwrap();
++    assert_eq!(narrow.evidence().values(), retry.evidence().values());
++}
++
++#[test]
++fn asymmetric_arbitrary_degree_tensor_has_exact_independent_midpoint_derivatives() {
++    for (n, m) in [(2, 3), (7, 2), (33, 2)] {
++        // Bernstein controls of (u,v,u^n v^m); no degree reduction is assumed.
++        let controls = (0..=m)
++            .map(|j| {
++                (0..=n)
++                    .map(|i| Point3::new(q(i, n), q(j, m), i32::from(i == n && j == m).into()))
++                    .collect()
++            })
++            .collect();
++        let source = Surface::rational_bezier(
++            controls,
++            vec![vec![1.into(); n as usize + 1]; m as usize + 1],
++        )
++        .unwrap();
++        let domain = BoxN::new([d(1, 1, -1), d(1, 1, -1)]).unwrap();
++        let prepared = prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap();
++        let report = prepared
++            .enclose(&domain, -128, &mut graph(), &mut arithmetic())
++            .unwrap();
++        assert_eq!(
++            report.coordinates(),
++            [&d(1, 1, -1), &d(1, 1, -1), &d(1, 1, -n - m)]
++        );
++        assert_eq!(
++            report.partials()[0],
++            [&d(1, 1, 0), &d(0, 0, 0), &d(n.into(), n.into(), 1 - n - m)]
++        );
++        assert_eq!(
++            report.partials()[1],
++            [&d(0, 0, 0), &d(1, 1, 0), &d(m.into(), m.into(), 1 - n - m)]
++        );
++        let coarse = prepared
++            .enclose(&domain, -16, &mut graph(), &mut arithmetic())
++            .unwrap();
++        for (fine, coarse) in report
++            .evidence()
++            .values()
++            .iter()
++            .zip(coarse.evidence().values())
++        {
++            assert!(fine.subset_of(coarse, &mut arithmetic()).unwrap());
++        }
++        assert_eq!(
++            report.evidence().values(),
++            prepared
++                .enclose(&domain, -128, &mut graph(), &mut arithmetic())
++                .unwrap()
++                .evidence()
++                .values()
++        );
++    }
++}
++
++#[test]
++fn algebraic_subdivisions_feed_ranges_with_both_chain_rule_factors() {
++    let alpha = (Real::from(2).sqrt().unwrap() / Real::from(2)).unwrap();
++    let (u_left, _) = patch().split_u_at(&alpha).unwrap();
++    let (both_left, _) = u_left.split_v_at(&alpha).unwrap();
++    // S(alpha*u,alpha*v)=(alpha*u,2alpha*v,uv/2).
++    let report = enclose(&both_left, &BoxN::new([d(1, 1, 0), d(1, 1, 0)]).unwrap());
++    for (range, expected) in [
++        (
++            report.coordinates()[0],
++            Rational::from(1) / Rational::from(2),
++        ),
++        (report.coordinates()[1], Rational::from(2)),
++        (
++            report.partials()[0][0],
++            Rational::from(1) / Rational::from(2),
++        ),
++        (report.partials()[1][1], Rational::from(2)),
++    ] {
++        let bounds = range.to_rational(&mut arithmetic()).unwrap();
++        let (lo, hi) = bounds.bounds().unwrap();
++        assert!(!lo.is_negative());
++        assert!(lo * lo <= expected && hi * hi >= expected);
++    }
++    for range in [
++        report.coordinates()[2],
++        report.partials()[0][2],
++        report.partials()[1][2],
++    ] {
++        contains(
++            range,
++            Rational::from(1) / Rational::from(2),
++            Rational::from(1) / Rational::from(2),
++        );
++    }
++    encloses_rational_point(report.partials()[0][1], 0.into());
++    encloses_rational_point(report.partials()[1][0], 0.into());
++    exact_values(
++        &prepare_rational_bezier_surface_ranges(&both_left, &mut graph()).unwrap(),
++        [1.into(), 1.into()],
++        [alpha.clone(), Real::from(2) * &alpha, q(1, 2)],
++        [
++            [alpha.clone(), 0.into(), q(1, 2)],
++            [0.into(), Real::from(2) * &alpha, q(1, 2)],
++        ],
++    );
++}
++
++#[test]
++fn constant_and_rank_one_patches_have_c1_ranges_without_an_immersion_claim() {
++    for rank_one in [false, true] {
++        let source = Surface::rational_bezier(
++            vec![
++                vec![
++                    Point3::new(0.into(), 2.into(), 3.into()),
++                    Point3::new(i32::from(rank_one).into(), 2.into(), 3.into()),
++                ];
++                2
++            ],
++            vec![vec![1.into(); 2]; 2],
++        )
++        .unwrap();
++        let report = enclose(&source, &BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap());
++        assert_eq!(
++            report.coordinates(),
++            [&d(0, i64::from(rank_one), 0), &d(2, 2, 0), &d(3, 3, 0)]
++        );
++        assert_eq!(
++            report.partials()[0],
++            [
++                &d(i64::from(rank_one), i64::from(rank_one), 0),
++                &d(0, 0, 0),
++                &d(0, 0, 0)
++            ]
++        );
++        assert_eq!(report.partials()[1], [&d(0, 0, 0); 3]);
++        assert!(matches!(
++            source.normal_at(&hypercurve::Point2::new(q(1, 2), q(1, 2)).into()),
++            Err(GeometryError::SingularSurfaceParameter)
++        ));
++    }
++}
++
++#[test]
++fn empty_outside_and_unsupported_inputs_remain_distinct() {
++    let source = patch();
++    let prepared = prepare_rational_bezier_surface_ranges(&source, &mut graph()).unwrap();
++    // Cartesian emptiness is canonical even when the other lane is outside UV.
++    let empty = BoxN::new([DyadicInterval::empty(), d(9, 10, 0)]).unwrap();
++    let report = prepared
++        .enclose(&empty, -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert!(report.parameters().is_empty());
++    assert!(
++        report
++            .evidence()
++            .values()
++            .iter()
++            .all(DyadicInterval::is_empty)
++    );
++    assert!(
++        report
++            .native_bounds(&mut graph(), &mut arithmetic())
++            .unwrap()
++            .bounds()
++            .is_none()
++    );
++    for domain in [
++        BoxN::new([d(-1, 0, 0), d(0, 1, 0)]).unwrap(),
++        BoxN::new([d(0, 1, 0), d(1, 2, 0)]).unwrap(),
++    ] {
++        assert!(matches!(
++            prepared.enclose(&domain, -64, &mut graph(), &mut arithmetic()),
++            Err(SurfaceRangeError::Geometry(
++                GeometryError::SurfaceParameterOutsideDomain
++            ))
++        ));
++    }
++    let plane = Surface::plane(
++        Point3::new(0.into(), 0.into(), 0.into()),
++        Vector3::new([1.into(), 0.into(), 0.into()]),
++        Vector3::new([0.into(), 1.into(), 0.into()]),
++    )
++    .unwrap();
++    assert!(matches!(
++        prepare_rational_bezier_surface_ranges(&plane, &mut graph()),
++        Err(SurfaceRangeError::UnsupportedSurface(_))
++    ));
++}
++
++#[test]
++fn resource_failures_and_cancellation_are_typed_and_retryable() {
++    let source = patch();
++    let mut g = graph();
++    let prepared = prepare_rational_bezier_surface_ranges(&source, &mut g).unwrap();
++    let work = 100_000_000 - g.remaining_work();
++    for limit in [0, 1, work / 2, work - 1] {
++        assert!(matches!(
++            prepare_rational_bezier_surface_ranges(
++                &source,
++                &mut ExpressionBudget::new(1_000_000, limit)
++            ),
++            Err(SurfaceRangeError::Expression(
++                ExpressionError::WorkExhausted
++            ))
++        ));
++    }
++    assert!(
++        prepare_rational_bezier_surface_ranges(
++            &source,
++            &mut ExpressionBudget::new(1_000_000, work)
++        )
++        .is_ok()
++    );
++    assert!(matches!(
++        prepare_rational_bezier_surface_ranges(&source, &mut ExpressionBudget::new(1, 100_000_000)),
++        Err(SurfaceRangeError::Expression(
++            ExpressionError::SizeExhausted
++        ))
++    ));
++    let domain = BoxN::new([d(1, 2, -2), d(2, 3, -2)]).unwrap();
++    let mut g = graph();
++    let mut a = arithmetic();
++    let reference = prepared.enclose(&domain, -64, &mut g, &mut a).unwrap();
++    let work = 100_000_000 - g.remaining_work();
++    let arithmetic_work = 1_000_000_000_000 - a.remaining_work();
++    for limit in 0..work {
++        assert!(
++            matches!(
++                prepared.enclose(
++                    &domain,
++                    -64,
++                    &mut ExpressionBudget::new(1_000_000, limit),
++                    &mut arithmetic()
++                ),
++                Err(SurfaceRangeError::Expression(
++                    ExpressionError::WorkExhausted
++                ))
++            ),
++            "work cutoff {limit}"
++        );
++    }
++    let exact = prepared
++        .enclose(
++            &domain,
++            -64,
++            &mut ExpressionBudget::new(1_000_000, work),
++            &mut DyadicBudget::new(16384, arithmetic_work),
++        )
++        .unwrap();
++    assert_eq!(reference.evidence().values(), exact.evidence().values());
++    let failure = prepared
++        .enclose(
++            &domain,
++            -64,
++            &mut graph(),
++            &mut DyadicBudget::new(16384, arithmetic_work - 1),
++        )
++        .unwrap_err();
++    assert!(matches!(
++        failure,
++        SurfaceRangeError::Interval(IntervalError::WorkExhausted)
++            | SurfaceRangeError::Expression(ExpressionError::Enclosure {
++                source: IntervalError::WorkExhausted,
++                ..
++            })
++            | SurfaceRangeError::Expression(ExpressionError::ArgumentEnclosure {
++                source: IntervalError::WorkExhausted,
++                ..
++            })
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        prepare_rational_bezier_surface_ranges(&source, &mut cancelled),
++        Err(SurfaceRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert!(matches!(
++        prepared.enclose(&domain, -64, &mut cancelled, &mut arithmetic()),
++        Err(SurfaceRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert!(matches!(
++        reference.native_bounds(&mut cancelled, &mut arithmetic()),
++        Err(SurfaceRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert_eq!(
++        reference.evidence().values(),
++        enclose(&source, &domain).evidence().values()
++    );
++}
++
++#[test]
++fn spatial_exclusion_preserves_touching_candidates_and_tiny_distinct_gaps() {
++    let report = enclose(&patch(), &BoxN::new([d(0, 1, 0), d(0, 1, 0)]).unwrap());
++    let projected = report
++        .native_bounds(&mut graph(), &mut arithmetic())
++        .unwrap();
++    let bounds = projected.bounds().unwrap();
++    let tiny = Real::from(2).powi((-80).into()).unwrap();
++    for policy in [PredicatePolicy::STRICT, PredicatePolicy::APPROXIMATE_512] {
++        for (minimum_x, expected) in [(Real::one(), true), (Real::one() + &tiny, false)] {
++            let outcome = ordered_aabb3s_intersect(
++                &bounds.mins,
++                &bounds.maxs,
++                &Point3::new(minimum_x, 0.into(), 0.into()),
++                &Point3::new(2.into(), 2.into(), 1.into()),
++                policy,
++            );
++            assert!(
++                matches!(outcome,PredicateOutcome::Decided{value,certainty:Certainty::Exact,..} if value==expected)
++            );
++        }
++    }
++}
++
++#[test]
++fn immutable_program_sharing_keeps_worker_budgets_and_domain_evidence_separate() {
++    let prepared = prepare_rational_bezier_surface_ranges(&patch(), &mut graph()).unwrap();
++    let domains = [
++        BoxN::new([d(0, 1, -1), d(1, 2, -1)]).unwrap(),
++        BoxN::new([d(1, 2, -1), d(0, 1, -1)]).unwrap(),
++    ];
++    let serial = domains
++        .iter()
++        .map(|domain| {
++            prepared
++                .enclose(domain, -64, &mut graph(), &mut arithmetic())
++                .unwrap()
++        })
++        .collect::<Vec<_>>();
++    std::thread::scope(|scope| {
++        let workers = domains
++            .iter()
++            .map(|domain| {
++                let prepared = &prepared;
++                scope.spawn(move || {
++                    // Each worker owns an explicit budget; no implicit shared allowance.
++                    let mut exhausted = ExpressionBudget::new(1_000_000, 0);
++                    assert!(matches!(
++                        prepared.enclose(domain, -64, &mut exhausted, &mut arithmetic()),
++                        Err(SurfaceRangeError::Expression(
++                            ExpressionError::WorkExhausted
++                        ))
++                    ));
++                    prepared
++                        .enclose(domain, -64, &mut graph(), &mut arithmetic())
++                        .unwrap()
++                })
++            })
++            .collect::<Vec<_>>();
++        for ((worker, expected), domain) in workers.into_iter().zip(&serial).zip(&domains) {
++            let actual = worker.join().unwrap();
++            assert_eq!(actual.parameters(), domain);
++            assert_eq!(actual.evidence().values(), expected.evidence().values());
++        }
++    });
++    let report = prepared
++        .enclose(&domains[0], -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(report.evidence().values(), serial[0].evidence().values());
++}
++
++#[test]
++fn native_asymmetric_patch_ranges_feed_certified_spatial_exclusion() {
++    // Rows increase v, columns increase u: S(u,v) = (u, 2v, uv).
++    let surface = Surface::rational_bezier(
++        vec![
++            vec![
++                Point3::new(0.into(), 0.into(), 0.into()),
++                Point3::new(1.into(), 0.into(), 0.into()),
++            ],
++            vec![
++                Point3::new(0.into(), 2.into(), 0.into()),
++                Point3::new(1.into(), 2.into(), 1.into()),
++            ],
++        ],
++        vec![vec![1.into(), 1.into()]; 2],
++    )
++    .unwrap();
++    let mut graph = ExpressionBudget::new(1_000_000, 100_000_000);
++    let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000_000);
++    let prepared = prepare_rational_bezier_surface_ranges(&surface, &mut graph).unwrap();
++    let domain = BoxN::new([d(1, 2, -2), d(2, 3, -2)]).unwrap();
++    let report = prepared
++        .enclose(&domain, -64, &mut graph, &mut arithmetic)
++        .unwrap();
++    assert_eq!(report.parameters(), &domain);
++    assert_eq!(
++        report.coordinates(),
++        [&d(1, 2, -2), &d(2, 3, -1), &d(1, 3, -3)]
++    );
++    assert_eq!(
++        report.partials()[0],
++        [&d(1, 1, 0), &d(0, 0, 0), &d(2, 3, -2)]
++    );
++    assert_eq!(
++        report.partials()[1],
++        [&d(0, 0, 0), &d(2, 2, 0), &d(1, 2, -2)]
++    );
++    let projected = report.native_bounds(&mut graph, &mut arithmetic).unwrap();
++    assert!(std::ptr::eq(projected.evidence(), &report));
++    let bounds = projected.bounds().unwrap();
++    for policy in [PredicatePolicy::STRICT, PredicatePolicy::APPROXIMATE_512] {
++        assert!(matches!(
++            ordered_aabb3s_intersect(
++                &bounds.mins,
++                &bounds.maxs,
++                &Point3::new(2.into(), 2.into(), 2.into()),
++                &Point3::new(3.into(), 3.into(), 3.into()),
++                policy,
++            ),
++            PredicateOutcome::Decided {
++                value: false,
++                certainty: Certainty::Exact,
++                ..
++            }
++        ));
++    }
++}
+diff --git a/crates/hyperbrep/tests/surface_ranges_example.rs b/crates/hyperbrep/tests/surface_ranges_example.rs
+new file mode 100644
+index 000000000..ba9fc50fb
+--- /dev/null
++++ b/crates/hyperbrep/tests/surface_ranges_example.rs
+@@ -0,0 +1,7 @@
++#![cfg(feature = "interval-ranges")]
++#[path = "../examples/surface_ranges.rs"]
++mod consumer;
++#[test]
++fn actual_native_surface_range_consumer() {
++    consumer::run().unwrap();
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 8f67f2522..7fc366f2f 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Compile native bivariate polynomial quotients into shared expression/Jacobian
++  programs with exact coefficients, ordered bindings, original denominator guards
++  and explicit graph/work budgets.
++
+ - Add opt-in sensitivity-retained Taylor noise enclosures for repeated affine
+   observations, retaining exact sources, shared selected monomials and every
+   omitted contribution in distinct residual bounds.
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 2dfa68529..7ccc3f025 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -27,6 +27,7 @@ mod affine;
+ pub use affine::{AffineParameterization, AffineProgram};
+ mod jacobian;
+ pub use jacobian::JacobianProgram;
++mod bivariate;
+ 
+ /// An operation on two expressions, preserving left-to-right evaluation.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+diff --git a/crates/hypersolve/src/expression_program/bivariate.rs b/crates/hypersolve/src/expression_program/bivariate.rs
+new file mode 100644
+index 000000000..90ef0b0d1
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/bivariate.rs
+@@ -0,0 +1,117 @@
++//! Native coefficient grids compiled through the shared expression builder.
++use super::{
++    BinaryOperation, ExpressionBudget, ExpressionDefinition, ExpressionError, ExpressionNode,
++    ExpressionProgram, jacobian::Builder,
++};
++use crate::{BivariatePolynomial, SymbolId, SymbolRef};
++use hyperreal::Real;
++
++impl ExpressionProgram {
++    /// Compile ordered bivariate numerators over one shared denominator.
++    ///
++    /// The binding order is the polynomial's first axis, then its second axis.
++    /// Coefficient rows may be ragged; empty rows and grids are zero. Exact
++    /// coefficients and explicit division guards are retained, including for a
++    /// zero numerator. No cancellation, sign test or scalar demotion is applied.
++    /// This constructs a definition, not evidence that the denominator is nonzero
++    /// on any domain. Evaluation and regularity certification remain separate.
++    ///
++    /// Graph limits charge visited rows, emitted nodes, binding/output records
++    /// and validation. Entry checks precede graph allocation; scalar payload
++    /// cloning/destruction, arithmetic, coefficient growth and total heap bytes
++    /// retain the expression budget's exclusions. Cancellation is checked during
++    /// construction and before publication. Failure stores no global state.
++    pub fn from_bivariate_quotients(
++        numerators: &[BivariatePolynomial],
++        denominator: &BivariatePolynomial,
++        variables: [SymbolId; 2],
++        budget: &mut ExpressionBudget,
++    ) -> Result<Self, ExpressionError> {
++        budget.charge(0)?;
++        budget.check_entries(&[2, 2, numerators.len()])?;
++        budget.charge(2)?;
++        if variables[0] == variables[1] {
++            return Err(ExpressionError::DuplicateVariable(variables[0]));
++        }
++        let mut builder = Builder {
++            definition: ExpressionDefinition {
++                variables: variables.to_vec(),
++                nodes: Vec::new(),
++                outputs: Vec::new(),
++            },
++            outputs: numerators.len(),
++            budget,
++        };
++        let u = builder.push(ExpressionNode::Variable(SymbolRef::new(variables[0], None)))?;
++        let v = builder.push(ExpressionNode::Variable(SymbolRef::new(variables[1], None)))?;
++        let weight = append_bivariate(&mut builder, denominator, [u, v])?;
++        for numerator in numerators {
++            let numerator = append_bivariate(&mut builder, numerator, [u, v])?;
++            let quotient = builder.push(ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                left: numerator,
++                right: weight,
++            })?;
++            builder.budget.charge(1)?;
++            builder.definition.outputs.push(quotient);
++        }
++        let program = Self::from_definition(builder.definition, builder.budget)?;
++        budget.charge(0)?;
++        Ok(program)
++    }
++}
++
++fn append_bivariate(
++    builder: &mut Builder<'_>,
++    polynomial: &BivariatePolynomial,
++    [u, v]: [usize; 2],
++) -> Result<usize, ExpressionError> {
++    let mut outer = None;
++    for row in polynomial.coefficients.iter().rev() {
++        builder.budget.charge(1)?;
++        let mut inner = None;
++        for coefficient in row.iter().rev() {
++            let product = inner
++                .map(|left| {
++                    builder.push(ExpressionNode::Binary {
++                        operation: BinaryOperation::Mul,
++                        left,
++                        right: v,
++                    })
++                })
++                .transpose()?;
++            let constant = builder.push(ExpressionNode::Constant(coefficient.clone()))?;
++            inner = Some(match product {
++                None => constant,
++                Some(left) => builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Add,
++                    left,
++                    right: constant,
++                })?,
++            });
++        }
++        let value = match inner {
++            Some(value) => value,
++            None => builder.push(ExpressionNode::Constant(Real::zero()))?,
++        };
++        outer = Some(match outer {
++            None => value,
++            Some(left) => {
++                let product = builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Mul,
++                    left,
++                    right: u,
++                })?;
++                builder.push(ExpressionNode::Binary {
++                    operation: BinaryOperation::Add,
++                    left: product,
++                    right: value,
++                })?
++            }
++        });
++    }
++    match outer {
++        Some(value) => Ok(value),
++        None => builder.push(ExpressionNode::Constant(Real::zero())),
++    }
++}
+diff --git a/crates/hypersolve/tests/bivariate_expression.rs b/crates/hypersolve/tests/bivariate_expression.rs
+new file mode 100644
+index 000000000..55659d06b
+--- /dev/null
++++ b/crates/hypersolve/tests/bivariate_expression.rs
+@@ -0,0 +1,278 @@
++#![cfg(feature = "expression-program")]
++
++use hyperreal::Real;
++use hypersolve::{
++    BivariatePolynomial, SymbolId,
++    expression_program::{
++        BinaryOperation, ExpressionBudget, ExpressionError, ExpressionNode, ExpressionProgram,
++    },
++    work_budget::CancellationToken,
++};
++
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 1_000_000)
++}
++
++#[test]
++fn empty_ragged_polynomials_keep_shared_original_denominator_guards() {
++    let zero = BivariatePolynomial::new(Vec::new());
++    let ragged = BivariatePolynomial::new(vec![vec![], vec![], vec![5.into()]]);
++    // W=v, so the second output is 5u²/v and the first remains 0/v.
++    let w = BivariatePolynomial::new(vec![vec![0.into(), 1.into()]]);
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[zero, ragged],
++        &w,
++        [SymbolId(0), SymbolId(1)],
++        &mut budget(),
++    )
++    .unwrap();
++    assert_eq!(
++        program
++            .eval_real(&[2.into(), 4.into()], &mut budget())
++            .unwrap(),
++        vec![Real::from(0), Real::from(5)]
++    );
++    let divisors: Vec<_> = program
++        .definition()
++        .outputs
++        .iter()
++        .map(|&output| {
++            let ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                right,
++                ..
++            } = program.definition().nodes[output]
++            else {
++                panic!("each output keeps its division guard")
++            };
++            right
++        })
++        .collect();
++    assert_eq!(divisors[0], divisors[1]);
++    let error = program
++        .eval_real(&[2.into(), 0.into()], &mut budget())
++        .unwrap_err();
++    assert!(matches!(error, ExpressionError::Scalar { .. }));
++    assert!(std::error::Error::source(&error).is_some());
++    let replay =
++        ExpressionProgram::from_definition(program.definition().clone(), &mut budget()).unwrap();
++    assert_eq!(replay.definition(), program.definition());
++    assert!(matches!(
++        replay.eval_real(&[2.into(), 0.into()], &mut budget()),
++        Err(ExpressionError::Scalar { .. })
++    ));
++}
++
++#[test]
++fn construction_budget_boundaries_cancellation_and_retry_are_explicit() {
++    let p = BivariatePolynomial::new(vec![vec![1.into(), 2.into()], vec![3.into()]]);
++    let w = BivariatePolynomial::new(vec![vec![1.into()]]);
++    let build = |budget: &mut ExpressionBudget| {
++        ExpressionProgram::from_bivariate_quotients(
++            std::slice::from_ref(&p),
++            &w,
++            [SymbolId(0), SymbolId(1)],
++            budget,
++        )
++    };
++    let mut ample = budget();
++    let program = build(&mut ample).unwrap();
++    let work = 1_000_000 - ample.remaining_work();
++    assert!(work > 0);
++    for limit in 0..work {
++        assert!(
++            matches!(
++                build(&mut ExpressionBudget::new(100_000, limit)),
++                Err(ExpressionError::WorkExhausted)
++            ),
++            "work limit {limit}"
++        );
++    }
++    assert_eq!(
++        build(&mut ExpressionBudget::new(100_000, work))
++            .unwrap()
++            .definition(),
++        program.definition()
++    );
++    let definition = program.definition();
++    let entries = definition.variables.len() + definition.nodes.len() + definition.outputs.len();
++    for limit in 0..entries {
++        assert!(
++            matches!(
++                build(&mut ExpressionBudget::new(limit, 1_000_000)),
++                Err(ExpressionError::SizeExhausted)
++            ),
++            "entry limit {limit}"
++        );
++    }
++    assert_eq!(
++        build(&mut ExpressionBudget::new(entries, work))
++            .unwrap()
++            .definition(),
++        definition
++    );
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        build(&mut cancelled),
++        Err(ExpressionError::Cancelled)
++    ));
++    assert_eq!(cancelled.remaining_work(), 1_000_000);
++    assert_eq!(build(&mut budget()).unwrap().definition(), definition);
++    assert!(matches!(
++        ExpressionProgram::from_bivariate_quotients(&[], &w, [SymbolId(9); 2], &mut budget()),
++        Err(ExpressionError::DuplicateVariable(SymbolId(9)))
++    ));
++}
++
++#[test]
++fn bivariate_quotients_preserve_axis_order_and_independent_derivatives() {
++    // P(u,v) = 1 + 2v + 3u + 4u²v; W(u,v) = 1 + u.
++    // The ragged middle row and asymmetric coefficients expose transposition.
++    let p = BivariatePolynomial::new(vec![
++        vec![1.into(), 2.into()],
++        vec![3.into()],
++        vec![0.into(), 4.into()],
++    ]);
++    let w = BivariatePolynomial::new(vec![vec![1.into()], vec![1.into()]]);
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[p],
++        &w,
++        [SymbolId(7), SymbolId(2)],
++        &mut budget(),
++    )
++    .unwrap();
++    // P(1,2)=16, W=2. P_u=19, P_v=6, so Q_u=11/2, Q_v=3.
++    assert_eq!(
++        program
++            .eval_real(&[1.into(), 2.into()], &mut budget())
++            .unwrap(),
++        vec![Real::from(8)]
++    );
++    let jacobian = program
++        .jacobian(&[SymbolId(7), SymbolId(2)], &mut budget())
++        .unwrap();
++    let values = jacobian
++        .program()
++        .eval_real(&[1.into(), 2.into()], &mut budget())
++        .unwrap();
++    assert_eq!(values[0], Real::from(8));
++    assert_eq!(
++        values[jacobian.partial_output(0, 0).unwrap()],
++        (Real::from(11) / Real::from(2)).unwrap()
++    );
++    assert_eq!(
++        values[jacobian.partial_output(0, 1).unwrap()],
++        Real::from(3)
++    );
++}
++
++#[test]
++fn high_degree_algebraic_coefficients_retain_independent_values_and_derivatives() {
++    // P=sqrt(2)*u^34*v^3+3, W=1+v. This is outside a low-degree catalog.
++    let alpha = Real::from(2).sqrt().unwrap();
++    let mut coefficients = vec![vec![]; 35];
++    coefficients[0] = vec![3.into()];
++    coefficients[34] = vec![0.into(), 0.into(), 0.into(), alpha.clone()];
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[BivariatePolynomial::new(coefficients)],
++        &BivariatePolynomial::new(vec![vec![1.into(), 1.into()]]),
++        [SymbolId(8), SymbolId(3)],
++        &mut budget(),
++    )
++    .unwrap();
++    let jacobian = program
++        .jacobian(&[SymbolId(8), SymbolId(3)], &mut budget())
++        .unwrap();
++    let values = jacobian
++        .program()
++        .eval_real(&[1.into(), 1.into()], &mut budget())
++        .unwrap();
++    let expected = [
++        (&alpha + Real::from(3)) / Real::from(2),
++        Ok(Real::from(17) * &alpha),
++        (Real::from(5) * &alpha - Real::from(3)) / Real::from(4),
++    ];
++    for (slot, expected) in [
++        0,
++        jacobian.partial_output(0, 0).unwrap(),
++        jacobian.partial_output(0, 1).unwrap(),
++    ]
++    .into_iter()
++    .zip(expected)
++    {
++        assert_eq!(
++            hyperlimit::compare_reals(
++                &values[slot],
++                &expected.unwrap(),
++                hyperlimit::PredicatePolicy::STRICT
++            )
++            .value(),
++            Some(std::cmp::Ordering::Equal)
++        );
++    }
++}
++
++#[test]
++fn empty_output_maps_still_validate_ordered_bindings() {
++    let program = ExpressionProgram::from_bivariate_quotients(
++        &[],
++        &BivariatePolynomial::new(vec![]),
++        [SymbolId(7), SymbolId(2)],
++        &mut budget(),
++    )
++    .unwrap();
++    assert_eq!(program.definition().variables, [SymbolId(7), SymbolId(2)]);
++    assert!(
++        program
++            .eval_real(&[1.into(), 2.into()], &mut budget())
++            .unwrap()
++            .is_empty()
++    );
++    for arguments in [vec![], vec![1.into()], vec![1.into(), 2.into(), 3.into()]] {
++        assert!(
++            matches!(program.eval_real(&arguments,&mut budget()),Err(ExpressionError::BindingCount{expected:2,actual}) if actual==arguments.len())
++        );
++    }
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn native_definition_replay_preserves_shared_denominator_and_rejects_bad_references() {
++    let source = ExpressionProgram::from_bivariate_quotients(
++        &[
++            BivariatePolynomial::new(vec![vec![], vec![2.into()]]),
++            BivariatePolynomial::new(vec![]),
++        ],
++        &BivariatePolynomial::new(vec![vec![0.into(), 1.into()]]),
++        [SymbolId(4), SymbolId(9)],
++        &mut budget(),
++    )
++    .unwrap();
++    let bytes = serde_json::to_string(source.definition()).unwrap();
++    let definition = serde_json::from_str(&bytes).unwrap();
++    let replay = ExpressionProgram::from_definition(definition, &mut budget()).unwrap();
++    assert_eq!(source.definition(), replay.definition());
++    assert_eq!(serde_json::to_string(replay.definition()).unwrap(), bytes);
++    assert_eq!(
++        replay
++            .eval_real(&[3.into(), 2.into()], &mut budget())
++            .unwrap(),
++        [Real::from(3), Real::from(0)]
++    );
++    assert!(matches!(
++        replay.eval_real(&[3.into(), 0.into()], &mut budget()),
++        Err(ExpressionError::Scalar { .. })
++    ));
++    let mut invalid = source.definition().clone();
++    let output = invalid.outputs[0];
++    let ExpressionNode::Binary { right, .. } = &mut invalid.nodes[output] else {
++        panic!("division guard")
++    };
++    *right = output;
++    assert!(
++        matches!(ExpressionProgram::from_definition(invalid,&mut budget()),Err(ExpressionError::InvalidReference{node,input}) if node==output && input==output)
++    );
++}
