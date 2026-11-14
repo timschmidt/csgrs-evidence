@@ -1,0 +1,1199 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index ef7884cc8..baceeb98c 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add opt-in exact source-bound coordinate transitions for direct chart transport.
++
+ - Add optional trajectory Taylor enclosures over certified Picard tubes, with
+   source-bound normalized Lie coefficients, complete next-order remainders,
+   analytic time/state domain proofs, typed failure and fresh-process replay.
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 4735ac856..eb4fffe97 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ coordinates = ["field", "hypersolve/coordinate-program"]
++coordinate-transition = ["coordinates", "hypersolve/coordinate-transition"]
+ taylor-model = ["field", "hypersolve/taylor-model"]
+ taylor-flow = ["taylor-model"]
+ taylor-affine = ["taylor-model", "hypersolve/taylor-affine"]
+@@ -66,3 +67,8 @@ required-features = ["coordinates"]
+ name = "taylor_flow"
+ harness = false
+ required-features = ["taylor-flow"]
++
++[[bench]]
++name = "coordinate_transition"
++harness = false
++required-features = ["coordinate-transition"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index d99c91a16..a6c249d5e 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -150,3 +150,5 @@ certified trajectory and endpoint enclosures. Every contribution and both source
+ proofs remain inspectable; generated endpoints can seed later steps. Replay the
+ field definition, order and proposal. This is a forward-step verifier, not an
+ automatic order/step controller or adaptive wrapping algorithm.
++
++With `coordinate-transition`, `CoordinateField::transition_to` prepares direct endpoint transport between two validated charts of the same field. `enclose` retains the exact relation and input beside its outer box, which can enter the destination chart’s next step. Frame selection and QR wrapping control remain separate work.
+diff --git a/crates/hyperdynamics/benches/coordinate_transition.rs b/crates/hyperdynamics/benches/coordinate_transition.rs
+new file mode 100644
+index 000000000..20741cfd0
+--- /dev/null
++++ b/crates/hyperdynamics/benches/coordinate_transition.rs
+@@ -0,0 +1,154 @@
++//! Complete direct and Cartesian-roundtrip chart transport, with all proofs retained.
++use criterion::{Criterion, black_box, criterion_group, criterion_main};
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    coordinates::{CoordinateFieldTransition, CoordinateTransport},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{CoordinateChange, ExpressionBudget, ExpressionProgram},
++};
++const X: SymbolId = SymbolId(0);
++const Y: SymbolId = SymbolId(1);
++const T: SymbolId = SymbolId(2);
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn d(l: i64, u: i64) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), 0).unwrap()
++}
++fn change(shear: i64, origin: [i64; 2]) -> CoordinateChange {
++    CoordinateChange {
++        variables: vec![X, Y],
++        to_source: vec![vec![1.into(), shear.into()], vec![0.into(), 1.into()]],
++        from_source: vec![vec![1.into(), (-shear).into()], vec![0.into(), 1.into()]],
++        origin: origin.into_iter().map(Into::into).collect(),
++    }
++}
++struct Fixture {
++    name: &'static str,
++    direct: CoordinateFieldTransition<2>,
++    to_physical: CoordinateFieldTransition<2>,
++    from_physical: CoordinateFieldTransition<2>,
++    initial: BoxN<DyadicInterval, 2>,
++    expected_direct: BoxN<DyadicInterval, 2>,
++    expected_roundtrip: BoxN<DyadicInterval, 2>,
++}
++fn fixture(
++    name: &'static str,
++    old: i64,
++    new: i64,
++    origin: [i64; 2],
++    direct: [(i64, i64); 2],
++    roundtrip: [(i64, i64); 2],
++) -> Fixture {
++    let source = ExpressionProgram::compile(
++        &[Expr::int(129), Expr::int(1)],
++        &[Y, T, X],
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    let f = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time: T,
++            state: vec![X, Y],
++        },
++        &mut budget(),
++    )
++    .unwrap();
++    let a = f
++        .in_coordinates(change(old, [10, -3]), &mut budget())
++        .unwrap();
++    let b = f
++        .in_coordinates(change(new, origin), &mut budget())
++        .unwrap();
++    let physical = f.in_coordinates(change(0, [0, 0]), &mut budget()).unwrap();
++    Fixture {
++        name,
++        direct: a.transition_to(&b, &mut budget()).unwrap(),
++        to_physical: a.transition_to(&physical, &mut budget()).unwrap(),
++        from_physical: physical.transition_to(&b, &mut budget()).unwrap(),
++        initial: BoxN::new([d(0, 0), d(-1, 1)]).unwrap(),
++        expected_direct: BoxN::new(direct.map(|(l, u)| d(l, u))).unwrap(),
++        expected_roundtrip: BoxN::new(roundtrip.map(|(l, u)| d(l, u))).unwrap(),
++    }
++}
++fn fixtures() -> Vec<Fixture> {
++    vec![
++        fixture(
++            "identity",
++            0,
++            0,
++            [10, -3],
++            [(0, 0), (-1, 1)],
++            [(0, 0), (-1, 1)],
++        ),
++        fixture(
++            "same_shear",
++            128,
++            128,
++            [10, -3],
++            [(0, 0), (-1, 1)],
++            [(-256, 256), (-1, 1)],
++        ),
++        fixture(
++            "changed_shear",
++            128,
++            64,
++            [12, -2],
++            [(-2, 126), (-2, 0)],
++            [(-130, 254), (-2, 0)],
++        ),
++    ]
++}
++fn direct(f: &Fixture) -> CoordinateTransport<2> {
++    f.direct.enclose(f.initial.clone(), &mut budget()).unwrap()
++}
++fn roundtrip(f: &Fixture) -> (CoordinateTransport<2>, CoordinateTransport<2>) {
++    let mut work = budget();
++    let first = f.to_physical.enclose(f.initial.clone(), &mut work).unwrap();
++    let second = f
++        .from_physical
++        .enclose(first.enclosure().clone(), &mut work)
++        .unwrap();
++    (first, second)
++}
++fn check(f: &Fixture) {
++    assert_eq!(direct(f).enclosure(), &f.expected_direct);
++    assert_eq!(roundtrip(f).1.enclosure(), &f.expected_roundtrip);
++    // Independent exact endpoint boxes derived from the affine relations above.
++    assert!(
++        f.expected_direct
++            .subset_of(
++                &f.expected_roundtrip,
++                &mut hyperinterval::DyadicBudget::new(16384, 1_000_000)
++            )
++            .unwrap()
++    );
++}
++fn benchmarks(c: &mut Criterion) {
++    for f in fixtures() {
++        check(&f);
++        let mut group = c.benchmark_group(f.name);
++        group.bench_function("direct", |b| {
++            b.iter(|| {
++                let proof = direct(black_box(&f));
++                black_box(&proof);
++                drop(proof);
++            })
++        });
++        group.bench_function("roundtrip", |b| {
++            b.iter(|| {
++                let proof = roundtrip(black_box(&f));
++                black_box(&proof);
++                drop(proof);
++            })
++        });
++        group.finish();
++    }
++}
++criterion_group!(benches, benchmarks);
++criterion_main!(benches);
+diff --git a/crates/hyperdynamics/src/field/coordinates.rs b/crates/hyperdynamics/src/field/coordinates.rs
+index c4cc8a6df..b42c7783f 100644
+--- a/crates/hyperdynamics/src/field/coordinates.rs
++++ b/crates/hyperdynamics/src/field/coordinates.rs
+@@ -294,3 +294,8 @@ impl<const N: usize> CoordinateStep<N> {
+         self.source_boxes.as_ref().map(|v| &v.2)
+     }
+ }
++
++#[cfg(feature = "coordinate-transition")]
++mod transition;
++#[cfg(feature = "coordinate-transition")]
++pub use transition::{CoordinateFieldTransition, CoordinateTransport, CoordinateTransportError};
+diff --git a/crates/hyperdynamics/src/field/coordinates/transition.rs b/crates/hyperdynamics/src/field/coordinates/transition.rs
+new file mode 100644
+index 000000000..46a29294a
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/coordinates/transition.rs
+@@ -0,0 +1,162 @@
++//! Direct endpoint transport between validated state charts.
++use super::*;
++use hypersolve::expression_program::{CoordinateTransition, CoordinateTransitionError};
++
++/// Incompatible field semantics or original transition/materialization diagnostic.
++#[derive(Clone, Debug)]
++pub enum CoordinateTransportError {
++    /// The charts assign different time or ordered state meaning to their source.
++    InterpretationMismatch,
++    /// Original exact source/transition construction failure.
++    Transition(CoordinateTransitionError),
++    /// Original graph, scalar or interval carrier failure.
++    Field(FieldError),
++}
++impl fmt::Display for CoordinateTransportError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "coordinate transport: {self:?}")
++    }
++}
++impl std::error::Error for CoordinateTransportError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Transition(e) => Some(e),
++            Self::Field(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<ExpressionError> for CoordinateTransportError {
++    fn from(e: ExpressionError) -> Self {
++        Self::Field(e.into())
++    }
++}
++impl From<IntervalLatticeError> for CoordinateTransportError {
++    fn from(e: IntervalLatticeError) -> Self {
++        Self::Field(e.into())
++    }
++}
++
++/// Shared exact chart relation with the source's original time/state meaning.
++#[derive(Clone, Debug)]
++pub struct CoordinateFieldTransition<const N: usize> {
++    from: CoordinateField<N>,
++    to: CoordinateField<N>,
++    relation: CoordinateTransition,
++}
++impl<const N: usize> CoordinateField<N> {
++    /// Prepare direct transport into an independently validated chart of this field.
++    ///
++    /// This composes exact matrices before projecting intervals. It does not
++    /// select a frame, perform QR factorization or assert a width improvement.
++    /// Source and interpretation mismatches fail before any enclosure, even for
++    /// an eventual empty input. Both original chart proofs are retained.
++    pub fn transition_to(
++        &self,
++        target: &Self,
++        budget: &mut EnclosureBudget,
++    ) -> Result<CoordinateFieldTransition<N>, CoordinateTransportError> {
++        budget
++            .graph
++            .charge(N.checked_add(1).ok_or(ExpressionError::SizeExhausted)?)?;
++        let from = self.original_field().identity();
++        let to = target.original_field().identity();
++        if from.time() != to.time() || from.state() != to.state() {
++            return Err(CoordinateTransportError::InterpretationMismatch);
++        }
++        let relation = self
++            .transformation()
++            .transition_to(target.transformation(), &mut budget.graph)
++            .map_err(CoordinateTransportError::Transition)?;
++        budget.graph.charge(1)?;
++        let result = CoordinateFieldTransition {
++            from: self.clone(),
++            to: target.clone(),
++            relation,
++        };
++        budget.graph.charge(0)?;
++        Ok(result)
++    }
++}
++impl<const N: usize> CoordinateFieldTransition<N> {
++    /// The originating field chart.
++    pub fn from(&self) -> &CoordinateField<N> {
++        &self.from
++    }
++    /// The destination field chart; its operations consume `enclose` output.
++    pub fn to(&self) -> &CoordinateField<N> {
++        &self.to
++    }
++    /// Retained exact affine map and both original inverse proofs.
++    pub fn relation(&self) -> &CoordinateTransition {
++        &self.relation
++    }
++    /// Enclose the exact affine image of an owned native box in the next chart.
++    ///
++    /// Input and relation remain authoritative. The returned box is an explicit
++    /// outer projection, generally not equal to that correlated image. It is a
++    /// sound enlarged initial set for subsequent operations in `to()`. Empty and
++    /// unit sets remain distinct. No ODE existence claim is made by transport.
++    ///
++    /// The shared budget covers graph evaluation, coefficient enclosure and
++    /// publication; its scalar-payload, refinement and total-heap exclusions
++    /// remain. A failed final check returns no completed transport certificate.
++    pub fn enclose(
++        &self,
++        initial: BoxN<DyadicInterval, N>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<CoordinateTransport<N>, CoordinateTransportError> {
++        budget.graph.charge(0)?;
++        budget.graph.check_entries(&[N, N])?;
++        let enclosure = if let Some(lanes) = initial.lanes() {
++            let values = self.relation.program().eval_dyadic(
++                lanes,
++                budget.policy.precision,
++                &mut budget.graph,
++                &mut budget.arithmetic,
++            )?;
++            budget.graph.charge(N)?;
++            BoxN::new(values.try_into().expect("validated transition dimension"))?
++        } else {
++            BoxN::empty()?
++        };
++        budget.graph.charge(1)?;
++        let result = CoordinateTransport {
++            transition: self.clone(),
++            initial,
++            enclosure,
++            policy: budget.policy(),
++        };
++        budget.graph.charge(0)?;
++        Ok(result)
++    }
++}
++/// Completed direct chart transport, retaining the exact image's definition.
++///
++/// Reconstruct the original field and both charts and call `enclose` on the
++/// original input. No serialized relation, enclosure or flag is accepted as proof.
++#[derive(Clone, Debug)]
++pub struct CoordinateTransport<const N: usize> {
++    transition: CoordinateFieldTransition<N>,
++    initial: BoxN<DyadicInterval, N>,
++    enclosure: BoxN<DyadicInterval, N>,
++    policy: EnclosurePolicy,
++}
++impl<const N: usize> CoordinateTransport<N> {
++    /// Original chart association and exact transition coefficients.
++    pub fn transition(&self) -> &CoordinateFieldTransition<N> {
++        &self.transition
++    }
++    /// Exact Cartesian parameter set in the originating chart.
++    pub fn initial(&self) -> &BoxN<DyadicInterval, N> {
++        &self.initial
++    }
++    /// Certified Cartesian outer enclosure in the destination chart.
++    pub fn enclosure(&self) -> &BoxN<DyadicInterval, N> {
++        &self.enclosure
++    }
++    /// Enclosure policy used for this complete transport.
++    pub fn policy(&self) -> EnclosurePolicy {
++        self.policy
++    }
++}
+diff --git a/crates/hyperdynamics/tests/field_coordinates.rs b/crates/hyperdynamics/tests/field_coordinates.rs
+index b1de4f103..aed70756c 100644
+--- a/crates/hyperdynamics/tests/field_coordinates.rs
++++ b/crates/hyperdynamics/tests/field_coordinates.rs
+@@ -495,3 +495,7 @@ fn source_projection_charges_coefficient_and_carrier_validation_scans() {
+ 
+ #[cfg(feature = "serde")]
+ use hyperdynamics::field::coordinates::CoordinateFieldDefinition;
++
++#[cfg(feature = "coordinate-transition")]
++#[path = "field_coordinates/transition.rs"]
++mod transition;
+diff --git a/crates/hyperdynamics/tests/field_coordinates/transition.rs b/crates/hyperdynamics/tests/field_coordinates/transition.rs
+new file mode 100644
+index 000000000..99c2bf07d
+--- /dev/null
++++ b/crates/hyperdynamics/tests/field_coordinates/transition.rs
+@@ -0,0 +1,357 @@
++use super::*;
++use hyperdynamics::field::coordinates::{CoordinateFieldTransition, CoordinateTransportError};
++fn identity() -> CoordinateChange {
++    CoordinateChange {
++        variables: vec![X, Y],
++        to_source: vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]],
++        from_source: vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]],
++        origin: vec![0.into(), 0.into()],
++    }
++}
++fn wide() -> CoordinateField<2> {
++    let mut c = change();
++    c.to_source[0][1] = 128.into();
++    c.from_source[0][1] = (-128).into();
++    field(&[Expr::int(129), Expr::int(1)], vec![X, Y])
++        .in_coordinates(c, &mut budget())
++        .unwrap()
++}
++#[test]
++fn direct_chart_transport_avoids_cartesian_roundtrip_wrapping() {
++    let a = wide();
++    let b = a
++        .original_field()
++        .in_coordinates(a.transformation().change().clone(), &mut budget())
++        .unwrap();
++    let physical = a
++        .original_field()
++        .in_coordinates(identity(), &mut budget())
++        .unwrap();
++    let initial = BoxN::new([d(0, 0), d(-1, 1)]).unwrap();
++    let direct = a
++        .transition_to(&b, &mut budget())
++        .unwrap()
++        .enclose(initial.clone(), &mut budget())
++        .unwrap();
++    assert_eq!(direct.enclosure(), &initial);
++    assert_eq!(direct.initial(), &initial);
++    let projected = a
++        .transition_to(&physical, &mut budget())
++        .unwrap()
++        .enclose(initial.clone(), &mut budget())
++        .unwrap();
++    assert_eq!(
++        projected.enclosure().lanes(),
++        Some(&[d(-118, 138), d(-4, -2)])
++    );
++    let roundtrip = physical
++        .transition_to(&b, &mut budget())
++        .unwrap()
++        .enclose(projected.enclosure().clone(), &mut budget())
++        .unwrap();
++    assert_eq!(
++        roundtrip.enclosure().lanes(),
++        Some(&[d(-256, 256), d(-1, 1)])
++    );
++    assert!(
++        direct
++            .enclosure()
++            .subset_of(
++                roundtrip.enclosure(),
++                &mut hyperinterval::DyadicBudget::new(16384, 1_000_000)
++            )
++            .unwrap()
++    );
++}
++#[test]
++fn generated_endpoint_changes_chart_and_is_consumed_by_next_step() {
++    let a = chart(); // x=10+y0+y1, y=-3+y1, native derivative (1,1).
++    let first = a.certify_step(proposal(), &mut budget());
++    assert!(matches!(first.status(), CoordinateStatus::Certified));
++    let mut c = change();
++    c.origin = vec![12.into(), (-2).into()];
++    let b = a.original_field().in_coordinates(c, &mut budget()).unwrap();
++    let transition = a.transition_to(&b, &mut budget()).unwrap();
++    let transported = transition
++        .enclose(
++            first.native().end_enclosure().unwrap().clone(),
++            &mut budget(),
++        )
++        .unwrap();
++    assert_eq!(transported.enclosure().lanes(), Some(&[d(-1, 1), d(-1, 1)]));
++    let next = transported.transition().to().certify_step(
++        PicardProposal {
++            start: d(1, 1),
++            end: d(2, 2),
++            initial: transported.enclosure().clone(),
++            candidate: BoxN::new([d(-1, 2), d(-1, 2)]).unwrap(),
++        },
++        &mut budget(),
++    );
++    assert!(
++        matches!(next.status(), CoordinateStatus::Certified),
++        "{:?}",
++        next.status()
++    );
++    // Exact source flow from the original correlated set at t=2: (14+a+b,-1+b).
++    assert_eq!(
++        next.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(12, 16), d(-2, 0)])
++    );
++    let again = b
++        .transition_to(&a, &mut budget())
++        .unwrap()
++        .enclose(
++            next.native().end_enclosure().unwrap().clone(),
++            &mut budget(),
++        )
++        .unwrap();
++    assert_eq!(again.enclosure().lanes(), Some(&[d(1, 3), d(1, 3)]));
++}
++#[test]
++fn empty_unit_foreign_fields_and_time_interpretation() {
++    let a = chart();
++    let m = a.transition_to(&a, &mut budget()).unwrap();
++    assert!(
++        m.enclose(BoxN::empty().unwrap(), &mut budget())
++            .unwrap()
++            .enclosure()
++            .is_empty()
++    );
++    let p = field::<0>(&[], vec![])
++        .in_coordinates(
++            CoordinateChange {
++                variables: vec![],
++                to_source: vec![],
++                from_source: vec![],
++                origin: vec![],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let u = p
++        .transition_to(&p, &mut budget())
++        .unwrap()
++        .enclose(BoxN::new([]).unwrap(), &mut budget())
++        .unwrap();
++    assert!(!u.enclosure().is_empty());
++    let other = field(&[Expr::int(4), Expr::int(1)], vec![X, Y])
++        .in_coordinates(change(), &mut budget())
++        .unwrap();
++    assert!(matches!(
++        a.transition_to(&other, &mut budget()),
++        Err(CoordinateTransportError::Transition(_))
++    ));
++    let id = a.original_field().identity();
++    let f = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: id.source().clone(),
++            time: X,
++            state: vec![T, Y],
++        },
++        &mut budget(),
++    )
++    .unwrap();
++    let mut c = change();
++    c.variables = vec![T, Y];
++    let other = f.in_coordinates(c, &mut budget()).unwrap();
++    assert!(matches!(
++        a.transition_to(&other, &mut budget()),
++        Err(CoordinateTransportError::InterpretationMismatch)
++    ));
++}
++fn prepared() -> CoordinateFieldTransition<2> {
++    let a = chart();
++    a.transition_to(&a, &mut budget()).unwrap()
++}
++#[test]
++fn transport_final_work_scalar_limits_cancellation_and_retry() {
++    let m = prepared();
++    let initial = proposal().initial;
++    let mut full = budget();
++    m.enclose(initial.clone(), &mut full).unwrap();
++    let used = EnclosurePolicy::default().graph_work - full.remaining_graph_work();
++    let mut short = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: used - 1,
++        ..EnclosurePolicy::default()
++    });
++    assert!(matches!(
++        m.enclose(initial.clone(), &mut short),
++        Err(CoordinateTransportError::Field(
++            hyperdynamics::field::FieldError::Expression(
++                hypersolve::expression_program::ExpressionError::WorkExhausted
++            )
++        ))
++    ));
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: used,
++        ..EnclosurePolicy::default()
++    });
++    assert_eq!(
++        m.enclose(initial.clone(), &mut exact).unwrap().enclosure(),
++        &initial
++    );
++    assert_eq!(exact.remaining_graph_work(), 0);
++    let scalar_used = EnclosurePolicy::default().scalar_work - full.remaining_scalar_work();
++    let mut short = EnclosureBudget::new(EnclosurePolicy {
++        scalar_work: scalar_used - 1,
++        ..EnclosurePolicy::default()
++    });
++    assert!(m.enclose(initial.clone(), &mut short).is_err());
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        scalar_work: scalar_used,
++        ..EnclosurePolicy::default()
++    });
++    m.enclose(initial.clone(), &mut exact).unwrap();
++    assert_eq!(exact.remaining_scalar_work(), 0);
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.set_cancellation(Some(token));
++    assert!(m.enclose(initial.clone(), &mut cancelled).is_err());
++    assert_eq!(
++        m.enclose(initial.clone(), &mut budget())
++            .unwrap()
++            .enclosure(),
++        &initial
++    );
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_transition_replay_rechecks_sources_and_inverses() {
++    use hyperdynamics::field::coordinates::CoordinateFieldDefinition;
++    const KEY: &str = "HYPERDYNAMICS_CHART_TRANSITION_REPLAY";
++    if let Ok(data) = std::env::var(KEY) {
++        let (a, b, input): (
++            CoordinateFieldDefinition,
++            CoordinateFieldDefinition,
++            BoxN<DyadicInterval, 2>,
++        ) = serde_json::from_str(&data).unwrap();
++        let mut invalid = b.clone();
++        invalid.change.from_source[0][1] = 0.into();
++        assert!(CoordinateField::<2>::from_definition(invalid, &mut budget()).is_err());
++        let a = CoordinateField::<2>::from_definition(a, &mut budget()).unwrap();
++        let b = CoordinateField::<2>::from_definition(b, &mut budget()).unwrap();
++        let mut work = budget();
++        let result = a
++            .transition_to(&b, &mut work)
++            .unwrap()
++            .enclose(input, &mut work)
++            .unwrap();
++        assert_eq!(result.enclosure().lanes(), Some(&[d(0, 0), d(-1, 1)]));
++        println!(
++            "TRANSITION {:?} GRAPH {} SCALAR {}",
++            result,
++            work.remaining_graph_work(),
++            work.remaining_scalar_work()
++        );
++        return;
++    }
++    let a = wide();
++    let id = a.original_field().identity();
++    let definition = CoordinateFieldDefinition {
++        source: FieldDefinition {
++            source: id.source().clone(),
++            time: id.time(),
++            state: id.state().to_vec(),
++        },
++        change: a.transformation().change().clone(),
++    };
++    let data = serde_json::to_string(&(
++        definition.clone(),
++        definition,
++        BoxN::new([d(0, 0), d(-1, 1)]).unwrap(),
++    ))
++    .unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "transition::fresh_process_transition_replay_rechecks_sources_and_inverses",
++                "--nocapture",
++            ])
++            .env(KEY, &data)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{} {}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let text = String::from_utf8(child.stdout).unwrap();
++        let line = text
++            .lines()
++            .find(|l| l.starts_with("TRANSITION "))
++            .unwrap()
++            .to_owned();
++        if let Some(expected) = previous {
++            assert_eq!(line, expected);
++        }
++        previous = Some(line);
++    }
++}
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn transport_getters_do_not_rediscover_scalar_proofs() {
++    use hyperreal::dispatch_trace;
++    let m = prepared();
++    let proof = m.enclose(proposal().initial, &mut budget()).unwrap();
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| {
++        std::hint::black_box(proof.initial());
++        std::hint::black_box(proof.enclosure());
++        std::hint::black_box(proof.policy());
++        let m = proof.transition();
++        std::hint::black_box(m.from());
++        std::hint::black_box(m.to());
++        let r = m.relation();
++        std::hint::black_box(r.from());
++        std::hint::black_box(r.to());
++        std::hint::black_box(r.matrix());
++        std::hint::black_box(r.origin());
++        std::hint::black_box(r.program());
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
++#[cfg(feature = "taylor-flow")]
++#[test]
++fn taylor_endpoint_survives_transport_and_further_taylor_step() {
++    use hyperdynamics::field::taylor_flow::FlowTaylorStatus;
++    let a = chart();
++    let t = a.transformed_field().flow_taylor(2, &mut budget()).unwrap();
++    let first = t.certify_step(proposal(), &mut budget());
++    assert!(matches!(first.status(), FlowTaylorStatus::Certified));
++    let mut c = change();
++    c.origin = vec![12.into(), (-2).into()];
++    let b = a.original_field().in_coordinates(c, &mut budget()).unwrap();
++    let proof = a
++        .transition_to(&b, &mut budget())
++        .unwrap()
++        .enclose(first.end_enclosure().unwrap().clone(), &mut budget())
++        .unwrap();
++    let next = b
++        .transformed_field()
++        .flow_taylor(2, &mut budget())
++        .unwrap()
++        .certify_step(
++            PicardProposal {
++                start: d(1, 1),
++                end: d(2, 2),
++                initial: proof.enclosure().clone(),
++                candidate: BoxN::new([d(-1, 2), d(-1, 2)]).unwrap(),
++            },
++            &mut budget(),
++        );
++    assert!(matches!(next.status(), FlowTaylorStatus::Certified));
++    assert_eq!(
++        b.source_enclosure(next.end_enclosure().unwrap(), &mut budget())
++            .unwrap()
++            .lanes(),
++        Some(&[d(12, 16), d(-2, 0)])
++    );
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index c443f5fbf..596021b5e 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in exact source-bound coordinate transitions for direct chart transport.
++
+ - Add opt-in polynomial output maps over existing Taylor models, retaining exact
+   coefficients, every truncated term and residual cross-product, shared proof
+   stages, checked subdomain reuse and source/map replay. `taylor-polynomial`
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 3b3520a8c..76091d6b8 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -44,6 +44,7 @@ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
+ coordinate-program = ["expression-program"]
++coordinate-transition = ["coordinate-program"]
+ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
+ taylor-polynomial = ["taylor-affine"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index d259a85d0..0adab9bd4 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -677,3 +677,5 @@ zero coefficients. Invalid shapes, wrong inverses, undecided identities and
+ resource failures are distinct. Replay the original definition and chart to
+ regenerate the evidence. Graph limits do not bound exact scalar/predicate payload
+ work, total heap bytes or cancellation inside one scalar/predicate stage.
++
++The opt-in `coordinate-transition` feature composes two validated charts of the same source into an exact affine map, retaining both inverse proofs. Interval evaluation can then project that map without first projecting through source coordinates.
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 14602f3a1..dd25139dc 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -632,3 +632,6 @@ pub use taylor::{
+     TaylorPolynomialError, TaylorPolynomialModel, TaylorPolynomialProduct, TaylorPolynomialTerms,
+     TaylorRange,
+ };
++
++#[cfg(feature = "coordinate-transition")]
++pub use coordinates::{CoordinateTransition, CoordinateTransitionError};
+diff --git a/crates/hypersolve/src/expression_program/coordinates.rs b/crates/hypersolve/src/expression_program/coordinates.rs
+index 466243d41..fd3a99425 100644
+--- a/crates/hypersolve/src/expression_program/coordinates.rs
++++ b/crates/hypersolve/src/expression_program/coordinates.rs
+@@ -326,3 +326,8 @@ fn affine_row(
+     }
+     Ok(root)
+ }
++
++#[cfg(feature = "coordinate-transition")]
++mod transition;
++#[cfg(feature = "coordinate-transition")]
++pub use transition::{CoordinateTransition, CoordinateTransitionError};
+diff --git a/crates/hypersolve/src/expression_program/coordinates/transition.rs b/crates/hypersolve/src/expression_program/coordinates/transition.rs
+new file mode 100644
+index 000000000..0dfeddedd
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/coordinates/transition.rs
+@@ -0,0 +1,170 @@
++//! Source-bound composition of two already certified exact charts.
++use super::*;
++
++/// Incompatible chart associations or original arithmetic/resource failure.
++#[derive(Clone, Debug)]
++pub enum CoordinateTransitionError {
++    /// Charts refer to different structural source definitions.
++    SourceMismatch,
++    /// Charts reinterpret different variables or a different variable order.
++    VariableMismatch,
++    /// Original coordinate arithmetic or graph diagnostic.
++    Coordinate(CoordinateError),
++}
++impl fmt::Display for CoordinateTransitionError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "coordinate transition: {self:?}")
++    }
++}
++impl std::error::Error for CoordinateTransitionError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Coordinate(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<ExpressionError> for CoordinateTransitionError {
++    fn from(e: ExpressionError) -> Self {
++        Self::Coordinate(e.into())
++    }
++}
++impl From<Problem> for CoordinateTransitionError {
++    fn from(e: Problem) -> Self {
++        Self::Coordinate(CoordinateError::Scalar(e))
++    }
++}
++
++#[derive(Debug)]
++struct TransitionData {
++    from: CoordinateProgram,
++    to: CoordinateProgram,
++    matrix: Vec<Vec<Real>>,
++    origin: Vec<Real>,
++    program: ExpressionProgram,
++}
++
++/// Exact affine relation between two charts of the same structural source.
++///
++/// For x=c0+A0*y=c1+A1*z, this retains z=B1*A0*y+B1*(c0-c1).
++/// The target chart already proves B1*A1=I under STRICT. Composing exact
++/// coefficients before enclosure avoids an intermediate Cartesian projection.
++/// Evaluation gives an outer enclosure of this retained exact affine image;
++/// it does not assert that the image is Cartesian or that projections are equal.
++///
++/// Replay source and both coordinate changes, then regenerate this relation.
++/// It cannot be deserialized as a certificate. Scalar arithmetic/refinement and
++/// payload lifecycle, predicate internals, total heap bytes and cancellation
++/// inside scalar work retain the coordinate program's accounting exclusions.
++#[derive(Clone, Debug)]
++pub struct CoordinateTransition(Arc<TransitionData>);
++impl CoordinateTransition {
++    /// Original chart, including its source and strict inverse proof.
++    pub fn from(&self) -> &CoordinateProgram {
++        &self.0.from
++    }
++    /// Destination chart with the same structural source and ordered variables.
++    pub fn to(&self) -> &CoordinateProgram {
++        &self.0.to
++    }
++    /// Exact row-major B1*A0, computed before native enclosure.
++    pub fn matrix(&self) -> &[Vec<Real>] {
++        &self.0.matrix
++    }
++    /// Exact B1*(c0-c1).
++    pub fn origin(&self) -> &[Real] {
++        &self.0.origin
++    }
++    /// Executable affine relation with inputs in `from().change().variables` order.
++    /// Other source bindings, such as time, are not inputs to this state map.
++    /// This map alone makes no source-domain or ODE existence claim.
++    pub fn program(&self) -> &ExpressionProgram {
++        &self.0.program
++    }
++}
++impl CoordinateProgram {
++    /// Compose exact chart coefficients, preserving both validated associations.
++    ///
++    /// Structural source equality permits independently reconstructed definitions;
++    /// allocation identity is not required. Equality of arbitrary mathematical
++    /// functions is not inferred. No chart is selected or declared optimal here.
++    pub fn transition_to(
++        &self,
++        target: &Self,
++        budget: &mut ExpressionBudget,
++    ) -> Result<CoordinateTransition, CoordinateTransitionError> {
++        budget.charge(0)?;
++        let source = self.source().definition();
++        let other = target.source().definition();
++        // Fixed-arity node scans are charged; exact scalar payload comparison
++        // retains the original ExpressionBudget exclusions.
++        for definition in [source, other] {
++            budget.charge(definition.variables.len())?;
++            budget.charge(definition.nodes.len())?;
++            budget.charge(definition.outputs.len())?;
++        }
++        if source != other {
++            return Err(CoordinateTransitionError::SourceMismatch);
++        }
++        let n = self.change().variables.len();
++        budget.charge(n)?;
++        budget.charge(target.change().variables.len())?;
++        if self.change().variables != target.change().variables {
++            return Err(CoordinateTransitionError::VariableMismatch);
++        }
++        let square = n.checked_mul(n).ok_or(ExpressionError::SizeExhausted)?;
++        budget.check_entries(&[square, n, n, n, n])?;
++        let a = self.change();
++        let b = target.change();
++        let mut delta = Vec::with_capacity(n);
++        for (old, new) in a.origin.iter().zip(&b.origin) {
++            budget.charge(1)?;
++            delta.push(old - new);
++        }
++        let mut matrix = Vec::with_capacity(n);
++        let mut origin = Vec::with_capacity(n);
++        for row in &b.from_source {
++            budget.charge(n)?;
++            origin.push(Real::sum_products(row, &delta)?);
++            budget.charge(1)?;
++            let mut values = Vec::with_capacity(n);
++            for column in 0..n {
++                budget.charge(n)?;
++                let axis: Vec<_> = a.to_source.iter().map(|r| r[column].clone()).collect();
++                budget.charge(n)?;
++                values.push(Real::sum_products(row, &axis)?);
++            }
++            matrix.push(values);
++        }
++        budget.charge(n)?;
++        let mut builder = Builder {
++            definition: ExpressionDefinition {
++                variables: a.variables.clone(),
++                nodes: Vec::new(),
++                outputs: Vec::new(),
++            },
++            outputs: n,
++            budget,
++        };
++        let mut inputs = Vec::with_capacity(n);
++        for &variable in &a.variables {
++            inputs.push(builder.push(ExpressionNode::Variable(SymbolRef::new(variable, None)))?);
++        }
++        for (row, offset) in matrix.iter().zip(&origin) {
++            let root = affine_row(&mut builder, row, &inputs, offset)?;
++            builder.budget.charge(1)?;
++            builder.definition.outputs.push(root);
++        }
++        let program = ExpressionProgram::from_definition(builder.definition, builder.budget)?;
++        budget.charge(1)?;
++        let transition = CoordinateTransition(Arc::new(TransitionData {
++            from: self.clone(),
++            to: target.clone(),
++            matrix,
++            origin,
++            program,
++        }));
++        budget.charge(0)?;
++        Ok(transition)
++    }
++}
+diff --git a/crates/hypersolve/tests/program_coordinate_transition.rs b/crates/hypersolve/tests/program_coordinate_transition.rs
+new file mode 100644
+index 000000000..fd12cbdd2
+--- /dev/null
++++ b/crates/hypersolve/tests/program_coordinate_transition.rs
+@@ -0,0 +1,198 @@
++#![cfg(feature = "coordinate-transition")]
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{CoordinateChange, ExpressionBudget, ExpressionProgram},
++};
++const X: SymbolId = SymbolId(0);
++const Y: SymbolId = SymbolId(1);
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn chart() -> CoordinateChange {
++    CoordinateChange {
++        variables: vec![X, Y],
++        to_source: vec![vec![1.into(), 128.into()], vec![0.into(), 1.into()]],
++        from_source: vec![vec![1.into(), (-128).into()], vec![0.into(), 1.into()]],
++        origin: vec![10.into(), (-3).into()],
++    }
++}
++#[test]
++fn identical_sheared_charts_compose_exactly_before_enclosure() {
++    let p =
++        ExpressionProgram::compile(&[Expr::int(2), Expr::int(1)], &[Y, X], &mut budget()).unwrap();
++    let a = p.change_coordinates(chart(), &mut budget()).unwrap();
++    let b = p.change_coordinates(chart(), &mut budget()).unwrap();
++    let map = a.transition_to(&b, &mut budget()).unwrap();
++    assert_eq!(
++        map.matrix(),
++        &[
++            vec![Real::one(), Real::zero()],
++            vec![Real::zero(), Real::one()]
++        ]
++    );
++    assert_eq!(map.origin(), &[Real::zero(), Real::zero()]);
++    assert_eq!(
++        map.program()
++            .eval_real(&[2.into(), 3.into()], &mut budget())
++            .unwrap(),
++        vec![Real::from(2), Real::from(3)]
++    );
++}
++
++fn source() -> ExpressionProgram {
++    ExpressionProgram::compile(&[Expr::int(2), Expr::int(1)], &[Y, X], &mut budget()).unwrap()
++}
++#[test]
++fn independent_changed_chart_coefficients_and_point_values() {
++    let p = source();
++    let a = p.change_coordinates(chart(), &mut budget()).unwrap();
++    let b = p
++        .change_coordinates(
++            CoordinateChange {
++                variables: vec![X, Y],
++                to_source: vec![vec![2.into(), 0.into()], vec![0.into(), (-1).into()]],
++                from_source: vec![
++                    vec![(Real::one() / Real::from(2)).unwrap(), 0.into()],
++                    vec![0.into(), (-1).into()],
++                ],
++                origin: vec![6.into(), 2.into()],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let m = a.transition_to(&b, &mut budget()).unwrap();
++    assert_eq!(
++        m.matrix(),
++        &[
++            vec![(Real::one() / Real::from(2)).unwrap(), 64.into()],
++            vec![0.into(), (-1).into()]
++        ]
++    );
++    assert_eq!(m.origin(), &[Real::from(2), Real::from(5)]);
++    for y in -3..=3 {
++        for x in -3..=3 {
++            let z = m
++                .program()
++                .eval_real(&[Real::from(2 * x), y.into()], &mut budget())
++                .unwrap();
++            assert_eq!(z, vec![Real::from(2 + x + 64 * y), Real::from(5 - y)]);
++            // Independent original-coordinate equality, not agreement of wrappers.
++            assert_eq!(
++                &z[0] * Real::from(2) + Real::from(6),
++                Real::from(10 + 2 * x + 128 * y)
++            );
++            assert_eq!(Real::from(2) - &z[1], Real::from(-3 + y));
++        }
++    }
++    assert_eq!(m.from().inverse_evidence().len(), 4);
++    assert_eq!(m.to().inverse_evidence().len(), 4);
++}
++#[test]
++fn algebraic_scaling_translation_and_zero_dimension() {
++    let s = Real::from(2).sqrt().unwrap();
++    let p = ExpressionProgram::compile(&[Expr::int(1)], &[X], &mut budget()).unwrap();
++    let c = CoordinateChange {
++        variables: vec![X],
++        to_source: vec![vec![s.clone()]],
++        from_source: vec![vec![s.clone().inverse().unwrap()]],
++        origin: vec![s.clone()],
++    };
++    let a = p.change_coordinates(c.clone(), &mut budget()).unwrap();
++    let b = p
++        .change_coordinates(
++            CoordinateChange {
++                origin: vec![&s * Real::from(2)],
++                ..c
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let m = a.transition_to(&b, &mut budget()).unwrap();
++    assert_eq!(m.matrix(), &[vec![Real::one()]]);
++    assert_eq!(m.origin(), &[Real::from(-1)]);
++    assert_eq!(
++        m.program().eval_real(&[3.into()], &mut budget()).unwrap(),
++        vec![Real::from(2)]
++    );
++    let p = ExpressionProgram::compile(&[], &[], &mut budget()).unwrap();
++    let a = p
++        .change_coordinates(
++            CoordinateChange {
++                variables: vec![],
++                to_source: vec![],
++                from_source: vec![],
++                origin: vec![],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let m = a.transition_to(&a, &mut budget()).unwrap();
++    assert!(m.matrix().is_empty());
++    assert!(m.origin().is_empty());
++    assert!(
++        m.program()
++            .eval_real(&[], &mut budget())
++            .unwrap()
++            .is_empty()
++    );
++}
++#[test]
++fn structural_reconstruction_is_admitted_but_foreign_sources_and_orders_are_not() {
++    use hypersolve::expression_program::CoordinateTransitionError as E;
++    let a = source().change_coordinates(chart(), &mut budget()).unwrap();
++    let b = source().change_coordinates(chart(), &mut budget()).unwrap();
++    a.transition_to(&b, &mut budget()).unwrap();
++    let p =
++        ExpressionProgram::compile(&[Expr::int(3), Expr::int(1)], &[Y, X], &mut budget()).unwrap();
++    let b = p.change_coordinates(chart(), &mut budget()).unwrap();
++    assert!(matches!(
++        a.transition_to(&b, &mut budget()),
++        Err(E::SourceMismatch)
++    ));
++    let mut c = chart();
++    c.variables.swap(0, 1);
++    let b = source().change_coordinates(c, &mut budget()).unwrap();
++    assert!(matches!(
++        a.transition_to(&b, &mut budget()),
++        Err(E::VariableMismatch)
++    ));
++    let mut invalid = chart();
++    invalid.from_source[0][1] = 0.into();
++    assert!(source().change_coordinates(invalid, &mut budget()).is_err());
++}
++#[test]
++fn preparation_final_work_and_cancellation_do_not_publish_partial_relations() {
++    use hypersolve::expression_program::{
++        CoordinateError, CoordinateTransitionError as E, ExpressionError,
++    };
++    let a = source().change_coordinates(chart(), &mut budget()).unwrap();
++    let mut full = budget();
++    a.transition_to(&a, &mut full).unwrap();
++    let used = budget().remaining_work() - full.remaining_work();
++    let mut short = ExpressionBudget::new(1_000_000, used - 1);
++    assert!(matches!(
++        a.transition_to(&a, &mut short),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::WorkExhausted
++        )))
++    ));
++    let mut exact = ExpressionBudget::new(1_000_000, used);
++    a.transition_to(&a, &mut exact).unwrap();
++    assert_eq!(exact.remaining_work(), 0);
++    assert!(
++        a.transition_to(&a, &mut ExpressionBudget::new(0, 100_000_000))
++            .is_err()
++    );
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        a.transition_to(&a, &mut cancelled),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    a.transition_to(&a, &mut budget()).unwrap();
++}
