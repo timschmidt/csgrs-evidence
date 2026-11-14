@@ -1,0 +1,1289 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 9c40ec8f7..a45f7dd8b 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add an optional Taylor noise field-image consumer with exact cancellation
++  assertions and subsequent use of its explicit Cartesian enclosure.
++
++
+ - Add opt-in automatic finite-window QR evolution with exact frame/transport proofs,
+   explicit Picard or trajectory Taylor endpoints, retained attempts and typed failure.
+ 
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 3cf692f7f..ff136eab0 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -24,6 +24,7 @@ taylor-flow = ["taylor-model"]
+ taylor-evolution = ["taylor-flow"]
+ adaptive-taylor = ["taylor-flow"]
+ taylor-affine = ["taylor-model", "hypersolve/taylor-affine"]
++taylor-noise = ["taylor-affine", "hypersolve/taylor-noise"]
+ taylor-polynomial = ["taylor-model", "hypersolve/taylor-polynomial"]
+ reachability = ["field"]
+ rk-proposal = ["field", "hypersolve/float-proposal-program", "hyperinterval/float-proposal"]
+@@ -96,3 +97,7 @@ required-features = ["adaptive-taylor", "taylor-evolution"]
+ name = "qr_evolution"
+ harness = false
+ required-features = ["qr-evolution"]
++
++[[example]]
++name = "taylor_noise"
++required-features = ["taylor-noise"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index eeb94c6c5..3f4e264a8 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -263,3 +263,13 @@ graph/native counters are shared; exact scalar payload/refinement, nested retain
+ size, vector capacity, whole heap and within-scalar cancellation remain outside a total
+ resource claim. Replay the field definition, request and all selection options to rebuild
+ proofs; serialized statuses and cached enclosures are not certificates.
++
++
++Enable `taylor-noise` and run `cargo run -p hyperdynamics --features taylor-noise
++--example taylor_noise` for repeated affine observations of a nonlinear field.
++Hypersolve retains a bounded set of shared monomials using certified contribution
++widths and includes every omitted term in distinct residual bounds. The example
++checks an exact cancellation and consumes an explicit Cartesian projection in a
++further field-image operation while retaining the original source certificate.
++This is field-image wrapping control; noise propagation through ODE trajectories
++and sensitivity-adaptive noise creation are not implemented by this feature.
+diff --git a/crates/hyperdynamics/examples/taylor_noise.rs b/crates/hyperdynamics/examples/taylor_noise.rs
+new file mode 100644
+index 000000000..8f1a3133e
+--- /dev/null
++++ b/crates/hyperdynamics/examples/taylor_noise.rs
+@@ -0,0 +1,119 @@
++//! Sensitivity-retained shared noise for repeated nonlinear field observations.
++//! This certifies field images; it does not propagate noise through an ODE flow.
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    taylor::FieldTaylorRequest,
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorAffineMap, TaylorAffineModel, TaylorAffineRow,
++        TaylorNoiseModel,
++    },
++};
++use std::sync::Arc;
++fn d(a: i64, b: i64) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), 0).unwrap()
++}
++/// Build a field certificate, retain one shared noise column, then consume its
++/// explicit Cartesian projection in another certified field-image operation.
++pub fn run() -> Result<(), Box<dyn std::error::Error>> {
++    let (time, x, y) = (SymbolId(1), SymbolId(2), SymbolId(3));
++    let v = Expr::anonymous_symbol(x);
++    let square = Expr::int(16) * v.clone() * v;
++    let mut graph = ExpressionBudget::new(100_000, 10_000_000);
++    let source = ExpressionProgram::compile(
++        &[square.clone() + Expr::anonymous_symbol(y), square],
++        &[y, time, x],
++        &mut graph,
++    )?;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let field = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![x, y],
++        },
++        &mut budget,
++    )?;
++    let field_model = field.taylor_model(
++        FieldTaylorRequest {
++            time: d(0, 0),
++            state: BoxN::new([d(-1, 1), d(-1, 1)])?,
++            order: 2,
++        },
++        &mut budget,
++    )?;
++    // One explicit caller-owned clone; all later queries retain this certificate.
++    let original = Arc::new(field_model.model().expect("nonempty domain").clone());
++    let identity = TaylorAffineMap {
++        input_count: 2,
++        rows: vec![
++            TaylorAffineRow {
++                coefficients: vec![Real::one(), Real::zero()],
++                offset: Real::zero(),
++            },
++            TaylorAffineRow {
++                coefficients: vec![Real::zero(), Real::one()],
++                offset: Real::zero(),
++            },
++        ],
++    };
++    let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000_000);
++    let affine = Arc::new(TaylorAffineModel::new(
++        original,
++        identity,
++        &mut graph,
++        &mut arithmetic,
++    )?);
++    let noise = TaylorNoiseModel::new(affine, 1, &mut graph, &mut arithmetic)?;
++    let observation = TaylorAffineMap {
++        input_count: 2,
++        rows: vec![
++            TaylorAffineRow {
++                coefficients: vec![Real::one(), -Real::one()],
++                offset: Real::zero(),
++            },
++            TaylorAffineRow {
++                coefficients: vec![Real::zero(), Real::one()],
++                offset: Real::zero(),
++            },
++        ],
++    };
++    let range = noise.enclose(&observation, &mut graph, &mut arithmetic)?;
++    // Independent identities: f0-f1=y, f1=16*x².
++    assert_eq!(range.bounds(), &[d(-1, 1), d(0, 16)]);
++    assert_eq!(
++        noise.source().source().source().definition(),
++        field_model.identity().source()
++    );
++    // Deliberately project to a box for the next enclosure operation. The noise
++    // object remains available for future observations without adopting that box.
++    let next = field.image(
++        &d(0, 0),
++        &BoxN::new(range.bounds().to_vec().try_into().unwrap())?,
++        &mut budget,
++    )?;
++    for (exact, outer) in [d(0, 32), d(0, 16)].iter().zip(next.lanes().unwrap()) {
++        assert!(exact.subset_of(outer, &mut arithmetic)?);
++    }
++    assert_eq!(
++        noise
++            .enclose(&observation, &mut graph, &mut arithmetic)?
++            .bounds(),
++        range.bounds()
++    );
++    println!(
++        "retained columns: {}; observables: {:?}; next image: {next:?}",
++        noise.columns().len(),
++        range.bounds()
++    );
++    Ok(())
++}
++#[cfg(not(test))]
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    run()
++}
+diff --git a/crates/hyperdynamics/tests/field_taylor_noise.rs b/crates/hyperdynamics/tests/field_taylor_noise.rs
+new file mode 100644
+index 000000000..c54f5ea12
+--- /dev/null
++++ b/crates/hyperdynamics/tests/field_taylor_noise.rs
+@@ -0,0 +1,7 @@
++#![cfg(feature = "taylor-noise")]
++#[path = "../examples/taylor_noise.rs"]
++mod consumer;
++#[test]
++fn field_noise_observation_and_subsequent_image() {
++    consumer::run().unwrap();
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 5117cc6a5..8f67f2522 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in sensitivity-retained Taylor noise enclosures for repeated affine
++  observations, retaining exact sources, shared selected monomials and every
++  omitted contribution in distinct residual bounds.
++
++
+ - Add opt-in certified Taylor model composition, preserving both source proofs,
+   full outer-domain inclusion, generated polynomial/cross-remainder evidence and
+   the complete outer residual. Generated results accept subsequent model maps.
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 8b1ab1e3e..8deaf5bce 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -48,6 +48,7 @@ qr-coordinates = ["coordinate-program"]
+ coordinate-transition = ["coordinate-program"]
+ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
++taylor-noise = ["taylor-affine"]
+ taylor-polynomial = ["taylor-affine"]
+ taylor-composition = ["taylor-polynomial"]
+ float-proposal-program = ["expression-program"]
+@@ -110,3 +111,8 @@ required-features = ["taylor-polynomial"]
+ name = "taylor_composition"
+ harness = false
+ required-features = ["taylor-composition"]
++
++[[bench]]
++name = "taylor_noise"
++harness = false
++required-features = ["taylor-noise"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 9ab7160af..c7e38c79e 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -655,6 +655,21 @@ function, not an ODE coordinate-change certificate or nonlinear model arithmetic
+ The graph/native budgets apply with the existing scalar/payload exclusions;
+ entry checks are stage-local, not a total live-memory bound.
+ 
++`taylor-noise` adds `TaylorNoiseModel` over an existing `TaylorAffineModel`.
++It retains at most a requested number of shared monomial columns, ranked by
++certified coefficient-times-monomial widths. Every omitted contribution enters
++its affine output omission residual; equal bounds do not merge identities.
++Original Taylor residual coordinates keep their exact affine weights separately,
++so duplication and cancellation of a known shared residual remain available.
++`enclose` combines exact coefficients for an affine observation before projecting
++retained noise. Independence is an outer-enclosure device, not a claim about the
++original functions. The exact source and all discarded term indices remain
++available. Reducing capacity can widen answers; no box replaces the source.
++Replay the original Taylor definition/request, affine map and capacity. Graph
++and native budgets cover selection and queries, with the existing exact-scalar
++and heap-byte exclusions. See the Hyperdynamics `taylor_noise` example for a
++field-image consumer; no ODE noise-propagation guarantee is implied.
++
+ Enable `taylor-polynomial` for `TaylorPolynomialModel` output maps over an
+ existing shared Taylor model. Validated `ExpressionProgram` maps may use constants,
+ inputs, negation, addition, subtraction and multiplication. Products retain exact
+diff --git a/crates/hypersolve/benches/taylor_noise.rs b/crates/hypersolve/benches/taylor_noise.rs
+new file mode 100644
+index 000000000..129d56abd
+--- /dev/null
++++ b/crates/hypersolve/benches/taylor_noise.rs
+@@ -0,0 +1,118 @@
++//! Complete affine-observation enclosures, with identical exact output bounds.
++//! The original Taylor/affine certificate is common input. Cold noise rows include
++//! noise preparation and destruction; warm rows reuse that prepared representation.
++use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorAffineMap, TaylorAffineModel, TaylorAffineRow,
++        TaylorNoiseModel, TaylorRequest,
++    },
++};
++use std::{hint::black_box, sync::Arc};
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 100_000_000)
++}
++fn scalar() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(a: i64, b: i64) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), 0).unwrap()
++}
++fn source() -> Arc<TaylorAffineModel> {
++    let x = Expr::anonymous_symbol(SymbolId(0));
++    let shared = Expr::int(16) * x.clone() * x.clone();
++    let p = ExpressionProgram::compile(&[shared.clone() + x, shared], &[SymbolId(0)], &mut graph())
++        .unwrap();
++    let original = Arc::new(
++        p.taylor_model(
++            TaylorRequest {
++                center: vec![d(0, 0)],
++                domain: vec![d(-1, 1)],
++                order: 2,
++                precision: -64,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    let identity = TaylorAffineMap {
++        input_count: 2,
++        rows: vec![
++            TaylorAffineRow {
++                coefficients: vec![Real::one(), Real::zero()],
++                offset: Real::zero(),
++            },
++            TaylorAffineRow {
++                coefficients: vec![Real::zero(), Real::one()],
++                offset: Real::zero(),
++            },
++        ],
++    };
++    Arc::new(TaylorAffineModel::new(original, identity, &mut graph(), &mut scalar()).unwrap())
++}
++fn bench(c: &mut Criterion) {
++    let source = source();
++    let prepared = TaylorNoiseModel::new(source.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    let mut group = c.benchmark_group("taylor_noise_observations");
++    for queries in [1, 16] {
++        let maps: Vec<_> = (1..=queries)
++            .map(|n| TaylorAffineMap {
++                input_count: 2,
++                rows: vec![TaylorAffineRow {
++                    coefficients: vec![Real::from(n), Real::from(-n)],
++                    offset: Real::zero(),
++                }],
++            })
++            .collect();
++        let expected: Vec<_> = (1..=queries).map(|n| d(-n, n)).collect();
++        group.bench_with_input(
++            BenchmarkId::new("full_affine", queries),
++            &queries,
++            |b, _| {
++                b.iter(|| {
++                    let mut g = graph();
++                    let mut a = scalar();
++                    for (map, bound) in maps.iter().zip(&expected) {
++                        let result = source
++                            .transform(black_box(map.clone()), &mut g, &mut a)
++                            .unwrap();
++                        assert_eq!(result.range().bounds(), std::slice::from_ref(bound));
++                        drop(black_box(result));
++                    }
++                })
++            },
++        );
++        group.bench_with_input(BenchmarkId::new("noise_cold", queries), &queries, |b, _| {
++            b.iter(|| {
++                let mut g = graph();
++                let mut a = scalar();
++                let model =
++                    TaylorNoiseModel::new(black_box(source.clone()), 1, &mut g, &mut a).unwrap();
++                for (map, bound) in maps.iter().zip(&expected) {
++                    let result = model.enclose(black_box(map), &mut g, &mut a).unwrap();
++                    assert_eq!(result.bounds(), std::slice::from_ref(bound));
++                    drop(black_box(result));
++                }
++                drop(black_box(model));
++            })
++        });
++        group.bench_with_input(BenchmarkId::new("noise_warm", queries), &queries, |b, _| {
++            b.iter(|| {
++                let mut g = graph();
++                let mut a = scalar();
++                for (map, bound) in maps.iter().zip(&expected) {
++                    let result = prepared.enclose(black_box(map), &mut g, &mut a).unwrap();
++                    assert_eq!(result.bounds(), std::slice::from_ref(bound));
++                    drop(black_box(result));
++                }
++            })
++        });
++    }
++    group.finish();
++}
++criterion_group!(benches, bench);
++criterion_main!(benches);
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index 59e21f8bf..2dfa68529 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -638,3 +638,6 @@ pub use coordinates::{CoordinateTransition, CoordinateTransitionError};
+ 
+ #[cfg(feature = "qr-coordinates")]
+ pub use coordinates::{QrCoordinateError, QrCoordinateProgram, QrCoordinateRequest};
++
++#[cfg(feature = "taylor-noise")]
++pub use taylor::{TaylorNoiseColumn, TaylorNoiseModel};
+diff --git a/crates/hypersolve/src/expression_program/taylor.rs b/crates/hypersolve/src/expression_program/taylor.rs
+index 2be740f7e..2a5477028 100644
+--- a/crates/hypersolve/src/expression_program/taylor.rs
++++ b/crates/hypersolve/src/expression_program/taylor.rs
+@@ -370,3 +370,6 @@ pub use model::{
+     TaylorPolynomialError, TaylorPolynomialModel, TaylorPolynomialProduct, TaylorPolynomialTerms,
+     TaylorRange,
+ };
++
++#[cfg(feature = "taylor-noise")]
++pub use model::{TaylorNoiseColumn, TaylorNoiseModel};
+diff --git a/crates/hypersolve/src/expression_program/taylor/model.rs b/crates/hypersolve/src/expression_program/taylor/model.rs
+index d7fdcec70..24131c7d1 100644
+--- a/crates/hypersolve/src/expression_program/taylor/model.rs
++++ b/crates/hypersolve/src/expression_program/taylor/model.rs
+@@ -587,3 +587,6 @@ pub use affine::TaylorAffineRange as TaylorRange;
+ pub use polynomial::{
+     TaylorPolynomialError, TaylorPolynomialModel, TaylorPolynomialProduct, TaylorPolynomialTerms,
+ };
++
++#[cfg(feature = "taylor-noise")]
++pub use affine::{TaylorNoiseColumn, TaylorNoiseModel};
+diff --git a/crates/hypersolve/src/expression_program/taylor/model/affine.rs b/crates/hypersolve/src/expression_program/taylor/model/affine.rs
+index 3b9e4893e..e355815cc 100644
+--- a/crates/hypersolve/src/expression_program/taylor/model/affine.rs
++++ b/crates/hypersolve/src/expression_program/taylor/model/affine.rs
+@@ -419,3 +419,9 @@ impl TaylorAffineRange {
+         self.bounds
+     }
+ }
++
++#[cfg(feature = "taylor-noise")]
++mod noise;
++
++#[cfg(feature = "taylor-noise")]
++pub use noise::{TaylorNoiseColumn, TaylorNoiseModel};
+diff --git a/crates/hypersolve/src/expression_program/taylor/model/affine/noise.rs b/crates/hypersolve/src/expression_program/taylor/model/affine/noise.rs
+new file mode 100644
+index 000000000..53259b819
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/taylor/model/affine/noise.rs
+@@ -0,0 +1,330 @@
++//! Independent outer noise coordinates, selected by certified contribution widths.
++use super::*;
++use core::cmp::Ordering;
++
++/// A retained shared monomial, treated as a bounded independent parameter only
++/// when projecting an enclosure. This does not assert functional independence.
++#[derive(Clone, Debug)]
++pub struct TaylorNoiseColumn {
++    term: usize,
++    domain: DyadicInterval,
++    variation: DyadicInterval,
++}
++impl TaylorNoiseColumn {
++    /// Index into the retained source's `terms()`. Identity is source-relative;
++    /// equal bounds never establish equality of distinct monomials or residuals.
++    pub fn term_index(&self) -> usize {
++        self.term
++    }
++    /// Certified full-domain range of the original centered monomial.
++    pub fn domain(&self) -> &DyadicInterval {
++        &self.domain
++    }
++    /// Maximum width of its coefficient-times-monomial enclosure over outputs.
++    /// A certified variation upper bound, not an exact derivative or importance.
++    pub fn variation(&self) -> &DyadicInterval {
++        &self.variation
++    }
++}
++
++/// A bounded-column outer representation of an unchanged exact Taylor source.
++///
++/// Constants remain exact. Selected monomials retain their shared exact output
++/// coefficient vectors. For enclosure, each monomial ranges independently over
++/// its certified interval; original functional dependencies remain in `source`.
++/// Every omitted contribution is added to its original output's residual bound.
++/// Omission residuals remain distinct, even when their bounds agree. The original
++/// Taylor residual coordinates retain their exact affine weights separately, so
++/// known duplication/cancellation of an original residual is not lost.
++///
++/// Selection uses descending certified variation bounds, with original canonical
++/// term order breaking ties. `maximum_noise` limits retained nonconstant columns,
++/// not the original source or residual count. Zero retains only the constants
++/// and full residual boxes. Queries combine exact weights before projecting the
++/// selected columns, and intersect with the independently projected source image.
++/// No intermediate box is adopted as a replacement exact source.
++///
++/// Replay the original Taylor definition/request, affine map and noise capacity.
++/// This private proof is not deserialized. The fixed original domain cannot be
++/// extrapolated. Construction uses O(T*K) bounded selection work and O(T+K+N+D)
++/// structural scratch for T terms, K retained columns, N outputs and D inputs.
++/// Graph/native budgets cover loops, entries, comparisons and interval arithmetic;
++/// inherited exact-Real payload/refinement, heap-byte and in-scalar cancellation
++/// exclusions remain. Shared source storage is retained, not counted as a copy.
++/// Explicit clones are caller-owned work, outside construction/query budgets.
++#[derive(Clone, Debug)]
++pub struct TaylorNoiseModel {
++    source: Arc<TaylorAffineModel>,
++    maximum_noise: usize,
++    constant: usize,
++    columns: Vec<TaylorNoiseColumn>,
++    discarded: Vec<usize>,
++    discarded_remainder: Vec<DyadicInterval>,
++    remainder: Vec<DyadicInterval>,
++}
++impl TaylorNoiseModel {
++    /// Prepare a certified outer representation without changing the exact source.
++    /// Failure leaves the shared source unchanged and available for a fresh retry.
++    pub fn new(
++        source: Arc<TaylorAffineModel>,
++        maximum_noise: usize,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<Self, TaylorAffineError> {
++        graph.charge(0)?;
++        let terms = source.terms.len();
++        let outputs = source.map.rows.len();
++        let capacity = maximum_noise.min(terms);
++        let request = source.source.request();
++        graph.check_entries(&[
++            terms,
++            terms,
++            terms,
++            terms,
++            terms,
++            capacity,
++            capacity,
++            capacity,
++            capacity,
++            outputs,
++            outputs,
++            request.domain.len(),
++            1,
++        ])?;
++        if source.range.is_empty() {
++            graph.charge(0)?;
++            return Ok(Self {
++                source,
++                maximum_noise,
++                constant: 0,
++                columns: Vec::new(),
++                discarded: Vec::new(),
++                discarded_remainder: Vec::new(),
++                remainder: Vec::new(),
++            });
++        }
++        let shifts = model::shifts(&request.domain, &request.center, graph, arithmetic)?;
++        let one = DyadicInterval::point(1.into(), 0)?;
++        let mut constant = 0;
++        let mut candidates = Vec::new();
++        for (index, term) in source.terms.iter().enumerate() {
++            graph.charge(1)?;
++            if term.powers().is_empty() {
++                constant = index;
++                continue;
++            }
++            let (_, domain) = model::contribution(
++                &term.monomial,
++                &one,
++                &shifts,
++                source.source.source().definition(),
++                request.precision,
++                graph,
++                arithmetic,
++            )?;
++            let mut variation = model::zero()?;
++            for coefficient in &term.coefficients {
++                graph.charge(1)?;
++                let width = DyadicInterval::from_real(coefficient, request.precision, arithmetic)?
++                    .mul(&domain, arithmetic)?
++                    .width(arithmetic)?;
++                if width.compare_singleton(&variation, arithmetic)? == Ordering::Greater {
++                    variation = width;
++                }
++            }
++            candidates.push(Some(TaylorNoiseColumn {
++                term: index,
++                domain,
++                variation,
++            }));
++        }
++        // Fallible exact comparisons share both budgets. Never use a guessed
++        // ordering or an infallible sort closure when comparison can exhaust.
++        let mut selected: Vec<usize> = Vec::new();
++        if capacity != 0 {
++            for (index, candidate) in candidates.iter().enumerate() {
++                graph.charge(1)?;
++                let candidate = candidate.as_ref().expect("not yet moved");
++                let mut position = selected.len();
++                for (slot, previous) in selected.iter().enumerate() {
++                    graph.charge(1)?;
++                    let previous = candidates[*previous].as_ref().expect("not yet moved");
++                    if candidate
++                        .variation
++                        .compare_singleton(&previous.variation, arithmetic)?
++                        == Ordering::Greater
++                    {
++                        position = slot;
++                        break;
++                    }
++                }
++                if position < capacity {
++                    // Include element moves in structural work before mutation.
++                    graph.charge(selected.len() - position)?;
++                    graph.charge(1)?;
++                    selected.insert(position, index);
++                    selected.truncate(capacity);
++                }
++            }
++        }
++        let mut columns = Vec::new();
++        for index in selected {
++            graph.charge(1)?;
++            columns.push(candidates[index].take().expect("selected once"));
++        }
++        let mut discarded_remainder = Vec::new();
++        for _ in &source.remainder {
++            graph.charge(1)?;
++            discarded_remainder.push(model::zero()?);
++        }
++        let mut discarded = Vec::new();
++        for candidate in candidates {
++            graph.charge(1)?;
++            let Some(candidate) = candidate else { continue };
++            for (bound, coefficient) in discarded_remainder
++                .iter_mut()
++                .zip(&source.terms[candidate.term].coefficients)
++            {
++                graph.charge(1)?;
++                let contribution =
++                    DyadicInterval::from_real(coefficient, request.precision, arithmetic)?
++                        .mul(&candidate.domain, arithmetic)?;
++                *bound = bound.add(&contribution, arithmetic)?;
++            }
++            discarded.push(candidate.term);
++        }
++        let mut remainder = Vec::new();
++        for (original, omitted) in source.remainder.iter().zip(&discarded_remainder) {
++            graph.charge(1)?;
++            remainder.push(original.add(omitted, arithmetic)?);
++        }
++        graph.charge(0)?;
++        Ok(Self {
++            source,
++            maximum_noise,
++            constant,
++            columns,
++            discarded,
++            discarded_remainder,
++            remainder,
++        })
++    }
++    /// Original exact source, including all coefficients, guards and residual proof.
++    pub fn source(&self) -> &Arc<TaylorAffineModel> {
++        &self.source
++    }
++    /// Requested capacity; the actual retained count may be smaller.
++    pub fn maximum_noise(&self) -> usize {
++        self.maximum_noise
++    }
++    /// Selected shared columns in descending variation order, with stable ties.
++    pub fn columns(&self) -> &[TaylorNoiseColumn] {
++        &self.columns
++    }
++    /// Original term indices whose full contributions were added to the residual.
++    /// This omits constants and preserves original source order.
++    pub fn discarded_terms(&self) -> &[usize] {
++        &self.discarded
++    }
++    /// Every omitted monomial contribution, in affine source output order.
++    /// These bounds do not include the separately retained original residuals.
++    pub fn discarded_remainder(&self) -> &[DyadicInterval] {
++        &self.discarded_remainder
++    }
++    /// Cartesian projection of original residuals plus every discarded contribution.
++    /// Queries retain original residual identities through the exact source map;
++    /// this projection does not replace that map. Empty sources have no claim.
++    pub fn remainder(&self) -> &[DyadicInterval] {
++        &self.remainder
++    }
++    /// Certify an affine observation over the original domain. The map's inputs
++    /// refer to source outputs. This query does not mutate or reselect the model.
++    /// Invalid shapes fail before empty shortcuts; no partial result is published.
++    pub fn enclose(
++        &self,
++        map: &TaylorAffineMap,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<TaylorAffineRange, TaylorAffineError> {
++        let entries = map.validate(self.source.map.rows.len(), graph)?;
++        graph.check_entries(&[entries, map.rows.len(), self.source.map.rows.len()])?;
++        graph.charge(map.rows.len())?;
++        if self.source.range.is_empty() {
++            graph.charge(0)?;
++            return Ok(TaylorAffineRange {
++                bounds: vec![DyadicInterval::empty(); map.rows.len()],
++                empty: true,
++            });
++        }
++        let precision = self.source.source.request().precision;
++        let mut bounds = Vec::new();
++        for (output, row) in map.rows.iter().enumerate() {
++            graph.charge(row.coefficients.len())?;
++            let constant = Real::sum_products(
++                &row.coefficients,
++                &self.source.terms[self.constant].coefficients,
++            )
++            .map_err(TaylorAffineError::Scalar)?
++                + &row.offset;
++            let mut value = DyadicInterval::from_real(&constant, precision, arithmetic)?;
++            for column in &self.columns {
++                graph.charge(row.coefficients.len())?;
++                graph.charge(1)?;
++                let coefficient = Real::sum_products(
++                    &row.coefficients,
++                    &self.source.terms[column.term].coefficients,
++                )
++                .map_err(TaylorAffineError::Scalar)?;
++                let weight = DyadicInterval::from_real(&coefficient, precision, arithmetic)?;
++                value = value.add(&weight.mul(&column.domain, arithmetic)?, arithmetic)?;
++            }
++            for (column, residual) in self.source.source.remainder().iter().enumerate() {
++                graph.charge(1)?;
++                if residual.signs() == hyperinterval::SignSet::Zero {
++                    continue;
++                }
++                graph.charge(row.coefficients.len())?;
++                let weights: Vec<_> = self
++                    .source
++                    .map
++                    .rows
++                    .iter()
++                    .map(|source_row| source_row.coefficients[column].clone())
++                    .collect();
++                let coefficient = Real::sum_products(&row.coefficients, &weights)
++                    .map_err(TaylorAffineError::Scalar)?;
++                let weight = DyadicInterval::from_real(&coefficient, precision, arithmetic)?;
++                value = value.add(&weight.mul(residual, arithmetic)?, arithmetic)?;
++            }
++            value = value.add(
++                &bound_row(
++                    row,
++                    &self.discarded_remainder,
++                    false,
++                    precision,
++                    graph,
++                    arithmetic,
++                )?,
++                arithmetic,
++            )?;
++            let independent = bound_row(
++                row,
++                self.source.range.bounds(),
++                true,
++                precision,
++                graph,
++                arithmetic,
++            )?;
++            value = value.intersection(&independent, arithmetic)?;
++            if value.is_empty() {
++                return Err(TaylorError::InconsistentEnclosure { output }.into());
++            }
++            bounds.push(value);
++        }
++        graph.charge(0)?;
++        Ok(TaylorAffineRange {
++            bounds,
++            empty: false,
++        })
++    }
++}
+diff --git a/crates/hypersolve/tests/program_taylor_noise.rs b/crates/hypersolve/tests/program_taylor_noise.rs
+new file mode 100644
+index 000000000..7f828efcb
+--- /dev/null
++++ b/crates/hypersolve/tests/program_taylor_noise.rs
+@@ -0,0 +1,522 @@
++#![cfg(feature = "taylor-noise")]
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::{Rational, Real};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorAffineError, TaylorAffineMap, TaylorAffineModel,
++        TaylorAffineRow, TaylorNoiseModel, TaylorRequest,
++    },
++};
++use std::sync::Arc;
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 10_000_000)
++}
++fn scalar() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn map(rows: &[&[i32]], inputs: usize) -> TaylorAffineMap {
++    TaylorAffineMap {
++        input_count: inputs,
++        rows: rows
++            .iter()
++            .map(|r| TaylorAffineRow {
++                coefficients: r.iter().map(|&x| Real::from(x)).collect(),
++                offset: Real::zero(),
++            })
++            .collect(),
++    }
++}
++fn source(
++    outputs: &[Expr],
++    center: i64,
++    domain: DyadicInterval,
++    order: usize,
++) -> Arc<TaylorAffineModel> {
++    let p = ExpressionProgram::compile(outputs, &[SymbolId(7)], &mut graph()).unwrap();
++    let original = Arc::new(
++        p.taylor_model(
++            TaylorRequest {
++                center: vec![d(center, center, 0)],
++                domain: vec![domain],
++                order,
++                precision: -64,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    let rows = (0..outputs.len())
++        .map(|i| TaylorAffineRow {
++            coefficients: (0..outputs.len())
++                .map(|j| Real::from(i32::from(i == j)))
++                .collect(),
++            offset: Real::zero(),
++        })
++        .collect();
++    Arc::new(
++        TaylorAffineModel::new(
++            original,
++            TaylorAffineMap {
++                input_count: outputs.len(),
++                rows,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    )
++}
++fn polynomial(center: i64, domain: DyadicInterval) -> Arc<TaylorAffineModel> {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let quadratic = Expr::int(16) * x.clone() * x.clone();
++    source(&[quadratic.clone() + x, quadratic], center, domain, 2)
++}
++#[test]
++fn dominant_shared_noise_cancels_and_omitted_terms_are_charged() {
++    let original = polynomial(0, d(-1, 1, 0));
++    let difference = map(&[&[1, -1]], 2);
++    let boxed = TaylorNoiseModel::new(original.clone(), 0, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(boxed.columns().len(), 0);
++    assert_eq!(
++        boxed
++            .enclose(&difference, &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        &[d(-17, 17, 0)]
++    );
++    let retained = TaylorNoiseModel::new(original.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    assert!(Arc::ptr_eq(retained.source(), &original));
++    assert_eq!(retained.maximum_noise(), 1);
++    assert_eq!(retained.columns().len(), 1);
++    let column = &retained.columns()[0];
++    assert_eq!(
++        original.terms()[column.term_index()].powers(),
++        &[(SymbolId(7), 2)]
++    );
++    assert_eq!(column.domain(), &d(0, 1, 0));
++    assert_eq!(column.variation(), &d(16, 16, 0));
++    assert_eq!(retained.remainder(), &[d(-1, 1, 0), d(0, 0, 0)]);
++    assert_eq!(retained.discarded_terms().len(), 1);
++    assert_eq!(
++        original.terms()[retained.discarded_terms()[0]].powers(),
++        &[(SymbolId(7), 1)]
++    );
++    let exact = original
++        .transform(difference.clone(), &mut graph(), &mut scalar())
++        .unwrap();
++    let answer = retained
++        .enclose(&difference, &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(answer.bounds(), &[d(-1, 1, 0)]);
++    assert_eq!(answer.bounds(), exact.range().bounds());
++    // Repeated observations preserve the source and return identical exact bounds.
++    for _ in 0..8 {
++        assert_eq!(
++            retained
++                .enclose(&difference, &mut graph(), &mut scalar())
++                .unwrap()
++                .bounds(),
++            answer.bounds()
++        );
++    }
++    let all = TaylorNoiseModel::new(original, usize::MAX, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(all.columns().len(), 2);
++    assert!(all.discarded_terms().is_empty());
++    assert_eq!(
++        all.enclose(&difference, &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        answer.bounds()
++    );
++}
++#[test]
++fn exact_point_oracles_cover_shifted_asymmetric_domains_and_every_capacity() {
++    for center in [0, 1, 2, 3] {
++        let original = polynomial(center, d(0, 3, 0));
++        for capacity in 0..4 {
++            let noise =
++                TaylorNoiseModel::new(original.clone(), capacity, &mut graph(), &mut scalar())
++                    .unwrap();
++            let mut observation = map(&[&[-3, 2], &[1, -1], &[0, 0]], 2);
++            for row in &mut observation.rows {
++                row.offset = Real::from(5);
++            }
++            let range = noise
++                .enclose(&observation, &mut graph(), &mut scalar())
++                .unwrap();
++            for i in 0..=24 {
++                let x = Rational::from(i) / Rational::from(8);
++                let expected = [
++                    Rational::from(-16) * &x * &x - Rational::from(3) * &x + Rational::from(5),
++                    &x + Rational::from(5),
++                    Rational::from(5),
++                ];
++                for (bound, expected) in range.bounds().iter().zip(expected) {
++                    assert!(
++                        bound
++                            .to_rational(&mut scalar())
++                            .unwrap()
++                            .contains_point(&expected)
++                    );
++                }
++            }
++            assert_eq!(range.bounds()[2], d(5, 5, 0));
++        }
++    }
++}
++#[test]
++fn equal_residual_bounds_remain_distinct_functions() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let original = source(
++        &[
++            Expr::int(1) / (Expr::int(1) - x.clone()),
++            Expr::int(1) / (Expr::int(1) + x),
++        ],
++        0,
++        d(-1, 1, -2),
++        0,
++    );
++    assert_eq!(original.remainder()[0], original.remainder()[1]);
++    let noise = TaylorNoiseModel::new(original, 8, &mut graph(), &mut scalar()).unwrap();
++    let range = noise
++        .enclose(&map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_ne!(range.bounds(), &[d(0, 0, 0)]);
++    // At x=1/4 the exact difference is 8/15, while at -1/4 it is -8/15.
++    let bound = range.bounds()[0].to_rational(&mut scalar()).unwrap();
++    for sign in [-1, 1] {
++        assert!(bound.contains_point(&(Rational::from(sign * 8) / Rational::from(15))));
++    }
++}
++#[test]
++fn empty_unit_constants_and_shape_validation_are_distinct() {
++    let empty = source(&[Expr::int(3)], 0, DyadicInterval::empty(), 2);
++    let model = TaylorNoiseModel::new(empty, 1, &mut graph(), &mut scalar()).unwrap();
++    assert!(model.remainder().is_empty());
++    let range = model
++        .enclose(&map(&[], 1), &mut graph(), &mut scalar())
++        .unwrap();
++    assert!(range.is_empty());
++    assert!(range.bounds().is_empty());
++    assert!(matches!(
++        model.enclose(&map(&[], 2), &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::InputCount { .. })
++    ));
++    assert!(matches!(
++        model.enclose(&map(&[&[]], 1), &mut graph(), &mut scalar()),
++        Err(TaylorAffineError::RowWidth { .. })
++    ));
++    let constant = source(&[Expr::int(3)], 0, d(-1, 1, 0), 0);
++    let model = TaylorNoiseModel::new(constant, 0, &mut graph(), &mut scalar()).unwrap();
++    let unit = model
++        .enclose(&map(&[], 1), &mut graph(), &mut scalar())
++        .unwrap();
++    assert!(!unit.is_empty());
++    assert!(unit.bounds().is_empty());
++    assert_eq!(
++        model
++            .enclose(&map(&[&[2]], 1), &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        &[d(6, 6, 0)]
++    );
++    let zero_outputs = source(&[], 0, d(-1, 1, 0), 1);
++    let model =
++        TaylorNoiseModel::new(zero_outputs, usize::MAX, &mut graph(), &mut scalar()).unwrap();
++    assert!(
++        !model
++            .enclose(&map(&[&[]], 0), &mut graph(), &mut scalar())
++            .unwrap()
++            .is_empty()
++    );
++}
++#[test]
++fn tied_variations_preserve_canonical_term_order_and_replay() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let original = source(
++        &[x.clone() + Expr::int(2) * x.clone() * x],
++        0,
++        d(-1, 1, 0),
++        2,
++    );
++    let first = TaylorNoiseModel::new(original.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(
++        original.terms()[first.columns()[0].term_index()].powers(),
++        &[(SymbolId(7), 1)]
++    );
++    let rebuilt = source(
++        &[Expr::anonymous_symbol(SymbolId(7))
++            + Expr::int(2)
++                * Expr::anonymous_symbol(SymbolId(7))
++                * Expr::anonymous_symbol(SymbolId(7))],
++        0,
++        d(-1, 1, 0),
++        2,
++    );
++    let replay = TaylorNoiseModel::new(rebuilt, 1, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(
++        first.columns()[0].term_index(),
++        replay.columns()[0].term_index()
++    );
++    assert_eq!(first.remainder(), replay.remainder());
++    assert_eq!(
++        first
++            .enclose(&map(&[&[1]], 1), &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        replay
++            .enclose(&map(&[&[1]], 1), &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds()
++    );
++}
++
++#[test]
++fn resource_boundaries_cancellation_and_retry_preserve_source() {
++    use hypersolve::{
++        expression_program::{ExpressionError, TaylorError},
++        work_budget::CancellationToken,
++    };
++    let original = polynomial(0, d(-1, 1, 0));
++    let mut g = graph();
++    let mut a = scalar();
++    let gw = g.remaining_work();
++    let aw = a.remaining_work();
++    let model = TaylorNoiseModel::new(original.clone(), 1, &mut g, &mut a).unwrap();
++    let gw = gw - g.remaining_work();
++    let aw = aw - a.remaining_work();
++    assert!(gw > 0 && aw > 0);
++    let rebuilt = TaylorNoiseModel::new(
++        original.clone(),
++        1,
++        &mut ExpressionBudget::new(100_000, gw),
++        &mut DyadicBudget::new(16384, aw),
++    )
++    .unwrap();
++    assert_eq!(rebuilt.remainder(), model.remainder());
++    assert!(matches!(
++        TaylorNoiseModel::new(
++            original.clone(),
++            1,
++            &mut ExpressionBudget::new(100_000, gw - 1),
++            &mut scalar()
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::WorkExhausted
++        )))
++    ));
++    assert!(matches!(
++        TaylorNoiseModel::new(
++            original.clone(),
++            1,
++            &mut graph(),
++            &mut DyadicBudget::new(16384, aw - 1)
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Interval(
++            hyperinterval::IntervalError::WorkExhausted
++        )))
++    ));
++    assert!(matches!(
++        TaylorNoiseModel::new(
++            original.clone(),
++            1,
++            &mut ExpressionBudget::new(1, 1_000_000),
++            &mut scalar()
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::SizeExhausted
++        )))
++    ));
++    let observation = map(&[&[1, -1]], 2);
++    let mut g = graph();
++    let mut a = scalar();
++    let gw = g.remaining_work();
++    let aw = a.remaining_work();
++    let answer = model.enclose(&observation, &mut g, &mut a).unwrap();
++    let gw = gw - g.remaining_work();
++    let aw = aw - a.remaining_work();
++    let exact = model
++        .enclose(
++            &observation,
++            &mut ExpressionBudget::new(100_000, gw),
++            &mut DyadicBudget::new(16384, aw),
++        )
++        .unwrap();
++    assert_eq!(exact.bounds(), answer.bounds());
++    assert!(matches!(
++        model.enclose(
++            &observation,
++            &mut ExpressionBudget::new(100_000, gw - 1),
++            &mut scalar()
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::WorkExhausted
++        )))
++    ));
++    assert!(matches!(
++        model.enclose(
++            &observation,
++            &mut graph(),
++            &mut DyadicBudget::new(16384, aw - 1)
++        ),
++        Err(TaylorAffineError::Taylor(TaylorError::Interval(
++            hyperinterval::IntervalError::WorkExhausted
++        )))
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        TaylorNoiseModel::new(original.clone(), 1, &mut cancelled, &mut scalar()),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    assert!(matches!(
++        model.enclose(&observation, &mut cancelled, &mut scalar()),
++        Err(TaylorAffineError::Taylor(TaylorError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    let retried = TaylorNoiseModel::new(original.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    assert!(Arc::ptr_eq(retried.source(), &original));
++    assert_eq!(
++        retried
++            .enclose(&observation, &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        answer.bounds()
++    );
++}
++
++#[test]
++fn mixed_monomials_use_shared_parameters_with_noncanonical_binding_order() {
++    let (x, y) = (
++        Expr::anonymous_symbol(SymbolId(7)),
++        Expr::anonymous_symbol(SymbolId(3)),
++    );
++    let shared = Expr::int(32) * x.clone() * y.clone();
++    let p = ExpressionProgram::compile(
++        &[shared.clone() + x, shared + y],
++        &[SymbolId(7), SymbolId(3)],
++        &mut graph(),
++    )
++    .unwrap();
++    let taylor = p
++        .taylor_model(
++            TaylorRequest {
++                center: vec![d(0, 0, 0), d(0, 0, 0)],
++                domain: vec![d(-1, 1, 0), d(-2, 2, 0)],
++                order: 2,
++                precision: -64,
++            },
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap();
++    let original = Arc::new(
++        TaylorAffineModel::new(
++            Arc::new(taylor),
++            map(&[&[1, 0], &[0, 1]], 2),
++            &mut graph(),
++            &mut scalar(),
++        )
++        .unwrap(),
++    );
++    let model = TaylorNoiseModel::new(original.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    let column = &model.columns()[0];
++    assert_eq!(
++        original.terms()[column.term_index()].powers(),
++        &[(SymbolId(3), 1), (SymbolId(7), 1)]
++    );
++    assert_eq!(column.domain(), &d(-2, 2, 0));
++    let range = model
++        .enclose(&map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(range.bounds(), &[d(-3, 3, 0)]);
++    for x in -4..=4 {
++        for y in -8..=8 {
++            let expected = Rational::from(x - y) / Rational::from(4);
++            assert!(
++                range.bounds()[0]
++                    .to_rational(&mut scalar())
++                    .unwrap()
++                    .contains_point(&expected)
++            );
++        }
++    }
++}
++
++#[test]
++fn irrational_shared_coefficients_cancel_before_enclosure() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let coefficient = Real::from(16) * Real::from(2).sqrt().unwrap();
++    let shared = Expr::real(coefficient.clone()) * x.clone() * x.clone();
++    let original = source(&[shared.clone() + x, shared], 0, d(-1, 1, 0), 2);
++    let model = TaylorNoiseModel::new(original.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(
++        original.terms()[model.columns()[0].term_index()].coefficients(),
++        &[coefficient.clone(), coefficient]
++    );
++    assert_eq!(
++        model
++            .enclose(&map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        &[d(-1, 1, 0)]
++    );
++}
++
++#[test]
++fn generated_affine_sources_keep_offsets_and_capacity_tradeoffs_explicit() {
++    let original = polynomial(0, d(-1, 1, 0));
++    let mut shear = map(&[&[2, 1], &[1, 1]], 2);
++    shear.rows[0].offset = Real::from(5);
++    shear.rows[1].offset = Real::from(-2);
++    let transformed = Arc::new(
++        original
++            .transform(shear, &mut graph(), &mut scalar())
++            .unwrap(),
++    );
++    let observation = map(&[&[2, -3]], 2);
++    // 2*(2*f0+f1+5)-3*(f0+f1-2) = x+16.
++    // Dropping the shared linear monomial loses its cross-output correlation,
++    // conservatively yielding x in [-7,7]; keeping it recovers [-1,1].
++    let one = TaylorNoiseModel::new(transformed.clone(), 1, &mut graph(), &mut scalar()).unwrap();
++    let two = TaylorNoiseModel::new(transformed, 2, &mut graph(), &mut scalar()).unwrap();
++    assert_eq!(
++        one.enclose(&observation, &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        &[d(9, 23, 0)]
++    );
++    assert_eq!(
++        two.enclose(&observation, &mut graph(), &mut scalar())
++            .unwrap()
++            .bounds(),
++        &[d(15, 17, 0)]
++    );
++}
++
++#[test]
++fn duplicated_original_residual_cancels_even_without_retained_monomials() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let original = source(&[Expr::int(1) / (Expr::int(1) - x)], 0, d(-1, 1, -2), 0);
++    assert_ne!(original.remainder(), &[d(0, 0, 0)]);
++    let duplicate = Arc::new(
++        original
++            .transform(map(&[&[1], &[1]], 1), &mut graph(), &mut scalar())
++            .unwrap(),
++    );
++    let model = TaylorNoiseModel::new(duplicate, 0, &mut graph(), &mut scalar()).unwrap();
++    let difference = model
++        .enclose(&map(&[&[1, -1]], 2), &mut graph(), &mut scalar())
++        .unwrap();
++    assert_eq!(difference.bounds(), &[d(0, 0, 0)]);
++}
