@@ -1,0 +1,1 @@
+Whole-horizon fixed-order Taylor composition is admitted on the declared corpus. The full goal remains active. Automatic order/frame control, universal performance, whole-resource closure, release and push are not claimed.
