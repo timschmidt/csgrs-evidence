@@ -1,0 +1,1191 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b82aac8e6..148f5fa8d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2533,6 +2533,7 @@ dependencies = [
+  "cavalier_contours",
+  "curvo",
+  "geo",
++ "hyperinterval",
+  "hyperlimit",
+  "hyperreal",
+  "hypersolve",
+diff --git a/crates/hypercurve/CHANGELOG.md b/crates/hypercurve/CHANGELOG.md
+index 74873bec7..ebdc2642b 100644
+--- a/crates/hypercurve/CHANGELOG.md
++++ b/crates/hypercurve/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add optional prepared rational Bézier coordinate and tangent ranges through
++  the shared dyadic expression evaluator. Retain native source, local domain,
++  derivative association and full-domain regularity evidence across repeated
++  queries, with typed domain/resource failures and explicit accounting limits.
++
+ - Retain exact SVG transform tokens and affine composition, including nested
+   groups, authored rotation centers and symbolic rotation/skew trigonometry.
+   Matrix coefficients and underflow-small translations no longer enter through
+diff --git a/crates/hypercurve/Cargo.toml b/crates/hypercurve/Cargo.toml
+index 0993c0760..ce3b115ed 100644
+--- a/crates/hypercurve/Cargo.toml
++++ b/crates/hypercurve/Cargo.toml
+@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
+ repository = "https://github.com/timschmidt/csgrs"
+ documentation = "https://docs.rs/hypercurve"
+ readme = "README.md"
+-include = ["/src/**", "/tests/support/**", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
++include = ["/src/**", "/tests/support/**", "/examples/interval_ranges.rs", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
+ keywords = ["cad", "curves", "geometry", "hyperreal", "topology"]
+ categories = ["mathematics", "graphics", "algorithms"]
+ 
+@@ -19,6 +19,7 @@ all-features = true
+ [dependencies]
+ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = false }
+ hypersolve = { version = "0.4.0", path = "../hypersolve", default-features = false }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["hyperreal"], optional = true }
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false, features = ["std"] }
+ hypertri = { version = "0.5.0", path = "../hypertri", default-features = false, features = ["earcut"], optional = true }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+@@ -34,6 +35,7 @@ proptest = "1"
+ 
+ [features]
+ default = []
++interval-ranges = ["dep:hyperinterval", "hypersolve/interval-program"]
+ dispatch-trace = ["hyperreal/dispatch-trace", "hyperlimit/dispatch-trace", "hypersolve/dispatch-trace"]
+ triangulation = ["dep:hypertri"]
+ svg = ["dep:svg", "dep:svgtypes", "hyperreal/serde"]
+@@ -45,6 +47,10 @@ comparative-benchmarks = [
+     "dep:nalgebra",
+ ]
+ 
++[[example]]
++name = "interval_ranges"
++required-features = ["interval-ranges"]
++
+ [[bench]]
+ name = "containment"
+ harness = false
+@@ -143,3 +149,8 @@ required-features = ["comparative-benchmarks"]
+ [[bench]]
+ name = "pathological_regions"
+ harness = false
++
++[[bench]]
++name = "interval_ranges"
++harness = false
++required-features = ["interval-ranges"]
+diff --git a/crates/hypercurve/README.md b/crates/hypercurve/README.md
+index 22fded579..6a2ea0951 100644
+--- a/crates/hypercurve/README.md
++++ b/crates/hypercurve/README.md
+@@ -17,6 +17,15 @@ belongs in [Hypermesh](https://github.com/timschmidt/csgrs/tree/main/crates/hype
+ 
+ This README describes crate version `0.4.0`.
+ 
++With `interval-ranges`, `interval_ranges::prepare_rational_bezier_ranges`
++prepares repeated dyadic coordinate and tangent queries for native rational
++Bézier spans, including generated spans with algebraic controls. Each result
++retains the native source, parameter domain and shared regularity evidence.
++Queries use explicit graph/arithmetic budgets; a failed denominator enclosure
++remains a typed failure. A borrowed `native_bounds` projection feeds the existing
++`Aabb2` broad phase while retaining the original evidence. Run the
++`interval_ranges` example with this feature.
++
+ ## Primary types
+ 
+ | Type | Role |
+diff --git a/crates/hypercurve/benches/interval_ranges.rs b/crates/hypercurve/benches/interval_ranges.rs
+new file mode 100644
+index 000000000..4a3d5ecce
+--- /dev/null
++++ b/crates/hypercurve/benches/interval_ranges.rs
+@@ -0,0 +1,136 @@
++//! Complete repeated coordinate/derivative queries, including prepared graphs.
++use hypercurve::{
++    Aabb2, HomogeneousControl2, Point2, RationalBezier2,
++    interval_ranges::{RationalBezierRangeEnclosure, prepare_rational_bezier_ranges},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::Real;
++use hypersolve::expression_program::ExpressionBudget;
++use std::{hint::black_box, time::Instant};
++fn source(case: usize) -> RationalBezier2 {
++    match case {
++        0 => RationalBezier2::try_new(
++            vec![
++                Point2::from_values(0, 0),
++                Point2::from_values(1, 0),
++                Point2::from_values(2, 1),
++            ],
++            vec![Real::one(); 3],
++        )
++        .unwrap(),
++        1 => RationalBezier2::from_homogeneous_controls(vec![
++            HomogeneousControl2::new(Real::from(0), Real::from(1), Real::from(1)),
++            HomogeneousControl2::new(Real::from(1), Real::from(1), Real::from(2)),
++        ])
++        .unwrap(),
++        _ => {
++            let n = 8;
++            RationalBezier2::try_new(
++                (0..=n)
++                    .map(|i| {
++                        Point2::new(
++                            (Real::from(i) / Real::from(n)).unwrap(),
++                            Real::from(i32::from(i == n)),
++                        )
++                    })
++                    .collect(),
++                vec![Real::one(); n as usize + 1],
++            )
++            .unwrap()
++        }
++    }
++}
++fn complete(
++    source: &RationalBezier2,
++    shared: bool,
++    graph: &mut ExpressionBudget,
++    arithmetic: &mut DyadicBudget,
++) -> Vec<RationalBezierRangeEnclosure> {
++    let prepared = shared.then(|| prepare_rational_bezier_ranges(source, graph).unwrap());
++    let mut reports = Vec::new();
++    for i in 0..16 {
++        let parameters = DyadicInterval::new(i.into(), (i + 1).into(), -4).unwrap();
++        let report = match prepared.as_ref() {
++            Some(p) => p.enclose(&parameters, -32, graph, arithmetic).unwrap(),
++            None => prepare_rational_bezier_ranges(source, graph)
++                .unwrap()
++                .enclose(&parameters, -32, graph, arithmetic)
++                .unwrap(),
++        };
++        assert_eq!(report.parameters(), &parameters);
++        let projected = report.native_bounds(graph, arithmetic).unwrap();
++        let query = Aabb2::new_unchecked(Point2::from_values(3, 3), Point2::from_values(4, 4));
++        assert!(
++            !projected
++                .bounds()
++                .expect("nonempty cell")
++                .overlaps(&query)
++                .unwrap()
++        );
++        reports.push(report);
++    }
++    reports
++}
++fn main() {
++    let iterations: u32 = std::env::var("CURVE_RANGE_ITERATIONS")
++        .map(|s| s.parse().unwrap())
++        .unwrap_or(32);
++    let samples: u32 = std::env::var("CURVE_RANGE_SAMPLES")
++        .map(|s| s.parse().unwrap())
++        .unwrap_or(30);
++    for (case, name) in ["polynomial", "rational", "degree8"]
++        .into_iter()
++        .enumerate()
++    {
++        let source = source(case);
++        let expected = complete(
++            &source,
++            false,
++            &mut ExpressionBudget::new(1_000_000, 100_000_000),
++            &mut DyadicBudget::new(16384, 1_000_000_000_000),
++        );
++        let check = complete(
++            &source,
++            true,
++            &mut ExpressionBudget::new(1_000_000, 100_000_000),
++            &mut DyadicBudget::new(16384, 1_000_000_000_000),
++        );
++        for (a, b) in expected.iter().zip(check.iter()) {
++            assert_eq!(
++                a.evidence().program().program().definition(),
++                b.evidence().program().program().definition()
++            );
++            assert_eq!(a.evidence().arguments(), b.evidence().arguments());
++            assert_eq!(a.evidence().values(), b.evidence().values());
++        }
++        for sample in 0..samples + 2 {
++            for shared in if sample % 2 == 0 {
++                [false, true]
++            } else {
++                [true, false]
++            } {
++                let start = Instant::now();
++                for _ in 0..iterations {
++                    let reports = complete(
++                        black_box(&source),
++                        shared,
++                        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++                        &mut DyadicBudget::new(16384, 1_000_000_000_000),
++                    );
++                    for (r, e) in reports.iter().zip(&expected) {
++                        assert_eq!(r.evidence().values(), e.evidence().values());
++                    }
++                    drop(black_box(reports));
++                }
++                if sample >= 2 {
++                    println!(
++                        "{name}/{} sample={} iterations={iterations} total_ns={}",
++                        if shared { "shared" } else { "independent" },
++                        sample - 2,
++                        start.elapsed().as_nanos()
++                    );
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/hypercurve/examples/interval_ranges.rs b/crates/hypercurve/examples/interval_ranges.rs
+new file mode 100644
+index 000000000..9f6061461
+--- /dev/null
++++ b/crates/hypercurve/examples/interval_ranges.rs
+@@ -0,0 +1,44 @@
++//! Reuse a native source and its tangent proof over adjoining parameter cells.
++use hypercurve::{Aabb2, Point2, RationalBezier2, interval_ranges::prepare_rational_bezier_ranges};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::Real;
++use hypersolve::expression_program::ExpressionBudget;
++
++pub fn run() -> Result<(), Box<dyn std::error::Error>> {
++    // P(t) = (2t, t^2). Controls and every query endpoint stay exact.
++    let curve = RationalBezier2::try_new(
++        vec![
++            Point2::new(Real::from(0), Real::from(0)),
++            Point2::new(Real::from(1), Real::from(0)),
++            Point2::new(Real::from(2), Real::from(1)),
++        ],
++        vec![Real::one(); 3],
++    )?;
++    let mut graph = ExpressionBudget::new(100_000, 1_000_000);
++    let mut arithmetic = DyadicBudget::new(4096, 100_000_000);
++    let prepared = prepare_rational_bezier_ranges(&curve, &mut graph)?;
++    for cell in 0..4 {
++        let parameters = DyadicInterval::new(cell.into(), (cell + 1).into(), -2)?;
++        let report = prepared.enclose(&parameters, -32, &mut graph, &mut arithmetic)?;
++        assert_eq!(report.parameters(), &parameters);
++        let native = report.native_bounds(&mut graph, &mut arithmetic)?;
++        let distant = Aabb2::new_unchecked(Point2::from_values(3, 3), Point2::from_values(4, 4));
++        assert!(!native.bounds().expect("nonempty cell").overlaps(&distant)?);
++        assert_eq!(native.evidence().parameters(), &parameters);
++        assert_eq!(
++            report.source().homogeneous_controls(),
++            curve.homogeneous_controls()
++        );
++        assert_eq!(report.tangents()[0], &DyadicInterval::point(2.into(), 0)?);
++        println!(
++            "parameters={parameters:?} coordinates={:?} tangents={:?}",
++            report.coordinates(),
++            report.tangents()
++        );
++    }
++    Ok(())
++}
++#[allow(dead_code)]
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    run()
++}
+diff --git a/crates/hypercurve/src/interval_ranges.rs b/crates/hypercurve/src/interval_ranges.rs
+new file mode 100644
+index 000000000..95f016ea0
+--- /dev/null
++++ b/crates/hypercurve/src/interval_ranges.rs
+@@ -0,0 +1,322 @@
++//! Native curve sources with shared dyadic range and regularity evidence.
++use std::{borrow::Cow, fmt};
++
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++use hyperreal::Real;
++use hypersolve::{
++    RationalParametricCurve2, SymbolId, SymbolRef,
++    expression_program::{
++        BinaryOperation, ExpressionBudget, ExpressionDefinition, ExpressionError, ExpressionNode,
++        ExpressionProgram, JacobianProgram, RegularJacobianEnclosure,
++    },
++};
++
++use crate::bezier_parameter::bernstein_to_power_coefficients;
++use crate::{Aabb2, CurveError, Point2, RationalBezier2};
++
++/// Native source conversion, invalid local domain, or original resource diagnostic.
++#[derive(Debug)]
++pub enum CurveRangeError {
++    /// Native homogeneous source conversion failed.
++    Source(CurveError),
++    /// A nonempty query extends outside this source's local unit chart.
++    OutsideUnitDomain,
++    /// Original graph, differentiation, domain or resource diagnostic.
++    Expression(ExpressionError),
++    /// Original interval validation, arithmetic or resource diagnostic.
++    Interval(IntervalError),
++}
++impl fmt::Display for CurveRangeError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "rational curve range: {self:?}")
++    }
++}
++impl std::error::Error for CurveRangeError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Source(error) => Some(error),
++            Self::Expression(error) => Some(error),
++            Self::Interval(error) => Some(error),
++            Self::OutsideUnitDomain => None,
++        }
++    }
++}
++impl From<ExpressionError> for CurveRangeError {
++    fn from(error: ExpressionError) -> Self {
++        Self::Expression(error)
++    }
++}
++impl From<IntervalError> for CurveRangeError {
++    fn from(error: IntervalError) -> Self {
++        Self::Interval(error)
++    }
++}
++
++/// Exact native source and a reusable coordinate/derivative expression program.
++///
++/// This is preparation, not a curve-range certificate. The original homogeneous
++/// controls and lineage remain shared through the native immutable carrier.
++/// The graph represents X(t)/W(t), Y(t)/W(t), retaining denominator guards.
++#[derive(Clone, Debug)]
++pub struct PreparedRationalBezierRanges {
++    source: RationalBezier2,
++    jacobian: JacobianProgram,
++}
++
++/// Whole-domain coordinate and tangent enclosures with their native source.
++///
++/// Coordinates enclose every point of the source at the retained parameters;
++/// tangents enclose derivatives with respect to that source's local parameter.
++/// This establishes neither an exact range hull nor topology or source fidelity
++/// beyond the supplied native curve. Empty domains yield empty numerical ranges.
++/// C1 smoothness does not assert nonzero tangents, immersion or injectivity.
++/// No serialized certificate or cached flag is accepted as replay authority.
++#[derive(Clone, Debug)]
++pub struct RationalBezierRangeEnclosure {
++    source: RationalBezier2,
++    evidence: RegularJacobianEnclosure,
++}
++
++/// A native broad-phase box borrowing the range evidence that justifies it.
++///
++/// Empty parameter sets have no finite box. For a nonempty set, non-overlap with
++/// another box excludes this curve image; overlap does not prove intersection.
++/// Existing Aabb2 predicates retain their own certainty and failure semantics.
++#[derive(Debug)]
++pub struct CurveRangeBox<'a> {
++    evidence: &'a RationalBezierRangeEnclosure,
++    bounds: Option<Aabb2>,
++}
++impl CurveRangeBox<'_> {
++    /// Original native curve, selected parameter domain and regularity evidence.
++    pub fn evidence(&self) -> &RationalBezierRangeEnclosure {
++        self.evidence
++    }
++    /// Native ordered box, or None for an empty parameter set.
++    pub fn bounds(&self) -> Option<&Aabb2> {
++        self.bounds.as_ref()
++    }
++}
++
++/// Prepare repeated range queries for an existing exact native rational span.
++///
++/// Arbitrary finite degree, algebraic controls and generated native spans retain
++/// their exact definitions. Existing native Bernstein conversion is reused;
++/// the adapter builds no independent geometry or arithmetic kernel. An existing
++/// native basis may be borrowed, but this operation never populates that cache:
++/// doing so would change later high-degree native point-evaluation dispatch.
++/// The graph budget reserves `6*n*n + 6*n` structural conversion units, where n
++/// is the number of homogeneous controls, even if the native basis is cached.
++/// It also charges emitted nodes, validation and differentiation. Entry checks
++/// precede conversion and allocation. Scalar arithmetic, coefficient growth,
++/// payload cloning/destruction and total heap bytes remain outside this budget.
++/// Cancellation cannot interrupt native scalar work or basis conversion; it is
++/// checked before and after conversion and before publishing the prepared result.
++/// Scalar caches retain their existing semantics; failures never become cached
++/// proof of undecidability. The native geometry basis cache remains unchanged.
++pub fn prepare_rational_bezier_ranges(
++    source: &RationalBezier2,
++    graph: &mut ExpressionBudget,
++) -> Result<PreparedRationalBezierRanges, CurveRangeError> {
++    graph.charge(0)?;
++    let n = source.homogeneous_controls().len();
++    let nodes = n.checked_mul(9).ok_or(ExpressionError::SizeExhausted)?;
++    let conversion_entries = n.checked_mul(6).ok_or(ExpressionError::SizeExhausted)?;
++    graph.check_entries(&[1, nodes, 2, conversion_entries])?;
++    let conversion_work = n
++        .checked_mul(n)
++        .and_then(|v| v.checked_mul(6))
++        .and_then(|v| v.checked_add(conversion_entries))
++        .ok_or(ExpressionError::SizeExhausted)?;
++    graph.charge(conversion_work)?;
++    let controls = source.homogeneous_controls();
++    let basis = match source.cached_homogeneous_power_basis() {
++        Some(basis) => Cow::Borrowed(basis),
++        None => Cow::Owned(RationalParametricCurve2::new(
++            bernstein_to_power_coefficients(controls.iter().map(|c| c.x().clone()).collect())
++                .map_err(CurveRangeError::Source)?,
++            bernstein_to_power_coefficients(controls.iter().map(|c| c.y().clone()).collect())
++                .map_err(CurveRangeError::Source)?,
++            bernstein_to_power_coefficients(controls.iter().map(|c| c.weight().clone()).collect())
++                .map_err(CurveRangeError::Source)?,
++        )),
++    };
++    graph.charge(1)?;
++    let parameter = SymbolId(0);
++    let mut definition = ExpressionDefinition {
++        variables: vec![parameter],
++        nodes: vec![ExpressionNode::Variable(SymbolRef::new(parameter, None))],
++        outputs: Vec::new(),
++    };
++    let x = append_polynomial(&basis.x_numerator, &mut definition.nodes, graph)?;
++    let y = append_polynomial(&basis.y_numerator, &mut definition.nodes, graph)?;
++    let weight = append_polynomial(&basis.weight, &mut definition.nodes, graph)?;
++    for numerator in [x, y] {
++        graph.charge(2)?;
++        definition.outputs.push(definition.nodes.len());
++        definition.nodes.push(ExpressionNode::Binary {
++            operation: BinaryOperation::Div,
++            left: numerator,
++            right: weight,
++        });
++    }
++    let program = ExpressionProgram::from_definition(definition, graph)?;
++    let jacobian = program.jacobian(&[parameter], graph)?;
++    graph.charge(1)?;
++    let prepared = PreparedRationalBezierRanges {
++        source: source.clone(),
++        jacobian,
++    };
++    graph.charge(0)?;
++    Ok(prepared)
++}
++
++// Encode the native ascending power coefficients. Numerical evaluation and
++// differentiation remain in the shared expression program, not this adapter.
++fn append_polynomial(
++    coefficients: &[Real],
++    nodes: &mut Vec<ExpressionNode>,
++    graph: &mut ExpressionBudget,
++) -> Result<usize, ExpressionError> {
++    let (leading, rest) = coefficients
++        .split_last()
++        .expect("native homogeneous power basis is nonempty");
++    graph.charge(1)?;
++    let mut value = nodes.len();
++    nodes.push(ExpressionNode::Constant(leading.clone()));
++    for coefficient in rest.iter().rev() {
++        graph.charge(3)?;
++        let product = nodes.len();
++        nodes.push(ExpressionNode::Binary {
++            operation: BinaryOperation::Mul,
++            left: value,
++            right: 0,
++        });
++        let constant = nodes.len();
++        nodes.push(ExpressionNode::Constant(coefficient.clone()));
++        value = nodes.len();
++        nodes.push(ExpressionNode::Binary {
++            operation: BinaryOperation::Add,
++            left: product,
++            right: constant,
++        });
++    }
++    Ok(value)
++}
++
++impl PreparedRationalBezierRanges {
++    /// Native exact source, including retained subdivision lineage.
++    pub fn source(&self) -> &RationalBezier2 {
++        &self.source
++    }
++    /// Original coordinate graph and generated derivative association.
++    pub fn program(&self) -> &JacobianProgram {
++        &self.jacobian
++    }
++    /// Enclose coordinates and local tangents on a dyadic subset of `[0,1]`.
++    ///
++    /// Precision selects an enclosure grid, not a final-width guarantee. All
++    /// nested graph/native work shares these budgets. Exact scalar refinement
++    /// retains the expression evaluator's accounting exclusions. A denominator
++    /// enclosure containing zero refuses certification even if the actual curve
++    /// is regular; it does not assert a pole. Subdivision or a larger arithmetic
++    /// budget can be retried without mutating this prepared object. Source and
++    /// full-domain regularity evidence survive as part of every successful result.
++    pub fn enclose(
++        &self,
++        parameters: &DyadicInterval,
++        precision: i32,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<RationalBezierRangeEnclosure, CurveRangeError> {
++        graph.charge(0)?;
++        let unit = DyadicInterval::new(0.into(), 1.into(), 0)?;
++        if !parameters.subset_of(&unit, arithmetic)? {
++            return Err(CurveRangeError::OutsideUnitDomain);
++        }
++        let evidence = self.jacobian.enclose_regular(
++            std::slice::from_ref(parameters),
++            precision,
++            graph,
++            arithmetic,
++        )?;
++        graph.charge(1)?;
++        let result = RationalBezierRangeEnclosure {
++            source: self.source.clone(),
++            evidence,
++        };
++        graph.charge(0)?;
++        Ok(result)
++    }
++}
++impl RationalBezierRangeEnclosure {
++    /// Project into the existing native broad phase, retaining borrowed evidence.
++    ///
++    /// Dyadic bounds convert exactly to rational Real endpoints. Ordered interval
++    /// invariants justify native box ordering without a new predicate kernel.
++    /// Copies/conversions share the supplied budgets; Real payload construction
++    /// retains the scalar accounting exclusions. Cancellation and resource failure
++    /// publish no partial box and do not mutate this report. No approximate point
++    /// or fitted curve is constructed from these enclosure endpoints.
++    pub fn native_bounds(
++        &self,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<CurveRangeBox<'_>, CurveRangeError> {
++        graph.charge(0)?;
++        graph.check_entries(&[4])?;
++        graph.charge(1)?;
++        let bounds = if self.coordinates()[0].is_empty() {
++            None
++        } else {
++            graph.charge(2)?;
++            let [x, y] = self.coordinates();
++            let [(x_min, x_max), (y_min, y_max)] =
++                [x.to_rational(arithmetic)?, y.to_rational(arithmetic)?].map(|coordinate| {
++                    coordinate
++                        .into_bounds()
++                        .expect("nonempty regular coordinate enclosure")
++                });
++            graph.charge(4)?;
++            Some(Aabb2::new_unchecked(
++                Point2::new(Real::new(x_min), Real::new(y_min)),
++                Point2::new(Real::new(x_max), Real::new(y_max)),
++            ))
++        };
++        graph.charge(0)?;
++        Ok(CurveRangeBox {
++            evidence: self,
++            bounds,
++        })
++    }
++
++    /// Original native source; numerical enclosures never replace it.
++    pub fn source(&self) -> &RationalBezier2 {
++        &self.source
++    }
++    /// Exact dyadic local parameter set certified by this report.
++    pub fn parameters(&self) -> &DyadicInterval {
++        &self.evidence.arguments()[0]
++    }
++    /// Coordinate enclosures in x,y order.
++    pub fn coordinates(&self) -> [&DyadicInterval; 2] {
++        [&self.evidence.values()[0], &self.evidence.values()[1]]
++    }
++    /// Local parameter derivative enclosures in x,y order.
++    pub fn tangents(&self) -> [&DyadicInterval; 2] {
++        std::array::from_fn(|row| {
++            &self.evidence.values()[self
++                .evidence
++                .program()
++                .partial_output(row, 0)
++                .expect("prepared two-output one-parameter Jacobian")]
++        })
++    }
++    /// Original source-domain continuity and C1 certificate, including precision.
++    pub fn evidence(&self) -> &RegularJacobianEnclosure {
++        &self.evidence
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/hypercurve/src/interval_ranges/tests.rs b/crates/hypercurve/src/interval_ranges/tests.rs
+new file mode 100644
+index 000000000..ad075bade
+--- /dev/null
++++ b/crates/hypercurve/src/interval_ranges/tests.rs
+@@ -0,0 +1,524 @@
++use super::*;
++use crate::{HomogeneousControl2, Point2};
++use hyperreal::Rational;
++
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn parabola() -> RationalBezier2 {
++    RationalBezier2::try_new(vec![pt!(0, 0), pt!(1, 0), pt!(2, 1)], vec![r!(1); 3]).unwrap()
++}
++fn enclose(source: &RationalBezier2, domain: &DyadicInterval) -> RationalBezierRangeEnclosure {
++    prepare_rational_bezier_ranges(source, &mut graph())
++        .unwrap()
++        .enclose(domain, -64, &mut graph(), &mut arithmetic())
++        .unwrap()
++}
++fn rational_contains(interval: &DyadicInterval, lower: Rational, upper: Rational) {
++    let q = interval.to_rational(&mut arithmetic()).unwrap();
++    assert!(q.contains_point(&lower), "{q:?} lacks {lower}");
++    assert!(q.contains_point(&upper), "{q:?} lacks {upper}");
++}
++#[test]
++fn polynomial_coordinate_and_derivative_ranges_are_exact_and_reusable() {
++    let source = parabola();
++    let prepared = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++    for domain in [d(1, 2, -2), d(2, 3, -2)] {
++        let report = prepared
++            .enclose(&domain, -32, &mut graph(), &mut arithmetic())
++            .unwrap();
++        let expected_x = domain.mul(&d(2, 2, 0), &mut arithmetic()).unwrap();
++        let expected_y = domain.square(&mut arithmetic()).unwrap();
++        assert_eq!(report.coordinates(), [&expected_x, &expected_y]);
++        assert_eq!(report.tangents(), [&d(2, 2, 0), &expected_x]);
++        assert_eq!(report.parameters(), &domain);
++        assert!(report.source().shares_retained_data(&source));
++        assert!(std::ptr::eq(
++            report.evidence().program().source().definition(),
++            prepared.program().source().definition()
++        ));
++        let rebuilt = enclose(&source, &domain);
++        assert_eq!(report.evidence().values(), rebuilt.evidence().values());
++        assert_eq!(
++            report.evidence().program().program().definition(),
++            rebuilt.evidence().program().program().definition()
++        );
++    }
++    drop(source);
++    assert!(
++        prepared
++            .enclose(&d(0, 1, 0), -32, &mut graph(), &mut arithmetic())
++            .is_ok()
++    );
++}
++#[test]
++fn rational_coordinates_and_tangents_contain_independent_analytic_ranges() {
++    // C=(t/(1+t),1/(1+t)), C'=(1,-1)/(1+t)^2 on [0,1].
++    let source = RationalBezier2::from_homogeneous_controls(vec![
++        HomogeneousControl2::new(r!(0), r!(1), r!(1)),
++        HomogeneousControl2::new(r!(1), r!(1), r!(2)),
++    ])
++    .unwrap();
++    let report = enclose(&source, &d(0, 1, 0));
++    let half = Rational::from(1) / Rational::from(2);
++    let quarter = Rational::from(1) / Rational::from(4);
++    rational_contains(report.coordinates()[0], Rational::from(0), half.clone());
++    rational_contains(report.coordinates()[1], half, Rational::from(1));
++    rational_contains(report.tangents()[0], quarter.clone(), Rational::from(1));
++    rational_contains(report.tangents()[1], Rational::from(-1), -quarter);
++    let singleton = enclose(&source, &d(1, 1, -1));
++    for (range, expected) in singleton.coordinates().into_iter().zip([
++        Rational::from(1) / Rational::from(3),
++        Rational::from(2) / Rational::from(3),
++    ]) {
++        rational_contains(range, expected.clone(), expected);
++    }
++}
++#[test]
++fn arbitrary_degree_power_family_has_independent_exact_midpoint_expectations() {
++    for n in [1, 2, 5, 12, 65] {
++        // Bernstein controls of (t,t^n): x_i=i/n and y_i=0 except y_n=1.
++        let controls = (0..=n)
++            .map(|i| {
++                Point2::new(
++                    (Real::from(i) / Real::from(n)).unwrap(),
++                    Real::from(i32::from(i == n)),
++                )
++            })
++            .collect();
++        let source = RationalBezier2::try_new(controls, vec![r!(1); n as usize + 1]).unwrap();
++        let prepared = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++        let report = prepared
++            .enclose(&d(1, 1, -1), -128, &mut graph(), &mut arithmetic())
++            .unwrap();
++        assert_eq!(report.coordinates(), [&d(1, 1, -1), &d(1, 1, -n)]);
++        assert_eq!(
++            report.tangents(),
++            [&d(1, 1, 0), &d(n.into(), n.into(), 1 - n)]
++        );
++        if n == 65 {
++            let coarse = prepared
++                .enclose(&d(1, 1, -1), -64, &mut graph(), &mut arithmetic())
++                .unwrap();
++            assert_eq!(coarse.coordinates()[1], &d(0, 1, -64));
++            assert!(
++                d(1, 1, -65)
++                    .subset_of(coarse.coordinates()[1], &mut arithmetic())
++                    .unwrap()
++            );
++            let fine_again = prepared
++                .enclose(&d(1, 1, -1), -128, &mut graph(), &mut arithmetic())
++                .unwrap();
++            assert_eq!(fine_again.evidence().values(), report.evidence().values());
++        }
++    }
++}
++#[test]
++fn algebraic_subdivision_reversal_and_reconstruction_preserve_source_and_chain_rule() {
++    let original = parabola();
++    let alpha = (r!(2).sqrt().unwrap() / r!(2)).unwrap();
++    let (left, _) = original.split_at_exact(&alpha).unwrap();
++    let reversed = left.reversed();
++    let rebuilt =
++        RationalBezier2::from_homogeneous_controls(reversed.homogeneous_controls().to_vec())
++            .unwrap();
++    for source in [&reversed, &rebuilt] {
++        let report = enclose(source, &d(0, 0, 0));
++        // Reversed left piece: (sqrt(2)*(1-t), (1-t)^2/2).
++        let x = report.coordinates()[0]
++            .to_rational(&mut arithmetic())
++            .unwrap();
++        let (lower, upper) = x.bounds().unwrap();
++        assert!(!lower.is_negative());
++        assert!(lower * lower <= Rational::from(2));
++        assert!(upper * upper >= Rational::from(2));
++        rational_contains(
++            report.coordinates()[1],
++            Rational::from(1) / Rational::from(2),
++            Rational::from(1) / Rational::from(2),
++        );
++        rational_contains(report.tangents()[1], Rational::from(-1), Rational::from(-1));
++        let dx = report.tangents()[0].to_rational(&mut arithmetic()).unwrap();
++        let (lo, hi) = dx.bounds().unwrap();
++        assert!(hi.is_negative());
++        assert!(hi * hi <= Rational::from(2) && lo * lo >= Rational::from(2));
++        assert!(report.source().shares_retained_data(source));
++    }
++}
++#[test]
++fn denominator_overestimation_is_a_typed_noncertificate_and_subdivision_retries() {
++    // W=(t-1/2)^2+1/16 > 0. The whole Horner interval still crosses zero.
++    let source = RationalBezier2::from_homogeneous_controls(vec![
++        HomogeneousControl2::new(r!(0), r!(1), r!(5 / 16)),
++        HomogeneousControl2::new(r!(1 / 2), r!(1), r!(-3 / 16)),
++        HomogeneousControl2::new(r!(1), r!(1), r!(5 / 16)),
++    ])
++    .unwrap();
++    let prepared = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++    assert!(matches!(
++        prepared.enclose(&d(0, 1, 0), -64, &mut graph(), &mut arithmetic()),
++        Err(CurveRangeError::Expression(ExpressionError::Enclosure {
++            source: IntervalError::ContainsZero,
++            ..
++        }))
++    ));
++    let report = prepared
++        .enclose(&d(0, 1, -4), -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    rational_contains(
++        report.coordinates()[0],
++        Rational::from(0),
++        Rational::from(16) / Rational::from(65),
++    );
++    // t=1/16 has W=65/256, hence x=16/65; native source was not changed.
++    assert!(report.source().shares_retained_data(&source));
++}
++#[test]
++fn empty_invalid_domains_and_resource_failures_stay_distinct_and_retryable() {
++    let source = parabola();
++    let mut g = graph();
++    let prepared = prepare_rational_bezier_ranges(&source, &mut g).unwrap();
++    let prepare_work = 100_000_000 - g.remaining_work();
++    for limit in 0..prepare_work {
++        assert!(
++            prepare_rational_bezier_ranges(&source, &mut ExpressionBudget::new(1_000_000, limit))
++                .is_err(),
++            "preparation cutoff {limit}"
++        );
++    }
++    assert!(
++        prepare_rational_bezier_ranges(
++            &source,
++            &mut ExpressionBudget::new(1_000_000, prepare_work)
++        )
++        .is_ok()
++    );
++    let empty = prepared
++        .enclose(
++            &DyadicInterval::empty(),
++            -64,
++            &mut graph(),
++            &mut arithmetic(),
++        )
++        .unwrap();
++    assert!(
++        empty
++            .coordinates()
++            .into_iter()
++            .chain(empty.tangents())
++            .all(DyadicInterval::is_empty)
++    );
++    for domain in [d(-1, 0, 0), d(1, 2, 0)] {
++        assert!(matches!(
++            prepared.enclose(&domain, -64, &mut graph(), &mut arithmetic()),
++            Err(CurveRangeError::OutsideUnitDomain)
++        ));
++    }
++    let mut g = graph();
++    let mut a = arithmetic();
++    let full = prepared.enclose(&d(0, 1, -1), -32, &mut g, &mut a).unwrap();
++    let work = 100_000_000 - g.remaining_work();
++    let scalar = 1_000_000_000_000 - a.remaining_work();
++    for limit in 0..work {
++        assert!(
++            prepared
++                .enclose(
++                    &d(0, 1, -1),
++                    -32,
++                    &mut ExpressionBudget::new(1_000_000, limit),
++                    &mut arithmetic()
++                )
++                .is_err(),
++            "query cutoff {limit}"
++        );
++    }
++    let exact = prepared
++        .enclose(
++            &d(0, 1, -1),
++            -32,
++            &mut ExpressionBudget::new(1_000_000, work),
++            &mut DyadicBudget::new(16384, scalar),
++        )
++        .unwrap();
++    assert_eq!(exact.evidence().values(), full.evidence().values());
++    assert!(
++        prepared
++            .enclose(
++                &d(0, 1, -1),
++                -32,
++                &mut graph(),
++                &mut DyadicBudget::new(16384, scalar - 1)
++            )
++            .is_err()
++    );
++    assert!(
++        prepared
++            .enclose(
++                &d(0, 1, -1),
++                -32,
++                &mut graph(),
++                &mut DyadicBudget::new(1, u64::MAX)
++            )
++            .is_err()
++    );
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = graph();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        prepare_rational_bezier_ranges(&source, &mut cancelled),
++        Err(CurveRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert!(matches!(
++        prepared.enclose(&d(0, 1, -1), -32, &mut cancelled, &mut arithmetic()),
++        Err(CurveRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    let retry = enclose(&source, &d(0, 1, -1));
++    assert_eq!(retry.evidence().values(), full.evidence().values());
++}
++#[test]
++fn fresh_process_reconstructs_native_controls_and_replays_range_proof() {
++    const KEY: &str = "HYPERCURVE_RANGE_REPLAY_CONTROLS";
++    if let Ok(encoded) = std::env::var(KEY) {
++        let data: Vec<i32> = encoded.split(',').map(|x| x.parse().unwrap()).collect();
++        assert_eq!(data.len() % 3, 0);
++        let source = RationalBezier2::from_homogeneous_controls(
++            data.chunks_exact(3)
++                .map(|c| {
++                    HomogeneousControl2::new(Real::from(c[0]), Real::from(c[1]), Real::from(c[2]))
++                })
++                .collect(),
++        )
++        .unwrap();
++        let report = enclose(&source, &d(1, 3, -2));
++        println!("PROOF={:?}", report.evidence());
++        return;
++    }
++    let mut previous = None;
++    for _ in 0..3 {
++        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","interval_ranges::tests::fresh_process_reconstructs_native_controls_and_replays_range_proof","--nocapture"]).env(KEY,"0,0,1,1,0,1,2,1,1").output().unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let text = String::from_utf8(output.stdout).unwrap();
++        let proof = text
++            .lines()
++            .find(|l| l.starts_with("PROOF="))
++            .unwrap()
++            .to_owned();
++        if let Some(old) = previous.as_ref() {
++            assert_eq!(&proof, old);
++        }
++        previous = Some(proof);
++    }
++}
++
++#[test]
++fn native_box_projection_keeps_evidence_empty_semantics_and_touching_candidates() {
++    let source = parabola();
++    let report = enclose(&source, &d(1, 2, -2));
++    let mut g = graph();
++    let mut a = arithmetic();
++    let projected = report.native_bounds(&mut g, &mut a).unwrap();
++    assert!(std::ptr::eq(projected.evidence(), &report));
++    let bounds = projected.bounds().unwrap();
++    assert_eq!(bounds.min_x(), &r!(1 / 2));
++    assert_eq!(bounds.max_x(), &r!(1));
++    assert_eq!(bounds.min_y(), &r!(1 / 16));
++    assert_eq!(bounds.max_y(), &r!(1 / 4));
++    assert!(
++        bounds
++            .overlaps(&Aabb2::from_point(Point2::new(r!(1), r!(1 / 4))))
++            .unwrap()
++    );
++    assert!(!bounds.overlaps(&Aabb2::from_point(pt!(3, 3))).unwrap());
++    let work = 100_000_000 - g.remaining_work();
++    let native = 1_000_000_000_000 - a.remaining_work();
++    for limit in 0..work {
++        assert!(matches!(
++            report.native_bounds(
++                &mut ExpressionBudget::new(1_000_000, limit),
++                &mut arithmetic()
++            ),
++            Err(CurveRangeError::Expression(ExpressionError::WorkExhausted))
++        ));
++    }
++    assert_eq!(
++        report
++            .native_bounds(
++                &mut ExpressionBudget::new(1_000_000, work),
++                &mut DyadicBudget::new(16384, native)
++            )
++            .unwrap()
++            .bounds(),
++        Some(bounds)
++    );
++    assert!(matches!(
++        report.native_bounds(&mut graph(), &mut DyadicBudget::new(16384, native - 1)),
++        Err(CurveRangeError::Interval(IntervalError::WorkExhausted))
++    ));
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut g = graph();
++    g.cancellation = Some(token);
++    assert!(matches!(
++        report.native_bounds(&mut g, &mut arithmetic()),
++        Err(CurveRangeError::Expression(ExpressionError::Cancelled))
++    ));
++    assert_eq!(
++        report
++            .native_bounds(&mut graph(), &mut arithmetic())
++            .unwrap()
++            .bounds(),
++        Some(bounds)
++    );
++    let empty = enclose(&source, &DyadicInterval::empty());
++    assert!(
++        empty
++            .native_bounds(&mut graph(), &mut arithmetic())
++            .unwrap()
++            .bounds()
++            .is_none()
++    );
++}
++
++#[test]
++fn zero_weight_control_remains_homogeneous_and_has_exact_midpoint_tangent() {
++    let source = RationalBezier2::from_homogeneous_controls(vec![
++        HomogeneousControl2::new(r!(0), r!(0), r!(1)),
++        HomogeneousControl2::new(r!(1), r!(1), r!(0)),
++        HomogeneousControl2::new(r!(2), r!(0), r!(1)),
++    ])
++    .unwrap();
++    // X=2t, Y=2t(1-t), W=(1-t)^2+t^2. No affine middle control exists.
++    let report = enclose(&source, &d(1, 1, -1));
++    assert_eq!(report.coordinates(), [&d(2, 2, 0), &d(1, 1, 0)]);
++    assert_eq!(report.tangents(), [&d(4, 4, 0), &d(0, 0, 0)]);
++    assert_eq!(report.source().homogeneous_controls()[1].weight(), &r!(0));
++    assert!(source.cached_homogeneous_power_basis().is_none());
++}
++
++#[test]
++fn constant_curve_is_c1_without_claiming_nonzero_tangents_or_injectivity() {
++    let source = RationalBezier2::try_new(vec![pt!(2, 3); 3], vec![r!(1); 3]).unwrap();
++    let report = enclose(&source, &d(0, 1, 0));
++    assert_eq!(report.coordinates(), [&d(2, 2, 0), &d(3, 3, 0)]);
++    assert_eq!(report.tangents(), [&d(0, 0, 0), &d(0, 0, 0)]);
++    let projected = report
++        .native_bounds(&mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(projected.bounds(), Some(&Aabb2::from_point(pt!(2, 3))));
++}
++
++#[test]
++fn preparation_and_failed_attempts_leave_native_basis_caches_unchanged() {
++    let source = parabola();
++    assert!(source.cached_homogeneous_power_basis().is_none());
++    // The conversion reservation is 6*n*n+6*n=72. Fail after conversion.
++    assert!(matches!(
++        prepare_rational_bezier_ranges(&source, &mut ExpressionBudget::new(1_000_000, 73)),
++        Err(CurveRangeError::Expression(ExpressionError::WorkExhausted))
++    ));
++    assert!(source.cached_homogeneous_power_basis().is_none());
++    let independent = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++    assert!(source.cached_homogeneous_power_basis().is_none());
++    assert_eq!(
++        source.point_at(&r!(1 / 2)).unwrap(),
++        Point2::new(r!(1), r!(1 / 4))
++    );
++    let native = source.cached_homogeneous_power_basis().unwrap() as *const _;
++    let reused = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++    assert_eq!(
++        source.cached_homogeneous_power_basis().unwrap() as *const _,
++        native
++    );
++    assert_eq!(
++        independent.program().program().definition(),
++        reused.program().program().definition()
++    );
++    assert_eq!(
++        independent
++            .enclose(&d(0, 1, 0), -64, &mut graph(), &mut arithmetic())
++            .unwrap()
++            .evidence()
++            .values(),
++        reused
++            .enclose(&d(0, 1, 0), -64, &mut graph(), &mut arithmetic())
++            .unwrap()
++            .evidence()
++            .values()
++    );
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn high_degree_native_point_dispatch_is_unchanged_by_range_preparation() {
++    use hyperreal::dispatch_trace;
++    // Fixed dispatch counts require a fresh scalar-cache lifecycle. A reused
++    // libtest worker can retain scalar facts from unrelated earlier fixtures.
++    const CHILD: &str = "HYPERCURVE_INTERVAL_RANGE_DISPATCH_CHILD";
++    if std::env::var_os(CHILD).is_none() {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "interval_ranges::tests::high_degree_native_point_dispatch_is_unchanged_by_range_preparation",
++                "--nocapture",
++            ])
++            .env(CHILD, "1")
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        return;
++    }
++    for policy in [
++        crate::PredicatePolicy::STRICT,
++        crate::PredicatePolicy::APPROXIMATE_512,
++    ] {
++        let n = 257;
++        let source = RationalBezier2::try_new(
++            (0..=n)
++                .map(|i| {
++                    Point2::new(
++                        (Real::from(i) / Real::from(n)).unwrap(),
++                        Real::from(i32::from(i == n)),
++                    )
++                })
++                .collect(),
++            vec![r!(1); n as usize + 1],
++        )
++        .unwrap();
++        // Match the external dispatch probe: construct the query before recording.
++        let parameter = r!(1 / 2);
++        let evaluate = || {
++            let outcome = crate::evaluate_under(policy, || source.point_at(&parameter));
++            assert_eq!(outcome.certainty(), crate::CurveCertainty::Certified);
++            outcome.certified().unwrap().unwrap()
++        };
++        let warm = evaluate();
++        dispatch_trace::reset();
++        let expected = dispatch_trace::with_recording(evaluate);
++        let baseline = dispatch_trace::take_trace();
++        assert_eq!(expected, warm);
++        assert_eq!(baseline.rational.temporary_rationals, 2567);
++        assert_eq!(baseline.rational.gcds, 751);
++        let _prepared = prepare_rational_bezier_ranges(&source, &mut graph()).unwrap();
++        assert!(source.cached_homogeneous_power_basis().is_none());
++        dispatch_trace::reset();
++        let actual = dispatch_trace::with_recording(evaluate);
++        assert_eq!(actual, expected);
++        assert_eq!(dispatch_trace::take_trace(), baseline);
++    }
++}
+diff --git a/crates/hypercurve/src/lib.rs b/crates/hypercurve/src/lib.rs
+index f463e1329..c352b5884 100644
+--- a/crates/hypercurve/src/lib.rs
++++ b/crates/hypercurve/src/lib.rs
+@@ -24,6 +24,10 @@ extern crate hypersolve;
+ #[macro_use]
+ mod test_macros;
+ 
++/// Prepared native rational-span coordinate and tangent enclosures.
++#[cfg(feature = "interval-ranges")]
++pub mod interval_ranges;
++
+ #[cfg(test)]
+ mod algebraic_image_tests;
+ mod arc_bezier;
+diff --git a/crates/hypercurve/src/rational_bezier_general.rs b/crates/hypercurve/src/rational_bezier_general.rs
+index fe96693b1..4f5af9fbe 100644
+--- a/crates/hypercurve/src/rational_bezier_general.rs
++++ b/crates/hypercurve/src/rational_bezier_general.rs
+@@ -3171,6 +3171,11 @@ impl RationalBezier2 {
+         &self.data.homogeneous_controls
+     }
+ 
++    #[cfg(feature = "interval-ranges")]
++    pub(crate) fn cached_homogeneous_power_basis(&self) -> Option<&RationalParametricCurve2> {
++        self.data.homogeneous_power_basis.get()
++    }
++
+     pub(crate) fn homogeneous_power_basis(&self) -> CurveResult<&RationalParametricCurve2> {
+         if let Some(power_basis) = self.data.homogeneous_power_basis.get() {
+             return Ok(power_basis);
+diff --git a/crates/hypercurve/tests/interval_ranges_example.rs b/crates/hypercurve/tests/interval_ranges_example.rs
+new file mode 100644
+index 000000000..c0f62de5a
+--- /dev/null
++++ b/crates/hypercurve/tests/interval_ranges_example.rs
+@@ -0,0 +1,7 @@
++#![cfg(feature = "interval-ranges")]
++#[path = "../examples/interval_ranges.rs"]
++mod consumer;
++#[test]
++fn actual_native_curve_consumer() {
++    consumer::run().unwrap();
++}
