@@ -1,0 +1,6 @@
+from pathlib import Path
+import subprocess,json,hashlib
+s=Path(__file__).parent;r=Path('/mnt/development/csgrs-dynamics-ci')
+def git(*args):return subprocess.check_output(['git',*args],cwd=r)
+base=git('rev-parse','HEAD').decode().strip();assert base==json.loads((s/'BASELINE.json').read_text())['csgrs']['head'];q=json.loads((s/'QUALIFICATION.json').read_text());assert all(q[x]['validation_steps']==9 for x in ['1_95_0','stable']);assert (s/'format.exit').read_text().strip()=='0';assert (s/'install-msrv-hack.exit').read_text().strip()=='0'
+paths=['.github/workflows/hyperdynamics.yml','.github/workflows/workspace.yml'];status=git('status','--porcelain=v1').decode().splitlines();assert {x[3:] for x in status}==set(paths);assert not git('diff','--cached','--binary');git('diff','--check');git('add','--',*paths);git('commit','-m','Continuously qualify Hyperdynamics feature and runtime contracts');commit=git('rev-parse','HEAD').decode().strip();assert not git('status','--porcelain');patch=git('diff','--binary',base,commit);(s/'candidate.patch').write_bytes(patch);(s/'SOURCE.json').write_text(json.dumps(dict(base=base,commit=commit,paths=paths,patch_sha256=hashlib.sha256(patch).hexdigest(),status='isolated workflow candidate; locally qualified on both toolchains'),indent=2)+'\n');print(commit)
