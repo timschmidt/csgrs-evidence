@@ -1,0 +1,90 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9098f0bd8..b547169c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2743,9 +2743,11 @@ version = "0.2.0"
+ dependencies = [
+  "criterion 0.5.1",
+  "fast-surface-nets",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
++ "hypersolve",
+  "hypervoxel",
+  "proptest",
+ ]
+diff --git a/crates/hypersdf/CHANGELOG.md b/crates/hypersdf/CHANGELOG.md
+index 7cd9135ef..79f475329 100644
+--- a/crates/hypersdf/CHANGELOG.md
++++ b/crates/hypersdf/CHANGELOG.md
+@@ -4,6 +4,11 @@
+ 
+ Initial release.
+ 
++- Optional `enclosure-program` supplies source-bound whole-cell and Taylor
++  enclosures for smooth scalar expressions and translations. It retains original
++  field identity, domain errors, full remainders, distance qualification and
++  caller-owned budgets; unsupported forms and unresolved signs remain explicit.
++
+ Hypersdf provides signed-distance and implicit-field expressions for the
+ Hyper geometry stack. It retains expression structure and exact parameters so
+ that inside, boundary, and outside questions are answered from the field
+diff --git a/crates/hypersdf/Cargo.toml b/crates/hypersdf/Cargo.toml
+index 47d23856b..5c6aa0186 100644
+--- a/crates/hypersdf/Cargo.toml
++++ b/crates/hypersdf/Cargo.toml
+@@ -26,6 +26,9 @@ hyperlimit = { version = "0.5.0", path = "../hyperlimit" }
+ hyperreal = { version = "0.14.0", path = "../hyperreal" }
+ hypervoxel = { version = "0.3.0", path = "../hypervoxel", optional = true }
+ 
++hypersolve = { version = "0.4.0", path = "../hypersolve", default-features = false, features = ["taylor-model"], optional = true }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["hyperreal"], optional = true }
++
+ [dev-dependencies]
+ criterion = "0.5"
+ proptest = "1.7.0"
+@@ -36,5 +39,6 @@ harness = false
+ 
+ [features]
+ default = []
++enclosure-program = ["dep:hypersolve", "dep:hyperinterval"]
+ dispatch-trace = ["hyperlimit/dispatch-trace", "hyperreal/dispatch-trace"]
+ hypervoxel-adapter = ["dep:hypervoxel"]
+diff --git a/crates/hypersdf/README.md b/crates/hypersdf/README.md
+index 511ddc4e1..e5aec0567 100644
+--- a/crates/hypersdf/README.md
++++ b/crates/hypersdf/README.md
+@@ -40,7 +40,17 @@ cargo run -p hypersdf --example basic
+ ```
+ 
+ There are no default features. Enable `hypervoxel-adapter` only when
+-materializing a classified field batch into Hypervoxel records.
++materializing a classified field batch into Hypervoxel records. Enable
++`enclosure-program` for `SdfProgram`, an owned translation of smooth scalar
++expressions into Hypersolve programs. It certifies whole-cell dyadic images,
++including sine/cosine/tangent, and optionally centered Taylor images with their
++complete remainder. Source distance qualification is preserved; a range merely
++containing zero does not certify a crossing. Constants, coordinates, linear
++fields, scalar arithmetic, square root, complement, offset and translations are
++supported. Primitive, piecewise and affine nodes have explicit unsupported
++results on this optional path; existing queries remain available. Graph and
++native arithmetic budgets are caller-owned; scalar refinement/payload and heap
++exclusions remain explicit.
+ 
+ ## Quick start
+ 
+diff --git a/crates/hypersdf/src/lib.rs b/crates/hypersdf/src/lib.rs
+index 29c4b59cd..c912002c4 100644
+--- a/crates/hypersdf/src/lib.rs
++++ b/crates/hypersdf/src/lib.rs
+@@ -1288,3 +1288,9 @@ mod tests {
+         );
+     }
+ }
++
++/// Native source-bound whole-cell and Taylor enclosures.
++#[cfg(feature = "enclosure-program")]
++pub mod enclosure;
++#[cfg(feature = "enclosure-program")]
++pub use enclosure::{SdfCellEnclosure, SdfProgram, SdfProgramError};

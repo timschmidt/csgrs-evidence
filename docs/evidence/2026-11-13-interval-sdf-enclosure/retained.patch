@@ -1,0 +1,875 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 9098f0bd8..b547169c6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2743,9 +2743,11 @@ version = "0.2.0"
+ dependencies = [
+  "criterion 0.5.1",
+  "fast-surface-nets",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperlimit",
+  "hyperreal",
++ "hypersolve",
+  "hypervoxel",
+  "proptest",
+ ]
+diff --git a/crates/hypersdf/CHANGELOG.md b/crates/hypersdf/CHANGELOG.md
+index 7cd9135ef..79f475329 100644
+--- a/crates/hypersdf/CHANGELOG.md
++++ b/crates/hypersdf/CHANGELOG.md
+@@ -4,6 +4,11 @@
+ 
+ Initial release.
+ 
++- Optional `enclosure-program` supplies source-bound whole-cell and Taylor
++  enclosures for smooth scalar expressions and translations. It retains original
++  field identity, domain errors, full remainders, distance qualification and
++  caller-owned budgets; unsupported forms and unresolved signs remain explicit.
++
+ Hypersdf provides signed-distance and implicit-field expressions for the
+ Hyper geometry stack. It retains expression structure and exact parameters so
+ that inside, boundary, and outside questions are answered from the field
+diff --git a/crates/hypersdf/Cargo.toml b/crates/hypersdf/Cargo.toml
+index 47d23856b..5c6aa0186 100644
+--- a/crates/hypersdf/Cargo.toml
++++ b/crates/hypersdf/Cargo.toml
+@@ -26,6 +26,9 @@ hyperlimit = { version = "0.5.0", path = "../hyperlimit" }
+ hyperreal = { version = "0.14.0", path = "../hyperreal" }
+ hypervoxel = { version = "0.3.0", path = "../hypervoxel", optional = true }
+ 
++hypersolve = { version = "0.4.0", path = "../hypersolve", default-features = false, features = ["taylor-model"], optional = true }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["hyperreal"], optional = true }
++
+ [dev-dependencies]
+ criterion = "0.5"
+ proptest = "1.7.0"
+@@ -36,5 +39,6 @@ harness = false
+ 
+ [features]
+ default = []
++enclosure-program = ["dep:hypersolve", "dep:hyperinterval"]
+ dispatch-trace = ["hyperlimit/dispatch-trace", "hyperreal/dispatch-trace"]
+ hypervoxel-adapter = ["dep:hypervoxel"]
+diff --git a/crates/hypersdf/README.md b/crates/hypersdf/README.md
+index 511ddc4e1..e5aec0567 100644
+--- a/crates/hypersdf/README.md
++++ b/crates/hypersdf/README.md
+@@ -40,7 +40,17 @@ cargo run -p hypersdf --example basic
+ ```
+ 
+ There are no default features. Enable `hypervoxel-adapter` only when
+-materializing a classified field batch into Hypervoxel records.
++materializing a classified field batch into Hypervoxel records. Enable
++`enclosure-program` for `SdfProgram`, an owned translation of smooth scalar
++expressions into Hypersolve programs. It certifies whole-cell dyadic images,
++including sine/cosine/tangent, and optionally centered Taylor images with their
++complete remainder. Source distance qualification is preserved; a range merely
++containing zero does not certify a crossing. Constants, coordinates, linear
++fields, scalar arithmetic, square root, complement, offset and translations are
++supported. Primitive, piecewise and affine nodes have explicit unsupported
++results on this optional path; existing queries remain available. Graph and
++native arithmetic budgets are caller-owned; scalar refinement/payload and heap
++exclusions remain explicit.
+ 
+ ## Quick start
+ 
+diff --git a/crates/hypersdf/src/enclosure.rs b/crates/hypersdf/src/enclosure.rs
+new file mode 100644
+index 000000000..7fc926b8b
+--- /dev/null
++++ b/crates/hypersdf/src/enclosure.rs
+@@ -0,0 +1,349 @@
++//! Retained implicit expressions interpreted through native Hypersolve proofs.
++use crate::{Sdf, SdfCellLocation, SdfCoordinate, SdfExpr, SdfMetricStatus, SdfTransform};
++use hyperinterval::{DyadicBudget, DyadicInterval, SignSet};
++use hyperreal::Real;
++use hypersolve::{
++    SymbolId, SymbolRef,
++    expression_program::{
++        BinaryOperation as B, ExpressionBudget, ExpressionDefinition, ExpressionError,
++        ExpressionNode as Node, ExpressionProgram, TaylorError, TaylorModel, TaylorRequest,
++        UnaryOperation as U,
++    },
++};
++use std::{fmt, sync::Arc};
++
++/// Unsupported source structure or an original proof/resource diagnostic.
++#[derive(Clone, Debug)]
++pub enum SdfProgramError {
++    /// This compiler has no source-preserving translation for the named form.
++    Unsupported(&'static str),
++    /// Original graph, domain, resource or cancellation diagnostic.
++    Expression(ExpressionError),
++    /// Original Taylor regularity, coefficient or remainder diagnostic.
++    Taylor(TaylorError),
++}
++impl fmt::Display for SdfProgramError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "SDF program: {self:?}")
++    }
++}
++impl std::error::Error for SdfProgramError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Expression(e) => Some(e),
++            Self::Taylor(e) => Some(e),
++            Self::Unsupported(_) => None,
++        }
++    }
++}
++impl From<ExpressionError> for SdfProgramError {
++    fn from(e: ExpressionError) -> Self {
++        Self::Expression(e)
++    }
++}
++impl From<TaylorError> for SdfProgramError {
++    fn from(e: TaylorError) -> Self {
++        Self::Taylor(e)
++    }
++}
++
++/// Shared original implicit field and its exact source translation.
++///
++/// Coordinates are always bound as x,y,z. Supported forms are constants,
++/// coordinates, linear fields, add/subtract/multiply, sqrt, sin/cos/tan,
++/// complement, offset and translation. Primitive, piecewise and affine nodes
++/// currently return `Unsupported`; existing SDF APIs remain available.
++/// No metric-distance or zero-set topology guarantee follows from compilation.
++/// Replay by compiling the original SDF again, never by adopting serialized
++/// generated nodes or flags as proof of their association with that SDF.
++#[derive(Clone, Debug)]
++pub struct SdfProgram {
++    source: Arc<Sdf>,
++    program: ExpressionProgram,
++}
++impl SdfProgram {
++    /// Compile without recursive traversal or cloning the source tree.
++    ///
++    /// Graph entries/work include traversal tasks, emitted nodes, validation and
++    /// publication. Scalar payloads, source ingestion/destruction and heap bytes
++    /// retain ExpressionBudget's exclusions. The source is immutable and no
++    /// failed attempt caches evidence. No domain guard is simplified away.
++    pub fn compile(
++        source: Arc<Sdf>,
++        budget: &mut ExpressionBudget,
++    ) -> Result<Self, SdfProgramError> {
++        let program = compile(source.expr(), budget)?;
++        let result = Self { source, program };
++        budget.charge(0)?;
++        Ok(result)
++    }
++    /// Authoritative original implicit field, including its metric qualification.
++    pub fn source(&self) -> &Arc<Sdf> {
++        &self.source
++    }
++    /// Exact generated definition; bindings are x,y,z and output zero is the field.
++    pub fn program(&self) -> &ExpressionProgram {
++        &self.program
++    }
++    /// Certify a natural whole-cell image using the native interval evaluator.
++    /// Empty Cartesian cells remain distinct from nonempty zero-valued fields.
++    pub fn image(
++        &self,
++        cell: [DyadicInterval; 3],
++        precision: i32,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SdfCellEnclosure, SdfProgramError> {
++        let values = self
++            .program
++            .eval_dyadic(&cell, precision, graph, arithmetic)?;
++        graph.charge(5)?;
++        let result = SdfCellEnclosure {
++            source: self.clone(),
++            cell,
++            image: values.into_iter().next().expect("one field output"),
++            model: None,
++        };
++        graph.charge(0)?;
++        Ok(result)
++    }
++    /// Certify a centered exact polynomial plus the complete Taylor remainder.
++    /// Native regularity applies on the entire cell. Request coordinates are x,y,z.
++    /// A containing-zero image remains unresolved, not a proof of a boundary.
++    pub fn taylor_cell(
++        &self,
++        request: TaylorRequest,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<SdfCellEnclosure, SdfProgramError> {
++        let model = self.program.taylor_model(request, graph, arithmetic)?;
++        graph.charge(6)?;
++        let cell = model
++            .request()
++            .domain
++            .clone()
++            .try_into()
++            .expect("validated three inputs");
++        let result = SdfCellEnclosure {
++            source: self.clone(),
++            cell,
++            image: model.image()[0].clone(),
++            model: Some(model),
++        };
++        graph.charge(0)?;
++        Ok(result)
++    }
++}
++
++/// Source-bound whole-cell range; no sampling, metric promotion or mesh claim.
++#[derive(Clone, Debug)]
++pub struct SdfCellEnclosure {
++    source: SdfProgram,
++    cell: [DyadicInterval; 3],
++    image: DyadicInterval,
++    model: Option<TaylorModel>,
++}
++impl SdfCellEnclosure {
++    /// Retained original field and validated native program association.
++    pub fn source(&self) -> &SdfProgram {
++        &self.source
++    }
++    /// Cartesian query cell in x,y,z order.
++    pub fn cell(&self) -> &[DyadicInterval; 3] {
++        &self.cell
++    }
++    /// Certified scalar image, including all remainder contributions when present.
++    pub fn image(&self) -> &DyadicInterval {
++        &self.image
++    }
++    /// Complete native Taylor proof, if this report used Taylor evaluation.
++    pub fn model(&self) -> Option<&TaylorModel> {
++        self.model.as_ref()
++    }
++    /// Preserve the source's distance qualification independently of range certainty.
++    pub fn metric_status(&self) -> SdfMetricStatus {
++        self.source.source.metric_status()
++    }
++    /// Whole-cell sign classification; None denotes an empty cell. Boundary is
++    /// claimed only when the entire image is exactly zero; a range that merely
++    /// contains zero is Unknown and proves neither a crossing nor a surface.
++    pub fn location(&self) -> Option<SdfCellLocation> {
++        match self.image.signs() {
++            SignSet::Empty => None,
++            SignSet::Negative => Some(SdfCellLocation::ConservativeInside),
++            SignSet::Positive => Some(SdfCellLocation::ConservativeOutside),
++            SignSet::Zero => Some(SdfCellLocation::Boundary),
++            _ => Some(SdfCellLocation::Unknown),
++        }
++    }
++}
++
++enum Task<'a> {
++    Visit(&'a SdfExpr, [usize; 3]),
++    Unary(U),
++    Binary(B),
++    Offset(&'a Real),
++    Tan,
++}
++struct Builder<'a> {
++    budget: &'a mut ExpressionBudget,
++    nodes: Vec<Node>,
++}
++impl Builder<'_> {
++    fn emit(&mut self, node: Node) -> Result<usize, ExpressionError> {
++        self.budget.check_entries(&[3, self.nodes.len(), 2])?;
++        self.budget.charge(1)?;
++        let id = self.nodes.len();
++        self.nodes.push(node);
++        Ok(id)
++    }
++    fn constant(&mut self, x: &Real) -> Result<usize, ExpressionError> {
++        self.emit(Node::Constant(x.clone()))
++    }
++    fn binary(
++        &mut self,
++        operation: B,
++        left: usize,
++        right: usize,
++    ) -> Result<usize, ExpressionError> {
++        self.emit(Node::Binary {
++            operation,
++            left,
++            right,
++        })
++    }
++    fn unary(&mut self, operation: U, input: usize) -> Result<usize, ExpressionError> {
++        self.emit(Node::Unary { operation, input })
++    }
++}
++fn compile(
++    expr: &SdfExpr,
++    budget: &mut ExpressionBudget,
++) -> Result<ExpressionProgram, SdfProgramError> {
++    budget.charge(0)?;
++    budget.check_entries(&[8])?;
++    let variables = vec![SymbolId(0), SymbolId(1), SymbolId(2)];
++    let mut b = Builder {
++        budget,
++        nodes: Vec::new(),
++    };
++    for id in &variables {
++        b.emit(Node::Variable(SymbolRef {
++            id: *id,
++            name: None,
++        }))?;
++    }
++    let mut tasks = vec![Task::Visit(expr, [0, 1, 2])];
++    let mut results = Vec::new();
++    while let Some(task) = tasks.pop() {
++        // Reserve the largest one-step expansion (linear or translation),
++        // including both stacks, before emitting or enqueueing any work.
++        b.budget
++            .check_entries(&[4, b.nodes.len(), tasks.len(), results.len(), 12])?;
++        b.budget.charge(1)?;
++        match task {
++            Task::Visit(expr, xyz) => match expr {
++                SdfExpr::Constant(x) => results.push(b.constant(x)?),
++                SdfExpr::Coordinate(axis) => results.push(
++                    xyz[match axis {
++                        SdfCoordinate::X => 0,
++                        SdfCoordinate::Y => 1,
++                        SdfCoordinate::Z => 2,
++                    }],
++                ),
++                SdfExpr::Linear {
++                    coefficients,
++                    offset,
++                } => {
++                    let mut terms = [0; 3];
++                    for i in 0..3 {
++                        let c = b.constant(&coefficients.0[i])?;
++                        terms[i] = b.binary(B::Mul, c, xyz[i])?;
++                    }
++                    let xy = b.binary(B::Add, terms[0], terms[1])?;
++                    let xyz = b.binary(B::Add, xy, terms[2])?;
++                    let offset = b.constant(offset)?;
++                    results.push(b.binary(B::Add, xyz, offset)?);
++                }
++                SdfExpr::Add(a, c) | SdfExpr::Sub(a, c) | SdfExpr::Mul(a, c) => {
++                    let op = match expr {
++                        SdfExpr::Add(..) => B::Add,
++                        SdfExpr::Sub(..) => B::Sub,
++                        _ => B::Mul,
++                    };
++                    tasks.push(Task::Binary(op));
++                    tasks.push(Task::Visit(c, xyz));
++                    tasks.push(Task::Visit(a, xyz));
++                }
++                SdfExpr::Sqrt(x) | SdfExpr::Sin(x) | SdfExpr::Cos(x) | SdfExpr::Complement(x) => {
++                    let op = match expr {
++                        SdfExpr::Sqrt(_) => U::Sqrt,
++                        SdfExpr::Sin(_) => U::Sin,
++                        SdfExpr::Cos(_) => U::Cos,
++                        _ => U::Neg,
++                    };
++                    tasks.push(Task::Unary(op));
++                    tasks.push(Task::Visit(x, xyz));
++                }
++                SdfExpr::Tan(x) => {
++                    tasks.push(Task::Tan);
++                    tasks.push(Task::Visit(x, xyz));
++                }
++                SdfExpr::Offset { child, amount } => {
++                    tasks.push(Task::Offset(amount));
++                    tasks.push(Task::Visit(child, xyz));
++                }
++                SdfExpr::Transform {
++                    child,
++                    transform: SdfTransform::Translation { offset },
++                } => {
++                    let mut moved = xyz;
++                    for (i, value) in [&offset.x, &offset.y, &offset.z].into_iter().enumerate() {
++                        let c = b.constant(value)?;
++                        moved[i] = b.binary(B::Sub, xyz[i], c)?;
++                    }
++                    tasks.push(Task::Visit(child, moved));
++                }
++                SdfExpr::Primitive(_) => return Err(SdfProgramError::Unsupported("primitive")),
++                SdfExpr::Union(..) => return Err(SdfProgramError::Unsupported("union")),
++                SdfExpr::Intersection(..) => {
++                    return Err(SdfProgramError::Unsupported("intersection"));
++                }
++                SdfExpr::Abs(_) => return Err(SdfProgramError::Unsupported("absolute value")),
++                SdfExpr::Transform { .. } => {
++                    return Err(SdfProgramError::Unsupported("affine transform"));
++                }
++            },
++            Task::Unary(op) => {
++                let x = results.pop().expect("visited operand");
++                results.push(b.unary(op, x)?);
++            }
++            Task::Binary(op) => {
++                let right = results.pop().expect("visited right");
++                let left = results.pop().expect("visited left");
++                results.push(b.binary(op, left, right)?);
++            }
++            Task::Offset(amount) => {
++                let x = results.pop().expect("visited child");
++                let c = b.constant(amount)?;
++                results.push(b.binary(B::Sub, x, c)?);
++            }
++            Task::Tan => {
++                let x = results.pop().expect("visited tangent operand");
++                let sin = b.unary(U::Sin, x)?;
++                let cos = b.unary(U::Cos, x)?;
++                results.push(b.binary(B::Div, sin, cos)?);
++            }
++        }
++    }
++    b.budget.charge(1)?;
++    ExpressionProgram::from_definition(
++        ExpressionDefinition {
++            variables,
++            nodes: b.nodes,
++            outputs: results,
++        },
++        b.budget,
++    )
++    .map_err(Into::into)
++}
+diff --git a/crates/hypersdf/src/lib.rs b/crates/hypersdf/src/lib.rs
+index 29c4b59cd..c912002c4 100644
+--- a/crates/hypersdf/src/lib.rs
++++ b/crates/hypersdf/src/lib.rs
+@@ -1288,3 +1288,9 @@ mod tests {
+         );
+     }
+ }
++
++/// Native source-bound whole-cell and Taylor enclosures.
++#[cfg(feature = "enclosure-program")]
++pub mod enclosure;
++#[cfg(feature = "enclosure-program")]
++pub use enclosure::{SdfCellEnclosure, SdfProgram, SdfProgramError};
+diff --git a/crates/hypersdf/tests/enclosure_program.rs b/crates/hypersdf/tests/enclosure_program.rs
+new file mode 100644
+index 000000000..02514a486
+--- /dev/null
++++ b/crates/hypersdf/tests/enclosure_program.rs
+@@ -0,0 +1,424 @@
++#![cfg(feature = "enclosure-program")]
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::Vector3;
++use hyperlimit::Point3;
++use hyperreal::Real;
++use hypersdf::{
++    Sdf, SdfCellLocation as Location, SdfExpr, SdfMetricStatus, SdfProgram, SdfProgramError,
++};
++use hypersolve::{
++    Expr,
++    expression_program::{ExpressionBudget, ExpressionError, ExpressionProgram, TaylorRequest},
++    work_budget::CancellationToken,
++};
++use std::sync::Arc;
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn zero() -> DyadicInterval {
++    d(0, 0, 0)
++}
++fn program(expr: SdfExpr) -> SdfProgram {
++    SdfProgram::compile(Arc::new(Sdf::new(expr)), &mut graph()).unwrap()
++}
++fn point(x: i64, y: i64, z: i64) -> Point3 {
++    Point3::new(x.into(), y.into(), z.into())
++}
++fn logistic() -> SdfExpr {
++    SdfExpr::x().mul_expr(SdfExpr::constant(Real::one()).sub_expr(SdfExpr::x()))
++}
++
++#[test]
++fn complete_cells_have_certified_signs_without_metric_promotion() {
++    let source = Arc::new(Sdf::new(SdfExpr::x().sin().add_expr(SdfExpr::y().cos())));
++    assert!(
++        source
++            .interval_cell(&point(0, 0, 0), &point(1, 0, 0))
++            .interval
++            .is_none()
++    );
++    let p = SdfProgram::compile(source.clone(), &mut graph()).unwrap();
++    assert!(Arc::ptr_eq(p.source(), &source));
++    let cell = [d(0, 1, 0), zero(), d(-20, 20, 0)];
++    let result = p
++        .image(cell.clone(), -48, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(result.location(), Some(Location::ConservativeOutside));
++    assert_eq!(result.metric_status(), SdfMetricStatus::SignEquivalent);
++    assert_eq!(result.cell(), &cell);
++    assert!(result.model().is_none());
++    let negative = program(SdfExpr::x().sin().add_expr(SdfExpr::y().cos()).complement());
++    assert_eq!(
++        negative
++            .image(cell, -48, &mut graph(), &mut arithmetic())
++            .unwrap()
++            .location(),
++        Some(Location::ConservativeInside)
++    );
++    let crossing = program(SdfExpr::x().sin());
++    assert_eq!(
++        crossing
++            .image(
++                [d(-1, 1, 0), zero(), zero()],
++                -48,
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .unwrap()
++            .location(),
++        Some(Location::Unknown)
++    );
++    assert_eq!(
++        crossing
++            .image(
++                [zero(), zero(), zero()],
++                -48,
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .unwrap()
++            .location(),
++        Some(Location::Boundary)
++    );
++    assert_eq!(
++        crossing
++            .image(
++                [DyadicInterval::empty(), zero(), zero()],
++                -48,
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .unwrap()
++            .location(),
++        None
++    );
++}
++
++#[test]
++fn exact_translation_linear_and_arithmetic_match_independent_values() {
++    let expr = SdfExpr::linear(Vector3([2.into(), (-3).into(), 5.into()]), (-7).into())
++        .mul_expr(SdfExpr::x().sub_expr(SdfExpr::y()))
++        .offset(4.into())
++        .translate(point(1, -2, 3))
++        .translate(point(2, 1, -1));
++    let p = program(expr);
++    for x in -3i64..=3 {
++        for y in -3i64..=3 {
++            let z = 2;
++            let a = x - 3;
++            let b = y + 1;
++            let c = z - 2;
++            let expected = Real::from((2 * a - 3 * b + 5 * c - 7) * (a - b) - 4);
++            assert_eq!(
++                p.source().evaluate_point(&point(x, y, z)).unwrap(),
++                expected
++            );
++            assert_eq!(
++                p.program()
++                    .eval_real(&[x.into(), y.into(), z.into()], &mut graph())
++                    .unwrap(),
++                vec![expected]
++            );
++        }
++    }
++    let p = program(
++        SdfExpr::x()
++            .sqrt()
++            .add_expr(SdfExpr::y().tan())
++            .add_expr(SdfExpr::z().cos()),
++    );
++    assert_eq!(
++        p.program()
++            .eval_real(&[4.into(), 0.into(), 0.into()], &mut graph())
++            .unwrap(),
++        vec![Real::from(3)]
++    );
++}
++
++#[test]
++fn taylor_dependency_reduction_retains_full_remainder_and_composes() {
++    let p = program(logistic().offset((Real::from(3) / Real::from(8)).unwrap()));
++    let cell = [d(0, 1, 0), zero(), zero()];
++    let natural = p
++        .image(cell.clone(), -64, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(natural.image(), &d(-3, 5, -3));
++    assert_eq!(natural.location(), Some(Location::Unknown));
++    let request = TaylorRequest {
++        center: vec![d(1, 1, -1), zero(), zero()],
++        domain: cell.to_vec(),
++        order: 2,
++        precision: -64,
++    };
++    let t = p
++        .taylor_cell(request, &mut graph(), &mut arithmetic())
++        .unwrap();
++    assert_eq!(t.image(), &d(-3, -1, -3));
++    assert_eq!(t.location(), Some(Location::ConservativeInside));
++    let model = t.model().unwrap();
++    assert_eq!(model.remainder(), &[zero()]);
++    assert_eq!(
++        model
++            .enclose_on(
++                &[d(1, 1, -1), zero(), zero()],
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .unwrap(),
++        vec![d(-1, -1, -3)]
++    );
++    assert!(
++        model
++            .enclose_on(
++                &[d(2, 2, 0), zero(), zero()],
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .is_err()
++    );
++    assert_eq!(
++        model
++            .enclose_on(
++                &[DyadicInterval::empty(), zero(), zero()],
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .unwrap(),
++        vec![DyadicInterval::empty()]
++    );
++    let id = hypersolve::SymbolId(55);
++    let outer =
++        ExpressionProgram::compile(&[Expr::anonymous_symbol(id).powi(2)], &[id], &mut graph())
++            .unwrap();
++    let composed = outer
++        .compose(t.source().program(), &[0], &mut graph())
++        .unwrap();
++    assert_eq!(
++        composed
++            .program()
++            .eval_real(
++                &[(Real::from(1) / Real::from(2)).unwrap(), 0.into(), 0.into()],
++                &mut graph()
++            )
++            .unwrap(),
++        vec![
++            (Real::from(-1) / Real::from(8)).unwrap(),
++            (Real::from(1) / Real::from(64)).unwrap()
++        ]
++    );
++}
++
++#[test]
++fn original_guards_and_unsupported_forms_are_not_empty_or_success() {
++    let p =
++        program(SdfExpr::constant(Real::zero()).mul_expr(SdfExpr::constant(Real::from(-1)).sqrt()));
++    assert!(
++        p.program()
++            .eval_real(&[0.into(), 0.into(), 0.into()], &mut graph())
++            .is_err()
++    );
++    assert!(
++        p.image(
++            [zero(), zero(), zero()],
++            -32,
++            &mut graph(),
++            &mut arithmetic()
++        )
++        .is_err()
++    );
++    assert_eq!(
++        p.image(
++            [zero(), DyadicInterval::empty(), zero()],
++            -32,
++            &mut graph(),
++            &mut arithmetic()
++        )
++        .unwrap()
++        .location(),
++        None
++    );
++    let tangent = program(SdfExpr::x().tan());
++    assert!(
++        tangent
++            .image(
++                [d(1, 2, 0), zero(), zero()],
++                -48,
++                &mut graph(),
++                &mut arithmetic()
++            )
++            .is_err()
++    );
++    let root = program(SdfExpr::x().sqrt());
++    assert!(
++        root.image(
++            [d(0, 1, 0), zero(), zero()],
++            -32,
++            &mut graph(),
++            &mut arithmetic()
++        )
++        .is_ok()
++    );
++    assert!(
++        root.taylor_cell(
++            TaylorRequest {
++                center: vec![d(1, 1, -1), zero(), zero()],
++                domain: vec![d(0, 1, 0), zero(), zero()],
++                order: 1,
++                precision: -32
++            },
++            &mut graph(),
++            &mut arithmetic()
++        )
++        .is_err()
++    );
++    for expr in [
++        SdfExpr::x().abs(),
++        SdfExpr::x().union(SdfExpr::y()),
++        SdfExpr::x().intersection(SdfExpr::y()),
++        SdfExpr::sphere(point(0, 0, 0), Real::one()),
++    ] {
++        assert!(matches!(
++            SdfProgram::compile(Arc::new(Sdf::new(expr)), &mut graph()),
++            Err(SdfProgramError::Unsupported(_))
++        ));
++    }
++}
++
++#[test]
++fn work_size_cancellation_and_late_publication_failure_retry() {
++    let source = Arc::new(Sdf::new(logistic()));
++    let mut b = graph();
++    let start = b.remaining_work();
++    let p = SdfProgram::compile(source.clone(), &mut b).unwrap();
++    let used = start - b.remaining_work();
++    assert!(
++        SdfProgram::compile(source.clone(), &mut ExpressionBudget::new(1_000_000, used)).is_ok()
++    );
++    assert!(matches!(
++        SdfProgram::compile(
++            source.clone(),
++            &mut ExpressionBudget::new(1_000_000, used - 1)
++        ),
++        Err(SdfProgramError::Expression(ExpressionError::WorkExhausted))
++    ));
++    assert!(matches!(
++        SdfProgram::compile(source.clone(), &mut ExpressionBudget::new(1, 1000000)),
++        Err(SdfProgramError::Expression(ExpressionError::SizeExhausted))
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut b = graph();
++    b.cancellation = Some(token);
++    assert!(matches!(
++        SdfProgram::compile(source.clone(), &mut b),
++        Err(SdfProgramError::Expression(ExpressionError::Cancelled))
++    ));
++    assert!(SdfProgram::compile(source, &mut graph()).is_ok());
++    let cell = [d(0, 1, 0), zero(), zero()];
++    let mut b = graph();
++    let start = b.remaining_work();
++    p.image(cell.clone(), -32, &mut b, &mut arithmetic())
++        .unwrap();
++    let used = start - b.remaining_work();
++    assert!(matches!(
++        p.image(
++            cell.clone(),
++            -32,
++            &mut ExpressionBudget::new(1_000_000, used - 1),
++            &mut arithmetic()
++        ),
++        Err(SdfProgramError::Expression(ExpressionError::WorkExhausted))
++    ));
++    assert!(
++        p.image(
++            cell,
++            -32,
++            &mut ExpressionBudget::new(1_000_000, used),
++            &mut arithmetic()
++        )
++        .is_ok()
++    );
++}
++
++#[test]
++fn fresh_process_rebuilds_original_source_and_proof() {
++    const KEY: &str = "HYPERSDF_ENCLOSURE_REPLAY_OFFSET_EIGHTHS";
++    if let Ok(value) = std::env::var(KEY) {
++        let amount = value.parse::<i64>().unwrap();
++        let p = program(logistic().offset((Real::from(amount) / Real::from(8)).unwrap()));
++        let r = p
++            .taylor_cell(
++                TaylorRequest {
++                    center: vec![d(1, 1, -1), zero(), zero()],
++                    domain: vec![d(0, 1, 0), zero(), zero()],
++                    order: 2,
++                    precision: -64,
++                },
++                &mut graph(),
++                &mut arithmetic(),
++            )
++            .unwrap();
++        assert_eq!(r.image(), &d(-3, -1, -3));
++        assert_eq!(r.model().unwrap().remainder(), &[zero()]);
++        assert_eq!(r.location(), Some(Location::ConservativeInside));
++        return;
++    }
++    // Replay the authored recipe and exact parameter, not generated graph flags.
++    let status = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "fresh_process_rebuilds_original_source_and_proof",
++            "--nocapture",
++        ])
++        .env(KEY, "3")
++        .status()
++        .unwrap();
++    assert!(status.success());
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn compilation_does_not_run_predicates_or_scalar_dispatch() {
++    use hyperreal::dispatch_trace;
++    let source = Arc::new(Sdf::new(logistic().translate(point(1, 2, 3))));
++    dispatch_trace::reset();
++    let p = dispatch_trace::with_recording(|| {
++        SdfProgram::compile(source.clone(), &mut graph()).unwrap()
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++    assert!(Arc::ptr_eq(p.source(), &source));
++}
++
++#[test]
++fn nested_translation_keeps_source_guards_and_linear_graph_growth() {
++    let mut expr = logistic();
++    for _ in 0..128 {
++        expr = expr.translate(point(1, 0, 0));
++    }
++    let p = program(expr);
++    assert_eq!(p.program().definition().nodes.len(), 3 + 128 * 6 + 3);
++    assert_eq!(
++        p.program()
++            .eval_real(&[128.into(), 0.into(), 0.into()], &mut graph())
++            .unwrap(),
++        vec![Real::zero()]
++    );
++    let malformed = TaylorRequest {
++        center: vec![zero()],
++        domain: vec![zero()],
++        order: 2,
++        precision: -32,
++    };
++    assert!(
++        p.taylor_cell(malformed, &mut graph(), &mut arithmetic())
++            .is_err()
++    );
++}
