@@ -1,0 +1,832 @@
+diff --git a/crates/hyperdynamics/examples/coordinates.rs b/crates/hyperdynamics/examples/coordinates.rs
+index 3ea084462..ff0f8454e 100644
+--- a/crates/hyperdynamics/examples/coordinates.rs
++++ b/crates/hyperdynamics/examples/coordinates.rs
+@@ -1,10 +1,11 @@
+ //! Exact state scaling admits a Picard step rejected in the original coordinates.
+ use hyperdynamics::field::{
+     EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
+-    coordinates::CoordinateStatus,
++    coordinates::{CoordinateEvolutionStatus, CoordinateStatus},
++    evolution::{EvolutionOptions, EvolutionRequest},
+     picard::{PicardFailure, PicardProposal, PicardStatus},
+ };
+-use hyperinterval::DyadicInterval;
++use hyperinterval::{DyadicBudget, DyadicInterval};
+ use hyperlattice_interval::BoxN;
+ use hyperreal::Real;
+ use hypersolve::{
+@@ -75,5 +76,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         step.status(),
+         step.source_end_enclosure()
+     );
++    // Continue in the exact chart. Each endpoint stays in chart coordinates;
++    // original-coordinate Cartesian projections never become the next input.
++    let evolution = chart.integrate(
++        EvolutionRequest {
++            start: d(0, 0, 0),
++            end: d(1, 1, 0),
++            initial: BoxN::new([d(0, 0, 0), d(-1, 1, 0)])?,
++        },
++        EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            ..EvolutionOptions::default()
++        },
++        &mut budget,
++    );
++    assert!(matches!(
++        evolution.status(),
++        CoordinateEvolutionStatus::Completed
++    ));
++    assert_eq!(evolution.segments().len(), 4);
++    // The native candidate search widens the velocity box to [-3,3] for its
++    // self-map proof. The final envelope therefore exceeds the exact reachable
++    // set; retaining an exact chart does not remove native interval overestimation.
++    assert_eq!(
++        evolution.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(-384, 384, 0), d(-1, 1, 0)])
++    );
++    // Independent affine solution: x(t)=128*t*y(0), y(t)=y(0).
++    for (index, segment) in evolution.segments().enumerate() {
++        let bound = 32 * i64::try_from(index + 1)?;
++        let analytic = [d(-bound, bound, 0), d(-1, 1, 0)];
++        for enclosure in [segment.source_tube(), segment.source_end_enclosure()] {
++            for (exact, outer) in analytic.iter().zip(enclosure.lanes().unwrap()) {
++                assert!(exact.subset_of(outer, &mut DyadicBudget::new(16384, 1_000_000_000))?);
++            }
++        }
++    }
++    println!(
++        "Whole horizon: {:?}; endpoint: {:?}",
++        evolution.status(),
++        evolution.source_end_enclosure()
++    );
+     Ok(())
+ }
+diff --git a/crates/hyperdynamics/fuzz/README.md b/crates/hyperdynamics/fuzz/README.md
+index 9f7ae3f0d..bfd57c715 100644
+--- a/crates/hyperdynamics/fuzz/README.md
++++ b/crates/hyperdynamics/fuzz/README.md
+@@ -5,7 +5,8 @@ Eight bytes select a unimodular shear, translation, polynomial evaluation point,
+ time and constant velocity. Independent integer formulas check transformed
+ nonlinear values and Jacobians. Each input also rejects a wrong inverse and a
+ short graph budget, replays the field/chart, and certifies then transports a
+-constant-flow step with an independent exact endpoint. All selected cases must
++constant-flow step and one to four whole-horizon segments with independent exact
++endpoints in both coordinate systems. All selected cases must
+ complete; deliberate failure controls do not count as geometric success.
+ 
+ ```sh
+diff --git a/crates/hyperdynamics/fuzz/fuzz_targets/coordinate_change.rs b/crates/hyperdynamics/fuzz/fuzz_targets/coordinate_change.rs
+index 5536f3a51..2c6ff4bec 100644
+--- a/crates/hyperdynamics/fuzz/fuzz_targets/coordinate_change.rs
++++ b/crates/hyperdynamics/fuzz/fuzz_targets/coordinate_change.rs
+@@ -1,7 +1,10 @@
+ #![no_main]
+ use hyperdynamics::field::{
+     EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
+-    coordinates::{CoordinateField, CoordinateFieldDefinition, CoordinateStatus},
++    coordinates::{
++        CoordinateEvolutionStatus, CoordinateField, CoordinateFieldDefinition, CoordinateStatus,
++    },
++    evolution::{EvolutionOptions, EvolutionRequest},
+     picard::PicardProposal,
+ };
+ use hyperinterval::DyadicInterval;
+@@ -148,4 +151,33 @@ fuzz_target!(|data: &[u8]| {
+         proof.source_end_enclosure().unwrap().lanes(),
+         Some(&[d(x + p, x + p), d(y + q, y + q)])
+     );
++    let steps = 1 + i64::from(data[0] % 4);
++    let evolution = field.integrate(
++        EvolutionRequest {
++            start: d(0, 0),
++            end: d(steps, steps),
++            initial: BoxN::new([d(a, a), d(bv, bv)]).unwrap(),
++        },
++        EvolutionOptions {
++            maximum_step: Some(d(1, 1)),
++            ..EvolutionOptions::default()
++        },
++        &mut b(),
++    );
++    assert!(matches!(
++        evolution.status(),
++        CoordinateEvolutionStatus::Completed
++    ));
++    assert_eq!(evolution.segments().len(), steps as usize);
++    for (index, segment) in evolution.segments().enumerate() {
++        let t = i64::try_from(index + 1).unwrap();
++        assert_eq!(
++            segment.source_end_enclosure().lanes(),
++            Some(&[d(x + t * p, x + t * p), d(y + t * q, y + t * q)])
++        );
++        assert_eq!(
++            segment.native().end_enclosure().unwrap().lanes(),
++            Some(&[d(a + t * da, a + t * da), d(bv + t * q, bv + t * q)])
++        );
++    }
+ });
+diff --git a/crates/hyperdynamics/src/field/coordinates.rs b/crates/hyperdynamics/src/field/coordinates.rs
+index efdef78d4..c4cc8a6df 100644
+--- a/crates/hyperdynamics/src/field/coordinates.rs
++++ b/crates/hyperdynamics/src/field/coordinates.rs
+@@ -1,4 +1,7 @@
+ //! Exact state charts consumed by the existing field and Picard owners.
++mod evolution;
++pub use evolution::{CoordinateEvolution, CoordinateEvolutionStatus, CoordinateSegment};
++
+ use super::{
+     picard::{PicardFailure, PicardProposal, PicardReport, PicardStatus},
+     *,
+diff --git a/crates/hyperdynamics/src/field/coordinates/evolution.rs b/crates/hyperdynamics/src/field/coordinates/evolution.rs
+new file mode 100644
+index 000000000..c31d135e3
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/coordinates/evolution.rs
+@@ -0,0 +1,199 @@
++//! Whole-horizon evolution in one retained exact state chart.
++use super::{CoordinateField, CoordinateFieldError};
++use crate::field::{
++    EnclosureBudget,
++    evolution::{
++        EvolutionFailure, EvolutionOptions, EvolutionReport, EvolutionRequest, EvolutionStatus,
++    },
++    picard::PicardReport,
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::expression_program::ExpressionError;
++
++impl<const N: usize> CoordinateField<N> {
++    /// Integrate entirely in this fixed chart, then transport every accepted tube/end.
++    ///
++    /// The original initial set is exactly `c + A * request.initial`. Its Cartesian
++    /// projection is only an outer enclosure, never the input to the next step.
++    /// Native interval overestimation still accumulates between steps; this is not
++    /// an exact reachable-set representation or an adaptive change of frame.
++    ///
++    /// The same budget covers native integration and all output transport. A
++    /// stopped native run keeps its qualified prefix in `native()`. Original-
++    /// coordinate output is published atomically, only on whole-horizon success.
++    pub fn integrate(
++        &self,
++        request: EvolutionRequest<N>,
++        options: EvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> CoordinateEvolution<N> {
++        let native = self.transformed_field().integrate(request, options, budget);
++        let status = match native.status() {
++            EvolutionStatus::Completed => CoordinateEvolutionStatus::Completed,
++            EvolutionStatus::Identity => CoordinateEvolutionStatus::Identity,
++            EvolutionStatus::Empty => CoordinateEvolutionStatus::Empty,
++            EvolutionStatus::Stopped(reason) => CoordinateEvolutionStatus::Stopped(reason.clone()),
++        };
++        let mut result = CoordinateEvolution {
++            chart: self.clone(),
++            native,
++            status,
++            source: None,
++        };
++        if !matches!(result.status, CoordinateEvolutionStatus::Stopped(_)) {
++            match result.materialize(budget) {
++                Ok(source) => result.source = Some(source),
++                Err(error) => result.status = CoordinateEvolutionStatus::TransportFailed(error),
++            }
++        }
++        result
++    }
++}
++
++/// Whole-horizon outcome, separate from the native integration stage.
++#[derive(Clone, Debug)]
++pub enum CoordinateEvolutionStatus {
++    /// Native integration and all original-coordinate projections completed.
++    Completed,
++    /// Zero-duration identity with transported initial set; no ODE existence claim.
++    Identity,
++    /// Validated successful empty evolution.
++    Empty,
++    /// Original native failure, without a transported partial-output claim.
++    Stopped(EvolutionFailure),
++    /// Native completion succeeded but original-coordinate materialization failed.
++    TransportFailed(CoordinateFieldError),
++}
++
++#[derive(Clone, Debug)]
++struct SourceEvolution<const N: usize> {
++    initial: BoxN<DyadicInterval, N>,
++    segments: Vec<(BoxN<DyadicInterval, N>, BoxN<DyadicInterval, N>)>,
++}
++
++/// A native certified segment with its exact chart and original-coordinate envelopes.
++/// Time is unchanged by the chart; endpoints are in `native().proposal()`.
++#[derive(Clone, Copy, Debug)]
++pub struct CoordinateSegment<'a, const N: usize> {
++    chart: &'a CoordinateField<N>,
++    native: &'a PicardReport<N>,
++    tube: &'a BoxN<DyadicInterval, N>,
++    end: &'a BoxN<DyadicInterval, N>,
++}
++impl<'a, const N: usize> CoordinateSegment<'a, N> {
++    /// Exact source/transformed-field association and inverse evidence.
++    pub fn chart(&self) -> &'a CoordinateField<N> {
++        self.chart
++    }
++    /// Retained source-bound native proof, including exact time and state enclosures.
++    pub fn native(&self) -> &'a PicardReport<N> {
++        self.native
++    }
++    /// Cartesian outer enclosure of the original trajectory over this segment.
++    pub fn source_tube(&self) -> &'a BoxN<DyadicInterval, N> {
++        self.tube
++    }
++    /// Cartesian outer enclosure at this segment's exact endpoint.
++    pub fn source_end_enclosure(&self) -> &'a BoxN<DyadicInterval, N> {
++        self.end
++    }
++}
++
++/// Immutable evolution retaining the chart, all native attempts and transported output.
++///
++/// Replay the coordinate field definition and native request/options to regenerate
++/// proofs. No serialized status or projection is trusted as a certificate.
++/// Output allocation checks count native attempt/index records, source segment
++/// records, projected box lanes and transform temporaries together. These are
++/// structural entry bounds, not heap-byte limits; scalar payloads, vector capacity
++/// and refinement retain the exclusions of [`EnclosureBudget`].
++#[derive(Clone, Debug)]
++pub struct CoordinateEvolution<const N: usize> {
++    chart: CoordinateField<N>,
++    native: EvolutionReport<N>,
++    status: CoordinateEvolutionStatus,
++    source: Option<SourceEvolution<N>>,
++}
++impl<const N: usize> CoordinateEvolution<N> {
++    /// Retained original/transformed field association and exact chart.
++    pub fn chart(&self) -> &CoordinateField<N> {
++        &self.chart
++    }
++    /// All native attempts, policy, search options, status and qualified prefix.
++    pub fn native(&self) -> &EvolutionReport<N> {
++        &self.native
++    }
++    /// Whole-horizon status; native completion alone is insufficient.
++    pub fn status(&self) -> &CoordinateEvolutionStatus {
++        &self.status
++    }
++    /// Cartesian envelope of the correlated original initial set, after all transport.
++    pub fn source_initial_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.source.as_ref().map(|source| &source.initial)
++    }
++    /// Original-coordinate endpoint after whole-request success; absent on failure.
++    pub fn source_end_enclosure(&self) -> Option<&BoxN<DyadicInterval, N>> {
++        self.source.as_ref().map(|source| {
++            source
++                .segments
++                .last()
++                .map_or(&source.initial, |(_, end)| end)
++        })
++    }
++    /// All transported segments on completion, otherwise an empty iterator.
++    /// The separately qualified native prefix remains available through `native()`.
++    pub fn segments(&self) -> impl ExactSizeIterator<Item = CoordinateSegment<'_, N>> {
++        let source = self.source.as_ref().map_or(&[][..], |s| &s.segments);
++        self.native
++            .segments()
++            .zip(source)
++            .map(|(native, (tube, end))| CoordinateSegment {
++                chart: &self.chart,
++                native,
++                tube,
++                end,
++            })
++    }
++    fn materialize(
++        &self,
++        budget: &mut EnclosureBudget,
++    ) -> Result<SourceEvolution<N>, CoordinateFieldError> {
++        budget.graph.charge(0)?;
++        let count = self.native.segments().len();
++        let lanes = count
++            .checked_mul(2)
++            .and_then(|n| n.checked_add(1))
++            .and_then(|n| n.checked_mul(N))
++            .ok_or(ExpressionError::SizeExhausted)?;
++        let square = N.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
++        budget.graph.check_entries(&[
++            self.native.attempts().len(),
++            count,
++            count,
++            lanes,
++            square,
++            N,
++            N,
++            N,
++        ])?;
++        budget.graph.charge(1)?;
++        let initial = self
++            .chart
++            .source_enclosure(&self.native.request().initial, budget)?;
++        let mut segments = Vec::with_capacity(count);
++        for native in self.native.segments() {
++            budget.graph.charge(1)?;
++            let tube = self
++                .chart
++                .source_enclosure(native.tube().expect("accepted native segment"), budget)?;
++            let end = self.chart.source_enclosure(
++                native.end_enclosure().expect("accepted native segment"),
++                budget,
++            )?;
++            segments.push((tube, end));
++        }
++        budget.graph.charge(1)?;
++        Ok(SourceEvolution { initial, segments })
++    }
++}
+diff --git a/crates/hyperdynamics/tests/field_coordinates.rs b/crates/hyperdynamics/tests/field_coordinates.rs
+index 519ee05b5..b1de4f103 100644
+--- a/crates/hyperdynamics/tests/field_coordinates.rs
++++ b/crates/hyperdynamics/tests/field_coordinates.rs
+@@ -13,6 +13,9 @@ use hypersolve::{
+ const T: SymbolId = SymbolId(9);
+ const X: SymbolId = SymbolId(0);
+ const Y: SymbolId = SymbolId(1);
++
++#[path = "field_coordinates/whole_horizon.rs"]
++mod whole_horizon;
+ fn budget() -> EnclosureBudget {
+     EnclosureBudget::new(EnclosurePolicy::default())
+ }
+diff --git a/crates/hyperdynamics/tests/field_coordinates/whole_horizon.rs b/crates/hyperdynamics/tests/field_coordinates/whole_horizon.rs
+new file mode 100644
+index 000000000..87b9e50a0
+--- /dev/null
++++ b/crates/hyperdynamics/tests/field_coordinates/whole_horizon.rs
+@@ -0,0 +1,466 @@
++use super::*;
++use hyperdynamics::field::{
++    FieldError,
++    coordinates::{CoordinateEvolution, CoordinateEvolutionStatus},
++    evolution::{EvolutionFailure, EvolutionOptions, EvolutionRequest, EvolutionStatus},
++};
++use hyperinterval::{DyadicBudget, IntervalError};
++use hypersolve::expression_program::ExpressionError;
++
++fn request() -> EvolutionRequest<2> {
++    EvolutionRequest {
++        start: d(0, 0),
++        end: d(3, 3),
++        initial: BoxN::new([d(0, 0), d(-1, 1)]).unwrap(),
++    }
++}
++fn options() -> EvolutionOptions {
++    EvolutionOptions {
++        maximum_step: Some(d(1, 1)),
++        ..EvolutionOptions::default()
++    }
++}
++fn no_source<const N: usize>(report: &CoordinateEvolution<N>) {
++    assert!(report.source_initial_enclosure().is_none());
++    assert!(report.source_end_enclosure().is_none());
++    assert_eq!(report.segments().len(), 0);
++}
++fn constant_flow(report: &CoordinateEvolution<2>) {
++    assert!(
++        matches!(report.status(), CoordinateEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    assert_eq!(report.segments().len(), 3);
++    assert_eq!(report.native().reached_time(), &d(3, 3));
++    assert_eq!(
++        report.source_initial_enclosure().unwrap().lanes(),
++        Some(&[d(9, 11), d(-4, -2)])
++    );
++    // Independent analytic flow: x(t)=(10+b+2t,-3+b+t), b in [-1,1].
++    for (index, segment) in report.segments().enumerate() {
++        let t = i64::try_from(index + 1).unwrap();
++        assert_eq!(segment.native().proposal().start, d(t - 1, t - 1));
++        assert_eq!(segment.native().proposal().end, d(t, t));
++        assert_eq!(
++            segment.native().end_enclosure().unwrap().lanes(),
++            Some(&[d(t, t), d(t - 1, t + 1)])
++        );
++        assert_eq!(
++            segment.source_end_enclosure().lanes(),
++            Some(&[d(9 + 2 * t, 11 + 2 * t), d(-4 + t, -2 + t)])
++        );
++        let tube = [d(9 + 2 * (t - 1), 11 + 2 * t), d(-4 + t - 1, -2 + t)];
++        for (analytic, enclosed) in tube.iter().zip(segment.source_tube().lanes().unwrap()) {
++            assert!(
++                analytic
++                    .subset_of(enclosed, &mut DyadicBudget::new(16384, 1_000_000_000))
++                    .unwrap()
++            );
++        }
++        assert_eq!(
++            segment.chart().original_field().identity(),
++            report.chart().original_field().identity()
++        );
++        assert_eq!(
++            segment.native().identity(),
++            &report.chart().transformed_field().identity()
++        );
++    }
++    assert_eq!(
++        report.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(15, 17), d(-1, 1)])
++    );
++}
++
++#[test]
++fn exact_endpoints_retained_correlation_and_subsequent_consumption() {
++    let chart = chart();
++    let report = chart.integrate(request(), options(), &mut budget());
++    constant_flow(&report);
++    // Every native attempt is retained verbatim, including rejected candidates.
++    let direct = chart
++        .transformed_field()
++        .integrate(request(), options(), &mut budget());
++    assert_eq!(format!("{:?}", report.native()), format!("{direct:?}"));
++    assert!(report.native().attempts().len() > report.segments().len());
++    // x_source-y_source=13+y_native[0]. The retained chart proves the point 16;
++    // projecting first would only bound this difference by [14,18].
++    let invariant = field::<2>(
++        &[Expr::int(13) + Expr::anonymous_symbol(X), Expr::int(0)],
++        vec![X, Y],
++    );
++    assert_eq!(
++        invariant
++            .image(
++                &d(3, 3),
++                report.native().end_enclosure().unwrap(),
++                &mut budget()
++            )
++            .unwrap()
++            .lanes(),
++        Some(&[d(16, 16), d(0, 0)])
++    );
++    let next = report.chart().integrate(
++        EvolutionRequest {
++            start: d(3, 3),
++            end: d(4, 4),
++            initial: report.native().end_enclosure().unwrap().clone(),
++        },
++        options(),
++        &mut budget(),
++    );
++    assert!(matches!(
++        next.status(),
++        CoordinateEvolutionStatus::Completed
++    ));
++    assert_eq!(
++        next.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(17, 19), d(0, 2)])
++    );
++}
++
++#[test]
++fn late_transport_failure_is_atomic_and_retry_uses_fresh_budget() {
++    let chart = chart();
++    let mut native_budget = budget();
++    assert!(matches!(
++        chart
++            .transformed_field()
++            .integrate(request(), options(), &mut native_budget)
++            .status(),
++        EvolutionStatus::Completed
++    ));
++    let mut measured = budget();
++    constant_flow(&chart.integrate(request(), options(), &mut measured));
++    let p = measured.policy();
++    let gw = p.graph_work - measured.remaining_graph_work();
++    let sw = p.scalar_work - measured.remaining_scalar_work();
++    let ng = p.graph_work - native_budget.remaining_graph_work();
++    let ns = p.scalar_work - native_budget.remaining_scalar_work();
++    assert!(gw > ng && sw > ns);
++    for (graph_work, scalar_work, scalar_failure) in [
++        (ng, p.scalar_work, false),
++        (gw - 1, p.scalar_work, false),
++        (p.graph_work, ns, true),
++        (p.graph_work, sw - 1, true),
++    ] {
++        let mut limited = EnclosureBudget::new(EnclosurePolicy {
++            graph_work,
++            scalar_work,
++            ..p
++        });
++        let report = chart.integrate(request(), options(), &mut limited);
++        assert!(matches!(
++            report.native().status(),
++            EvolutionStatus::Completed
++        ));
++        match report.status() {
++            CoordinateEvolutionStatus::TransportFailed(CoordinateFieldError::Field(error)) => {
++                if scalar_failure && scalar_work == ns {
++                    assert!(
++                        matches!(error, FieldError::Scalar(IntervalError::WorkExhausted)),
++                        "scalar budget {scalar_work}: {error:?}"
++                    );
++                } else if scalar_failure {
++                    assert!(matches!(
++                        error,
++                        FieldError::Lattice(hyperlattice_interval::IntervalLatticeError::Scalar(
++                            IntervalError::WorkExhausted
++                        ))
++                    ));
++                } else {
++                    assert!(matches!(
++                        error,
++                        FieldError::Expression(ExpressionError::WorkExhausted)
++                    ));
++                }
++            }
++            other => panic!("unexpected status {other:?}"),
++        }
++        no_source(&report);
++    }
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: gw,
++        scalar_work: sw,
++        ..p
++    });
++    constant_flow(&chart.integrate(request(), options(), &mut exact));
++    assert_eq!(exact.remaining_graph_work(), 0);
++    assert_eq!(exact.remaining_scalar_work(), 0);
++    let mut twice = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: 2 * gw,
++        scalar_work: 2 * sw,
++        ..p
++    });
++    for _ in 0..2 {
++        constant_flow(&chart.integrate(request(), options(), &mut twice));
++    }
++    assert_eq!(twice.remaining_graph_work(), 0);
++    assert_eq!(twice.remaining_scalar_work(), 0);
++    println!("WORK native_graph={ng} native_scalar={ns} complete_graph={gw} complete_scalar={sw}");
++}
++
++#[test]
++fn native_prefix_and_cancellation_keep_original_diagnostics() {
++    let chart = chart();
++    let one = EvolutionOptions {
++        maximum_steps: 1,
++        ..options()
++    };
++    let mut direct_budget = budget();
++    let direct = chart
++        .transformed_field()
++        .integrate(request(), one.clone(), &mut direct_budget);
++    let mut wrapped_budget = budget();
++    let report = chart.integrate(request(), one, &mut wrapped_budget);
++    assert!(matches!(
++        report.status(),
++        CoordinateEvolutionStatus::Stopped(EvolutionFailure::StepLimit { limit: 1 })
++    ));
++    assert_eq!(report.native().segments().len(), 1);
++    assert!(report.native().prefix_end_enclosure().is_some());
++    assert_eq!(format!("{:?}", report.native()), format!("{direct:?}"));
++    assert_eq!(
++        wrapped_budget.remaining_graph_work(),
++        direct_budget.remaining_graph_work()
++    );
++    assert_eq!(
++        wrapped_budget.remaining_scalar_work(),
++        direct_budget.remaining_scalar_work()
++    );
++    no_source(&report);
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.set_cancellation(Some(token));
++    let report = chart.integrate(request(), options(), &mut cancelled);
++    assert!(matches!(
++        report.status(),
++        CoordinateEvolutionStatus::Stopped(EvolutionFailure::Field(FieldError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    no_source(&report);
++    constant_flow(&chart.integrate(request(), options(), &mut budget()));
++}
++
++#[test]
++fn output_entries_are_checked_together_before_transport_allocation() {
++    let chart = chart();
++    let req = EvolutionRequest {
++        end: d(64, 64),
++        ..request()
++    };
++    let native = chart
++        .transformed_field()
++        .integrate(req.clone(), options(), &mut budget());
++    assert!(matches!(native.status(), EvolutionStatus::Completed));
++    let n = native.segments().len();
++    let entries = native.attempts().len() + 2 * n + 2 * (1 + 2 * n) + 4 + 6;
++    let mut limited = EnclosureBudget::new(EnclosurePolicy {
++        graph_entries: entries - 1,
++        ..EnclosurePolicy::default()
++    });
++    let report = chart.integrate(req.clone(), options(), &mut limited);
++    assert!(
++        matches!(report.native().status(), EvolutionStatus::Completed),
++        "{:?}",
++        report.native().status()
++    );
++    assert!(matches!(
++        report.status(),
++        CoordinateEvolutionStatus::TransportFailed(CoordinateFieldError::Field(
++            FieldError::Expression(ExpressionError::SizeExhausted)
++        ))
++    ));
++    no_source(&report);
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_entries: entries,
++        ..EnclosurePolicy::default()
++    });
++    let report = chart.integrate(req, options(), &mut exact);
++    assert!(matches!(
++        report.status(),
++        CoordinateEvolutionStatus::Completed
++    ));
++    assert_eq!(report.segments().len(), 64);
++    assert_eq!(
++        report.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(137, 139), d(60, 62)])
++    );
++    println!("ENTRIES {entries}");
++}
++
++#[test]
++fn identity_empty_unit_and_invalid_requests_remain_distinct() {
++    let chart = chart();
++    let identity = chart.integrate(
++        EvolutionRequest {
++            end: d(0, 0),
++            ..request()
++        },
++        options(),
++        &mut budget(),
++    );
++    assert!(matches!(
++        identity.status(),
++        CoordinateEvolutionStatus::Identity
++    ));
++    assert_eq!(
++        identity.source_initial_enclosure(),
++        identity.source_end_enclosure()
++    );
++    assert_eq!(identity.segments().len(), 0);
++    let empty = chart.integrate(
++        EvolutionRequest {
++            initial: BoxN::empty().unwrap(),
++            ..request()
++        },
++        options(),
++        &mut budget(),
++    );
++    assert!(matches!(empty.status(), CoordinateEvolutionStatus::Empty));
++    assert!(empty.source_end_enclosure().unwrap().is_empty());
++    assert_eq!(empty.segments().len(), 0);
++    for initial in [request().initial, BoxN::empty().unwrap()] {
++        for (start, end, maximum_step, case) in [
++            (d(4, 4), d(3, 3), d(1, 1), 0),
++            (d(0, 1), d(3, 3), d(1, 1), 1),
++            (d(0, 0), d(0, 0), d(0, 0), 2),
++        ] {
++            let report = chart.integrate(
++                EvolutionRequest {
++                    start,
++                    end,
++                    initial: initial.clone(),
++                },
++                EvolutionOptions {
++                    maximum_step: Some(maximum_step),
++                    ..options()
++                },
++                &mut budget(),
++            );
++            match (case, report.status()) {
++                (0, CoordinateEvolutionStatus::Stopped(EvolutionFailure::ReversedTime))
++                | (1, CoordinateEvolutionStatus::Stopped(EvolutionFailure::NonPointTime))
++                | (2, CoordinateEvolutionStatus::Stopped(EvolutionFailure::InvalidMaximumStep)) => {
++                }
++                other => panic!("unexpected status {other:?}"),
++            }
++            no_source(&report);
++        }
++    }
++    let unit = field::<0>(&[], vec![])
++        .in_coordinates(
++            CoordinateChange {
++                variables: vec![],
++                to_source: vec![],
++                from_source: vec![],
++                origin: vec![],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let report = unit.integrate(
++        EvolutionRequest {
++            start: d(0, 0),
++            end: d(3, 3),
++            initial: BoxN::new([]).unwrap(),
++        },
++        options(),
++        &mut budget(),
++    );
++    assert!(matches!(
++        report.status(),
++        CoordinateEvolutionStatus::Completed
++    ));
++    assert_eq!(report.segments().len(), 3);
++    assert!(!report.source_end_enclosure().unwrap().is_empty());
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replays_chart_request_and_outputs() {
++    const KEY: &str = "HYPERDYNAMICS_COORDINATE_EVOLUTION_REPLAY";
++    if let Ok(data) = std::env::var(KEY) {
++        let (definition, req, opts): (
++            CoordinateFieldDefinition,
++            EvolutionRequest<2>,
++            EvolutionOptions,
++        ) = serde_json::from_str(&data).unwrap();
++        let chart = CoordinateField::from_definition(definition, &mut budget()).unwrap();
++        let report = chart.integrate(req, opts, &mut budget());
++        constant_flow(&report);
++        let rows: Vec<_> = report
++            .segments()
++            .map(|s| (s.source_tube(), s.source_end_enclosure()))
++            .collect();
++        println!(
++            "EVOLUTION {}",
++            serde_json::to_string(&(
++                report.source_initial_enclosure(),
++                rows,
++                report.source_end_enclosure()
++            ))
++            .unwrap()
++        );
++        return;
++    }
++    let chart = chart();
++    let identity = chart.original_field().identity();
++    let definition = CoordinateFieldDefinition {
++        source: FieldDefinition {
++            source: identity.source().clone(),
++            time: identity.time(),
++            state: identity.state().to_vec(),
++        },
++        change: change(),
++    };
++    let data = serde_json::to_string(&(definition, request(), options())).unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "whole_horizon::fresh_process_replays_chart_request_and_outputs",
++                "--nocapture",
++            ])
++            .env(KEY, &data)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{} {}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let text = String::from_utf8(child.stdout).unwrap();
++        let line = text
++            .lines()
++            .find(|s| s.starts_with("EVOLUTION "))
++            .unwrap()
++            .to_owned();
++        if let Some(expected) = previous {
++            assert_eq!(line, expected);
++        }
++        previous = Some(line);
++    }
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn native_and_transported_dispatch_counts_are_fixed() {
++    use hyperreal::dispatch_trace;
++    let chart = chart();
++    dispatch_trace::reset();
++    let report =
++        dispatch_trace::with_recording(|| chart.integrate(request(), options(), &mut budget()));
++    let trace = dispatch_trace::take_trace();
++    constant_flow(&report);
++    assert!(trace.dispatch.is_empty(), "{trace:?}");
++    assert_eq!(
++        trace.rational,
++        dispatch_trace::RationalTraceStats::default()
++    );
++}
