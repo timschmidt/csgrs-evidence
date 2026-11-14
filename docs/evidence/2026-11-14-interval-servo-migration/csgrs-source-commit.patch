@@ -1,0 +1,304 @@
+commit b30763aa5a4bf5895f62462cb900eb3730e0f49b
+Author:     Timothy Schmidt <tim@ai.replimat.org>
+AuthorDate: Sat Nov 14 00:28:01 2026 -0500
+Commit:     Timothy Schmidt <tim@ai.replimat.org>
+CommitDate: Sat Nov 14 00:28:01 2026 -0500
+
+    Share exact lattice midpoint arithmetic
+
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index 239a037a6..5d620fb10 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Share exact primitive lattice midpoint arithmetic between integer and fixed
++  intervals, retaining all rounding modes and full unsigned widths. Fixed
++  accessors avoid widened arithmetic and remain allocation-free.
++
+ - Preserve proved endpoint order during fixed arithmetic reconstruction and
+   exact storage conversion. Use native checked additive operations and explicit
+   checked narrowing without changing rounded bounds or failure outcomes.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 201452720..2baf49768 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -129,7 +129,8 @@ Integer arithmetic uses checked sum, difference, negation, product hull,
+ square and nonnegative integer powers. Integer multiplication can have gaps;
+ the result is the smallest containing integer range. Division is not silently
+ interpreted as truncated real arithmetic. Exact width/radius and explicitly
+-rounded midpoints support every primitive integer width, including i128/u128.
++rounded midpoints support every primitive integer width, including i128/u128. Fixed and integer midpoints share the same exact numerator kernel;
++fixed widths retain the full unsigned endpoint distance.
+ `scale` returns the smallest integer hull of multiplication by one exact
+ scalar. With either `integer` or `fixed`, `integer_quotient_bounds` returns the
+ integer floor and ceiling of an i128 ratio, with typed zero-denominator and
+diff --git a/crates/hyperinterval/src/bounds.rs b/crates/hyperinterval/src/bounds.rs
+index 1501c7fc8..934719b45 100644
+--- a/crates/hyperinterval/src/bounds.rs
++++ b/crates/hyperinterval/src/bounds.rs
+@@ -322,3 +322,28 @@ macro_rules! set_relations {
+ 
+ #[cfg(any(feature = "integer", feature = "fixed"))]
+ pub(crate) use set_relations;
++
++// Exact midpoint of ordered primitive lattice endpoints. Shared by discrete
++// integer ranges and fixed-point intervals; only the numerator is returned.
++#[cfg(any(feature = "integer", feature = "fixed"))]
++macro_rules! lattice_midpoint {
++    ($lower:expr, $upper:expr, $rounding:expr, $endpoint:ty) => {{
++        let lower = $lower;
++        let upper = $upper;
++        let rounding = $rounding;
++        let width = upper.abs_diff(lower);
++        // Half of the maximum unsigned distance fits the signed
++        // endpoint, and the sum is between lower and upper.
++        // These additions cannot wrap: both rounded choices lie in the bounds.
++        let floor = lower.wrapping_add((width / 2) as $endpoint);
++        let increment = width % 2 != 0
++            && match rounding {
++                crate::MidpointRounding::Floor => false,
++                crate::MidpointRounding::Ceiling => true,
++                crate::MidpointRounding::NearestTiesEven => floor % 2 != 0,
++            };
++        floor.wrapping_add(<$endpoint>::from(increment))
++    }};
++}
++#[cfg(any(feature = "integer", feature = "fixed"))]
++pub(crate) use lattice_midpoint;
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index 9d9860d29..1485347da 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -68,9 +68,10 @@ macro_rules! arithmetic {
+ 
+             /// Exact width in lattice units, including the full signed range.
+             /// Empty has no width and returns `None`.
++            #[inline(always)]
+             pub fn width_ulps(&self) -> Option<u64> {
+                 self.bounds()
+-                    .map(|(lower, upper)| (i128::from(upper) - i128::from(lower)) as u64)
++                    .map(|(lower, upper)| upper.abs_diff(lower) as u64)
+             }
+ 
+             /// Exact scale-tagged unsigned endpoint distance; empty has no width.
+@@ -143,18 +144,10 @@ macro_rules! arithmetic {
+             }
+ 
+             /// Midpoint lattice numerator with explicit rounding; empty returns `None`.
++            #[inline(always)]
+             pub fn midpoint(&self, rounding: MidpointRounding) -> Option<$endpoint> {
+                 self.bounds().map(|(lower, upper)| {
+-                    let width = i128::from(upper) - i128::from(lower);
+-                    let floor = i128::from(lower) + width / 2;
+-                    let increment = width % 2 != 0
+-                        && match rounding {
+-                            MidpointRounding::Floor => false,
+-                            MidpointRounding::Ceiling => true,
+-                            MidpointRounding::NearestTiesEven => floor % 2 != 0,
+-                        };
+-                    // The rounded midpoint lies between representable endpoints.
+-                    (floor + i128::from(increment)) as $endpoint
++                    crate::bounds::lattice_midpoint!(lower, upper, rounding, $endpoint)
+                 })
+             }
+ 
+diff --git a/crates/hyperinterval/src/integer_arithmetic.rs b/crates/hyperinterval/src/integer_arithmetic.rs
+index 4663b2aaa..99779b5d3 100644
+--- a/crates/hyperinterval/src/integer_arithmetic.rs
++++ b/crates/hyperinterval/src/integer_arithmetic.rs
+@@ -31,16 +31,7 @@ macro_rules! arithmetic {
+             #[inline(always)]
+             pub fn midpoint(&self, rounding: MidpointRounding) -> Option<$endpoint> {
+                 let (lower, upper) = self.bounds()?;
+-                let width = upper.abs_diff(lower);
+-                // Half of the maximum unsigned distance fits the signed
+-                // endpoint, and the sum is between lower and upper.
+-                let floor = lower + (width / 2) as $endpoint;
+-                let increment = width % 2 != 0 && match rounding {
+-                    MidpointRounding::Floor => false,
+-                    MidpointRounding::Ceiling => true,
+-                    MidpointRounding::NearestTiesEven => floor % 2 != 0,
+-                };
+-                Some(floor + <$endpoint>::from(increment))
++                Some(crate::bounds::lattice_midpoint!(lower, upper, rounding, $endpoint))
+             }
+ 
+             /// Outward integer radius around any supported rounded midpoint.
+diff --git a/crates/hyperinterval/tests/fixed_midpoint.rs b/crates/hyperinterval/tests/fixed_midpoint.rs
+new file mode 100644
+index 000000000..c387f9de1
+--- /dev/null
++++ b/crates/hyperinterval/tests/fixed_midpoint.rs
+@@ -0,0 +1,92 @@
++#![cfg(feature = "fixed")]
++use hyperinterval::{FixedInterval, MidpointRounding};
++
++macro_rules! check {
++    ($endpoint:ty, $scale:expr) => {{
++        type Interval = FixedInterval<$endpoint, $scale>;
++        let values = [
++            <$endpoint>::MIN,
++            <$endpoint>::MIN + 1,
++            -3,
++            -2,
++            -1,
++            0,
++            1,
++            2,
++            3,
++            <$endpoint>::MAX - 1,
++            <$endpoint>::MAX,
++        ];
++        let modes = [
++            MidpointRounding::Floor,
++            MidpointRounding::Ceiling,
++            MidpointRounding::NearestTiesEven,
++        ];
++        let empty = Interval::empty().unwrap();
++        assert_eq!(empty.width_ulps(), None);
++        for mode in modes {
++            assert_eq!(empty.midpoint(mode), None);
++        }
++        for lower in values {
++            for upper in values {
++                if lower > upper {
++                    continue;
++                }
++                let value = Interval::new(lower, upper).unwrap();
++                let sum = i128::from(lower) + i128::from(upper);
++                let floor = sum.div_euclid(2);
++                let remainder = sum.rem_euclid(2);
++                assert_eq!(
++                    u128::from(value.width_ulps().unwrap()),
++                    (i128::from(upper) - i128::from(lower)) as u128
++                );
++                for mode in modes {
++                    let expected = match mode {
++                        MidpointRounding::Floor => floor,
++                        MidpointRounding::Ceiling => floor + remainder,
++                        MidpointRounding::NearestTiesEven => {
++                            floor
++                                + if floor.rem_euclid(2) == 1 {
++                                    remainder
++                                } else {
++                                    0
++                                }
++                        }
++                    };
++                    let midpoint = value.midpoint(mode).unwrap();
++                    assert_eq!(i128::from(midpoint), expected);
++                    assert!(value.contains_point(midpoint));
++                    let generated = Interval::point(midpoint).unwrap();
++                    assert_eq!(generated.midpoint(mode), Some(midpoint));
++                    assert_eq!(generated.width_ulps(), Some(0));
++                }
++            }
++        }
++    }};
++}
++macro_rules! scales {
++    ($endpoint:ty; $($scale:expr),*) => { $(check!($endpoint, $scale);)* };
++}
++#[test]
++fn all_supported_scales_preserve_exact_midpoints_and_widths() {
++    scales!(i32; 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
++    scales!(i64; 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63);
++}
++
++#[cfg(all(feature = "hyperreal", feature = "dispatch-trace"))]
++#[test]
++fn fixed_midpoints_and_widths_have_no_scalar_dispatch() {
++    use hyperreal::dispatch_trace;
++    dispatch_trace::reset();
++    let result = dispatch_trace::with_recording(|| {
++        let value = FixedInterval::<i64, 32>::new(i64::MIN, i64::MAX).unwrap();
++        (
++            value.midpoint(MidpointRounding::NearestTiesEven),
++            value.width_ulps(),
++        )
++    });
++    assert_eq!(result, (Some(0), Some(u64::MAX)));
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
+diff --git a/crates/hyperinterval/tests/integer_midpoint.rs b/crates/hyperinterval/tests/integer_midpoint.rs
+new file mode 100644
+index 000000000..c433fadd8
+--- /dev/null
++++ b/crates/hyperinterval/tests/integer_midpoint.rs
+@@ -0,0 +1,71 @@
++#![cfg(feature = "integer")]
++use hyperinterval::{IntegerRange, MidpointRounding};
++
++#[test]
++fn every_integer_family_preserves_midpoint_at_extreme_endpoints() {
++    macro_rules! check {
++        ($endpoint:ty) => {{
++            let values: [$endpoint; 9] = [
++                <$endpoint>::MIN,
++                <$endpoint>::MIN + 1,
++                <$endpoint>::MIN / 2,
++                0,
++                1,
++                2,
++                <$endpoint>::MAX / 2,
++                <$endpoint>::MAX - 1,
++                <$endpoint>::MAX,
++            ];
++            let modes = [
++                MidpointRounding::Floor,
++                MidpointRounding::Ceiling,
++                MidpointRounding::NearestTiesEven,
++            ];
++            for mode in modes {
++                assert_eq!(IntegerRange::<$endpoint>::empty().midpoint(mode), None);
++            }
++            for lower in values {
++                for upper in values {
++                    if lower > upper {
++                        continue;
++                    }
++                    let range = IntegerRange::new(lower, upper).unwrap();
++                    // Divide before adding: this independent quotient/remainder
++                    // expectation also fits at the full i128/u128 extrema.
++                    let halves = lower.div_euclid(2) + upper.div_euclid(2);
++                    let residual = lower.rem_euclid(2) + upper.rem_euclid(2);
++                    let floor = halves + residual / 2;
++                    for mode in modes {
++                        let expected = match mode {
++                            MidpointRounding::Floor => floor,
++                            MidpointRounding::Ceiling => floor + residual % 2,
++                            MidpointRounding::NearestTiesEven => {
++                                floor
++                                    + if floor.rem_euclid(2) == 1 {
++                                        residual % 2
++                                    } else {
++                                        0
++                                    }
++                            }
++                        };
++                        assert_eq!(range.midpoint(mode), Some(expected));
++                        assert!(range.contains_point(expected));
++                        assert_eq!(IntegerRange::point(expected).midpoint(mode), Some(expected));
++                    }
++                }
++            }
++        }};
++    }
++    check!(i8);
++    check!(i16);
++    check!(i32);
++    check!(i64);
++    check!(i128);
++    check!(isize);
++    check!(u8);
++    check!(u16);
++    check!(u32);
++    check!(u64);
++    check!(u128);
++    check!(usize);
++}
