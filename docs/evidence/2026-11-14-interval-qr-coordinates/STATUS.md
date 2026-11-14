@@ -1,0 +1,1 @@
+Exact QR construction and field consumption admitted on the declared corpus. Full goal remains active; no phase completion, automatic frame controller, universal performance gain, whole-resource bound, release or push is claimed.

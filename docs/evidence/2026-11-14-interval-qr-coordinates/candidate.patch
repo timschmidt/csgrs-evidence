@@ -1,0 +1,1446 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index baceeb98c..db92fe556 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add opt-in exact QR coordinate construction with orthogonality and reconstruction evidence.
++
+ - Add opt-in exact source-bound coordinate transitions for direct chart transport.
+ 
+ - Add optional trajectory Taylor enclosures over certified Picard tubes, with
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index eb4fffe97..20c77adba 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ coordinates = ["field", "hypersolve/coordinate-program"]
++qr-coordinates = ["coordinate-transition", "hypersolve/qr-coordinates"]
+ coordinate-transition = ["coordinates", "hypersolve/coordinate-transition"]
+ taylor-model = ["field", "hypersolve/taylor-model"]
+ taylor-flow = ["taylor-model"]
+@@ -72,3 +73,8 @@ required-features = ["taylor-flow"]
+ name = "coordinate_transition"
+ harness = false
+ required-features = ["coordinate-transition"]
++
++[[bench]]
++name = "qr_coordinates"
++harness = false
++required-features = ["qr-coordinates"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index a6c249d5e..9666f63cb 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -152,3 +152,5 @@ field definition, order and proposal. This is a forward-step verifier, not an
+ automatic order/step controller or adaptive wrapping algorithm.
+ 
+ With `coordinate-transition`, `CoordinateField::transition_to` prepares direct endpoint transport between two validated charts of the same field. `enclose` retains the exact relation and input beside its outer box, which can enter the destination chart’s next step. Frame selection and QR wrapping control remain separate work.
++
++With `qr-coordinates`, `ExpressionField::in_qr_coordinates` constructs an exact orthonormal state chart from a basis and origin without a supplied inverse. The retained factorization and chart support existing Picard, Taylor, finite-horizon and direct endpoint-transport APIs. Frame selection remains caller-controlled.
+diff --git a/crates/hyperdynamics/benches/qr_coordinates.rs b/crates/hyperdynamics/benches/qr_coordinates.rs
+new file mode 100644
+index 000000000..036cdaec2
+--- /dev/null
++++ b/crates/hyperdynamics/benches/qr_coordinates.rs
+@@ -0,0 +1,186 @@
++//! Completed source-coordinate flow proofs in identity and exact QR frames.
++use criterion::{Criterion, black_box, criterion_group, criterion_main};
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    coordinates::{
++        CoordinateEvolution, CoordinateEvolutionStatus, CoordinateField, QrCoordinateField,
++    },
++    evolution::{EvolutionOptions, EvolutionRequest},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{CoordinateChange, ExpressionBudget, ExpressionProgram},
++};
++const X: SymbolId = SymbolId(0);
++const Y: SymbolId = SymbolId(1);
++const T: SymbolId = SymbolId(2);
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn d(l: i64, u: i64) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), 0).unwrap()
++}
++fn basis() -> Vec<Vec<Real>> {
++    vec![vec![3.into(), (-4).into()], vec![4.into(), 3.into()]]
++}
++fn ratio(n: i64, d: i64) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++struct Fixture {
++    name: &'static str,
++    source: ExpressionField<2>,
++    identity: CoordinateField<2>,
++    qr: QrCoordinateField<2>,
++    horizon: DyadicInterval,
++    expected: BoxN<DyadicInterval, 2>,
++    segments: [usize; 2],
++}
++fn fixture(
++    name: &'static str,
++    outputs: Vec<Expr>,
++    horizon: DyadicInterval,
++    expected: [i64; 2],
++    segments: [usize; 2],
++) -> Fixture {
++    let p = ExpressionProgram::compile(
++        &outputs,
++        &[Y, T, X],
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    let source = ExpressionField::<2>::from_definition(
++        FieldDefinition {
++            source: p.definition().clone(),
++            time: T,
++            state: vec![X, Y],
++        },
++        &mut budget(),
++    )
++    .unwrap();
++    let identity = source
++        .in_coordinates(
++            CoordinateChange {
++                variables: vec![X, Y],
++                to_source: vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]],
++                from_source: vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]],
++                origin: vec![0.into(), 0.into()],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let qr = prepare(&source);
++    Fixture {
++        name,
++        source,
++        identity,
++        qr,
++        horizon,
++        expected: BoxN::new(expected.map(|x| d(x, x))).unwrap(),
++        segments,
++    }
++}
++fn fixtures() -> Vec<Fixture> {
++    let x = Expr::anonymous_symbol(X);
++    let y = Expr::anonymous_symbol(Y);
++    vec![
++        fixture(
++            "rotated_equilibrium",
++            vec![
++                Expr::real(ratio(-7, 25)) * x.clone() + Expr::real(ratio(24, 25)) * y.clone(),
++                Expr::real(ratio(24, 25)) * x + Expr::real(ratio(7, 25)) * y,
++            ],
++            DyadicInterval::point(7.into(), -3).unwrap(),
++            [0, 0],
++            [2, 1],
++        ),
++        fixture(
++            "constant_flow",
++            vec![Expr::int(2), Expr::int(1)],
++            d(1, 1),
++            [2, 1],
++            [1, 1],
++        ),
++    ]
++}
++fn prepare(source: &ExpressionField<2>) -> QrCoordinateField<2> {
++    source
++        .in_qr_coordinates(basis(), vec![0.into(), 0.into()], &mut budget())
++        .unwrap()
++}
++fn run(chart: &CoordinateField<2>, horizon: &DyadicInterval) -> CoordinateEvolution<2> {
++    let report = chart.integrate(
++        EvolutionRequest {
++            start: d(0, 0),
++            end: horizon.clone(),
++            initial: BoxN::new([d(0, 0), d(0, 0)]).unwrap(),
++        },
++        EvolutionOptions::default(),
++        &mut budget(),
++    );
++    assert!(
++        matches!(report.status(), CoordinateEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    report
++}
++fn check(f: &Fixture) {
++    for (chart, count) in [(&f.identity, f.segments[0]), (f.qr.chart(), f.segments[1])] {
++        let report = run(chart, &f.horizon);
++        assert_eq!(report.native().reached_time(), &f.horizon);
++        assert_eq!(report.segments().len(), count);
++        let output = report.source_end_enclosure().unwrap();
++        let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000);
++        // Independent exact source flows: equilibrium at zero, or (2t,t).
++        assert!(f.expected.subset_of(output, &mut arithmetic).unwrap());
++        for width in output.widths(&mut arithmetic).unwrap().unwrap() {
++            assert!(
++                width
++                    .compare_singleton(
++                        &DyadicInterval::point(1.into(), -48).unwrap(),
++                        &mut arithmetic
++                    )
++                    .unwrap()
++                    != std::cmp::Ordering::Greater
++            );
++        }
++        eprintln!(
++            "COMPLETED {} segments={} attempts={} output={:?}",
++            f.name,
++            count,
++            report.native().attempts().len(),
++            output
++        );
++    }
++}
++fn benchmarks(c: &mut Criterion) {
++    for f in fixtures() {
++        check(&f);
++        let mut group = c.benchmark_group(f.name);
++        group.bench_function("identity", |b| {
++            b.iter(|| {
++                drop(black_box(run(
++                    black_box(&f.identity),
++                    black_box(&f.horizon),
++                )))
++            })
++        });
++        group.bench_function("qr", |b| {
++            b.iter(|| {
++                drop(black_box(run(
++                    black_box(f.qr.chart()),
++                    black_box(&f.horizon),
++                )))
++            })
++        });
++        group.bench_function("prepare_qr", |b| {
++            b.iter(|| drop(black_box(prepare(black_box(&f.source)))))
++        });
++        group.finish();
++    }
++}
++criterion_group!(benches, benchmarks);
++criterion_main!(benches);
+diff --git a/crates/hyperdynamics/src/field/coordinates.rs b/crates/hyperdynamics/src/field/coordinates.rs
+index b42c7783f..866d496d5 100644
+--- a/crates/hyperdynamics/src/field/coordinates.rs
++++ b/crates/hyperdynamics/src/field/coordinates.rs
+@@ -299,3 +299,8 @@ impl<const N: usize> CoordinateStep<N> {
+ mod transition;
+ #[cfg(feature = "coordinate-transition")]
+ pub use transition::{CoordinateFieldTransition, CoordinateTransport, CoordinateTransportError};
++
++#[cfg(feature = "qr-coordinates")]
++mod qr;
++#[cfg(feature = "qr-coordinates")]
++pub use qr::{QrCoordinateField, QrFieldError};
+diff --git a/crates/hyperdynamics/src/field/coordinates/qr.rs b/crates/hyperdynamics/src/field/coordinates/qr.rs
+new file mode 100644
+index 000000000..61c00b481
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/coordinates/qr.rs
+@@ -0,0 +1,104 @@
++//! Source-bound QR frames consumed by existing field and transport operations.
++use super::*;
++use hypersolve::expression_program::{QrCoordinateError, QrCoordinateProgram, QrCoordinateRequest};
++
++/// Exact QR construction or original field-construction failure.
++#[derive(Clone, Debug)]
++pub enum QrFieldError {
++    /// Original shape, rank, orthogonality, reconstruction or resource failure.
++    Qr(QrCoordinateError),
++    /// Original field interpretation, graph or derivative failure.
++    Field(FieldError),
++}
++impl fmt::Display for QrFieldError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "QR field: {self:?}")
++    }
++}
++impl std::error::Error for QrFieldError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Qr(error) => Some(error),
++            Self::Field(error) => Some(error),
++        }
++    }
++}
++impl From<ExpressionError> for QrFieldError {
++    fn from(error: ExpressionError) -> Self {
++        Self::Field(error.into())
++    }
++}
++/// Exact QR factorization and its original/transformed vector field association.
++///
++/// The chart and its endpoint transport feed existing Picard, Taylor and finite-
++/// horizon APIs. A frame alone proves neither existence nor reduced enclosure
++/// width. The caller supplies the basis; automatic frame selection remains separate.
++/// Replay the original field, basis and origin, never serialized proof flags.
++#[derive(Clone, Debug)]
++pub struct QrCoordinateField<const N: usize> {
++    factorization: QrCoordinateProgram,
++    chart: CoordinateField<N>,
++}
++impl<const N: usize> QrCoordinateField<N> {
++    /// Exact input basis, R, norm decisions and reconstruction/orthogonality proofs.
++    pub fn factorization(&self) -> &QrCoordinateProgram {
++        &self.factorization
++    }
++    /// Retained source-bound chart consumed by native steps and direct transport.
++    pub fn chart(&self) -> &CoordinateField<N> {
++        &self.chart
++    }
++}
++impl<const N: usize> ExpressionField<N> {
++    /// Construct an orthonormal state chart from an exact square basis and origin.
++    ///
++    /// No inverse is supplied by the caller. Hypersolve certifies Q-transpose as
++    /// the inverse, retains QR reconstruction and supplies the transformed source.
++    /// One shared budget covers all stages; the original exact scalar/predicate,
++    /// payload, total-heap and within-scalar cancellation exclusions remain.
++    pub fn in_qr_coordinates(
++        &self,
++        basis: Vec<Vec<hyperreal::Real>>,
++        origin: Vec<hyperreal::Real>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<QrCoordinateField<N>, QrFieldError> {
++        budget.graph.charge(N)?;
++        let factorization = self
++            .data
++            .identity
++            .0
++            .source
++            .qr_coordinates(
++                QrCoordinateRequest {
++                    variables: self.data.identity.state().to_vec(),
++                    basis,
++                    origin,
++                },
++                &mut budget.graph,
++            )
++            .map_err(QrFieldError::Qr)?;
++        let transformation = factorization.coordinates().clone();
++        budget.graph.charge(N)?;
++        let field = Self::from_validated_source(
++            transformation.program().clone(),
++            self.data.identity.time(),
++            self.data.identity.state().to_vec(),
++            self.data.inputs.len(),
++            budget,
++        )
++        .map_err(QrFieldError::Field)?;
++        budget.graph.charge(1)?;
++        let result = QrCoordinateField {
++            factorization,
++            chart: CoordinateField {
++                data: Arc::new(CoordinateData {
++                    original: self.clone(),
++                    transformation,
++                    field,
++                }),
++            },
++        };
++        budget.graph.charge(0)?;
++        Ok(result)
++    }
++}
+diff --git a/crates/hyperdynamics/tests/field_coordinates.rs b/crates/hyperdynamics/tests/field_coordinates.rs
+index aed70756c..0d60fc9ee 100644
+--- a/crates/hyperdynamics/tests/field_coordinates.rs
++++ b/crates/hyperdynamics/tests/field_coordinates.rs
+@@ -499,3 +499,7 @@ use hyperdynamics::field::coordinates::CoordinateFieldDefinition;
+ #[cfg(feature = "coordinate-transition")]
+ #[path = "field_coordinates/transition.rs"]
+ mod transition;
++
++#[cfg(feature = "qr-coordinates")]
++#[path = "field_coordinates/qr.rs"]
++mod qr;
+diff --git a/crates/hyperdynamics/tests/field_coordinates/qr.rs b/crates/hyperdynamics/tests/field_coordinates/qr.rs
+new file mode 100644
+index 000000000..ab77a9ed2
+--- /dev/null
++++ b/crates/hyperdynamics/tests/field_coordinates/qr.rs
+@@ -0,0 +1,449 @@
++use super::*;
++use hyperdynamics::field::coordinates::{QrCoordinateField, QrFieldError};
++use hyperreal::Real;
++fn basis() -> Vec<Vec<Real>> {
++    vec![vec![3.into(), (-4).into()], vec![4.into(), 3.into()]]
++}
++fn ratio(n: i64, d: i64) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++fn rotated() -> ExpressionField<2> {
++    let x = Expr::anonymous_symbol(X);
++    let y = Expr::anonymous_symbol(Y);
++    field(
++        &[
++            Expr::real(ratio(-7, 25)) * x.clone() + Expr::real(ratio(24, 25)) * y.clone(),
++            Expr::real(ratio(24, 25)) * x + Expr::real(ratio(7, 25)) * y,
++        ],
++        vec![X, Y],
++    )
++}
++#[test]
++fn qr_frame_derivatives_follow_independent_exact_diagonalization() {
++    let f = rotated();
++    let qr = f
++        .in_qr_coordinates(basis(), vec![0.into(), 0.into()], &mut budget())
++        .unwrap();
++    for x in -3..=3 {
++        for y in -3..=3 {
++            let values = qr
++                .chart()
++                .transformed_field()
++                .image(
++                    &d(0, 0),
++                    &BoxN::new([d(x, x), d(y, y)]).unwrap(),
++                    &mut budget(),
++                )
++                .unwrap();
++            assert_eq!(
++                qr.chart().transformed_field().identity().source().variables,
++                vec![Y, X, T]
++            );
++            assert_eq!(
++                qr.factorization()
++                    .coordinates()
++                    .program()
++                    .eval_real(
++                        &[y.into(), x.into(), 0.into()],
++                        &mut ExpressionBudget::new(1_000_000, 100_000_000)
++                    )
++                    .unwrap(),
++                vec![Real::from(x), Real::from(-y)]
++            );
++            for (lane, expected) in values.lanes().unwrap().iter().zip([d(x, x), d(-y, -y)]) {
++                tight(lane, &expected);
++            }
++        }
++    }
++    let jac = qr
++        .chart()
++        .transformed_field()
++        .jacobian(
++            &d(0, 0),
++            &BoxN::new([d(-1, 1), d(-1, 1)]).unwrap(),
++            &mut budget(),
++        )
++        .unwrap();
++    for (row, expected) in jac
++        .rows()
++        .unwrap()
++        .iter()
++        .zip([[d(1, 1), d(0, 0)], [d(0, 0), d(-1, -1)]])
++    {
++        for (lane, point) in row.iter().zip(expected) {
++            tight(lane, &point);
++        }
++    }
++    assert_eq!(
++        qr.factorization().coordinates().program().definition(),
++        qr.chart().transformation().program().definition()
++    );
++    assert_eq!(qr.chart().original_field().identity(), f.identity());
++}
++#[test]
++fn qr_frame_certifies_a_long_step_and_its_endpoint_is_transported() {
++    use hyperdynamics::field::picard::PicardFailure;
++    let f = rotated();
++    let qr = f
++        .in_qr_coordinates(basis(), vec![0.into(), 0.into()], &mut budget())
++        .unwrap();
++    let end = DyadicInterval::point(7.into(), -3).unwrap();
++    // Both attempts start from exactly the same singleton zero; no changed
++    // input-set/width contract accounts for the contraction difference.
++    let input = BoxN::new([d(0, 0), d(0, 0)]).unwrap();
++    let proposal = PicardProposal {
++        start: d(0, 0),
++        end: end.clone(),
++        initial: input.clone(),
++        candidate: input,
++    };
++    let old = f.certify_step(proposal.clone(), &mut budget());
++    assert!(matches!(
++        old.status(),
++        PicardStatus::Rejected(PicardFailure::ContractionNotCertified)
++    ));
++    let step = qr.chart().certify_step(proposal, &mut budget());
++    assert!(
++        matches!(step.status(), CoordinateStatus::Certified),
++        "{:?}",
++        step.status()
++    );
++    assert_eq!(
++        step.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(0, 0), d(0, 0)])
++    );
++    tight(step.native().evidence().contraction().unwrap(), &end);
++    let other = f
++        .in_qr_coordinates(
++            vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]],
++            vec![1.into(), (-2).into()],
++            &mut budget(),
++        )
++        .unwrap();
++    let transported = qr
++        .chart()
++        .transition_to(other.chart(), &mut budget())
++        .unwrap()
++        .enclose(
++            step.native().end_enclosure().unwrap().clone(),
++            &mut budget(),
++        )
++        .unwrap();
++    assert_eq!(transported.enclosure().lanes(), Some(&[d(-1, -1), d(2, 2)]));
++    let next = other.chart().certify_step(
++        PicardProposal {
++            start: end,
++            end: d(1, 1),
++            initial: transported.enclosure().clone(),
++            candidate: transported.enclosure().clone(),
++        },
++        &mut budget(),
++    );
++    assert!(matches!(next.status(), CoordinateStatus::Certified));
++    assert_eq!(
++        next.source_end_enclosure().unwrap().lanes(),
++        Some(&[d(0, 0), d(0, 0)])
++    );
++}
++fn constant_chart() -> QrCoordinateField<2> {
++    field(&[Expr::int(2), Expr::int(1)], vec![X, Y])
++        .in_qr_coordinates(basis(), vec![10.into(), (-3).into()], &mut budget())
++        .unwrap()
++}
++#[test]
++fn uncertain_initial_set_empty_unit_and_tight_candidate_rejection() {
++    let qr = constant_chart();
++    let tight_candidate = PicardProposal {
++        start: d(0, 0),
++        end: d(1, 1),
++        initial: BoxN::new([d(-1, 1), d(-1, 1)]).unwrap(),
++        candidate: BoxN::new([d(-1, 3), d(-2, 1)]).unwrap(),
++    };
++    assert!(matches!(
++        qr.chart()
++            .certify_step(tight_candidate.clone(), &mut budget())
++            .status(),
++        CoordinateStatus::Rejected(
++            hyperdynamics::field::picard::PicardFailure::SelfMapNotCertified
++        )
++    ));
++    let step = qr.chart().certify_step(
++        PicardProposal {
++            candidate: BoxN::new([d(-2, 4), d(-3, 2)]).unwrap(),
++            ..tight_candidate
++        },
++        &mut budget(),
++    );
++    assert!(
++        matches!(step.status(), CoordinateStatus::Certified),
++        "{:?}",
++        step.status()
++    );
++    // Source x(1)=12+(3a-4b)/5, y(1)=-2+(4a+3b)/5 for a,b in [-1,1].
++    let expected = [(53, 67), (-17, -3)].map(|(l, u)| {
++        (
++            hyperreal::Rational::from(l) / hyperreal::Rational::from(5),
++            hyperreal::Rational::from(u) / hyperreal::Rational::from(5),
++        )
++    });
++    for (lane, (low, high)) in step
++        .source_end_enclosure()
++        .unwrap()
++        .lanes()
++        .unwrap()
++        .iter()
++        .zip(expected)
++    {
++        let mut scalar = hyperinterval::DyadicBudget::new(16384, 1_000_000_000);
++        let bounds = lane.to_rational(&mut scalar).unwrap();
++        assert!(bounds.contains_point(&low));
++        assert!(bounds.contains_point(&high));
++    }
++    let empty = qr.chart().certify_step(
++        PicardProposal {
++            initial: BoxN::empty().unwrap(),
++            ..proposal()
++        },
++        &mut budget(),
++    );
++    assert!(matches!(empty.status(), CoordinateStatus::Empty));
++    let unit = field::<0>(&[], vec![])
++        .in_qr_coordinates(vec![], vec![], &mut budget())
++        .unwrap();
++    let step = unit.chart().certify_step(
++        PicardProposal {
++            start: d(0, 0),
++            end: d(1, 1),
++            initial: BoxN::new([]).unwrap(),
++            candidate: BoxN::new([]).unwrap(),
++        },
++        &mut budget(),
++    );
++    assert!(matches!(step.status(), CoordinateStatus::Certified));
++    assert!(!step.source_end_enclosure().unwrap().is_empty());
++}
++#[test]
++fn field_construction_final_cutoff_and_original_errors_are_preserved() {
++    let f = field::<2>(&[Expr::int(2), Expr::int(1)], vec![X, Y]);
++    let mut full = budget();
++    f.in_qr_coordinates(basis(), vec![10.into(), (-3).into()], &mut full)
++        .unwrap();
++    let used = EnclosurePolicy::default().graph_work - full.remaining_graph_work();
++    let mut short = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: used - 1,
++        ..EnclosurePolicy::default()
++    });
++    assert!(matches!(
++        f.in_qr_coordinates(basis(), vec![10.into(), (-3).into()], &mut short),
++        Err(QrFieldError::Field(
++            hyperdynamics::field::FieldError::Expression(
++                hypersolve::expression_program::ExpressionError::WorkExhausted
++            )
++        ))
++    ));
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: used,
++        ..EnclosurePolicy::default()
++    });
++    f.in_qr_coordinates(basis(), vec![10.into(), (-3).into()], &mut exact)
++        .unwrap();
++    assert_eq!(exact.remaining_graph_work(), 0);
++    assert!(matches!(
++        f.in_qr_coordinates(
++            vec![vec![0.into(), 0.into()], vec![0.into(), 0.into()]],
++            vec![0.into(), 0.into()],
++            &mut budget()
++        ),
++        Err(QrFieldError::Qr(
++            hypersolve::expression_program::QrCoordinateError::DependentColumn { .. }
++        ))
++    ));
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut b = budget();
++    b.set_cancellation(Some(token));
++    assert!(
++        f.in_qr_coordinates(basis(), vec![0.into(), 0.into()], &mut b)
++            .is_err()
++    );
++    f.in_qr_coordinates(basis(), vec![0.into(), 0.into()], &mut budget())
++        .unwrap();
++}
++
++fn tight(lane: &DyadicInterval, expected: &DyadicInterval) {
++    let mut work = hyperinterval::DyadicBudget::new(16384, 1_000_000_000);
++    assert!(expected.subset_of(lane, &mut work).unwrap());
++    assert!(
++        lane.width(&mut work)
++            .unwrap()
++            .compare_singleton(&DyadicInterval::point(1.into(), -48).unwrap(), &mut work)
++            .unwrap()
++            != std::cmp::Ordering::Greater
++    );
++}
++#[cfg(feature = "taylor-flow")]
++#[test]
++fn qr_generated_taylor_endpoints_reframe_and_continue() {
++    use hyperdynamics::field::taylor_flow::FlowTaylorStatus;
++    let qr = constant_chart();
++    let f = qr
++        .chart()
++        .transformed_field()
++        .flow_taylor(2, &mut budget())
++        .unwrap();
++    let first = f.certify_step(
++        PicardProposal {
++            start: d(0, 0),
++            end: d(1, 1),
++            initial: BoxN::new([d(-1, 1), d(-1, 1)]).unwrap(),
++            candidate: BoxN::new([d(-2, 4), d(-3, 2)]).unwrap(),
++        },
++        &mut budget(),
++    );
++    assert!(matches!(first.status(), FlowTaylorStatus::Certified));
++    let next = qr
++        .chart()
++        .original_field()
++        .in_qr_coordinates(basis(), vec![12.into(), (-2).into()], &mut budget())
++        .unwrap();
++    let transport = qr
++        .chart()
++        .transition_to(next.chart(), &mut budget())
++        .unwrap()
++        .enclose(first.end_enclosure().unwrap().clone(), &mut budget())
++        .unwrap();
++    let second = next
++        .chart()
++        .transformed_field()
++        .flow_taylor(2, &mut budget())
++        .unwrap()
++        .certify_step(
++            PicardProposal {
++                start: d(1, 1),
++                end: d(2, 2),
++                initial: transport.enclosure().clone(),
++                candidate: BoxN::new([d(-2, 4), d(-3, 2)]).unwrap(),
++            },
++            &mut budget(),
++        );
++    assert!(
++        matches!(second.status(), FlowTaylorStatus::Certified),
++        "{:?}",
++        second.status()
++    );
++    let physical = next
++        .chart()
++        .source_enclosure(second.end_enclosure().unwrap(), &mut budget())
++        .unwrap();
++    for (lane, (l, u)) in physical.lanes().unwrap().iter().zip([(63, 77), (-12, 2)]) {
++        let range = lane
++            .to_rational(&mut hyperinterval::DyadicBudget::new(16384, 1_000_000_000))
++            .unwrap();
++        assert!(
++            range.contains_point(&(hyperreal::Rational::from(l) / hyperreal::Rational::from(5)))
++        );
++        assert!(
++            range.contains_point(&(hyperreal::Rational::from(u) / hyperreal::Rational::from(5)))
++        );
++    }
++}
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn qr_evidence_getters_do_not_repeat_predicates() {
++    use hyperreal::dispatch_trace;
++    let qr = constant_chart();
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| {
++        let f = qr.factorization();
++        std::hint::black_box(f.request());
++        std::hint::black_box(f.upper());
++        std::hint::black_box(f.squared_norms());
++        std::hint::black_box(f.norm_evidence());
++        std::hint::black_box(f.reconstruction_evidence());
++        std::hint::black_box(f.coordinates());
++        std::hint::black_box(qr.chart());
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
++#[cfg(feature = "serde")]
++#[test]
++fn qr_field_replays_in_fresh_processes_without_serialized_certificates() {
++    const KEY: &str = "HYPERDYNAMICS_QR_REPLAY";
++    if let Ok(data) = std::env::var(KEY) {
++        let (definition, request): (
++            FieldDefinition,
++            hypersolve::expression_program::QrCoordinateRequest,
++        ) = serde_json::from_str(&data).unwrap();
++        let f = ExpressionField::<2>::from_definition(definition, &mut budget()).unwrap();
++        let mut invalid = request.basis.clone();
++        for row in &mut invalid {
++            row[1] = row[0].clone();
++        }
++        assert!(matches!(
++            f.in_qr_coordinates(invalid, request.origin.clone(), &mut budget()),
++            Err(QrFieldError::Qr(
++                hypersolve::expression_program::QrCoordinateError::DependentColumn { .. }
++            ))
++        ));
++        let mut work = budget();
++        let qr = f
++            .in_qr_coordinates(request.basis, request.origin, &mut work)
++            .unwrap();
++        let step = qr.chart().certify_step(
++            PicardProposal {
++                start: d(0, 0),
++                end: d(1, 1),
++                initial: BoxN::new([d(0, 0), d(0, 0)]).unwrap(),
++                candidate: BoxN::new([d(-1, 3), d(-2, 1)]).unwrap(),
++            },
++            &mut work,
++        );
++        assert!(matches!(step.status(), CoordinateStatus::Certified));
++        println!(
++            "QR {:?} STEP {:?} GRAPH {} SCALAR {}",
++            qr,
++            step,
++            work.remaining_graph_work(),
++            work.remaining_scalar_work()
++        );
++        return;
++    }
++    let qr = constant_chart();
++    let id = qr.chart().original_field().identity();
++    let definition = FieldDefinition {
++        source: id.source().clone(),
++        time: id.time(),
++        state: id.state().to_vec(),
++    };
++    let data = serde_json::to_string(&(definition, qr.factorization().request())).unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "qr::qr_field_replays_in_fresh_processes_without_serialized_certificates",
++                "--nocapture",
++            ])
++            .env(KEY, &data)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{} {}",
++            String::from_utf8_lossy(&child.stdout),
++            String::from_utf8_lossy(&child.stderr)
++        );
++        let out = String::from_utf8(child.stdout).unwrap();
++        let line = out
++            .lines()
++            .find(|line| line.starts_with("QR "))
++            .unwrap()
++            .to_owned();
++        if let Some(old) = previous {
++            assert_eq!(line, old);
++        }
++        previous = Some(line);
++    }
++}
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index 596021b5e..f5289ca9b 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in exact QR coordinate construction with orthogonality and reconstruction evidence.
++
+ - Add opt-in exact source-bound coordinate transitions for direct chart transport.
+ 
+ - Add opt-in polynomial output maps over existing Taylor models, retaining exact
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 76091d6b8..a9a7ac597 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -44,6 +44,7 @@ default = []
+ # Owned expression graphs; validated dynamics integration remains experimental.
+ expression-program = []
+ coordinate-program = ["expression-program"]
++qr-coordinates = ["coordinate-program"]
+ coordinate-transition = ["coordinate-program"]
+ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 0adab9bd4..697321428 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -679,3 +679,5 @@ regenerate the evidence. Graph limits do not bound exact scalar/predicate payloa
+ work, total heap bytes or cancellation inside one scalar/predicate stage.
+ 
+ The opt-in `coordinate-transition` feature composes two validated charts of the same source into an exact affine map, retaining both inverse proofs. Interval evaluation can then project that map without first projecting through source coordinates.
++
++The opt-in `qr-coordinates` feature constructs exact unpivoted QR frames from a square basis. It retains positive residual-norm decisions, the source-bound orthogonality proof and all reconstruction residual decisions; dependent and undecided columns remain distinct failures.
+diff --git a/crates/hypersolve/src/expression_program.rs b/crates/hypersolve/src/expression_program.rs
+index dd25139dc..59e21f8bf 100644
+--- a/crates/hypersolve/src/expression_program.rs
++++ b/crates/hypersolve/src/expression_program.rs
+@@ -635,3 +635,6 @@ pub use taylor::{
+ 
+ #[cfg(feature = "coordinate-transition")]
+ pub use coordinates::{CoordinateTransition, CoordinateTransitionError};
++
++#[cfg(feature = "qr-coordinates")]
++pub use coordinates::{QrCoordinateError, QrCoordinateProgram, QrCoordinateRequest};
+diff --git a/crates/hypersolve/src/expression_program/coordinates.rs b/crates/hypersolve/src/expression_program/coordinates.rs
+index fd3a99425..4fda6a0b6 100644
+--- a/crates/hypersolve/src/expression_program/coordinates.rs
++++ b/crates/hypersolve/src/expression_program/coordinates.rs
+@@ -331,3 +331,8 @@ fn affine_row(
+ mod transition;
+ #[cfg(feature = "coordinate-transition")]
+ pub use transition::{CoordinateTransition, CoordinateTransitionError};
++
++#[cfg(feature = "qr-coordinates")]
++mod qr;
++#[cfg(feature = "qr-coordinates")]
++pub use qr::{QrCoordinateError, QrCoordinateProgram, QrCoordinateRequest};
+diff --git a/crates/hypersolve/src/expression_program/coordinates/qr.rs b/crates/hypersolve/src/expression_program/coordinates/qr.rs
+new file mode 100644
+index 000000000..92abaeb8b
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/coordinates/qr.rs
+@@ -0,0 +1,275 @@
++//! Exact unpivoted QR construction, checked by source-bound chart admission.
++use super::*;
++
++/// Replay input for an exact orthonormal frame with positive QR diagonal.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct QrCoordinateRequest {
++    /// Ordered source variables reinterpreted as frame coordinates.
++    pub variables: Vec<SymbolId>,
++    /// Finite square basis M in row-major order. No inverse is required.
++    pub basis: Vec<Vec<Real>>,
++    /// Exact original-coordinate origin of the new frame.
++    pub origin: Vec<Real>,
++}
++
++/// Invalid, dependent, undecided or exhausted frame construction.
++#[derive(Clone, Debug)]
++pub enum QrCoordinateError {
++    /// An exact zero residual norm proves that this column is dependent.
++    DependentColumn {
++        /// Zero-based column in the unpivoted order.
++        column: usize,
++        /// Retained strict zero decision.
++        outcome: PredicateOutcome<Sign>,
++    },
++    /// A residual squared norm was not proved strictly positive.
++    NormNotCertified {
++        /// Zero-based column being normalized.
++        column: usize,
++        /// Exact squared norm consumed by the predicate.
++        squared_norm: Real,
++        /// Original outcome; unknown never means dependence.
++        outcome: PredicateOutcome<Sign>,
++    },
++    /// A reconstruction residual is provably nonzero.
++    ReconstructionMismatch {
++        /// Matrix row.
++        row: usize,
++        /// Matrix column.
++        column: usize,
++        /// Original nonzero decision for Q*R-M.
++        outcome: PredicateOutcome<Sign>,
++    },
++    /// A reconstruction residual could not be proved exactly zero.
++    ReconstructionUndecided {
++        /// Matrix row.
++        row: usize,
++        /// Matrix column.
++        column: usize,
++        /// Original undecided or inadmissible outcome.
++        outcome: PredicateOutcome<Sign>,
++    },
++    /// Original shape, binding, strict inverse, graph or exact scalar diagnostic.
++    Coordinate(CoordinateError),
++}
++impl fmt::Display for QrCoordinateError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "exact QR coordinates: {self:?}")
++    }
++}
++impl std::error::Error for QrCoordinateError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Coordinate(error) => Some(error),
++            _ => None,
++        }
++    }
++}
++impl From<CoordinateError> for QrCoordinateError {
++    fn from(error: CoordinateError) -> Self {
++        Self::Coordinate(error)
++    }
++}
++impl From<ExpressionError> for QrCoordinateError {
++    fn from(error: ExpressionError) -> Self {
++        Self::Coordinate(error.into())
++    }
++}
++impl From<Problem> for QrCoordinateError {
++    fn from(error: Problem) -> Self {
++        Self::Coordinate(CoordinateError::Scalar(error))
++    }
++}
++
++#[derive(Debug)]
++struct QrData {
++    request: QrCoordinateRequest,
++    coordinates: CoordinateProgram,
++    upper: Vec<Vec<Real>>,
++    squared_norms: Vec<Real>,
++    norm_evidence: Vec<PredicateOutcome<Sign>>,
++    reconstruction_evidence: Vec<PredicateOutcome<Sign>>,
++}
++/// Exact M=Q*R with upper-triangular R and positive diagonal, bound to a source.
++///
++/// Unpivoted modified Gram-Schmidt constructs the frame. Strict norm decisions
++/// precede normalization; the existing coordinate verifier independently proves
++/// Q-transpose*Q=I, and every Q*R-M residual is checked under STRICT. Reflections
++/// are allowed: orthogonal does not imply a positive determinant.
++///
++/// Replay the source and request; neither this type nor its proof flags can be
++/// deserialized. Finite graph work/entry limits cover structural construction and
++/// predicate-call setup, not exact scalar arithmetic/refinement, predicate
++/// internals, scalar payload lifecycle, total heap or within-scalar cancellation.
++/// No universal rank decision or practical bound is promised for arbitrary Real
++/// inputs. A positive-dimensional dependent basis does not produce a partial frame.
++#[derive(Clone, Debug)]
++pub struct QrCoordinateProgram(Arc<QrData>);
++impl QrCoordinateProgram {
++    /// Original basis, origin and variable order.
++    pub fn request(&self) -> &QrCoordinateRequest {
++        &self.0.request
++    }
++    /// Source-bound Q chart with strictly certified inverse Q-transpose.
++    pub fn coordinates(&self) -> &CoordinateProgram {
++        &self.0.coordinates
++    }
++    /// Exact row-major upper-triangular R; lower entries are structural zero.
++    pub fn upper(&self) -> &[Vec<Real>] {
++        &self.0.upper
++    }
++    /// Exact residual squared norms before each column normalization.
++    pub fn squared_norms(&self) -> &[Real] {
++        &self.0.squared_norms
++    }
++    /// Strict positive decisions in column order.
++    pub fn norm_evidence(&self) -> &[PredicateOutcome<Sign>] {
++        &self.0.norm_evidence
++    }
++    /// Strict zero decisions for Q*R-M in row-major order.
++    pub fn reconstruction_evidence(&self) -> &[PredicateOutcome<Sign>] {
++        &self.0.reconstruction_evidence
++    }
++}
++impl ExpressionProgram {
++    /// Construct and certify exact QR coordinates without a caller-authored inverse.
++    ///
++    /// Shape checks precede the finite unpivoted column recurrence. Binding and
++    /// inverse admission reuse `change_coordinates`; reconstruction checks and the
++    /// final cancellation check precede publication. No term is rounded or dropped.
++    /// This builds a chart, not an ODE proof or an adaptive frame-selection rule.
++    pub fn qr_coordinates(
++        &self,
++        request: QrCoordinateRequest,
++        budget: &mut ExpressionBudget,
++    ) -> Result<QrCoordinateProgram, QrCoordinateError> {
++        budget.charge(0)?;
++        let n = request.variables.len();
++        shape("outputs", None, self.definition().outputs.len(), n)?;
++        shape("origin", None, request.origin.len(), n)?;
++        shape("basis", None, request.basis.len(), n)?;
++        for (row, values) in request.basis.iter().enumerate() {
++            budget.charge(1)?;
++            shape("basis", Some(row), values.len(), n)?;
++        }
++        let square = n.checked_mul(n).ok_or(ExpressionError::SizeExhausted)?;
++        budget.check_entries(&[square, square, square, square, n, n, n, n])?;
++        budget.charge(square)?;
++        let mut upper = vec![vec![Real::zero(); n]; n];
++        let mut columns: Vec<Vec<Real>> = Vec::with_capacity(n);
++        let mut squared_norms = Vec::with_capacity(n);
++        let mut norm_evidence = Vec::with_capacity(n);
++        for column in 0..n {
++            budget.charge(n)?;
++            let mut residual: Vec<_> = request.basis.iter().map(|r| r[column].clone()).collect();
++            for (previous, q) in columns.iter().enumerate() {
++                budget.charge(n)?;
++                let coefficient = Real::sum_products(q, &residual)?;
++                for (value, direction) in residual.iter_mut().zip(q) {
++                    budget.charge(1)?;
++                    *value = &*value - &coefficient * direction;
++                }
++                upper[previous][column] = coefficient;
++            }
++            budget.charge(n)?;
++            let squared = Real::sum_products(&residual, &residual)?;
++            budget.charge(1)?;
++            let outcome = classify_real_sign(&squared, PredicatePolicy::STRICT);
++            match outcome {
++                PredicateOutcome::Decided {
++                    value: Sign::Positive,
++                    certainty: Certainty::Exact | Certainty::Filtered,
++                    ..
++                } => {}
++                PredicateOutcome::Decided {
++                    value: Sign::Zero,
++                    certainty: Certainty::Exact | Certainty::Filtered,
++                    ..
++                } => return Err(QrCoordinateError::DependentColumn { column, outcome }),
++                _ => {
++                    return Err(QrCoordinateError::NormNotCertified {
++                        column,
++                        squared_norm: squared,
++                        outcome,
++                    });
++                }
++            }
++            budget.charge(2)?;
++            squared_norms.push(squared.clone());
++            norm_evidence.push(outcome);
++            let length = squared.sqrt()?;
++            let inverse = length.clone().inverse()?;
++            for value in &mut residual {
++                budget.charge(1)?;
++                *value = &*value * &inverse;
++            }
++            upper[column][column] = length;
++            columns.push(residual);
++        }
++        budget.charge(square)?;
++        let matrix: Vec<Vec<Real>> = (0..n)
++            .map(|row| columns.iter().map(|column| column[row].clone()).collect())
++            .collect();
++        budget.charge(n)?;
++        budget.charge(n)?;
++        let coordinates = self.change_coordinates(
++            CoordinateChange {
++                variables: request.variables.clone(),
++                to_source: matrix,
++                from_source: columns,
++                origin: request.origin.clone(),
++            },
++            budget,
++        )?;
++        budget.check_entries(&[square, square, n, n])?;
++        let mut reconstruction_evidence = Vec::with_capacity(square);
++        for (row, values) in coordinates.change().to_source.iter().enumerate() {
++            budget.charge(1)?;
++            for column in 0..n {
++                budget.charge(n)?;
++                let axis: Vec<_> = upper.iter().map(|r| r[column].clone()).collect();
++                budget.charge(n)?;
++                let residual = Real::sum_products(values, &axis)? - &request.basis[row][column];
++                budget.charge(1)?;
++                let outcome = classify_real_sign(&residual, PredicatePolicy::STRICT);
++                match outcome {
++                    PredicateOutcome::Decided {
++                        value: Sign::Zero,
++                        certainty: Certainty::Exact | Certainty::Filtered,
++                        ..
++                    } => reconstruction_evidence.push(outcome),
++                    PredicateOutcome::Decided {
++                        value: Sign::Positive | Sign::Negative,
++                        certainty: Certainty::Exact | Certainty::Filtered,
++                        ..
++                    } => {
++                        return Err(QrCoordinateError::ReconstructionMismatch {
++                            row,
++                            column,
++                            outcome,
++                        });
++                    }
++                    _ => {
++                        return Err(QrCoordinateError::ReconstructionUndecided {
++                            row,
++                            column,
++                            outcome,
++                        });
++                    }
++                }
++            }
++        }
++        budget.charge(1)?;
++        let result = QrCoordinateProgram(Arc::new(QrData {
++            request,
++            coordinates,
++            upper,
++            squared_norms,
++            norm_evidence,
++            reconstruction_evidence,
++        }));
++        budget.charge(0)?;
++        Ok(result)
++    }
++}
+diff --git a/crates/hypersolve/tests/program_qr_coordinates.rs b/crates/hypersolve/tests/program_qr_coordinates.rs
+new file mode 100644
+index 000000000..6ebc1a258
+--- /dev/null
++++ b/crates/hypersolve/tests/program_qr_coordinates.rs
+@@ -0,0 +1,274 @@
++#![cfg(feature = "qr-coordinates")]
++use hyperreal::Real;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram, QrCoordinateRequest},
++};
++fn budget() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++#[test]
++fn exact_rotated_frame_is_built_without_an_authored_inverse() {
++    let [x, y] = [SymbolId(0), SymbolId(1)];
++    let source =
++        ExpressionProgram::compile(&[Expr::int(1), Expr::int(0)], &[y, x], &mut budget()).unwrap();
++    let qr = source
++        .qr_coordinates(
++            QrCoordinateRequest {
++                variables: vec![x, y],
++                basis: vec![vec![3.into(), (-4).into()], vec![4.into(), 3.into()]],
++                origin: vec![0.into(), 0.into()],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++    let fifth = (Real::one() / Real::from(5)).unwrap();
++    assert_eq!(
++        qr.coordinates().change().to_source,
++        vec![
++            vec![&fifth * Real::from(3), &fifth * Real::from(-4)],
++            vec![&fifth * Real::from(4), &fifth * Real::from(3)]
++        ]
++    );
++    assert_eq!(
++        qr.upper(),
++        &[
++            vec![Real::from(5), Real::zero()],
++            vec![Real::zero(), Real::from(5)]
++        ]
++    );
++    assert_eq!(qr.reconstruction_evidence().len(), 4);
++}
++fn source(n: usize) -> ExpressionProgram {
++    let variables: Vec<_> = (0..n)
++        .map(|i| SymbolId(u32::try_from(i).unwrap()))
++        .collect();
++    ExpressionProgram::compile(&vec![Expr::int(0); n], &variables, &mut budget()).unwrap()
++}
++fn request(basis: Vec<Vec<Real>>) -> QrCoordinateRequest {
++    let n = basis.len();
++    QrCoordinateRequest {
++        variables: (0..n)
++            .map(|i| SymbolId(u32::try_from(i).unwrap()))
++            .collect(),
++        basis,
++        origin: vec![Real::zero(); n],
++    }
++}
++fn ratio(n: i64, d: i64) -> Real {
++    (Real::from(n) / Real::from(d)).unwrap()
++}
++#[test]
++fn three_dimensional_decomposition_has_independent_exact_expected_factors() {
++    let basis = vec![
++        vec![12.into(), (-51).into(), 4.into()],
++        vec![6.into(), 167.into(), (-68).into()],
++        vec![(-4).into(), 24.into(), (-41).into()],
++    ];
++    let qr = source(3)
++        .qr_coordinates(request(basis), &mut budget())
++        .unwrap();
++    assert_eq!(
++        qr.coordinates().change().to_source,
++        vec![
++            vec![ratio(6, 7), ratio(-69, 175), ratio(-58, 175)],
++            vec![ratio(3, 7), ratio(158, 175), ratio(6, 175)],
++            vec![ratio(-2, 7), ratio(6, 35), ratio(-33, 35)]
++        ]
++    );
++    assert_eq!(
++        qr.upper(),
++        &[[14, 21, -14], [0, 175, -70], [0, 0, 35]].map(|row| row.map(Real::from).to_vec())
++    );
++    assert_eq!(
++        qr.squared_norms(),
++        &[Real::from(196), Real::from(30625), Real::from(1225)]
++    );
++    use hyperlimit::{Certainty, PredicateOutcome, Sign};
++    for proof in qr.norm_evidence() {
++        assert!(matches!(
++            proof,
++            PredicateOutcome::Decided {
++                value: Sign::Positive,
++                certainty: Certainty::Exact | Certainty::Filtered,
++                ..
++            }
++        ));
++    }
++    for proof in qr
++        .reconstruction_evidence()
++        .iter()
++        .chain(qr.coordinates().inverse_evidence())
++    {
++        assert!(matches!(
++            proof,
++            PredicateOutcome::Decided {
++                value: Sign::Zero,
++                certainty: Certainty::Exact | Certainty::Filtered,
++                ..
++            }
++        ));
++    }
++    assert_eq!(qr.norm_evidence().len(), 3);
++    assert_eq!(qr.reconstruction_evidence().len(), 9);
++}
++#[test]
++fn algebraic_reflections_near_dependence_and_unit_dimension_keep_exact_meaning() {
++    let qr = source(2)
++        .qr_coordinates(
++            request(vec![vec![1.into(), 1.into()], vec![1.into(), (-1).into()]]),
++            &mut budget(),
++        )
++        .unwrap();
++    let s = Real::from(2).sqrt().unwrap();
++    let h = (&s / Real::from(2)).unwrap();
++    assert_eq!(
++        qr.coordinates().change().to_source,
++        vec![vec![h.clone(), h.clone()], vec![h.clone(), -h]]
++    );
++    assert_eq!(qr.upper(), &[vec![s.clone(), 0.into()], vec![0.into(), s]]);
++    let qr = source(1)
++        .qr_coordinates(request(vec![vec![(-7).into()]]), &mut budget())
++        .unwrap();
++    assert_eq!(
++        qr.coordinates().change().to_source,
++        vec![vec![Real::from(-1)]]
++    );
++    assert_eq!(qr.upper(), &[vec![Real::from(7)]]);
++    let tiny = (Real::one() / Real::from(1_u128 << 100)).unwrap();
++    let qr = source(2)
++        .qr_coordinates(
++            request(vec![vec![1.into(), 1.into()], vec![0.into(), tiny.clone()]]),
++            &mut budget(),
++        )
++        .unwrap();
++    assert_eq!(
++        qr.coordinates().change().to_source,
++        vec![
++            vec![Real::one(), Real::zero()],
++            vec![Real::zero(), Real::one()]
++        ]
++    );
++    assert_eq!(
++        qr.upper(),
++        &[vec![Real::one(), Real::one()], vec![Real::zero(), tiny]]
++    );
++    let qr = source(0)
++        .qr_coordinates(request(vec![]), &mut budget())
++        .unwrap();
++    assert!(qr.upper().is_empty());
++    assert!(qr.norm_evidence().is_empty());
++    assert!(qr.reconstruction_evidence().is_empty());
++    assert!(
++        qr.coordinates()
++            .program()
++            .eval_real(&[], &mut budget())
++            .unwrap()
++            .is_empty()
++    );
++}
++#[test]
++fn dependent_unknown_and_malformed_inputs_have_distinct_outcomes() {
++    use hypersolve::expression_program::{
++        CoordinateError, ExpressionError, QrCoordinateError as E,
++    };
++    let p = source(2);
++    assert!(matches!(
++        p.qr_coordinates(
++            request(vec![vec![1.into(), 2.into()], vec![2.into(), 4.into()]]),
++            &mut budget()
++        ),
++        Err(E::DependentColumn { column: 1, .. })
++    ));
++    assert!(matches!(
++        p.qr_coordinates(
++            request(vec![vec![0.into(), 2.into()], vec![0.into(), 4.into()]]),
++            &mut budget()
++        ),
++        Err(E::DependentColumn { column: 0, .. })
++    ));
++    assert!(matches!(
++        p.qr_coordinates(
++            request(vec![vec![1.into()], vec![0.into(), 1.into()]]),
++            &mut budget()
++        ),
++        Err(E::Coordinate(CoordinateError::Shape {
++            field: "basis",
++            row: Some(0),
++            ..
++        }))
++    ));
++    let mut invalid = request(vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]]);
++    invalid.origin.pop();
++    assert!(matches!(
++        p.qr_coordinates(invalid, &mut budget()),
++        Err(E::Coordinate(CoordinateError::Shape {
++            field: "origin",
++            ..
++        }))
++    ));
++    let mut invalid = request(vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]]);
++    invalid.variables[1] = invalid.variables[0];
++    assert!(matches!(
++        p.qr_coordinates(invalid, &mut budget()),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::DuplicateVariable(_)
++        )))
++    ));
++    let mut invalid = request(vec![vec![1.into(), 0.into()], vec![0.into(), 1.into()]]);
++    invalid.variables[1] = SymbolId(99);
++    assert!(matches!(
++        p.qr_coordinates(invalid, &mut budget()),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::UnboundVariable(_)
++        )))
++    ));
++    let unresolved = (Real::e() + Real::one()).sin()
++        - Real::e().sin() * Real::one().cos()
++        - Real::e().cos() * Real::one().sin();
++    assert!(matches!(
++        source(1).qr_coordinates(request(vec![vec![unresolved]]), &mut budget()),
++        Err(E::NormNotCertified {
++            outcome: hyperlimit::PredicateOutcome::Unknown { .. },
++            ..
++        })
++    ));
++}
++#[test]
++fn final_work_entry_exhaustion_cancellation_and_retry_preserve_atomicity() {
++    use hypersolve::expression_program::{
++        CoordinateError, ExpressionError, QrCoordinateError as E,
++    };
++    let p = source(2);
++    let request = request(vec![vec![3.into(), (-4).into()], vec![4.into(), 3.into()]]);
++    let mut full = budget();
++    p.qr_coordinates(request.clone(), &mut full).unwrap();
++    let used = budget().remaining_work() - full.remaining_work();
++    let mut short = ExpressionBudget::new(1_000_000, used - 1);
++    assert!(matches!(
++        p.qr_coordinates(request.clone(), &mut short),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::WorkExhausted
++        )))
++    ));
++    let mut exact = ExpressionBudget::new(1_000_000, used);
++    p.qr_coordinates(request.clone(), &mut exact).unwrap();
++    assert_eq!(exact.remaining_work(), 0);
++    assert!(matches!(
++        p.qr_coordinates(request.clone(), &mut ExpressionBudget::new(0, 100_000_000)),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::SizeExhausted
++        )))
++    ));
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.cancellation = Some(token);
++    assert!(matches!(
++        p.qr_coordinates(request.clone(), &mut cancelled),
++        Err(E::Coordinate(CoordinateError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    p.qr_coordinates(request, &mut budget()).unwrap();
++}
