@@ -1,0 +1,1172 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 93b2fbe87..b82aac8e6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2717,7 +2717,10 @@ dependencies = [
+ name = "hyperphysics"
+ version = "0.3.0"
+ dependencies = [
++ "hyperdynamics",
++ "hyperinterval",
+  "hyperlattice",
++ "hyperlattice-interval",
+  "hyperlimit",
+  "hypermesh",
+  "hyperreal",
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 2165b0709..ddfe3dda6 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- `EnclosureBudget::graph_budget` exposes a bounded view for domain-adapter
++  source validation/compilation and bookkeeping. It shares the existing work
++  counter and limits without exposing mutable counter replacement.
++
+ - Add optional whole-horizon trajectory Taylor evolution with retained native search history and complete remainders.
+ 
+ - Add opt-in exact QR coordinate construction with orthogonality and reconstruction evidence.
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index 2689f201b..e3be27b4c 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -488,3 +488,6 @@ pub mod coordinates;
+ /// Source-bound trajectory Taylor enclosures over certified Picard tubes.
+ #[cfg(feature = "taylor-flow")]
+ pub mod taylor_flow;
++
++mod budget_adapter;
++pub use budget_adapter::EnclosureGraphBudget;
+diff --git a/crates/hyperdynamics/src/field/budget_adapter.rs b/crates/hyperdynamics/src/field/budget_adapter.rs
+new file mode 100644
+index 000000000..e5eaa20dd
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/budget_adapter.rs
+@@ -0,0 +1,51 @@
++//! Shared, configuration-preserving graph accounting for domain-owned adapters.
++use super::{
++    EnclosureBudget, ExpressionBudget, ExpressionDefinition, ExpressionError, ExpressionProgram,
++    SymbolId,
++};
++use hypersolve::Expr;
++
++/// Borrowed graph operations using an enclosure budget's existing counter.
++///
++/// This view permits charges and source construction without exposing a mutable
++/// counter that could be replaced with different limits or reset work. Native
++/// arithmetic remains in the enclosing budget. Existing graph/scalar resource
++/// exclusions are unchanged; this is not a total heap or scalar-work bound.
++pub struct EnclosureGraphBudget<'a> {
++    graph: &'a mut ExpressionBudget,
++}
++impl EnclosureGraphBudget<'_> {
++    /// Charge adapter work against the existing counter, checking cancellation.
++    pub fn charge(&mut self, amount: usize) -> Result<(), ExpressionError> {
++        self.graph.charge(amount)
++    }
++    /// Check aggregate structural entries against the existing configured limit.
++    pub fn check_entries(&self, counts: &[usize]) -> Result<(), ExpressionError> {
++        self.graph.check_entries(counts)
++    }
++    /// Validate an owned flat source with the same graph limits and work counter.
++    pub fn validate(
++        &mut self,
++        definition: ExpressionDefinition,
++    ) -> Result<ExpressionProgram, ExpressionError> {
++        ExpressionProgram::from_definition(definition, self.graph)
++    }
++    /// Compile source trees with the same graph limits and work counter.
++    pub fn compile(
++        &mut self,
++        outputs: &[Expr],
++        variables: &[SymbolId],
++    ) -> Result<ExpressionProgram, ExpressionError> {
++        ExpressionProgram::compile(outputs, variables, self.graph)
++    }
++}
++impl EnclosureBudget {
++    /// Borrow bounded graph operations for a domain adapter without resetting or
++    /// exposing mutable configuration. Nested construction consumes this budget's
++    /// existing structural work; it does not start an independent allowance.
++    pub fn graph_budget(&mut self) -> EnclosureGraphBudget<'_> {
++        EnclosureGraphBudget {
++            graph: &mut self.graph,
++        }
++    }
++}
+diff --git a/crates/hyperphysics/CHANGELOG.md b/crates/hyperphysics/CHANGELOG.md
+index 32e7ad5e7..063c61c16 100644
+--- a/crates/hyperphysics/CHANGELOG.md
++++ b/crates/hyperphysics/CHANGELOG.md
+@@ -2,6 +2,12 @@
+ 
+ ## [0.3.0] - Unreleased
+ 
++- Opt-in `certified-flow` builds source-bound Newtonian force fields for fixed
++  exact mass, retaining strict mass evidence and original force provenance.
++  `ForceAccumulator3::dynamics` supplies constant-force models; physical step and
++  horizon reports retain Hyperdynamics certificates and typed rejected attempts.
++  Existing discrete Euler replay is unchanged.
++
+ ### Breaking
+ 
+ - `PhysicsError` gains `TriangleIndexOutOfBounds` and `IntegrationPolicy`
+diff --git a/crates/hyperphysics/Cargo.toml b/crates/hyperphysics/Cargo.toml
+index f7e775f16..acfb6527a 100644
+--- a/crates/hyperphysics/Cargo.toml
++++ b/crates/hyperphysics/Cargo.toml
+@@ -19,6 +19,7 @@ all-features = true
+ 
+ [features]
+ default = []
++certified-flow = ["dep:hyperdynamics", "hyperdynamics/field"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+@@ -27,6 +28,7 @@ dispatch-trace = [
+ ]
+ 
+ [dependencies]
++hyperdynamics = { version = "0.1.0", path = "../hyperdynamics", default-features = false, optional = true }
+ # Cargo uses these paths in the workspace and retains the version requirements
+ # in the published manifest.
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice" }
+@@ -36,8 +38,15 @@ hyperreal = { version = "0.14.0", path = "../hyperreal" }
+ hypersolve = { version = "0.4.0", path = "../hypersolve" }
+ 
+ [dev-dependencies]
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["dyadic"] }
++hyperlattice-interval = { version = "0.1.0", path = "../hyperlattice-interval", default-features = false, features = ["dyadic"] }
+ proptest = "1.7.0"
+ 
+ [[bench]]
+ name = "mass_properties"
+ harness = false
++
++[[bench]]
++name = "certified_flow"
++harness = false
++required-features = ["certified-flow"]
+diff --git a/crates/hyperphysics/README.md b/crates/hyperphysics/README.md
+index 0955b0e29..880734dee 100644
+--- a/crates/hyperphysics/README.md
++++ b/crates/hyperphysics/README.md
+@@ -295,3 +295,37 @@ the focused regression, all-feature tests, and strict Clippy.
+ Extensions follow the stack-wide [admission protocol](../../docs/admission.md).
+ It defines the exactness, certainty, boundary, cache, validation, and evidence
+ requirements shared by the Hyper crates.
++
++## Certified point-mass motion
++
++The optional `certified-flow` feature adds `dynamics::PointMassDynamics3` for
++`x' = v, v' = F(t,x,v)/m`, with a fixed strictly positive exact mass. A
++`ForceFieldDefinition3` supplies three exact force expressions, explicit time and
++position/velocity symbol mappings, and source provenance. The force grammar is
++Hypersolve's existing grammar; supplied units and frame consistency remain authored
++assumptions. `ForceAccumulator3::dynamics` snapshots constant contributions through
++the existing force accumulator and retains every source/vector.
++
++`certify_step` accepts a Hyperdynamics `PicardProposal<6>`. State lanes are
++`[x,y,z,vx,vy,vz]`, allowing uncertain initial boxes. The returned physical report
++retains the model and native source/proposal/policy/evidence. Only successful native
++statuses expose a certified tube and endpoint. `integrate` retains the full attempt
++history and distinguishes a certified prefix from whole-horizon completion. These
++reports certify continuous trajectories; existing Euler methods still replay their
++original discrete updates. Derived endpoint boxes can feed later operations.
++
++Hypersolve owns expression validation and differentiation, Hyperinterval/Hyperlattice
++own enclosure arithmetic, and Hyperdynamics owns existence/uniqueness and evolution
++verification. The physical adapter introduces no second integrator. Original force
++guards, exact mass and its full strict positivity receipt remain available. Invalid
++or unresolved mass, invalid source/bindings, failed enclosures and exhausted/cancelled
++attempts retain typed outcomes. Empty state sets do not bypass model/time validation.
++
++Pass one `EnclosureBudget` through construction and subsequent calls. Its bounded
++graph view shares the configured counter without exposing a reset/replacement path.
++Scalar positivity/refinement, payload/source strings, total heap bytes and cancellation
++within scalar operations or constant-force accumulation remain outside a whole-resource
++claim. Replay the mass, full original force graph, symbol mappings, provenance and
++requests through constructors; serialized success flags are not certificates.
++Variable/uncertain mass, rotations, contacts/impulses and coupled bodies need separate
++contracts. This feature does not certify physical correctness of an authored force law.
+diff --git a/crates/hyperphysics/benches/certified_flow.rs b/crates/hyperphysics/benches/certified_flow.rs
+new file mode 100644
+index 000000000..98b821e86
+--- /dev/null
++++ b/crates/hyperphysics/benches/certified_flow.rs
+@@ -0,0 +1,113 @@
++//! Completed continuous-trajectory verification, with preparation measured separately.
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy,
++    picard::{PicardProposal, PicardStatus},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperphysics::{ForceAccumulator3, ForceContribution3, Real, Vector3};
++use std::{hint::black_box, time::Instant};
++fn b() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn main() {
++    let iterations: u32 = std::env::var("PHYSICS_FLOW_ITERATIONS")
++        .map(|v| v.parse().unwrap())
++        .unwrap_or(1_000);
++    assert!(iterations > 0);
++    let mut forces = ForceAccumulator3::default();
++    forces.push(ForceContribution3 {
++        source: "actuator".into(),
++        force: Vector3::new([Real::from(3), Real::from(-2), Real::zero()]),
++    });
++    forces.push(ForceContribution3 {
++        source: "bias".into(),
++        force: Vector3::new([Real::from(1), Real::from(-2), Real::zero()]),
++    });
++    let prepare = || forces.dynamics(Real::from(2), &mut b()).unwrap();
++    let model = prepare();
++    let proposal = PicardProposal {
++        start: d(0, 0, 0),
++        end: d(1, 1, -2),
++        initial: BoxN::new(std::array::from_fn(|_| d(0, 0, 0))).unwrap(),
++        candidate: BoxN::new([
++            d(0, 1, -3),
++            d(-1, 0, -3),
++            d(0, 0, 0),
++            d(0, 1, -1),
++            d(-1, 0, -1),
++            d(0, 0, 0),
++        ])
++        .unwrap(),
++    };
++    let expected = model.certify_step(proposal.clone(), &mut b());
++    assert!(matches!(
++        expected.native().status(),
++        PicardStatus::Certified
++    ));
++    let end = expected.native().end_enclosure().unwrap().lanes().unwrap();
++    assert_eq!(&end[3..], &[d(1, 1, -1), d(-1, -1, -1), d(0, 0, 0)]);
++    let mut arithmetic = DyadicBudget::new(4096, 100_000_000);
++    assert!(d(1, 1, -4).subset_of(&end[0], &mut arithmetic).unwrap());
++    assert!(d(-1, -1, -4).subset_of(&end[1], &mut arithmetic).unwrap());
++    for candidate in [prepare(), model.clone()] {
++        let result = candidate.certify_step(proposal.clone(), &mut b());
++        assert!(matches!(result.native().status(), PicardStatus::Certified));
++        assert_eq!(
++            result.native().end_enclosure(),
++            expected.native().end_enclosure()
++        );
++        assert_eq!(result.native().tube(), expected.native().tube());
++        assert_eq!(
++            result.native().evidence().jacobian(),
++            expected.native().evidence().jacobian()
++        );
++        assert_eq!(
++            result.native().evidence().contraction(),
++            expected.native().evidence().contraction()
++        );
++        assert_eq!(result.native().identity(), expected.native().identity());
++        assert_eq!(result.model().mass_sign(), expected.model().mass_sign());
++        assert_eq!(result.model().provenance(), expected.model().provenance());
++        assert_eq!(
++            result.model().constant_forces().unwrap().contributions(),
++            forces.contributions()
++        );
++    }
++    for mode in ["prepare", "reuse", "prepare_and_step"] {
++        for _ in 0..16 {
++            drop(prepare().certify_step(proposal.clone(), &mut b()));
++        }
++        let started = Instant::now();
++        for _ in 0..iterations {
++            if mode == "prepare" {
++                drop(black_box(prepare()));
++            } else {
++                let prepared;
++                let current = if mode == "reuse" {
++                    &model
++                } else {
++                    prepared = prepare();
++                    &prepared
++                };
++                let report = current.certify_step(black_box(proposal.clone()), &mut b());
++                assert!(matches!(report.native().status(), PicardStatus::Certified));
++                assert_eq!(
++                    report.native().end_enclosure(),
++                    expected.native().end_enclosure()
++                );
++                assert_eq!(report.native().tube(), expected.native().tube());
++                drop(black_box(report));
++            }
++        }
++        let elapsed = started.elapsed();
++        println!(
++            "{mode}: iterations={iterations} total_ns={} ns_per_operation={}",
++            elapsed.as_nanos(),
++            elapsed.as_nanos() / u128::from(iterations)
++        );
++    }
++}
+diff --git a/crates/hyperphysics/src/dynamics.rs b/crates/hyperphysics/src/dynamics.rs
+new file mode 100644
+index 000000000..3af79ea45
+--- /dev/null
++++ b/crates/hyperphysics/src/dynamics.rs
+@@ -0,0 +1,324 @@
++//! Source-bound Newtonian motion with native trajectory certificates.
++//!
++//! State order is `[x, y, z, vx, vy, vz]`. Hyperphysics retains physical meaning
++//! and force provenance; Hyperdynamics owns all ODE verification and evolution.
++use std::{fmt, sync::Arc};
++
++use crate::{ForceAccumulator3, SourceSpec};
++use hyperdynamics::field::{
++    EnclosureBudget, ExpressionField, FieldDefinition, FieldError,
++    evolution::{EvolutionOptions, EvolutionReport, EvolutionRequest},
++    picard::{PicardProposal, PicardReport},
++};
++use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy, Sign};
++use hyperreal::Real;
++use hypersolve::{
++    SymbolId, SymbolRef,
++    expression_program::{
++        BinaryOperation, ExpressionDefinition, ExpressionError, ExpressionNode, ExpressionProgram,
++    },
++};
++
++/// Replayable force source and its physical coordinate interpretation.
++///
++/// Exactly three outputs denote net Cartesian force, with seven distinct inputs
++/// denoting time and three position/velocity components. Binding order is arbitrary.
++/// Units/frame consistency and the physical force law are authored assumptions.
++/// Nonlinear/time/velocity dependence uses the existing Hypersolve grammar; source
++/// guards remain active. No scalar/vector expression is approximated on import.
++#[derive(Clone, Debug)]
++pub struct ForceFieldDefinition3 {
++    /// Exact force graph, including all ordered bindings and original guards.
++    pub source: ExpressionDefinition,
++    /// Time symbol.
++    pub time: SymbolId,
++    /// Cartesian position symbols, in x/y/z order.
++    pub position: [SymbolId; 3],
++    /// Cartesian velocity symbols, in x/y/z order.
++    pub velocity: [SymbolId; 3],
++    /// Authored source references; not independent verification of a force law.
++    pub provenance: Vec<SourceSpec>,
++}
++
++/// Physical validation or original lower-layer construction failure.
++#[derive(Clone, Debug)]
++pub enum DynamicsError {
++    /// Force output count differs from three.
++    ForceOutputCount { actual: usize },
++    /// Mass was not strictly certified positive. Retains a negative/zero result
++    /// separately from an unresolved predicate and its refinement requirement.
++    MassSign(PredicateOutcome<Sign>),
++    /// Original source/reference/graph resource or cancellation failure.
++    Expression(ExpressionError),
++    /// Original field shape/binding/derivative/native failure.
++    Field(FieldError),
++}
++impl fmt::Display for DynamicsError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "physical dynamics: {self:?}")
++    }
++}
++impl std::error::Error for DynamicsError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Expression(e) => Some(e),
++            Self::Field(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<ExpressionError> for DynamicsError {
++    fn from(e: ExpressionError) -> Self {
++        Self::Expression(e)
++    }
++}
++impl From<FieldError> for DynamicsError {
++    fn from(e: FieldError) -> Self {
++        Self::Field(e)
++    }
++}
++#[derive(Debug)]
++struct DynamicsData {
++    mass: Real,
++    mass_sign: PredicateOutcome<Sign>,
++    force_source: ExpressionProgram,
++    provenance: Vec<SourceSpec>,
++    constant_forces: Option<ForceAccumulator3>,
++    field: ExpressionField<6>,
++}
++
++/// Fixed-mass Newtonian model x'=v, v'=F(t,x,v)/m with immutable source evidence.
++///
++/// This is continuous dynamics, distinct from a discrete Euler replay. Constructing
++/// a field proves no trajectory. Step/evolution certificates depend on the supplied
++/// initial/candidate sets and retain native qualified failures. Variable/uncertain
++/// mass, contact impulses, rotations and coupled bodies require separate contracts.
++#[derive(Clone, Debug)]
++pub struct PointMassDynamics3(Arc<DynamicsData>);
++impl PointMassDynamics3 {
++    /// Validate an exact mass and force definition, then build its six-state field.
++    ///
++    /// Strict mass positivity retains its full predicate receipt. One shared graph
++    /// counter covers adapter work, original source validation and field/derivative
++    /// construction. Scalar positivity refinement/arithmetic, metadata byte copies,
++    /// total heap and cancellation within scalar operations retain explicit exclusions.
++    /// Failed construction leaves no published model or mutable source cache.
++    pub fn new(
++        mass: Real,
++        forces: ForceFieldDefinition3,
++        budget: &mut EnclosureBudget,
++    ) -> Result<Self, DynamicsError> {
++        Self::build(mass, forces, None, budget)
++    }
++    fn build(
++        mass: Real,
++        forces: ForceFieldDefinition3,
++        constant_forces: Option<ForceAccumulator3>,
++        budget: &mut EnclosureBudget,
++    ) -> Result<Self, DynamicsError> {
++        budget.graph_budget().charge(0)?;
++        if forces.source.outputs.len() != 3 {
++            return Err(DynamicsError::ForceOutputCount {
++                actual: forces.source.outputs.len(),
++            });
++        }
++        budget.graph_budget().check_entries(&[
++            forces.source.variables.len(),
++            forces.source.nodes.len(),
++            forces.source.outputs.len(),
++            forces.provenance.len(),
++            7,
++            6,
++        ])?;
++        budget.graph_budget().charge(1)?;
++        let mass_sign = hyperlimit::classify_real_sign(&mass, PredicatePolicy::STRICT);
++        if !matches!(
++            mass_sign,
++            PredicateOutcome::Decided {
++                value: Sign::Positive,
++                certainty: Certainty::Exact | Certainty::Filtered,
++                ..
++            }
++        ) {
++            return Err(DynamicsError::MassSign(mass_sign));
++        }
++        // Validate BEFORE appending nodes: an invalid original reference must not
++        // accidentally become a valid reference to a newly generated mass/velocity.
++        let force_source = budget.graph_budget().validate(forces.source)?;
++        let original = force_source.definition();
++        budget.graph_budget().charge(original.variables.len())?;
++        budget.graph_budget().charge(original.nodes.len())?;
++        budget.graph_budget().charge(original.outputs.len())?;
++        let mut source = original.clone();
++        let roots = [source.outputs[0], source.outputs[1], source.outputs[2]];
++        let mass_node = source.nodes.len();
++        budget.graph_budget().charge(1)?;
++        source.nodes.push(ExpressionNode::Constant(mass.clone()));
++        source.outputs.clear();
++        for id in forces.velocity {
++            budget.graph_budget().charge(2)?;
++            source.outputs.push(source.nodes.len());
++            source
++                .nodes
++                .push(ExpressionNode::Variable(SymbolRef::new(id, None)));
++        }
++        for root in roots {
++            budget.graph_budget().charge(2)?;
++            source.outputs.push(source.nodes.len());
++            source.nodes.push(ExpressionNode::Binary {
++                operation: BinaryOperation::Div,
++                left: root,
++                right: mass_node,
++            });
++        }
++        budget.graph_budget().charge(6)?;
++        let state = forces.position.into_iter().chain(forces.velocity).collect();
++        let field = ExpressionField::from_definition(
++            FieldDefinition {
++                source,
++                time: forces.time,
++                state,
++            },
++            budget,
++        )?;
++        budget.graph_budget().charge(1)?;
++        let result = Self(Arc::new(DynamicsData {
++            mass,
++            mass_sign,
++            force_source,
++            provenance: forces.provenance,
++            constant_forces,
++            field,
++        }));
++        budget.graph_budget().charge(0)?;
++        Ok(result)
++    }
++    /// Exact retained fixed mass.
++    pub fn mass(&self) -> &Real {
++        &self.0.mass
++    }
++    /// Original strict positive-mass predicate, including certainty and stage.
++    pub fn mass_sign(&self) -> PredicateOutcome<Sign> {
++        self.0.mass_sign
++    }
++    /// Original force graph, preserving its input order and domain guards.
++    pub fn force_source(&self) -> &ExpressionProgram {
++        &self.0.force_source
++    }
++    /// Authored force provenance.
++    pub fn provenance(&self) -> &[SourceSpec] {
++        &self.0.provenance
++    }
++    /// Every original contribution when built from a constant-force accumulator.
++    pub fn constant_forces(&self) -> Option<&ForceAccumulator3> {
++        self.0.constant_forces.as_ref()
++    }
++    /// Generated field and its exact time/state interpretation. Its state order is
++    /// `[x,y,z,vx,vy,vz]`. Lower-layer coordinate/Taylor consumers remain available.
++    pub fn field(&self) -> &ExpressionField<6> {
++        &self.0.field
++    }
++    /// Verify a proposed tube, retaining this model alongside all native evidence.
++    /// Rejected native attempts publish no certified tube/endpoint. Metadata sharing
++    /// does not create a new budget or change the native policy/status.
++    pub fn certify_step(
++        &self,
++        proposal: PicardProposal<6>,
++        budget: &mut EnclosureBudget,
++    ) -> PointMassStep3 {
++        PointMassStep3 {
++            model: self.clone(),
++            native: self.0.field.certify_step(proposal, budget),
++        }
++    }
++    /// Evolve across a finite horizon with shared native budgets and attempt history.
++    /// A certified prefix remains distinct from whole-request completion. Generated
++    /// end boxes feed subsequent steps without relabeling them as exact reachable sets.
++    pub fn integrate(
++        &self,
++        request: EvolutionRequest<6>,
++        options: EvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> PointMassEvolution3 {
++        PointMassEvolution3 {
++            model: self.clone(),
++            native: self.0.field.integrate(request, options, budget),
++        }
++    }
++}
++
++/// Attempted physical step, including its model and native proof or typed rejection.
++#[derive(Clone, Debug)]
++pub struct PointMassStep3 {
++    model: PointMassDynamics3,
++    native: PicardReport<6>,
++}
++impl PointMassStep3 {
++    /// Mass, original force sources and exact equations used for this attempt.
++    pub fn model(&self) -> &PointMassDynamics3 {
++        &self.model
++    }
++    /// Native source/proposal/policy, statuses and certified tube/end accessors.
++    pub fn native(&self) -> &PicardReport<6> {
++        &self.native
++    }
++}
++/// Whole-horizon physical evolution with retained model and qualified native prefix.
++#[derive(Clone, Debug)]
++pub struct PointMassEvolution3 {
++    model: PointMassDynamics3,
++    native: EvolutionReport<6>,
++}
++impl PointMassEvolution3 {
++    /// Original physical model and provenance.
++    pub fn model(&self) -> &PointMassDynamics3 {
++        &self.model
++    }
++    /// Native whole-request status, attempts and separate prefix/end accessors.
++    pub fn native(&self) -> &EvolutionReport<6> {
++        &self.native
++    }
++}
++impl ForceAccumulator3 {
++    /// Snapshot constant forces into continuous fixed-mass Newtonian dynamics.
++    ///
++    /// Uses existing exact force accumulation and retains every source contribution.
++    /// Labels are attributed to their original accumulator entries, not promoted to
++    /// external validation. Scalar summation and source-byte costs are outside the
++    /// graph budget; cancellation is checked before/after this scalar operation.
++    pub fn dynamics(
++        &self,
++        mass: Real,
++        budget: &mut EnclosureBudget,
++    ) -> Result<PointMassDynamics3, DynamicsError> {
++        let count = self.contributions().len();
++        budget.graph_budget().charge(0)?;
++        budget.graph_budget().check_entries(&[count, 7, 3, 3])?;
++        budget.graph_budget().charge(count)?;
++        let total = self.total_force();
++        budget.graph_budget().charge(count)?;
++        let provenance = self
++            .contributions()
++            .iter()
++            .map(|c| SourceSpec::new("ForceAccumulator3", c.source.clone()))
++            .collect();
++        budget.graph_budget().charge(count)?;
++        let retained = self.clone();
++        let forces = ForceFieldDefinition3 {
++            source: ExpressionDefinition {
++                variables: (0..7).map(SymbolId).collect(),
++                nodes: vec![
++                    ExpressionNode::Constant(total[0].clone()),
++                    ExpressionNode::Constant(total[1].clone()),
++                    ExpressionNode::Constant(total[2].clone()),
++                ],
++                outputs: vec![0, 1, 2],
++            },
++            time: SymbolId(0),
++            position: [SymbolId(1), SymbolId(2), SymbolId(3)],
++            velocity: [SymbolId(4), SymbolId(5), SymbolId(6)],
++            provenance,
++        };
++        PointMassDynamics3::build(mass, forces, Some(retained), budget)
++    }
++}
+diff --git a/crates/hyperphysics/src/lib.rs b/crates/hyperphysics/src/lib.rs
+index ae503e5b5..a4881000d 100644
+--- a/crates/hyperphysics/src/lib.rs
++++ b/crates/hyperphysics/src/lib.rs
+@@ -12,6 +12,8 @@
+ 
+ pub mod body;
+ pub mod contact;
++#[cfg(feature = "certified-flow")]
++pub mod dynamics;
+ pub mod em;
+ pub mod error;
+ pub mod fluid;
+diff --git a/crates/hyperphysics/tests/certified_flow.rs b/crates/hyperphysics/tests/certified_flow.rs
+new file mode 100644
+index 000000000..56b6e9fd1
+--- /dev/null
++++ b/crates/hyperphysics/tests/certified_flow.rs
+@@ -0,0 +1,511 @@
++#![cfg(feature = "certified-flow")]
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, FieldError,
++    evolution::{EvolutionOptions, EvolutionRequest, EvolutionStatus},
++    picard::{PicardFailure, PicardProposal, PicardStatus},
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hyperlimit::{Certainty, PredicateOutcome, Sign};
++use hyperphysics::{
++    ForceAccumulator3, ForceContribution3, Real, SourceSpec, StepReplayReport3, Vector3,
++    dynamics::{DynamicsError, ForceFieldDefinition3, PointMassDynamics3},
++};
++use hypersolve::{
++    Expr, SymbolId, expression_program::ExpressionError, work_budget::CancellationToken,
++};
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn d(a: i64, b: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(a.into(), b.into(), e).unwrap()
++}
++fn point(a: i64) -> DyadicInterval {
++    d(a, a, 0)
++}
++fn zero() -> BoxN<DyadicInterval, 6> {
++    BoxN::new(std::array::from_fn(|_| point(0))).unwrap()
++}
++fn force() -> ForceAccumulator3 {
++    let mut forces = ForceAccumulator3::default();
++    forces.push(ForceContribution3 {
++        source: "actuator".into(),
++        force: Vector3::new([Real::from(3), Real::from(-2), Real::zero()]),
++    });
++    forces.push(ForceContribution3 {
++        source: "bias".into(),
++        force: Vector3::new([Real::from(1), Real::from(-2), Real::zero()]),
++    });
++    forces
++}
++fn proposal() -> PicardProposal<6> {
++    PicardProposal {
++        start: point(0),
++        end: d(1, 1, -2),
++        initial: zero(),
++        candidate: BoxN::new([
++            d(0, 1, -3),
++            d(-1, 0, -3),
++            point(0),
++            d(0, 1, -1),
++            d(-1, 0, -1),
++            point(0),
++        ])
++        .unwrap(),
++    }
++}
++fn definition(
++    outputs: &[Expr],
++    bindings: &[SymbolId],
++    b: &mut EnclosureBudget,
++) -> ForceFieldDefinition3 {
++    let source = b.graph_budget().compile(outputs, bindings).unwrap();
++    ForceFieldDefinition3 {
++        source: source.definition().clone(),
++        time: SymbolId(0),
++        position: [SymbolId(1), SymbolId(2), SymbolId(3)],
++        velocity: [SymbolId(4), SymbolId(5), SymbolId(6)],
++        provenance: vec![SourceSpec::new("test force law", "exact expression")],
++    }
++}
++fn xyz() -> [SymbolId; 7] {
++    std::array::from_fn(|i| SymbolId(i as u32))
++}
++fn assert_contains(value: &DyadicInterval, n: i64, exponent: i32) {
++    assert!(
++        d(n, n, exponent)
++            .subset_of(value, &mut DyadicBudget::new(4096, 100_000_000))
++            .unwrap()
++    );
++}
++
++#[test]
++fn constant_force_flow_retains_all_sources_and_differs_from_discrete_replay() {
++    let mut forces = force();
++    let model = forces.dynamics(Real::from(2), &mut budget()).unwrap();
++    assert_eq!(
++        model.constant_forces().unwrap().contributions(),
++        forces.contributions()
++    );
++    assert_eq!(model.provenance().len(), 2);
++    assert!(matches!(
++        model.mass_sign(),
++        PredicateOutcome::Decided {
++            value: Sign::Positive,
++            certainty: Certainty::Exact | Certainty::Filtered,
++            ..
++        }
++    ));
++    forces.push(ForceContribution3 {
++        source: "later mutation".into(),
++        force: Vector3::new(std::array::from_fn(|_| Real::from(100))),
++    });
++    assert_eq!(model.constant_forces().unwrap().contributions().len(), 2);
++    let report = model.certify_step(proposal(), &mut budget());
++    assert!(
++        matches!(report.native().status(), PicardStatus::Certified),
++        "{:?}",
++        report.native().status()
++    );
++    assert_eq!(
++        report.native().identity(),
++        &report.model().field().identity()
++    );
++    let end = report.native().end_enclosure().unwrap().lanes().unwrap();
++    assert_eq!(&end[3..], &[d(1, 1, -1), d(-1, -1, -1), point(0)]);
++    // Independent continuous x=(F/(2m))*t^2, v=(F/m)*t at t=1/4.
++    assert_contains(&end[0], 1, -4);
++    assert_contains(&end[1], -1, -4);
++    assert_eq!(end[2], point(0));
++    let replay = StepReplayReport3::symplectic_euler_replay(
++        Real::from(2),
++        (Real::one() / Real::from(4)).unwrap(),
++        Vector3::zero(),
++        Vector3::zero(),
++        model.constant_forces().unwrap(),
++    )
++    .unwrap();
++    assert_eq!(
++        replay.proposed_position[0],
++        (Real::one() / Real::from(8)).unwrap()
++    );
++    assert_ne!(
++        replay.proposed_position[0],
++        (Real::one() / Real::from(16)).unwrap()
++    );
++    // The ODE report encloses a continuous trajectory; old exact Euler replay still
++    // denotes its original discrete method and is never used as this proof.
++    assert!(replay.exact_replay);
++}
++
++#[test]
++fn uncertain_initial_states_compose_and_whole_horizon_retains_attempts() {
++    let model = force().dynamics(Real::from(2), &mut budget()).unwrap();
++    let mut p = proposal();
++    p.initial = BoxN::new([
++        d(-1, 1, -4),
++        point(0),
++        point(0),
++        d(-1, 1, -3),
++        point(0),
++        point(0),
++    ])
++    .unwrap();
++    p.candidate = BoxN::new([
++        d(-1, 1, 0),
++        d(-1, 1, 0),
++        point(0),
++        d(-1, 1, 0),
++        d(-1, 1, 0),
++        point(0),
++    ])
++    .unwrap();
++    let first = model.certify_step(p.clone(), &mut budget());
++    assert!(matches!(first.native().status(), PicardStatus::Certified));
++    let mut next = p;
++    next.start = d(1, 1, -2);
++    next.end = d(1, 1, -1);
++    next.initial = first.native().end_enclosure().unwrap().clone();
++    next.candidate = BoxN::new([
++        d(-2, 2, 0),
++        d(-2, 2, 0),
++        point(0),
++        d(-2, 2, 0),
++        d(-2, 2, 0),
++        point(0),
++    ])
++    .unwrap();
++    let second = model.certify_step(next, &mut budget());
++    assert!(matches!(second.native().status(), PicardStatus::Certified));
++    let end = second.native().end_enclosure().unwrap().lanes().unwrap();
++    for x0 in [-1_i64, 1] {
++        for v0 in [-1_i64, 1] {
++            // x0/16+(v0/8)*(1/2)+(1/2)^2; v0/8+2*(1/2).
++            assert_contains(&end[0], x0 + v0 + 4, -4);
++            assert_contains(&end[3], v0 + 8, -3);
++        }
++    }
++    let whole = model.integrate(
++        EvolutionRequest {
++            start: point(0),
++            end: d(1, 1, -1),
++            initial: zero(),
++        },
++        EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            ..EvolutionOptions::default()
++        },
++        &mut budget(),
++    );
++    assert!(
++        matches!(whole.native().status(), EvolutionStatus::Completed),
++        "{:?}",
++        whole.native().status()
++    );
++    assert!(whole.native().attempts().len() >= whole.native().segments().len());
++    assert_eq!(whole.native().segments().len(), 2);
++    assert_eq!(whole.model().mass(), &Real::from(2));
++    let end = whole.native().end_enclosure().unwrap().lanes().unwrap();
++    assert_contains(&end[0], 1, -2);
++    assert_contains(&end[1], -1, -2);
++    assert_eq!(end[3], point(1));
++}
++
++#[test]
++fn nonlinear_time_velocity_forces_and_permuted_bindings_have_exact_source_meaning() {
++    let v = Expr::anonymous_symbol(SymbolId(4));
++    let x = Expr::anonymous_symbol(SymbolId(1));
++    let t = Expr::anonymous_symbol(SymbolId(0));
++    let outputs = [-x.clone() - v.clone() + t, x.clone() * x, Expr::int(0)];
++    for shift in 0..7 {
++        let mut bindings = xyz();
++        bindings.rotate_left(shift);
++        let model = PointMassDynamics3::new(
++            Real::from(2),
++            definition(&outputs, &bindings, &mut budget()),
++            &mut budget(),
++        )
++        .unwrap();
++        assert_eq!(model.force_source().definition().variables, bindings);
++        let state =
++            BoxN::new([point(2), point(0), point(0), point(3), point(0), point(0)]).unwrap();
++        let image = model
++            .field()
++            .image(&point(1), &state, &mut budget())
++            .unwrap();
++        assert_eq!(
++            image.lanes(),
++            Some(&[point(3), point(0), point(0), point(-2), point(2), point(0)])
++        );
++        let jac = model
++            .field()
++            .jacobian(&point(1), &state, &mut budget())
++            .unwrap();
++        let mut expected =
++            std::array::from_fn::<_, 6, _>(|_| std::array::from_fn::<_, 6, _>(|_| point(0)));
++        expected[0][3] = point(1);
++        expected[1][4] = point(1);
++        expected[2][5] = point(1);
++        expected[3][0] = d(-1, -1, -1);
++        expected[3][3] = d(-1, -1, -1);
++        expected[4][0] = point(2);
++        assert_eq!(jac.rows(), Some(&expected));
++        assert!(model.constant_forces().is_none());
++    }
++}
++
++#[test]
++fn original_invalid_refs_and_domain_guards_do_not_gain_validity_from_appended_nodes() {
++    let mut def = definition(
++        &std::array::from_fn::<_, 3, _>(|_| Expr::int(0)),
++        &xyz(),
++        &mut budget(),
++    );
++    def.source.outputs[0] = def.source.nodes.len();
++    assert!(matches!(
++        PointMassDynamics3::new(Real::one(), def, &mut budget()),
++        Err(DynamicsError::Expression(
++            ExpressionError::InvalidOutput { .. }
++        ))
++    ));
++    let x = Expr::anonymous_symbol(SymbolId(1));
++    let def = definition(
++        &[Expr::int(1) / x, Expr::int(0), Expr::int(0)],
++        &xyz(),
++        &mut budget(),
++    );
++    let model = PointMassDynamics3::new(Real::one(), def, &mut budget()).unwrap();
++    let failed = model.certify_step(proposal(), &mut budget());
++    assert!(matches!(
++        failed.native().status(),
++        PicardStatus::Rejected(PicardFailure::Field(_))
++    ));
++    assert!(failed.native().end_enclosure().is_none());
++}
++
++#[test]
++fn invalid_masses_shapes_empty_states_and_times_are_distinct() {
++    for mass in [Real::zero(), Real::from(-1)] {
++        assert!(matches!(
++            force().dynamics(mass, &mut budget()),
++            Err(DynamicsError::MassSign(PredicateOutcome::Decided {
++                value: Sign::Zero | Sign::Negative,
++                ..
++            }))
++        ));
++    }
++    let def = definition(&[Expr::int(0)], &xyz(), &mut budget());
++    assert!(matches!(
++        PointMassDynamics3::new(Real::one(), def, &mut budget()),
++        Err(DynamicsError::ForceOutputCount { actual: 1 })
++    ));
++    let mut def = definition(
++        &std::array::from_fn::<_, 3, _>(|_| Expr::int(0)),
++        &xyz(),
++        &mut budget(),
++    );
++    def.velocity[0] = def.position[0];
++    assert!(matches!(
++        PointMassDynamics3::new(Real::one(), def, &mut budget()),
++        Err(DynamicsError::Field(FieldError::DuplicateState(_)))
++    ));
++    let model = force().dynamics(Real::one(), &mut budget()).unwrap();
++    let mut p = proposal();
++    p.initial = BoxN::empty().unwrap();
++    let empty = model.certify_step(p.clone(), &mut budget());
++    assert!(matches!(empty.native().status(), PicardStatus::Empty));
++    assert!(empty.native().end_enclosure().unwrap().is_empty());
++    p.end = p.start.clone();
++    let invalid = model.certify_step(p, &mut budget());
++    assert!(matches!(
++        invalid.native().status(),
++        PicardStatus::Rejected(PicardFailure::NonPositiveDuration)
++    ));
++    assert!(invalid.native().end_enclosure().is_none());
++}
++
++#[test]
++fn shared_graph_budget_construction_cutoffs_cancelled_attempts_and_retry() {
++    let forces = force();
++    let mut measured = budget();
++    measured.graph_budget().charge(37).unwrap();
++    assert_eq!(
++        measured.remaining_graph_work(),
++        EnclosurePolicy::default().graph_work - 37
++    );
++    let model = forces.dynamics(Real::from(2), &mut measured).unwrap();
++    let spent = EnclosurePolicy::default().graph_work - measured.remaining_graph_work() - 37;
++    let mut small = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: spent - 1,
++        ..EnclosurePolicy::default()
++    });
++    assert!(matches!(
++        forces.dynamics(Real::from(2), &mut small),
++        Err(DynamicsError::Expression(ExpressionError::WorkExhausted))
++    ));
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut cancelled = budget();
++    cancelled.set_cancellation(Some(token));
++    assert!(matches!(
++        forces.dynamics(Real::from(2), &mut cancelled),
++        Err(DynamicsError::Expression(ExpressionError::Cancelled))
++    ));
++    let rejected = model.certify_step(proposal(), &mut cancelled);
++    assert!(matches!(
++        rejected.native().status(),
++        PicardStatus::Rejected(_)
++    ));
++    assert!(rejected.native().end_enclosure().is_none());
++    assert!(matches!(
++        model
++            .certify_step(proposal(), &mut budget())
++            .native()
++            .status(),
++        PicardStatus::Certified
++    ));
++    assert_eq!(
++        model.constant_forces().unwrap().contributions(),
++        forces.contributions()
++    );
++}
++
++#[test]
++fn algebraic_mass_is_authoritative_and_approximate_mass_signs_are_not_admitted() {
++    let root = Real::from(2).sqrt().unwrap();
++    let model = force().dynamics(root.clone(), &mut budget()).unwrap();
++    assert_eq!(model.mass(), &root);
++    let image = model
++        .field()
++        .image(&point(0), &zero(), &mut budget())
++        .unwrap();
++    let acceleration = image.lanes().unwrap()[3]
++        .to_rational(&mut DyadicBudget::new(4096, 100_000_000))
++        .unwrap();
++    // 4/sqrt(2) has positive square 8, independently of the emitted expression.
++    let lo = acceleration.lower().unwrap();
++    let hi = acceleration.upper().unwrap();
++    assert!(lo > &hyperreal::Rational::from(0));
++    assert!(lo.clone() * lo.clone() <= hyperreal::Rational::from(8));
++    assert!(hi.clone() * hi.clone() >= hyperreal::Rational::from(8));
++    let unresolved = (Real::e() + Real::one()).sin()
++        - Real::e().sin() * Real::one().cos()
++        - Real::e().cos() * Real::one().sin();
++    let approximate =
++        hyperlimit::classify_real_sign(&unresolved, hyperlimit::PredicatePolicy::APPROXIMATE_512);
++    assert!(matches!(
++        approximate,
++        PredicateOutcome::Decided {
++            certainty: Certainty::Approximate,
++            ..
++        }
++    ));
++    assert!(matches!(
++        force().dynamics(unresolved, &mut budget()),
++        Err(DynamicsError::MassSign(PredicateOutcome::Unknown { .. }))
++    ));
++}
++
++#[test]
++fn rejected_evolution_never_publishes_a_completed_endpoint() {
++    let model = force().dynamics(Real::from(2), &mut budget()).unwrap();
++    let request = EvolutionRequest {
++        start: point(0),
++        end: point(1),
++        initial: zero(),
++    };
++    let stopped = model.integrate(
++        request,
++        EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            maximum_steps: 1,
++            ..EvolutionOptions::default()
++        },
++        &mut budget(),
++    );
++    assert!(matches!(
++        stopped.native().status(),
++        EvolutionStatus::Stopped(_)
++    ));
++    assert!(stopped.native().end_enclosure().is_none());
++    assert!(stopped.native().prefix_end_enclosure().is_some());
++    assert_eq!(stopped.native().reached_time(), &d(1, 1, -2));
++    assert_eq!(stopped.model().mass(), &Real::from(2));
++    let rejected = model.certify_step(
++        proposal(),
++        &mut EnclosureBudget::new(EnclosurePolicy {
++            scalar_work: 0,
++            ..EnclosurePolicy::default()
++        }),
++    );
++    assert!(matches!(
++        rejected.native().status(),
++        PicardStatus::Rejected(_)
++    ));
++    assert!(rejected.native().end_enclosure().is_none());
++}
++
++#[test]
++fn exact_source_replay_rebuilds_physics_and_native_proofs_in_a_fresh_process() {
++    const KEY: &str = "HYPERPHYSICS_FLOW_REPLAY_CHILD";
++    if let Some(payload) = std::env::var_os(KEY) {
++        let values: Vec<i64> = payload
++            .to_str()
++            .unwrap()
++            .split(',')
++            .map(|v| v.parse().unwrap())
++            .collect();
++        assert_eq!(values.len(), 4);
++        let mut forces = ForceAccumulator3::default();
++        forces.push(ForceContribution3 {
++            source: "fixture wire definition".into(),
++            force: Vector3::new(std::array::from_fn(|i| Real::from(values[i]))),
++        });
++        let model = forces
++            .dynamics(Real::from(values[3]), &mut budget())
++            .unwrap();
++        let report = model.certify_step(proposal(), &mut budget());
++        assert!(matches!(report.native().status(), PicardStatus::Certified));
++        let end = report.native().end_enclosure().unwrap().lanes().unwrap();
++        assert_eq!(end[3], d(1, 1, -1));
++        assert_eq!(end[4], d(-1, -1, -1));
++        assert_contains(&end[0], 1, -4);
++        assert_contains(&end[1], -1, -4);
++        assert_eq!(model.provenance()[0].locator, "fixture wire definition");
++        return;
++    }
++    let output = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "exact_source_replay_rebuilds_physics_and_native_proofs_in_a_fresh_process",
++            "--nocapture",
++        ])
++        .env(KEY, "4,-4,0,2")
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn retained_physical_and_native_getters_do_not_recompute_predicates() {
++    let model = force().dynamics(Real::from(2), &mut budget()).unwrap();
++    let report = model.certify_step(proposal(), &mut budget());
++    hyperreal::dispatch_trace::reset();
++    let _recording = hyperreal::dispatch_trace::recording_scope();
++    std::hint::black_box(report.model().mass());
++    std::hint::black_box(report.model().mass_sign());
++    std::hint::black_box(report.model().force_source());
++    std::hint::black_box(report.model().provenance());
++    std::hint::black_box(report.model().constant_forces());
++    std::hint::black_box(report.model().field());
++    std::hint::black_box(report.native().status());
++    std::hint::black_box(report.native().end_enclosure());
++    std::hint::black_box(report.native().tube());
++    assert!(hyperreal::dispatch_trace::snapshot().is_empty());
++}
