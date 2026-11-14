@@ -1,0 +1,713 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 325619b6e..4d1150ce1 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Retain provider-owned metric/join failures through specialized scheduling,
++  including native failure distinctions and original causes without report conversion.
++
+ - Add fixed exact state charts and source-bound Picard tube/endpoint transport with explicit final materialization failures.
+ - Add a nonlinear-field affine Taylor observable example with explicit downstream projection.
+ - Add optional midpoint-centered field Taylor models, retaining exact source,
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 16e3806c2..64f7d21be 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -86,6 +86,12 @@ The motion-limit adapters also select exact route-wide axis limits and consume
+ `MetricPath`, `MetricSpan` and `JoinSpan` for feed, corner, lookahead and bounded
+ jerk work. Hyperpath supplies retained geometry and full join receipts. Run
+ `cargo run -p hyperdynamics --example feed_schedule` for an exact provider.
++The provider's associated `Error` retains its causes and receives native
++`DynamicsError` failures without merging their kinds. Mixed metric/join operations
++return the metric provider's error, with a cause-preserving join conversion.
++Jerk refinement additionally requires exact comparison with native failure kinds;
++only `JerkProposalUncertified` permits another halving. Hyperpath sources keep
++`RouteCertificationError` directly, including at deprecated entry points.
+ These adapters' extraction retention qualification remains in progress.
+ 
+ Enable `reachability` for `field.reach(request, policy, budget)`. The request gives
+diff --git a/crates/hyperdynamics/examples/feed_schedule.rs b/crates/hyperdynamics/examples/feed_schedule.rs
+index 792505ef3..0865ddaae 100644
+--- a/crates/hyperdynamics/examples/feed_schedule.rs
++++ b/crates/hyperdynamics/examples/feed_schedule.rs
+@@ -20,6 +20,7 @@ impl IncreasingLine {
+     }
+ }
+ impl MetricSpan for IncreasingLine {
++    type Error = DynamicsError;
+     fn exact_length(&self, _: PredicatePolicy) -> Result<Real, DynamicsError> {
+         Ok(&self.end - &self.start)
+     }
+@@ -28,6 +29,7 @@ impl MetricSpan for IncreasingLine {
+     }
+ }
+ impl JoinSpan for IncreasingLine {
++    type Error = DynamicsError;
+     type Receipt = PredicateOutcome<Ordering>;
+     fn classify_join(
+         &self,
+diff --git a/crates/hyperdynamics/src/feed.rs b/crates/hyperdynamics/src/feed.rs
+index 0e35c9e18..145fdf0e9 100644
+--- a/crates/hyperdynamics/src/feed.rs
++++ b/crates/hyperdynamics/src/feed.rs
+@@ -184,15 +184,15 @@ pub fn certify_constant_feed_time<P: MetricPath + ?Sized>(
+     feed_rate: Real,
+     target_time: Real,
+     policy: PredicatePolicy,
+-) -> Result<ConstantFeedTimeReport, DynamicsError> {
++) -> Result<ConstantFeedTimeReport, P::Error> {
+     if route.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     require_positive_feed(&feed_rate, policy)?;
+     match classify_real_sign(&target_time, policy).value() {
+-        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime),
++        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime.into()),
+         Some(Sign::Zero | Sign::Positive) => {}
+-        None => return Err(DynamicsError::PredicateUnresolved),
++        None => return Err(DynamicsError::PredicateUnresolved.into()),
+     }
+     let path_length = route.exact_length(policy)?;
+     let mut problem = Problem::default();
+@@ -227,16 +227,16 @@ pub fn certify_acceleration_limited_feed_time<P: MetricPath + ?Sized>(
+     acceleration: Real,
+     target_time: Real,
+     policy: PredicatePolicy,
+-) -> Result<AccelerationLimitedFeedTimeReport, DynamicsError> {
++) -> Result<AccelerationLimitedFeedTimeReport, P::Error> {
+     if route.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     require_positive_feed(&max_feed_rate, policy)?;
+     require_positive_acceleration(&acceleration, policy)?;
+     match classify_real_sign(&target_time, policy).value() {
+-        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime),
++        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime.into()),
+         Some(Sign::Zero | Sign::Positive) => {}
+-        None => return Err(DynamicsError::PredicateUnresolved),
++        None => return Err(DynamicsError::PredicateUnresolved.into()),
+     }
+     let path_length = route.exact_length(policy)?;
+     let profile =
+@@ -278,17 +278,17 @@ pub fn certify_symmetric_jerk_limited_feed_time<P: MetricPath + ?Sized>(
+     jerk: Real,
+     target_time: Real,
+     policy: PredicatePolicy,
+-) -> Result<JerkLimitedFeedTimeReport, DynamicsError> {
++) -> Result<JerkLimitedFeedTimeReport, P::Error> {
+     if route.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     require_positive_feed(&max_feed_rate, policy)?;
+     require_positive_acceleration(&max_acceleration, policy)?;
+     require_positive_jerk(&jerk, policy)?;
+     match classify_real_sign(&target_time, policy).value() {
+-        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime),
++        Some(Sign::Negative) => return Err(DynamicsError::NegativeTime.into()),
+         Some(Sign::Zero | Sign::Positive) => {}
+-        None => return Err(DynamicsError::PredicateUnresolved),
++        None => return Err(DynamicsError::PredicateUnresolved.into()),
+     }
+ 
+     let path_length = route.exact_length(policy)?;
+@@ -324,9 +324,9 @@ pub fn certify_corner_lookahead_limits<J: JoinSpan>(
+     max_acceleration: Real,
+     corner_radius: Real,
+     policy: PredicatePolicy,
+-) -> Result<CornerLookaheadLimitReport<J::Receipt>, DynamicsError> {
++) -> Result<CornerLookaheadLimitReport<J::Receipt>, J::Error> {
+     if spans.len() < 2 {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     require_nonnegative_feed(&candidate_corner_feed, policy)?;
+     require_positive_feed(&max_feed_rate, policy)?;
+@@ -361,13 +361,13 @@ pub fn certify_corner_lookahead_limits<J: JoinSpan>(
+ }
+ 
+ #[inline]
+-fn build_jerk_limited_report(
++fn build_jerk_limited_report<E: From<DynamicsError>>(
+     path_length: Real,
+     max_feed_rate: Real,
+     max_acceleration: Real,
+     jerk: Real,
+     target_time: Real,
+-) -> Result<JerkLimitedFeedTimeReport, DynamicsError> {
++) -> Result<JerkLimitedFeedTimeReport, E> {
+     let peak_feed_rate = (jerk.clone() * target_time.clone() * target_time.clone()
+         / Real::from(16))
+     .map_err(|_| DynamicsError::UnsupportedDivision)?;
+diff --git a/crates/hyperdynamics/src/jerk_schedule.rs b/crates/hyperdynamics/src/jerk_schedule.rs
+index 7999676f2..92ac9e286 100644
+--- a/crates/hyperdynamics/src/jerk_schedule.rs
++++ b/crates/hyperdynamics/src/jerk_schedule.rs
+@@ -232,7 +232,7 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
+-) -> Result<PlannedMonotonicJerkTransition, DynamicsError> {
++) -> Result<PlannedMonotonicJerkTransition, S::Error> {
+     require_nonnegative_feed(&start_feed, policy)?;
+     require_nonnegative_feed(&end_feed, policy)?;
+     require_positive_feed(&max_feed_rate, policy)?;
+@@ -243,10 +243,10 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+     require_positive_length(&path_length, policy)?;
+     let feed_sum = &start_feed + &end_feed;
+     match classify_real_sign(&feed_sum, policy).value() {
+-        Some(Sign::Zero) => return Err(DynamicsError::ZeroBoundaryFeeds),
++        Some(Sign::Zero) => return Err(DynamicsError::ZeroBoundaryFeeds.into()),
+         Some(Sign::Positive) => {}
+-        Some(Sign::Negative) => return Err(DynamicsError::NegativeFeedRate),
+-        None => return Err(DynamicsError::PredicateUnresolved),
++        Some(Sign::Negative) => return Err(DynamicsError::NegativeFeedRate.into()),
++        None => return Err(DynamicsError::PredicateUnresolved.into()),
+     }
+ 
+     let phase_time = (&path_length / &feed_sum).map_err(|_| DynamicsError::UnsupportedDivision)?;
+@@ -290,7 +290,7 @@ pub fn plan_monotonic_jerk_transition<S: MetricSpan>(
+         policy,
+     )?;
+     if !construction_certification.all_satisfied() || !report.all_satisfied() {
+-        return Err(DynamicsError::JerkProposalUncertified);
++        return Err(DynamicsError::JerkProposalUncertified.into());
+     }
+     let certification = report
+         .elements
+@@ -322,12 +322,12 @@ pub fn certify_jerk_ramp_feed_schedule<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
+-) -> Result<JerkRampFeedScheduleReport, DynamicsError> {
++) -> Result<JerkRampFeedScheduleReport, S::Error> {
+     if route.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     if route.len() != proposals.len() {
+-        return Err(DynamicsError::ScheduleShapeMismatch);
++        return Err(DynamicsError::ScheduleShapeMismatch.into());
+     }
+     require_positive_feed(&max_feed_rate, policy)?;
+     require_positive_acceleration(&max_acceleration, policy)?;
+@@ -377,12 +377,12 @@ pub fn certify_multi_phase_jerk_ramp_feed_schedule<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
+-) -> Result<MultiPhaseJerkRampFeedScheduleReport, DynamicsError> {
++) -> Result<MultiPhaseJerkRampFeedScheduleReport, S::Error> {
+     if route.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     if route.len() != phases.len() || phases.iter().any(Vec::is_empty) {
+-        return Err(DynamicsError::ScheduleShapeMismatch);
++        return Err(DynamicsError::ScheduleShapeMismatch.into());
+     }
+     require_positive_feed(&max_feed_rate, policy)?;
+     require_positive_acceleration(&max_acceleration, policy)?;
+diff --git a/crates/hyperdynamics/src/join.rs b/crates/hyperdynamics/src/join.rs
+index 621638b77..e667da6d9 100644
+--- a/crates/hyperdynamics/src/join.rs
++++ b/crates/hyperdynamics/src/join.rs
+@@ -9,9 +9,9 @@ use hyperlimit::PredicatePolicy;
+ /// exact corresponding relation; invalid or undecided geometry remains a typed
+ /// error. This container is not itself a validator of arbitrary user providers.
+ #[derive(Clone, Debug)]
+-pub struct ClassifiedJoin<E> {
++pub struct ClassifiedJoin<E, F = DynamicsError> {
+     /// Dynamics class or explicit failure from the geometry owner.
+-    pub classification: Result<CornerLookaheadJoinClass, DynamicsError>,
++    pub classification: Result<CornerLookaheadJoinClass, F>,
+     /// Complete source-owned predicate receipt, including failure evidence.
+     pub receipt: E,
+ }
+@@ -23,6 +23,10 @@ pub struct ClassifiedJoin<E> {
+ /// receipt. Repeated requests must remain valid for the same retained sources;
+ /// scheduling does not authorize precomputation, approximation or weaker proof.
+ pub trait JoinSpan {
++    /// Source failure retaining its cause and every native dynamics distinction.
++    /// Mixed metric/join scheduling converts this into the metric provider's
++    /// error; that conversion must retain this failure's original cause.
++    type Error: From<DynamicsError>;
+     /// Geometry-owned receipt transported without replacing it by a class alone.
+     type Receipt: Clone + core::fmt::Debug;
+     /// Classify this span's end against the outgoing span's start.
+@@ -30,5 +34,5 @@ pub trait JoinSpan {
+         &self,
+         outgoing: &Self,
+         policy: PredicatePolicy,
+-    ) -> ClassifiedJoin<Self::Receipt>;
++    ) -> ClassifiedJoin<Self::Receipt, Self::Error>;
+ }
+diff --git a/crates/hyperdynamics/src/lookahead.rs b/crates/hyperdynamics/src/lookahead.rs
+index 3d74464e0..31081b5e4 100644
+--- a/crates/hyperdynamics/src/lookahead.rs
++++ b/crates/hyperdynamics/src/lookahead.rs
+@@ -232,6 +232,8 @@ impl<E> LookaheadFeedScheduleReport<E> {
+ /// This function constructs a candidate and then invokes
+ /// [`certify_lookahead_feed_schedule`] as an independent replay. No sampled
+ /// time step, floating proposal, or firmware behavior participates.
++/// Different provider errors compose through `From<J::Error>` on the metric
++/// error; that conversion must retain the original join cause.
+ #[inline]
+ pub fn plan_lookahead_feed_schedule<S: MetricSpan, J: JoinSpan>(
+     route: &[S],
+@@ -240,15 +242,18 @@ pub fn plan_lookahead_feed_schedule<S: MetricSpan, J: JoinSpan>(
+     max_feed_rate: Real,
+     max_acceleration: Real,
+     policy: PredicatePolicy,
+-) -> Result<PlannedLookaheadFeedSchedule<J::Receipt>, DynamicsError> {
++) -> Result<PlannedLookaheadFeedSchedule<J::Receipt>, S::Error>
++where
++    S::Error: From<J::Error>,
++{
+     if route.is_empty() || spans.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     if route.len() != spans.len()
+         || limits.maximum_corner_feeds.len() != route.len().saturating_sub(1)
+         || limits.corner_radii.len() != route.len().saturating_sub(1)
+     {
+-        return Err(DynamicsError::ScheduleShapeMismatch);
++        return Err(DynamicsError::ScheduleShapeMismatch.into());
+     }
+ 
+     require_nonnegative_feed(&limits.maximum_entry_feed, policy)?;
+@@ -336,7 +341,7 @@ pub fn plan_lookahead_feed_schedule<S: MetricSpan, J: JoinSpan>(
+         .all(CandidateCertificationReport::all_satisfied)
+         || !certification.all_satisfied()
+     {
+-        return Err(DynamicsError::LookaheadProposalUncertified);
++        return Err(DynamicsError::LookaheadProposalUncertified.into());
+     }
+ 
+     Ok(PlannedLookaheadFeedSchedule {
+@@ -365,6 +370,11 @@ pub fn plan_lookahead_feed_schedule<S: MetricSpan, J: JoinSpan>(
+ /// current monotonic transition primitive to lookahead without solving a
+ /// floating cubic, sampling a controller trajectory, or treating a sharp
+ /// corner as retained blend geometry.
++///
++/// The source error must compare equal to `DynamicsError::JerkProposalUncertified`
++/// exactly when it denotes that native failure. All other errors propagate
++/// unchanged. This comparison classifies a failure; it must not make geometric
++/// decisions, consume proof evidence, or treat an unresolved error as retryable.
+ #[allow(clippy::too_many_arguments)]
+ #[inline]
+ pub fn plan_jerk_feasible_lookahead_schedule<S: MetricSpan, J: JoinSpan>(
+@@ -376,7 +386,10 @@ pub fn plan_jerk_feasible_lookahead_schedule<S: MetricSpan, J: JoinSpan>(
+     max_jerk: Real,
+     maximum_component_halvings: u32,
+     policy: PredicatePolicy,
+-) -> Result<PlannedJerkFeasibleLookaheadSchedule<J::Receipt>, DynamicsError> {
++) -> Result<PlannedJerkFeasibleLookaheadSchedule<J::Receipt>, S::Error>
++where
++    S::Error: From<J::Error> + PartialEq<DynamicsError>,
++{
+     require_positive_jerk(&max_jerk, policy)?;
+     let acceleration_plan = plan_lookahead_feed_schedule(
+         route,
+@@ -408,9 +421,9 @@ pub fn plan_jerk_feasible_lookahead_schedule<S: MetricSpan, J: JoinSpan>(
+                 ) {
+                     Ok(Some(_)) => {}
+                     Ok(None) => {
+-                        return Err(DynamicsError::JerkProposalUncertified);
++                        return Err(DynamicsError::JerkProposalUncertified.into());
+                     }
+-                    Err(DynamicsError::JerkProposalUncertified) => {
++                    Err(error) if error == DynamicsError::JerkProposalUncertified => {
+                         component_certifies = false;
+                         break;
+                     }
+@@ -421,7 +434,7 @@ pub fn plan_jerk_feasible_lookahead_schedule<S: MetricSpan, J: JoinSpan>(
+                 break;
+             }
+             if uniform_halvings == maximum_component_halvings {
+-                return Err(DynamicsError::JerkRefinementBudgetExceeded);
++                return Err(DynamicsError::JerkRefinementBudgetExceeded.into());
+             }
+             for feed in &mut selected_node_feeds[first_node..=last_node] {
+                 *feed = (&*feed / Real::from(2)).map_err(|_| DynamicsError::UnsupportedDivision)?;
+@@ -473,7 +486,7 @@ pub fn plan_jerk_feasible_lookahead_schedule<S: MetricSpan, J: JoinSpan>(
+             .flatten()
+             .all(PlannedMonotonicJerkTransition::all_satisfied)
+     {
+-        return Err(DynamicsError::JerkProposalUncertified);
++        return Err(DynamicsError::JerkProposalUncertified.into());
+     }
+ 
+     Ok(PlannedJerkFeasibleLookaheadSchedule {
+@@ -504,15 +517,18 @@ pub fn certify_lookahead_feed_schedule<S: MetricSpan, J: JoinSpan>(
+     max_feed_rate: Real,
+     max_acceleration: Real,
+     policy: PredicatePolicy,
+-) -> Result<LookaheadFeedScheduleReport<J::Receipt>, DynamicsError> {
++) -> Result<LookaheadFeedScheduleReport<J::Receipt>, S::Error>
++where
++    S::Error: From<J::Error>,
++{
+     if route.is_empty() || spans.is_empty() {
+-        return Err(DynamicsError::EmptyRoute);
++        return Err(DynamicsError::EmptyRoute.into());
+     }
+     if route.len() != spans.len()
+         || schedule.corner_feeds.len() != route.len().saturating_sub(1)
+         || schedule.corner_radii.len() != route.len().saturating_sub(1)
+     {
+-        return Err(DynamicsError::ScheduleShapeMismatch);
++        return Err(DynamicsError::ScheduleShapeMismatch.into());
+     }
+ 
+     require_nonnegative_feed(&schedule.entry_feed, policy)?;
+@@ -580,7 +596,7 @@ fn certify_local_corner_limits<J: JoinSpan>(
+     max_feed_rate: Real,
+     max_acceleration: Real,
+     policy: PredicatePolicy,
+-) -> Result<CornerLookaheadLimitReport<J::Receipt>, DynamicsError> {
++) -> Result<CornerLookaheadLimitReport<J::Receipt>, J::Error> {
+     let mut joins = Vec::with_capacity(spans.len().saturating_sub(1));
+     for (index, pair) in spans.windows(2).enumerate() {
+         let classified = pair[0].classify_join(&pair[1], policy);
+@@ -748,7 +764,7 @@ fn plan_span_monotonic_transition<S: MetricSpan>(
+     max_acceleration: Real,
+     max_jerk: Real,
+     policy: PredicatePolicy,
+-) -> Result<Option<PlannedMonotonicJerkTransition>, DynamicsError> {
++) -> Result<Option<PlannedMonotonicJerkTransition>, S::Error> {
+     if !feed_is_positive(start_feed, policy)? && !feed_is_positive(end_feed, policy)? {
+         return Ok(None);
+     }
+@@ -846,7 +862,7 @@ fn lookahead_join_class<J: JoinSpan>(
+     incoming: &J,
+     outgoing: &J,
+     policy: PredicatePolicy,
+-) -> Result<CornerLookaheadJoinClass, DynamicsError> {
++) -> Result<CornerLookaheadJoinClass, J::Error> {
+     let classified = incoming.classify_join(outgoing, policy);
+     classified.classification
+ }
+diff --git a/crates/hyperdynamics/src/metric.rs b/crates/hyperdynamics/src/metric.rs
+index b278d784f..fc1e7a011 100644
+--- a/crates/hyperdynamics/src/metric.rs
++++ b/crates/hyperdynamics/src/metric.rs
+@@ -21,8 +21,11 @@ pub enum SpanDynamicsClass {
+ /// supplies metric data, not a certificate of the source geometry's validity.
+ /// Consumers request lengths lazily and may query a source again during replay.
+ pub trait MetricSpan {
++    /// Source failure retaining its cause and every native dynamics distinction.
++    /// Conversion from `DynamicsError` must preserve its exact failure kind.
++    type Error: From<DynamicsError>;
+     /// Obtain the retained source length under the caller's predicate policy.
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError>;
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error>;
+     /// Identify a structural specialization; this does not certify axis limits.
+     fn dynamics_class(&self) -> SpanDynamicsClass;
+ }
+@@ -35,35 +38,40 @@ pub trait MetricSpan {
+ /// arbitrary provider code or establish geometry validity. Empty native slices
+ /// have zero length, while scheduling operations reject empty input first.
+ pub trait MetricPath {
++    /// Source failure retaining its cause and every native dynamics distinction.
++    type Error: From<DynamicsError>;
+     /// Whether this retained path contains no spans, without evaluating lengths.
+     fn is_empty(&self) -> bool;
+     /// Obtain the exact aggregate length under the caller's policy.
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError>;
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error>;
+ }
+ 
+ impl<S: MetricSpan> MetricPath for [S] {
++    type Error = S::Error;
+     fn is_empty(&self) -> bool {
+         <[S]>::is_empty(self)
+     }
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error> {
+         self.iter().try_fold(Real::zero(), |sum, span| {
+             span.exact_length(policy).map(|length| sum + length)
+         })
+     }
+ }
+ impl<S: MetricSpan, const N: usize> MetricPath for [S; N] {
++    type Error = S::Error;
+     fn is_empty(&self) -> bool {
+         N == 0
+     }
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error> {
+         MetricPath::exact_length(self.as_slice(), policy)
+     }
+ }
+ impl<S: MetricSpan> MetricPath for Vec<S> {
++    type Error = S::Error;
+     fn is_empty(&self) -> bool {
+         Vec::is_empty(self)
+     }
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error> {
+         MetricPath::exact_length(self.as_slice(), policy)
+     }
+ }
+diff --git a/crates/hyperdynamics/tests/feed_join_admission.rs b/crates/hyperdynamics/tests/feed_join_admission.rs
+index a0e286abf..9f9921eea 100644
+--- a/crates/hyperdynamics/tests/feed_join_admission.rs
++++ b/crates/hyperdynamics/tests/feed_join_admission.rs
+@@ -10,6 +10,7 @@ use hyperreal::Real;
+ 
+ struct Span(Real);
+ impl MetricSpan for Span {
++    type Error = DynamicsError;
+     fn exact_length(&self, _: PredicatePolicy) -> Result<Real, DynamicsError> {
+         Ok(self.0.clone())
+     }
+@@ -24,6 +25,7 @@ struct Receipt {
+ }
+ struct Join(u32);
+ impl JoinSpan for Join {
++    type Error = DynamicsError;
+     type Receipt = Receipt;
+     fn classify_join(&self, outgoing: &Self, _: PredicatePolicy) -> ClassifiedJoin<Receipt> {
+         ClassifiedJoin {
+@@ -121,6 +123,7 @@ struct ObservedSpan {
+     queries: Queries,
+ }
+ impl MetricSpan for ObservedSpan {
++    type Error = DynamicsError;
+     fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
+         self.queries.borrow_mut().push((self.name, policy));
+         self.length.clone()
+@@ -134,6 +137,7 @@ struct ObservedJoin {
+     invalid: bool,
+ }
+ impl JoinSpan for ObservedJoin {
++    type Error = DynamicsError;
+     type Receipt = Receipt;
+     fn classify_join(&self, _: &Self, policy: PredicatePolicy) -> ClassifiedJoin<Receipt> {
+         self.queries.borrow_mut().push(("join", policy));
+diff --git a/crates/hyperdynamics/tests/metric_admission.rs b/crates/hyperdynamics/tests/metric_admission.rs
+index a4b7d2684..237c983aa 100644
+--- a/crates/hyperdynamics/tests/metric_admission.rs
++++ b/crates/hyperdynamics/tests/metric_admission.rs
+@@ -3,6 +3,7 @@ use hyperlimit::PredicatePolicy;
+ use hyperreal::Real;
+ struct Span(Real);
+ impl MetricSpan for Span {
++    type Error = DynamicsError;
+     fn exact_length(&self, _: PredicatePolicy) -> Result<Real, DynamicsError> {
+         Ok(self.0.clone())
+     }
+@@ -114,6 +115,7 @@ struct ObservedSpan {
+     queries: RefCell<Vec<PredicatePolicy>>,
+ }
+ impl MetricSpan for ObservedSpan {
++    type Error = DynamicsError;
+     fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
+         self.queries.borrow_mut().push(policy);
+         self.length.borrow().clone()
+diff --git a/crates/hyperpath/src/routing.rs b/crates/hyperpath/src/routing.rs
+index 360f47430..e889c4d0a 100644
+--- a/crates/hyperpath/src/routing.rs
++++ b/crates/hyperpath/src/routing.rs
+@@ -1001,7 +1001,6 @@ pub fn certify_constant_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric acceleration-limited feed traversal time.
+@@ -1032,7 +1031,6 @@ pub fn certify_acceleration_limited_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ fn build_nonuniform_detour_meander_with_side(
+diff --git a/crates/hyperpath/src/routing/dynamics.rs b/crates/hyperpath/src/routing/dynamics.rs
+index b5da8fd5e..9ccdd9e59 100644
+--- a/crates/hyperpath/src/routing/dynamics.rs
++++ b/crates/hyperpath/src/routing/dynamics.rs
+@@ -84,8 +84,9 @@ impl From<RouteCertificationError> for DynamicsError {
+ }
+ 
+ impl MetricSpan for FeedPathElement {
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
+-        element_length(self, policy).map_err(Into::into)
++    type Error = RouteCertificationError;
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error> {
++        element_length(self, policy)
+     }
+     fn dynamics_class(&self) -> SpanDynamicsClass {
+         match self {
+@@ -98,12 +99,13 @@ impl MetricSpan for FeedPathElement {
+ }
+ 
+ impl hyperdynamics::JoinSpan for crate::tangent::TangentSpan {
++    type Error = RouteCertificationError;
+     type Receipt = crate::tangent::TangentJoinReport;
+     fn classify_join(
+         &self,
+         outgoing: &Self,
+         policy: PredicatePolicy,
+-    ) -> hyperdynamics::ClassifiedJoin<Self::Receipt> {
++    ) -> hyperdynamics::ClassifiedJoin<Self::Receipt, Self::Error> {
+         use crate::tangent::{TangentJoinClass, classify_tangent_join};
+         use hyperdynamics::CornerLookaheadJoinClass;
+         let receipt = classify_tangent_join(
+@@ -119,7 +121,7 @@ impl hyperdynamics::JoinSpan for crate::tangent::TangentSpan {
+             TangentJoinClass::ReversedTangent => Ok(CornerLookaheadJoinClass::ReversalStop),
+             TangentJoinClass::DegenerateTangent
+             | TangentJoinClass::EndpointMismatch
+-            | TangentJoinClass::Unknown => Err(DynamicsError::UnsupportedRouteGeometry),
++            | TangentJoinClass::Unknown => Err(RouteCertificationError::UnsupportedRouteGeometry),
+         };
+         hyperdynamics::ClassifiedJoin {
+             classification,
+@@ -127,3 +129,9 @@ impl hyperdynamics::JoinSpan for crate::tangent::TangentSpan {
+         }
+     }
+ }
++
++impl PartialEq<DynamicsError> for RouteCertificationError {
++    fn eq(&self, other: &DynamicsError) -> bool {
++        DynamicsError::from(*self) == *other
++    }
++}
+diff --git a/crates/hyperpath/src/routing/feed.rs b/crates/hyperpath/src/routing/feed.rs
+index 5bdb98cb7..d68712b79 100644
+--- a/crates/hyperpath/src/routing/feed.rs
++++ b/crates/hyperpath/src/routing/feed.rs
+@@ -52,7 +52,6 @@ pub fn certify_constant_feed_time_for_path(
+     policy: PredicatePolicy,
+ ) -> Result<ConstantFeedTimeReport, RouteCertificationError> {
+     hyperdynamics::certify_constant_feed_time(route, feed_rate, target_time, policy)
+-        .map_err(Into::into)
+ }
+ 
+ /// Certify symmetric acceleration-limited traversal for a mixed line/arc route.
+@@ -80,7 +79,6 @@ pub fn certify_acceleration_limited_feed_time_for_path(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric four-phase jerk-limited feed profile for a mixed route.
+@@ -109,7 +107,6 @@ pub fn certify_symmetric_jerk_limited_feed_time_for_path(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric four-phase jerk-limited feed traversal time.
+@@ -143,7 +140,6 @@ pub fn certify_symmetric_jerk_limited_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify exact lookahead corner-speed limits for retained tangent spans.
+@@ -181,7 +177,6 @@ pub fn certify_corner_lookahead_limits(
+         corner_radius,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ pub(crate) fn element_length(
+@@ -202,11 +197,12 @@ pub(crate) fn element_length(
+ 
+ pub(crate) struct AxisMetricPath<'a>(pub(crate) &'a [LinePathSegment]);
+ impl hyperdynamics::MetricPath for AxisMetricPath<'_> {
++    type Error = RouteCertificationError;
+     fn is_empty(&self) -> bool {
+         self.0.is_empty()
+     }
+-    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, hyperdynamics::DynamicsError> {
++    fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, Self::Error> {
+         super::route_axis_length(self.0, policy)
+-            .ok_or(hyperdynamics::DynamicsError::UnsupportedRouteGeometry)
++            .ok_or(RouteCertificationError::UnsupportedRouteGeometry)
+     }
+ }
+diff --git a/crates/hyperpath/src/routing/jerk_schedule.rs b/crates/hyperpath/src/routing/jerk_schedule.rs
+index ad250073c..6fb101b68 100644
+--- a/crates/hyperpath/src/routing/jerk_schedule.rs
++++ b/crates/hyperpath/src/routing/jerk_schedule.rs
+@@ -31,7 +31,6 @@ pub fn plan_monotonic_jerk_transition(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Compatibility wrapper for [`hyperdynamics::certify_jerk_ramp_feed_schedule`].
+@@ -55,7 +54,6 @@ pub fn certify_jerk_ramp_feed_schedule(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Compatibility wrapper for [`hyperdynamics::certify_multi_phase_jerk_ramp_feed_schedule`].
+@@ -79,5 +77,4 @@ pub fn certify_multi_phase_jerk_ramp_feed_schedule(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+diff --git a/crates/hyperpath/src/routing/lookahead.rs b/crates/hyperpath/src/routing/lookahead.rs
+index 1ff9b9eab..5ef42fccd 100644
+--- a/crates/hyperpath/src/routing/lookahead.rs
++++ b/crates/hyperpath/src/routing/lookahead.rs
+@@ -51,7 +51,6 @@ pub fn plan_lookahead_feed_schedule(
+         max_acceleration,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Plan exact lookahead nodes and conservatively refine them until every
+@@ -96,7 +95,6 @@ pub fn plan_jerk_feasible_lookahead_schedule(
+         maximum_component_halvings,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a local lookahead feed schedule for a retained mixed path.
+@@ -129,5 +127,4 @@ pub fn certify_lookahead_feed_schedule(
+         max_acceleration,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 89dcaa671..27b242623 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -10,6 +10,14 @@ length without copying geometry. Join providers retain complete source-owned
+ receipts in `ClassifiedJoin`; lower reports are generic over that receipt.
+ For Hyperpath sources, the receipt is `hyperpath::TangentJoinReport`.
+ 
++The pending provider protocols have an associated `Error`. Native examples use
++`DynamicsError`; Hyperpath sources use their unchanged `RouteCertificationError`.
++Scheduling returns the source error directly. `From<DynamicsError>` must preserve
++every native failure kind; mixed metric/join operations also require the metric
++error to preserve join causes through `From`. Jerk refinement requires exact
++comparison with `DynamicsError::JerkProposalUncertified`, and propagates other
++failures without retrying them. Provider errors need not implement `Clone`.
++
+ Hyperpath preserves its old concrete report aliases and deprecated function
+ paths through a coordinated minor release. Its old line-only feed operations
+ still require axis-aligned geometry through a borrowed metric adapter; mixed
