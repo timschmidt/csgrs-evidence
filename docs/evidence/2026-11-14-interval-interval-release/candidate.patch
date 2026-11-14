@@ -1,0 +1,299 @@
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index b35c49a28..f0412ea11 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -5,6 +5,62 @@ images. Hyperdynamics owns field semantics; Hypersolve validates expressions and
+ symbolic derivatives, Hyperlattice carries Cartesian vectors/matrices, and
+ Hyperinterval encloses scalar arithmetic. There is no geometry-layer dependency.
+ 
++With `field`, this example certifies `x'=2`, then consumes its endpoint in
++another horizon. The example also uses Hyperinterval with `dyadic`, Hyperlattice
++Interval with `dyadic`, and Hypersolve with `interval-program`.
++
++<!-- quickstart:start -->
++```rust
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest, EvolutionStatus},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let time = SymbolId(0);
++    let state = SymbolId(1);
++    let source = ExpressionProgram::compile(
++        &[Expr::int(2)],
++        &[time, state],
++        &mut ExpressionBudget::new(1000, 10000),
++    )?;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let field = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![state],
++        },
++        &mut budget,
++    )?;
++    let point = |n: i64| DyadicInterval::point(n.into(), 0);
++    let mut initial = BoxN::new([point(0)?])?;
++    for start in 0..2 {
++        let report = field.integrate(
++            EvolutionRequest {
++                start: point(start)?,
++                end: point(start + 1)?,
++                initial,
++            },
++            EvolutionOptions::default(),
++            &mut budget,
++        );
++        assert!(matches!(report.status(), EvolutionStatus::Completed));
++        assert_eq!(report.identity(), &field.identity());
++        initial = report.end_enclosure().expect("completed horizon").clone();
++        assert_eq!(initial.lanes(), Some(&[point(2 * (start + 1))?]));
++    }
++    Ok(())
++}
++```
++<!-- quickstart:end -->
++
+ Enable `field` for the sealed `EnclosedVectorField` interface and
+ `ExpressionField<N>`. A `FieldDefinition` supplies N output expressions, one time
+ variable and N distinct state variables. Source bindings may occur in any order.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 2baf49768..b6e924322 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -108,16 +108,21 @@ Hyperinterval encloses. Hyperlattice carries set-valued linear structure.
+ Hyperlimit decides. Hypersolve certifies. Hyperdynamics evolves. Domain crates
+ assign meaning.
+ 
++<!-- quickstart:start -->
+ ```rust
+-use hyperinterval::{FixedInterval, SignSet};
+-
+-type Q30Bounds = FixedInterval<i32, 30>;
+-let range = Q30Bounds::new(-(1 << 29), 1 << 29)?;
+-assert_eq!(range.signs(), SignSet::Mixed);
+-assert!(range.contains_point(0)); // zero is possible, not a scalar equality proof
+-assert_eq!(range.square()?.bounds(), Some((0, 1 << 28)));
+-# Ok::<(), hyperinterval::IntervalError>(())
++use hyperinterval::{FixedInterval, IntervalError, SignSet};
++
++fn main() -> Result<(), IntervalError> {
++    type Q30Bounds = FixedInterval<i32, 30>;
++    let range = Q30Bounds::new(-(1 << 29), 1 << 29)?;
++    assert_eq!(range.signs(), SignSet::Mixed);
++    assert!(range.contains_point(0)); // possible zero is not a scalar equality proof
++    assert_eq!(range.square()?.bounds(), Some((0, 1 << 28)));
++    assert_eq!(Q30Bounds::new(1, 0), Err(IntervalError::ReversedEndpoints));
++    Ok(())
++}
+ ```
++<!-- quickstart:end -->
+ 
+ Enable `fixed` for that example. `integer` enables exact discrete ranges of
+ all signed and unsigned primitive integer widths. Fixed endpoints represent
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 3d05873c0..3e2845ea5 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -5,17 +5,24 @@ scalar arithmetic; this package owns Cartesian structure and linear products.
+ Hyperlattice re-exports the same types for host consumers. This companion
+ provides the Rust 1.88, allocation-free `no_std` dependency path for firmware.
+ 
++<!-- quickstart:start -->
+ ```rust
+-use hyperlattice_interval::{IntervalMatrix, IntervalVector};
+ use hyperlattice_interval::hyperinterval::FixedInterval;
++use hyperlattice_interval::{IntervalLatticeError, IntervalMatrix, IntervalVector};
+ 
+-type I = FixedInterval<i32, 0>;
+-let matrix = IntervalMatrix::new([[I::point(2)?, I::point(-1)?]])?;
+-let vector = IntervalVector::new([I::new(1, 3)?, I::new(4, 5)?])?;
+-let image = matrix.mul_vector(&vector, &mut ())?;
+-assert_eq!(image.lanes().unwrap()[0].bounds(), Some((-3, 2)));
+-# Ok::<(), hyperlattice_interval::IntervalLatticeError>(())
++fn main() -> Result<(), IntervalLatticeError> {
++    type I = FixedInterval<i32, 0>;
++    let matrix = IntervalMatrix::new([[I::point(2)?, I::point(-1)?]])?;
++    let vector = IntervalVector::new([I::new(1, 3)?, I::new(4, 5)?])?;
++    let image = matrix.mul_vector(&vector, &mut ())?;
++    assert_eq!(image.lanes().unwrap()[0].bounds(), Some((-3, 2)));
++    let scale = IntervalMatrix::new([[I::point(2)?]])?;
++    let next = scale.mul_vector(&image, &mut ())?;
++    assert_eq!(next.lanes().unwrap()[0].bounds(), Some((-6, 4)));
++    Ok(())
++}
+ ```
++<!-- quickstart:end -->
+ 
+ Build and test with `cargo test -p hyperlattice-interval --features fixed`.
+ No scalar backend is enabled by default. `fixed` and `float-enclosure` require
+diff --git a/docs/RELEASE.md b/docs/RELEASE.md
+index 433e31e71..17bb51058 100644
+--- a/docs/RELEASE.md
++++ b/docs/RELEASE.md
+@@ -9,6 +9,9 @@ shipped-user-path rules in [`admission.md`](admission.md#the-shipped-user-path).
+ | Crate | Version | On crates.io | Notes |
+ | --- | --- | --- | --- |
+ | `hyperreal` | 0.14.0 | 0.13.0 | breaking |
++| `hyperinterval` | 0.1.0 | not verified | first coordinated interval release |
++| `hyperlattice-interval` | 0.1.0 | not verified | first coordinated interval release |
++| `hyperdynamics` | 0.1.0 | not verified | first coordinated interval release |
+ | `hyperlattice` | 0.7.0 | 0.6.0 | breaking |
+ | `hyperlimit` | 0.5.0 | 0.4.0 | breaking |
+ | `hypertri` | 0.5.0 | 0.4.0 | breaking |
+@@ -42,9 +45,11 @@ vendored `voxelis` 25.5.0 (`legacy-voxelis`), while crates.io has `voxelis`
+ dependency, the chain also holds back `csgrs`, `csgrs-ffi`, `hyperdrc` and
+ `hypercircuit`.
+ 
+-The crates that do not depend on `hypersdf` can be published now:
+-`hyperreal`, `hyperlattice`, `hyperlimit`, `hypertri`, `hypersolve`,
+-`hypercurve`, `hypermesh`, `hyperphysics`, `hypergraphics`, `hyperevolution`,
++These crates do not share the optional-voxel publication blocker; their other
++release checks still apply:
++`hyperreal`, `hyperinterval`, `hyperlattice-interval`, `hyperlattice`,
++`hyperlimit`, `hypertri`, `hypersolve`, `hyperdynamics`, `hypercurve`, `hypermesh`,
++`hyperphysics`, `hypergraphics`, `hyperevolution`,
+ `hyperpack`, `hyperparts` and `hyperpath`.
+ 
+ ### Known limitations
+@@ -96,7 +101,9 @@ Run these after the last change, in addition to the
+      transform, compose under `STRICT` with certified certainty, validate the
+      closed manifold and exact volume, export STL, OBJ and PLY, reimport STL
+      and OBJ, and check each format's counts and round trip;
+-   - every README quick start, extracted from its `quickstart` markers;
++   - every packaged README quick start, extracted from its `quickstart` markers;
++     the interval examples check typed scalar rejection, Cartesian composition
++     and a certified flow endpoint consumed by a subsequent horizon;
+    - C and C++ programs (`scripts/release-consumer/ffi_smoke.c`,
+      `bindings_smoke.cpp`) linked against the packaged `csgrs-ffi` static
+      library and its shipped header, a Python program through
+@@ -132,7 +139,8 @@ itself, and the crates.io and docs.rs builds, stay unverified until it happens.
+ 
+ Publish in dependency order, waiting for each crate to appear in the index:
+ 
+-1. `hyperreal`, `hyperlattice`, `hyperlimit`, `hypertri`, `hypersolve`,
++1. `hyperreal`, `hyperinterval`, `hyperlattice-interval`, `hyperlattice`,
++   `hyperlimit`, `hypertri`, `hypersolve`, `hyperdynamics`,
+    `hypercurve`, `hypermesh`, `hyperphysics`
+ 2. `hypergraphics`, `hyperevolution`, `hyperpack`, `hyperparts`, `hyperpath`
+ 3. after `hypervoxel` 0.3.0 is on crates.io: `hypersdf`, `csgrs`,
+diff --git a/scripts/release-check.sh b/scripts/release-check.sh
+index 9cd56b907..2758c0bf8 100755
+--- a/scripts/release-check.sh
++++ b/scripts/release-check.sh
+@@ -30,15 +30,24 @@ while [[ $# -gt 0 ]]; do
+   shift
+ done
+ 
++cargo_command=(cargo)
++[[ -z "${toolchain}" ]] || cargo_command+=("${toolchain}")
++
+ # Released crates in dependency order. hypervoxel, hyperbrep, hyperbrep-io
+ # and hyperspatial are not part of this release.
+ crates=(
+-  hyperreal hyperlattice hyperlimit hypertri hypersolve hypercurve hypermesh
++  hyperreal hyperinterval hyperlattice-interval hyperlattice hyperlimit hypertri
++  hypersolve hyperdynamics hypercurve hypermesh
+   hyperphysics hypersdf csgrs csgrs-ffi hypergraphics hyperevolution hyperpack
+   hyperparts hyperpath hyperdrc hypercircuit
+ )
+ # README quick starts that need non-default features of their crate.
+-declare -A quickstart_features=([hypertri]="earcut")
++declare -A quickstart_features=(
++  [hypertri]="earcut"
++  [hyperinterval]="fixed"
++  [hyperlattice-interval]="fixed"
++  [hyperdynamics]="field"
++)
+ 
+ target="${CARGO_TARGET_DIR:-${root}/target}/release-check"
+ # Unpacked packages and the consumer live outside the repository, so Cargo
+@@ -64,11 +73,11 @@ overlay=(--config 'patch.crates-io.hypervoxel.path="crates/hypervoxel"')
+ verify_args=()
+ [[ ${verify} -eq 1 ]] || verify_args=(--no-verify)
+ echo "== packaging ${#crates[@]} crates"
+-CARGO_HOME="${work}/cargo-home" CARGO_TARGET_DIR="${target}" cargo ${toolchain} package --locked \
++CARGO_HOME="${work}/cargo-home" CARGO_TARGET_DIR="${target}" "${cargo_command[@]}" package --locked \
+   "${overlay[@]}" "${verify_args[@]}" "${dirty[@]}" "${package_args[@]}"
+ 
+ echo "== documenting each crate with its docs.rs configuration"
+-cargo metadata --locked --no-deps --format-version 1 | python3 -c '
++"${cargo_command[@]}" metadata --locked --no-deps --format-version 1 | python3 -c '
+ import json, sys
+ crates = set(sys.argv[1:])
+ for package in json.load(sys.stdin)["packages"]:
+@@ -84,14 +93,19 @@ for package in json.load(sys.stdin)["packages"]:
+         args += ["--features", ",".join(docs["features"])]
+     print(" ".join(args))
+ ' "${crates[@]}" | while read -r -a doc_args; do
+-  RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR="${target}" cargo ${toolchain} doc --locked \
++  RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR="${target}" "${cargo_command[@]}" doc --locked \
+     --no-deps "${overlay[@]}" "${doc_args[@]}"
+ done
+ 
+ # Unpack exactly what would be uploaded.
+ declare -A version
+ for crate in "${crates[@]}"; do
+-  archive=$(ls "${target}/package/${crate}"-[0-9]*.crate | sort -V | tail -1)
++  archives=("${target}/package/${crate}"-[0-9]*.crate)
++  if [[ ${#archives[@]} -ne 1 || ! -f "${archives[0]}" ]]; then
++    echo "expected exactly one verified archive for ${crate}" >&2
++    exit 1
++  fi
++  archive="${archives[0]}"
+   tar -xzf "${archive}" -C "${work}/packages"
+   base=$(basename "${archive}" .crate)
+   version[${crate}]="${base#"${crate}"-}"
+@@ -128,8 +142,8 @@ cp scripts/release-consumer/user_path.rs "${consumer}/src/bin/user_path.rs"
+ echo 'fn main() {}' > "${consumer}/src/main.rs"
+ for crate in "${crates[@]}"; do
+   [[ ${crate} == csgrs-ffi ]] && continue
+-  readme="crates/${crate}/README.md"
+-  [[ ${crate} == csgrs ]] && readme="readme.md"
++  readme="${work}/packages/${crate}-${version[${crate}]}/README.md"
++  [[ ${crate} == csgrs ]] && readme="${work}/packages/csgrs-${version[csgrs]}/readme.md"
+   python3 - "${readme}" "${consumer}/src/bin/quickstart_${crate//-/_}.rs" <<'EOF'
+ import re, sys
+ text = open(sys.argv[1]).read()
+@@ -141,18 +155,20 @@ EOF
+ done
+ 
+ echo "== building the consumer against packaged sources"
+-(cd "${consumer}" && CARGO_TARGET_DIR="${target}/consumer" cargo ${toolchain} build --bins)
++(cd "${consumer}" && CARGO_TARGET_DIR="${target}/consumer" "${cargo_command[@]}" build --bins)
+ 
+ # Every released crate must resolve from the unpacked packages, never from
+ # the repository.
+-python3 - "${consumer}" "${root}" "${crates[@]}" <<'EOF'
++python3 - "${consumer}" "${root}" "${toolchain}" "${crates[@]}" <<'EOF'
+ import json, os, subprocess, sys
+-consumer, root, crates = sys.argv[1], os.path.realpath(sys.argv[2]), set(sys.argv[3:])
++consumer, root, toolchain = sys.argv[1], os.path.realpath(sys.argv[2]), sys.argv[3]
++crates = set(sys.argv[4:])
++cargo = ["cargo"] + ([toolchain] if toolchain else [])
+ # The lock file the build just wrote fixes the resolution. Metadata reads
+ # every locked package's manifest, including packages for other platforms
+ # that the build never downloaded, so it may fetch them.
+ meta = json.loads(subprocess.check_output(
+-    ["cargo", "metadata", "--format-version", "1", "--locked"], cwd=consumer))
++    cargo + ["metadata", "--format-version", "1", "--locked"], cwd=consumer))
+ packages = os.path.realpath(os.path.join(consumer, "..", "packages"))
+ for package in meta["packages"]:
+     path = os.path.realpath(package["manifest_path"])
+@@ -170,7 +186,7 @@ patches=()
+ for crate in "${crates[@]}"; do
+   patches+=(--config "patch.crates-io.${crate}.path=\"${work}/packages/${crate}-${version[${crate}]}\"")
+ done
+-(cd "${ffi}" && CARGO_TARGET_DIR="${target}/ffi" cargo ${toolchain} build "${patches[@]}" --lib)
++(cd "${ffi}" && CARGO_TARGET_DIR="${target}/ffi" "${cargo_command[@]}" build "${patches[@]}" --lib)
+ cc -std=c11 -Wall -Wextra -Werror -I "${ffi}/include" scripts/release-consumer/ffi_smoke.c \
+   "${target}/ffi/debug/libcsgrs_ffi.a" -lm -lpthread -ldl -o "${work}/ffi_smoke"
+ 

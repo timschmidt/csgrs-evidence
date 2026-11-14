@@ -1,0 +1,7 @@
+from pathlib import Path
+import subprocess,json,hashlib
+s=Path(__file__).parent;r=Path('/mnt/development/csgrs-interval-release')
+def git(*args):return subprocess.check_output(['git',*args],cwd=r)
+base=git('rev-parse','HEAD').decode().strip();assert base==json.loads((s/'BASELINE.json').read_text())['csgrs']['head'];assert (s/'final-release.exit').read_text().strip()=='0';assert (s/'format.exit').read_text().strip()=='0'
+for name in ['fixed-package-checks.json','focused-checks.json','packaged-feature-checks.json']:assert all(x['returncode']==0 for x in json.loads((s/name).read_text()))
+paths=['crates/hyperdynamics/README.md','crates/hyperinterval/README.md','crates/hyperlattice-interval/README.md','docs/RELEASE.md','scripts/release-check.sh'];assert sorted(git('diff','--name-only').decode().splitlines())==sorted(paths);assert not git('diff','--cached','--binary');git('diff','--check');git('add','--',*paths);git('commit','-m','Include interval crates in packaged release verification');commit=git('rev-parse','HEAD').decode().strip();assert not git('status','--porcelain');patch=git('diff','--binary',base,commit);(s/'candidate.patch').write_bytes(patch);(s/'SOURCE.json').write_text(json.dumps(dict(base=base,commit=commit,paths=paths,patch_sha256=hashlib.sha256(patch).hexdigest(),status='isolated candidate; stable and clean-checkout qualification pending; main not integrated'),indent=2)+'\n');print(commit)
