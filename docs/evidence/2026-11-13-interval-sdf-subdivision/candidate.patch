@@ -1,0 +1,119 @@
+diff --git a/crates/hypersdf/CHANGELOG.md b/crates/hypersdf/CHANGELOG.md
+index d12db13e0..394715dc8 100644
+--- a/crates/hypersdf/CHANGELOG.md
++++ b/crates/hypersdf/CHANGELOG.md
+@@ -16,6 +16,11 @@ Initial release.
+   preserves source qualification, parameter guards and native Taylor composition.
+   Nested frames retain shared graph coordinates without expanding source trees.
+ 
++- Adaptive source-bound cell covers reuse native exact box bisection, preserve
++  every parent/child enclosure, and expose depth-limited or singleton unresolved
++  leaves. Shared work limits, separate tree capacity and typed failure prevent
++  a partial traversal from being published as a complete cover.
++
+ Hypersdf provides signed-distance and implicit-field expressions for the
+ Hyper geometry stack. It retains expression structure and exact parameters so
+ that inside, boundary, and outside questions are answered from the field
+diff --git a/crates/hypersdf/Cargo.toml b/crates/hypersdf/Cargo.toml
+index 5c6aa0186..8ce947f04 100644
+--- a/crates/hypersdf/Cargo.toml
++++ b/crates/hypersdf/Cargo.toml
+@@ -39,6 +39,6 @@ harness = false
+ 
+ [features]
+ default = []
+-enclosure-program = ["dep:hypersolve", "dep:hyperinterval"]
++enclosure-program = ["dep:hypersolve", "dep:hyperinterval", "hyperlattice/interval-dyadic"]
+ dispatch-trace = ["hyperlimit/dispatch-trace", "hyperreal/dispatch-trace"]
+ hypervoxel-adapter = ["dep:hypervoxel"]
+diff --git a/crates/hypersdf/README.md b/crates/hypersdf/README.md
+index ef51aac63..5f246ef03 100644
+--- a/crates/hypersdf/README.md
++++ b/crates/hypersdf/README.md
+@@ -55,6 +55,12 @@ optional path; existing queries remain available. Graph and
+ native arithmetic budgets are caller-owned; scalar refinement/payload and heap
+ exclusions remain explicit.
+ 
++`SdfProgram::subdivide` builds a bounded adaptive closed cover using native exact
++box bisection. It retains parent/child enclosures and explicit unresolved leaves
++at the requested depth or at singleton cells. Capacity, arithmetic, domain and
++cancellation failures return errors without a partial cover. Adjacent children
++share a closed facet; a cover is not a surface mesh or a disjoint-volume model.
++
+ ## Quick start
+ 
+ This example intersects a sphere with a slab, offsets the result, and performs
+diff --git a/crates/hypersdf/src/enclosure.rs b/crates/hypersdf/src/enclosure.rs
+index c349e5ba0..8771e98fc 100644
+--- a/crates/hypersdf/src/enclosure.rs
++++ b/crates/hypersdf/src/enclosure.rs
+@@ -25,6 +25,15 @@ pub enum SdfProgramError {
+     Taylor(TaylorError),
+     /// Original strict primitive-parameter domain or undecided diagnostic.
+     Source(SdfEvaluationError),
++    /// Original exact box-selection, bisection or arithmetic diagnostic.
++    Lattice(hyperlattice::IntervalLatticeError),
++    /// The requested retained-tree capacity cannot admit the next records.
++    SubdivisionCapacity {
++        /// Configured maximum number of tree records.
++        limit: usize,
++        /// Total records required for the next complete split.
++        required: usize,
++    },
+ }
+ impl fmt::Display for SdfProgramError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+@@ -37,7 +46,8 @@ impl std::error::Error for SdfProgramError {
+             Self::Source(e) => Some(e),
+             Self::Expression(e) => Some(e),
+             Self::Taylor(e) => Some(e),
+-            Self::Unsupported(_) => None,
++            Self::Lattice(e) => Some(e),
++            Self::Unsupported(_) | Self::SubdivisionCapacity { .. } => None,
+         }
+     }
+ }
+@@ -46,6 +56,11 @@ impl From<SdfEvaluationError> for SdfProgramError {
+         Self::Source(e)
+     }
+ }
++impl From<hyperlattice::IntervalLatticeError> for SdfProgramError {
++    fn from(e: hyperlattice::IntervalLatticeError) -> Self {
++        Self::Lattice(e)
++    }
++}
+ impl From<ExpressionError> for SdfProgramError {
+     fn from(e: ExpressionError) -> Self {
+         Self::Expression(e)
+@@ -416,3 +431,7 @@ fn compile(
+ }
+ 
+ mod primitive;
++mod subdivision;
++pub use subdivision::{
++    SdfSubdivision, SdfSubdivisionCell, SdfSubdivisionOptions, SdfUnresolvedCell,
++};
+diff --git a/crates/hypersdf/src/lib.rs b/crates/hypersdf/src/lib.rs
+index c912002c4..4251f47cd 100644
+--- a/crates/hypersdf/src/lib.rs
++++ b/crates/hypersdf/src/lib.rs
+@@ -1293,4 +1293,7 @@ mod tests {
+ #[cfg(feature = "enclosure-program")]
+ pub mod enclosure;
+ #[cfg(feature = "enclosure-program")]
+-pub use enclosure::{SdfCellEnclosure, SdfProgram, SdfProgramError};
++pub use enclosure::{
++    SdfCellEnclosure, SdfProgram, SdfProgramError, SdfSubdivision, SdfSubdivisionCell,
++    SdfSubdivisionOptions, SdfUnresolvedCell,
++};
+diff --git a/crates/hypersdf/tests/enclosure_program.rs b/crates/hypersdf/tests/enclosure_program.rs
+index c3b08c007..1d49975b2 100644
+--- a/crates/hypersdf/tests/enclosure_program.rs
++++ b/crates/hypersdf/tests/enclosure_program.rs
+@@ -446,3 +446,6 @@ mod uncertainty;
+ 
+ #[path = "support/enclosure_affine.rs"]
+ mod affine_acceptance;
++
++#[path = "support/enclosure_subdivision.rs"]
++mod subdivision_acceptance;
