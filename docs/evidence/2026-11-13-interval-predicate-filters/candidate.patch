@@ -1,0 +1,88 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b547169c6..c07a0f9c3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2656,6 +2656,7 @@ dependencies = [
+  "apfp",
+  "criterion 0.5.1",
+  "geometry-predicates",
++ "hyperinterval",
+  "hyperlattice",
+  "hyperreal",
+  "proptest",
+diff --git a/crates/hyperlimit/Cargo.toml b/crates/hyperlimit/Cargo.toml
+index e1bc79e17..80a6ba0dd 100644
+--- a/crates/hyperlimit/Cargo.toml
++++ b/crates/hyperlimit/Cargo.toml
+@@ -21,6 +21,7 @@ all-features = true
+ [dependencies]
+ hyperreal = { version = "0.14.0", path = "../hyperreal" }
+ hyperlattice = { version = "0.7.0", path = "../hyperlattice" }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", features = ["hyperreal"] }
+ rayon = { version = "1.10", optional = true }
+ 
+ [dev-dependencies]
+diff --git a/crates/hyperlimit/src/predicates/filters.rs b/crates/hyperlimit/src/predicates/filters.rs
+index 90841fea7..9a3af318b 100644
+--- a/crates/hyperlimit/src/predicates/filters.rs
++++ b/crates/hyperlimit/src/predicates/filters.rs
+@@ -13,6 +13,47 @@ use hyperreal::Real;
+ use crate::predicate::{Certainty, Escalation, PredicateOutcome, RefinementNeed, Sign};
+ use crate::predicates::order::compare_reals_with_policy;
+ 
++// Experimental native stage: only reached after structural and signed-term
++// facts decline in the orientation callback. An inconclusive local budget is
++// not the predicate's final outcome; the unchanged resolver may still decide.
++pub(crate) fn native_interval_difference(
++    left: &Real,
++    right: &Real,
++) -> Option<PredicateOutcome<Sign>> {
++    use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError, SignSet};
++    crate::trace_dispatch!("hyperlimit", "native_interval_difference", "start");
++    let mut budget = DyadicBudget::new(4096, 1_000_000);
++    let result = (|| {
++        let a = DyadicInterval::from_real(left, -16, &mut budget)?;
++        let b = DyadicInterval::from_real(right, -16, &mut budget)?;
++        a.sub(&b, &mut budget)
++    })();
++    match result {
++        Ok(interval) => match interval.signs() {
++            SignSet::Positive => {
++                crate::trace_dispatch!("hyperlimit", "native_interval_difference", "positive");
++                Some(filtered(Sign::Positive, Certainty::Filtered))
++            }
++            SignSet::Negative => {
++                crate::trace_dispatch!("hyperlimit", "native_interval_difference", "negative");
++                Some(filtered(Sign::Negative, Certainty::Filtered))
++            }
++            _ => {
++                crate::trace_dispatch!("hyperlimit", "native_interval_difference", "inconclusive");
++                None
++            }
++        },
++        Err(IntervalError::WorkExhausted | IntervalError::SizeExhausted) => {
++            crate::trace_dispatch!("hyperlimit", "native_interval_difference", "local-exhaustion");
++            None
++        }
++        Err(_) => {
++            crate::trace_dispatch!("hyperlimit", "native_interval_difference", "unavailable");
++            None
++        }
++    }
++}
++
+ /// Classify a closed ball enclosure, preserving invalid-radius uncertainty.
+ pub fn classify_ball_sign_with_policy(
+     center: &Real,
+diff --git a/crates/hyperlimit/src/predicates/orient.rs b/crates/hyperlimit/src/predicates/orient.rs
+index 367078bb8..fa32ff3d1 100644
+--- a/crates/hyperlimit/src/predicates/orient.rs
++++ b/crates/hyperlimit/src/predicates/orient.rs
+@@ -91,6 +91,7 @@ pub(crate) fn orient2d_real_coordinates(
+             let left = mul(&abx, &acy);
+             let right = mul(&aby, &acx);
+             signed_term_filter(&[(&left, Sign::Positive), (&right, Sign::Negative)])
++                .or_else(|| super::filters::native_interval_difference(&left, &right))
+         },
+         || super::exact::orient2d_coordinates(a, b, c),
+         RefinementNeed::RealRefinement,
