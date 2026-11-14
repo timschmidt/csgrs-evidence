@@ -1,0 +1,38 @@
+diff --git a/crates/hyperdynamics/tests/adaptive_order_sharing.rs b/crates/hyperdynamics/tests/adaptive_order_sharing.rs
+index b24e63e87..a5bb8e3fe 100644
+--- a/crates/hyperdynamics/tests/adaptive_order_sharing.rs
++++ b/crates/hyperdynamics/tests/adaptive_order_sharing.rs
+@@ -425,3 +425,33 @@ mod consumer;
+ fn actual_shared_controller_example() {
+     consumer::run().unwrap();
+ }
++
++#[path = "support/flow_oracles.rs"]
++mod flow_oracles;
++#[test]
++fn nonzero_start_order_and_two_state_flow_match_independent_trigonometric_bounds() {
++    const Y: SymbolId = SymbolId(30);
++    let f = field::<2>(&[Expr::anonymous_symbol(Y), -Expr::anonymous_symbol(X)], &[X, Y]);
++    let options = AdaptiveTaylorOptions {
++        minimum_order: 1,
++        maximum_order: 4,
++        remainder_limits: [d(1, 1, -14), d(1, 1, -14)],
++        ..options()
++    };
++    let c = f.adaptive_taylor(options);
++    let req = request([d(1, 1, 0), d(0, 0, 0)]);
++    let independent = c.integrate(req.clone(), &mut budget());
++    let shared = c.share_preparation().integrate(req, &mut budget());
++    let r = shared.report();
++    assert!(matches!(r.status(), Status::Completed), "{:?}", r.status());
++    assert_eq!(format!("{r:?}"), format!("{independent:?}"));
++    assert_eq!(r.programs()[0].order(), 1);
++    assert!(r.programs().len() > 1);
++    let time = hyperreal::Rational::from(1) / hyperreal::Rational::from(4);
++    for (lane, sine) in r.end_enclosure().unwrap().lanes().unwrap().iter().zip([false, true]) {
++        let (lower, upper) = flow_oracles::alternating_trig(&time, sine);
++        let rational = lane.to_rational(&mut hyperinterval::DyadicBudget::new(16384, 1_000_000_000)).unwrap();
++        if sine { assert!(rational.contains_point(&(-upper))); assert!(rational.contains_point(&(-lower))); }
++        else { assert!(rational.contains_point(&lower)); assert!(rational.contains_point(&upper)); }
++    }
++}

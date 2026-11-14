@@ -1,0 +1,101 @@
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs b/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
+index 5875a0d44..0f23b51ea 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
+@@ -569,18 +569,4 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+         N,
+         self.field.flow_taylor(order, budget)
+     );
+-    adaptive_evolution!(evolve_shared, self, report, budget, order, N, {
+-        match report.programs.last() {
+-            Some(previous) => previous.extend_order(
+-                order
+-                    .checked_sub(previous.order())
+-                    .expect("new ascending order exceeds every cached order"),
+-                budget,
+-            ),
+-            None => self.field.flow_taylor(order, budget),
+-        }
+-    });
+ }
+-
+-/// Explicit lazy cross-order preparation sharing with retained adaptive history.
+-pub mod shared;
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/orders.rs b/crates/hyperdynamics/src/field/taylor_flow/orders.rs
+index 2d038dbf4..d0022348b 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/orders.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/orders.rs
+@@ -86,73 +86,3 @@ impl<const N: usize> FlowTaylorProgram<N> {
+         Ok(result)
+     }
+ }
+-
+-impl<const N: usize> FlowTaylorProgram<N> {
+-    /// Prepare additional polynomial orders while sharing every existing coefficient.
+-    ///
+-    /// `additional == 0` shares the complete program. Otherwise only the missing
+-    /// normalized Lie stages are generated, through the new mandatory remainder
+-    /// order. Source guards, time/state interpretation and derivative associations
+-    /// stay authoritative. This is preparation, not a trajectory certificate.
+-    ///
+-    /// Prefix stage handles/output positions and new structural work spend the
+-    /// supplied budget. Existing graph storage, exact scalar payload/refinement
+-    /// and total heap bytes retain the exclusions of `EnclosureBudget`. Failure
+-    /// leaves this input unchanged and publishes no partial program or cache.
+-    pub fn extend_order(
+-        &self,
+-        additional: usize,
+-        budget: &mut EnclosureBudget,
+-    ) -> Result<Self, FlowTaylorError> {
+-        budget.graph.charge(0)?;
+-        if additional == 0 {
+-            budget.graph.charge(1)?;
+-            let result = self.clone();
+-            budget.graph.charge(0)?;
+-            return Ok(result);
+-        }
+-        let order = self
+-            .order
+-            .checked_add(additional)
+-            .ok_or(FlowTaylorError::OrderOverflow)?;
+-        let count = order.checked_add(1).ok_or(FlowTaylorError::OrderOverflow)?;
+-        let columns = N.checked_add(1).ok_or(ExpressionError::SizeExhausted)?;
+-        let requests_len = N
+-            .checked_mul(columns)
+-            .ok_or(ExpressionError::SizeExhausted)?;
+-        let outputs = count.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
+-        budget
+-            .graph
+-            .check_entries(&[count, outputs, N, columns, requests_len, requests_len])?;
+-        let copy_work = N.checked_add(8).ok_or(ExpressionError::SizeExhausted)?;
+-        let mut stages = Vec::with_capacity(count);
+-        for stage in self.stages.iter() {
+-            budget.graph.charge(copy_work)?;
+-            stages.push(stage.clone());
+-        }
+-        let first = self
+-            .stages
+-            .len()
+-            .checked_add(1)
+-            .ok_or(FlowTaylorError::OrderOverflow)?;
+-        let field = &self.field;
+-        append_flow_stages!(
+-            field,
+-            stages,
+-            first,
+-            count,
+-            columns,
+-            requests_len,
+-            budget,
+-            N
+-        );
+-        budget.graph.charge(count)?;
+-        let result = Self {
+-            field: self.field.clone(),
+-            order,
+-            stages: stages.into(),
+-        };
+-        budget.graph.charge(0)?;
+-        Ok(result)
+-    }
+-}

@@ -1,0 +1,1547 @@
+diff --git a/crates/hyperdynamics/CHANGELOG.md b/crates/hyperdynamics/CHANGELOG.md
+index 4728aa8f4..265b3d752 100644
+--- a/crates/hyperdynamics/CHANGELOG.md
++++ b/crates/hyperdynamics/CHANGELOG.md
+@@ -2,6 +2,9 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add explicit lazy shared adaptive Taylor preparation and bounded incremental
++  order extension, preserving the independent controller and complete histories.
++
+ - Share prepared trajectory coefficient graphs across lower polynomial orders,
+   retaining the complete selected remainder stage and original source guards.
+ 
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index 8734674c4..0537504b8 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -110,3 +110,12 @@ required-features = ["taylor-flow"]
+ name = "taylor_orders"
+ harness = false
+ required-features = ["taylor-flow"]
++
++[[example]]
++name = "adaptive_shared"
++required-features = ["adaptive-taylor"]
++
++[[bench]]
++name = "adaptive_shared"
++harness = false
++required-features = ["adaptive-taylor"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index 1a44c2dad..78be57daa 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -277,5 +277,19 @@ trajectory existence, analyticity and the complete remainder are still certified
+ for each supplied domain. Lower orders copy a bounded array of stage handles;
+ same-order requests share the whole array. No source term or guard is discarded.
+ Run `cargo run -p hyperdynamics --features taylor-flow --example taylor_orders`.
+-The adaptive controller still prepares each distinct order independently; callers
++The default adaptive controller still prepares each distinct order independently; callers
+ can explicitly reuse a prepared higher order for their own finite portfolios.
++
++
++To reuse preparation automatically during adaptive integration, select
++`field.adaptive_taylor(options).share_preparation()` and call its `integrate`.
++The shared outcome's `report()` borrows the complete source-bound adaptive history,
++including rejected quality attempts, certified prefixes and whole-run status.
++The first demanded order is prepared normally; later missing orders extend the
++existing exact coefficient prefix. Maximum order is never prepared eagerly.
++The independent controller remains available with its original work accounting.
++Sharing changes preparation work, retained allocation and exhaustion points, so
++replay must retain this explicit strategy choice with the source/options/request.
++`FlowTaylorProgram::extend_order(additional, &mut budget)` also exposes bounded
++incremental preparation directly; its argument is an additional order count.
++Run `cargo run -p hyperdynamics --features adaptive-taylor --example adaptive_shared`.
+diff --git a/crates/hyperdynamics/benches/adaptive_shared.rs b/crates/hyperdynamics/benches/adaptive_shared.rs
+new file mode 100644
+index 000000000..7eb8d8333
+--- /dev/null
++++ b/crates/hyperdynamics/benches/adaptive_shared.rs
+@@ -0,0 +1,135 @@
++//! Complete independent/shared adaptive histories, including all trajectory preparation.
++use criterion::{Criterion, criterion_group, criterion_main};
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::adaptive::{
++        AdaptiveTaylorEvolution, AdaptiveTaylorField, AdaptiveTaylorOptions, AdaptiveTaylorStatus,
++        shared::{SharedAdaptiveTaylorEvolution, SharedAdaptiveTaylorField},
++    },
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++use std::hint::black_box;
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn controller(case: usize) -> AdaptiveTaylorField<1> {
++    let t = SymbolId(0);
++    let x = SymbolId(1);
++    let v = Expr::anonymous_symbol(x);
++    let rhs = match case {
++        0 => Expr::int(2),
++        1 => v,
++        _ => v.clone() * v,
++    };
++    let p = ExpressionProgram::compile(
++        &[rhs],
++        &[x, t],
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    let f = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: p.definition().clone(),
++            time: t,
++            state: vec![x],
++        },
++        &mut budget(),
++    )
++    .unwrap();
++    f.adaptive_taylor(AdaptiveTaylorOptions {
++        maximum_order: 3,
++        remainder_limits: [d(1, 1, -10)],
++        native: EvolutionOptions {
++            maximum_step: Some(d(1, 1, -3)),
++            ..Default::default()
++        },
++        ..Default::default()
++    })
++}
++fn request() -> EvolutionRequest<1> {
++    EvolutionRequest {
++        start: d(0, 0, 0),
++        end: d(1, 1, -2),
++        initial: BoxN::new([d(1, 1, 0)]).unwrap(),
++    }
++}
++enum Outcome {
++    Independent(AdaptiveTaylorEvolution<1>),
++    Shared(SharedAdaptiveTaylorEvolution<1>),
++}
++impl Outcome {
++    fn report(&self) -> &AdaptiveTaylorEvolution<1> {
++        match self {
++            Self::Independent(r) => r,
++            Self::Shared(r) => r.report(),
++        }
++    }
++}
++fn complete(
++    c: &AdaptiveTaylorField<1>,
++    shared: &SharedAdaptiveTaylorField<1>,
++    reuse: bool,
++    b: &mut EnclosureBudget,
++) -> Outcome {
++    let out = if reuse {
++        Outcome::Shared(shared.integrate(request(), b))
++    } else {
++        Outcome::Independent(c.integrate(request(), b))
++    };
++    assert!(matches!(
++        out.report().status(),
++        AdaptiveTaylorStatus::Completed
++    ));
++    for segment in out.report().segments() {
++        assert_eq!(segment.refinement().meets_limits(), Some(true));
++        assert!(segment.refinement().evidence().remainder().is_some());
++    }
++    out
++}
++fn benchmark(c: &mut Criterion) {
++    for (case, name) in ["constant", "exponential", "riccati"]
++        .into_iter()
++        .enumerate()
++    {
++        let controller = controller(case);
++        let shared = controller.clone().share_preparation();
++        let expected = complete(&controller, &shared, false, &mut budget());
++        let check = complete(&controller, &shared, true, &mut budget());
++        assert_eq!(
++            format!("{:?}", expected.report()),
++            format!("{:?}", check.report())
++        );
++        for reuse in [false, true] {
++            let mode = if reuse { "shared" } else { "independent" };
++            c.bench_function(&format!("adaptive_preparation/{name}/{mode}"), |b| {
++                b.iter(|| {
++                    let out = complete(black_box(&controller), &shared, reuse, &mut budget());
++                    assert_eq!(
++                        out.report().end_enclosure(),
++                        expected.report().end_enclosure()
++                    );
++                    assert_eq!(
++                        out.report().attempts().len(),
++                        expected.report().attempts().len()
++                    );
++                    assert_eq!(
++                        out.report().segments().len(),
++                        expected.report().segments().len()
++                    );
++                    drop(black_box(out));
++                })
++            });
++        }
++    }
++}
++criterion_group!(benches, benchmark);
++criterion_main!(benches);
+diff --git a/crates/hyperdynamics/examples/adaptive_shared.rs b/crates/hyperdynamics/examples/adaptive_shared.rs
+new file mode 100644
+index 000000000..1896442dd
+--- /dev/null
++++ b/crates/hyperdynamics/examples/adaptive_shared.rs
+@@ -0,0 +1,83 @@
++//! Lazy shared coefficient preparation with exact uncertain polynomial endpoints.
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::adaptive::{AdaptiveTaylorOptions, AdaptiveTaylorStatus},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++/// Run the shared controller and check exact endpoint and retained preparation.
++pub fn run() -> Result<(), Box<dyn std::error::Error>> {
++    let t = SymbolId(0);
++    let x = SymbolId(1);
++    let mut b = EnclosureBudget::new(EnclosurePolicy::default());
++    let source = ExpressionProgram::compile(
++        &[Expr::int(2) * Expr::anonymous_symbol(t)],
++        &[x, t],
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )?;
++    let f = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time: t,
++            state: vec![x],
++        },
++        &mut b,
++    )?;
++    let controller = f
++        .adaptive_taylor(AdaptiveTaylorOptions {
++            maximum_order: 3,
++            remainder_limits: [d(0, 0, 0)],
++            native: EvolutionOptions {
++                maximum_step: Some(d(1, 1, -3)),
++                ..Default::default()
++            },
++            ..Default::default()
++        })
++        .share_preparation();
++    let outcome = controller.integrate(
++        EvolutionRequest {
++            start: d(0, 0, 0),
++            end: d(1, 1, -1),
++            initial: BoxN::new([d(3, 4, 0)])?,
++        },
++        &mut b,
++    );
++    let report = outcome.report();
++    assert!(matches!(report.status(), AdaptiveTaylorStatus::Completed));
++    assert_eq!(
++        report.end_enclosure().unwrap().lanes(),
++        Some(&[d(13, 17, -2)])
++    );
++    assert_eq!(
++        report
++            .programs()
++            .iter()
++            .map(|p| p.order())
++            .collect::<Vec<_>>(),
++        [0, 1, 2]
++    );
++    assert!(std::ptr::eq(
++        report.programs()[1].stages()[1].program().definition(),
++        report.programs()[2].stages()[1].program().definition()
++    ));
++    assert!(
++        report
++            .attempts()
++            .iter()
++            .flat_map(|a| a.refinements())
++            .any(|r| r.meets_limits() == Some(false))
++    );
++    Ok(())
++}
++#[cfg(not(test))]
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    run()
++}
+diff --git a/crates/hyperdynamics/src/field/taylor_flow.rs b/crates/hyperdynamics/src/field/taylor_flow.rs
+index 61d11f582..7002b25f4 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow.rs
+@@ -104,39 +104,19 @@ pub struct FlowTaylorProgram<const N: usize> {
+     order: usize,
+     stages: Arc<[FlowTaylorStage<N>]>,
+ }
+-impl<const N: usize> ExpressionField<N> {
+-    /// Prepare a finite trajectory Taylor formula including its next-order remainder.
+-    /// This never changes the ordinary Picard or evolution algorithm.
+-    pub fn flow_taylor(
+-        &self,
+-        order: usize,
+-        budget: &mut EnclosureBudget,
+-    ) -> Result<FlowTaylorProgram<N>, FlowTaylorError> {
+-        budget.graph.charge(0)?;
+-        let count = order.checked_add(1).ok_or(FlowTaylorError::OrderOverflow)?;
+-        let columns = N.checked_add(1).ok_or(ExpressionError::SizeExhausted)?;
+-        let requests_len = N
+-            .checked_mul(columns)
+-            .ok_or(ExpressionError::SizeExhausted)?;
+-        budget
+-            .graph
+-            .check_entries(&[count, N, columns, requests_len, requests_len])?;
+-        budget.graph.charge(N)?;
+-        let mut stages = vec![FlowTaylorStage {
+-            degree: 1,
+-            derivatives: None,
+-            program: self.data.jacobian.source().clone(),
+-            outputs: std::array::from_fn(|i| i),
+-        }];
+-        for degree in 2..=count {
+-            budget.graph.charge(1)?;
+-            let previous = stages.last().expect("first coefficient exists");
++// One normalized Lie recurrence for fresh and incremental preparation.
++macro_rules! append_flow_stages {
++    ($field:ident, $stages:ident, $start:expr, $count:ident, $columns:ident,
++     $requests_len:ident, $budget:ident, $n:ident) => {
++        for degree in $start..=$count {
++            $budget.graph.charge(1)?;
++            let previous = $stages.last().expect("first coefficient exists");
+             let mut requests = Vec::new();
+             for &output in &previous.outputs {
+-                for variable in std::iter::once(self.data.identity.time())
+-                    .chain(self.data.identity.state().iter().copied())
++                for variable in std::iter::once($field.data.identity.time())
++                    .chain($field.data.identity.state().iter().copied())
+                 {
+-                    budget.graph.charge(2)?;
++                    $budget.graph.charge(2)?;
+                     requests.push(CoefficientRequest {
+                         output,
+                         powers: vec![(variable, 1)],
+@@ -145,12 +125,12 @@ impl<const N: usize> ExpressionField<N> {
+             }
+             let derivatives = previous
+                 .program
+-                .coefficients(&requests, &mut budget.graph)
++                .coefficients(&requests, &mut $budget.graph)
+                 .map_err(FlowTaylorError::Coefficient)?;
+             let source = derivatives.program().definition();
+-            let added_nodes = N
++            let added_nodes = $n
+                 .checked_mul(
+-                    N.checked_mul(2)
++                    $n.checked_mul(2)
+                         .and_then(|v| v.checked_add(1))
+                         .ok_or(ExpressionError::SizeExhausted)?,
+                 )
+@@ -164,39 +144,39 @@ impl<const N: usize> ExpressionField<N> {
+             let outputs = source
+                 .outputs
+                 .len()
+-                .checked_add(N)
++                .checked_add($n)
+                 .ok_or(ExpressionError::SizeExhausted)?;
+-            budget.graph.check_entries(&[
+-                count,
++            $budget.graph.check_entries(&[
++                $count,
+                 source.variables.len(),
+                 nodes,
+                 outputs,
+-                requests_len,
+-                requests_len,
+-                N,
++                $requests_len,
++                $requests_len,
++                $n,
+             ])?;
+-            budget.graph.charge(source.variables.len())?;
+-            budget.graph.charge(source.nodes.len())?;
+-            budget.graph.charge(source.outputs.len())?;
++            $budget.graph.charge(source.variables.len())?;
++            $budget.graph.charge(source.nodes.len())?;
++            $budget.graph.charge(source.outputs.len())?;
+             // No public graph builder exists. This is only the ODE recurrence:
+             // differentiation, validation and scalar evaluation stay in Hypersolve.
+             let mut definition = source.clone();
+-            budget.graph.charge(1)?;
++            $budget.graph.charge(1)?;
+             let denominator = definition.nodes.len();
+             definition
+                 .nodes
+                 .push(ExpressionNode::Constant(Real::from(degree as u128)));
+             let first = definition.outputs.len();
+-            for row in 0..N {
+-                budget.graph.charge(1)?;
++            for row in 0..$n {
++                $budget.graph.charge(1)?;
+                 let partial = |column: usize| {
+                     source.outputs[derivatives
+-                        .coefficient_output(row * columns + column)
++                        .coefficient_output(row * $columns + column)
+                         .expect("requested partial")]
+                 };
+                 let mut sum = partial(0);
+-                for state in 0..N {
+-                    budget.graph.charge(2)?;
++                for state in 0..$n {
++                    $budget.graph.charge(2)?;
+                     let product = definition.nodes.len();
+                     definition.nodes.push(ExpressionNode::Binary {
+                         operation: BinaryOperation::Mul,
+@@ -211,7 +191,7 @@ impl<const N: usize> ExpressionField<N> {
+                     });
+                     sum = next;
+                 }
+-                budget.graph.charge(2)?;
++                $budget.graph.charge(2)?;
+                 let value = definition.nodes.len();
+                 definition.nodes.push(ExpressionNode::Binary {
+                     operation: BinaryOperation::Div,
+@@ -220,15 +200,43 @@ impl<const N: usize> ExpressionField<N> {
+                 });
+                 definition.outputs.push(value);
+             }
+-            let program = ExpressionProgram::from_definition(definition, &mut budget.graph)?;
+-            budget.graph.charge(N)?;
+-            stages.push(FlowTaylorStage {
++            let program = ExpressionProgram::from_definition(definition, &mut $budget.graph)?;
++            $budget.graph.charge($n)?;
++            $stages.push(FlowTaylorStage {
+                 degree,
+                 derivatives: Some(derivatives),
+                 program,
+                 outputs: std::array::from_fn(|i| first + i),
+             });
+         }
++    };
++}
++
++impl<const N: usize> ExpressionField<N> {
++    /// Prepare a finite trajectory Taylor formula including its next-order remainder.
++    /// This never changes the ordinary Picard or evolution algorithm.
++    pub fn flow_taylor(
++        &self,
++        order: usize,
++        budget: &mut EnclosureBudget,
++    ) -> Result<FlowTaylorProgram<N>, FlowTaylorError> {
++        budget.graph.charge(0)?;
++        let count = order.checked_add(1).ok_or(FlowTaylorError::OrderOverflow)?;
++        let columns = N.checked_add(1).ok_or(ExpressionError::SizeExhausted)?;
++        let requests_len = N
++            .checked_mul(columns)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        budget
++            .graph
++            .check_entries(&[count, N, columns, requests_len, requests_len])?;
++        budget.graph.charge(N)?;
++        let mut stages = vec![FlowTaylorStage {
++            degree: 1,
++            derivatives: None,
++            program: self.data.jacobian.source().clone(),
++            outputs: std::array::from_fn(|i| i),
++        }];
++        append_flow_stages!(self, stages, 2, count, columns, requests_len, budget, N);
+         budget.graph.charge(count)?;
+         let result = FlowTaylorProgram {
+             field: self.clone(),
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs b/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
+index 42a492466..5875a0d44 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/adaptive.rs
+@@ -312,52 +312,23 @@ impl<const N: usize> AdaptiveTaylorEvolution<N> {
+         ])
+     }
+ }
+-impl<const N: usize> AdaptiveTaylorField<N> {
+-    /// Exact original field and its ordered time/state interpretation.
+-    pub fn field(&self) -> &ExpressionField<N> {
+-        &self.field
+-    }
+-    /// Original finite order/step/quality configuration.
+-    pub fn options(&self) -> &AdaptiveTaylorOptions<N> {
+-        &self.options
+-    }
+-    /// Integrate using first satisfactory ascending order, then bounded exact halving.
+-    /// Accepted durations may double for the next proposal, capped exactly. A native
+-    /// or Taylor mathematical/resource failure stops; it is never disguised as a
+-    /// quality miss or weaker-method success. No minimum-cost/order optimality is claimed.
+-    pub fn integrate(
+-        &self,
+-        request: EvolutionRequest<N>,
+-        budget: &mut EnclosureBudget,
+-    ) -> AdaptiveTaylorEvolution<N> {
+-        let mut report = AdaptiveTaylorEvolution {
+-            controller: self.clone(),
+-            request,
+-            policy: budget.policy(),
+-            programs: Vec::new(),
+-            attempts: Vec::new(),
+-            segments: Vec::new(),
+-            status: AdaptiveTaylorStatus::Identity,
+-        };
+-        report.status = match self.evolve(&mut report, budget) {
+-            Ok(status) => status,
+-            Err(error) => AdaptiveTaylorStatus::Stopped(error),
+-        };
+-        report
+-    }
+-    fn evolve(
+-        &self,
+-        report: &mut AdaptiveTaylorEvolution<N>,
+-        budget: &mut EnclosureBudget,
++// Identical adaptive search/proof/quality sequence under two preparation choices.
++macro_rules! adaptive_evolution {
++    ($method:ident, $this:ident, $report:ident, $budget:ident, $order:ident,
++     $n:ident, $prepare:expr) => {
++    fn $method(
++        &$this,
++        $report: &mut AdaptiveTaylorEvolution<$n>,
++        $budget: &mut EnclosureBudget,
+     ) -> Result<AdaptiveTaylorStatus, AdaptiveTaylorFailure> {
+-        budget.graph.charge(1)?;
+-        if self.options.minimum_order > self.options.maximum_order
+-            || self.options.maximum_order.checked_add(1).is_none()
++        $budget.graph.charge(1)?;
++        if $this.options.minimum_order > $this.options.maximum_order
++            || $this.options.maximum_order.checked_add(1).is_none()
+         {
+             return Err(AdaptiveTaylorFailure::InvalidOrderRange);
+         }
+-        for (coordinate, limit) in self.options.remainder_limits.iter().enumerate() {
+-            budget.graph.charge(1)?;
++        for (coordinate, limit) in $this.options.remainder_limits.iter().enumerate() {
++            $budget.graph.charge(1)?;
+             if !limit.is_singleton()
+                 || !matches!(
+                     limit.signs(),
+@@ -367,48 +338,48 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+                 return Err(AdaptiveTaylorFailure::InvalidRemainderLimit { coordinate });
+             }
+         }
+-        let mut cap = self.options.native.maximum_step.clone();
++        let mut cap = $this.options.native.maximum_step.clone();
+         let mut quality_halvings = 0;
+         let mut native_records = 0usize;
+         let mut refinements = 0usize;
+         loop {
+-            budget.graph.charge(0)?;
+-            if !report.attempts.is_empty()
+-                && report.segments.len() == self.options.native.maximum_steps
++            $budget.graph.charge(0)?;
++            if !$report.attempts.is_empty()
++                && $report.segments.len() == $this.options.native.maximum_steps
+             {
+                 return Err(EvolutionFailure::StepLimit {
+-                    limit: self.options.native.maximum_steps,
++                    limit: $this.options.native.maximum_steps,
+                 }
+                 .into());
+             }
+-            report.check_records(native_records, refinements, 1, budget)?;
+-            let start = report
++            $report.check_records(native_records, refinements, 1, $budget)?;
++            let start = $report
+                 .reached_time()
+-                .checked_pow(1, &mut budget.arithmetic)?;
+-            let end = report.request.end.checked_pow(1, &mut budget.arithmetic)?;
++                .checked_pow(1, &mut $budget.arithmetic)?;
++            let end = $report.request.end.checked_pow(1, &mut $budget.arithmetic)?;
+             let initial = copy_state(
+-                report
++                $report
+                     .prefix_end_enclosure()
+-                    .unwrap_or(&report.request.initial),
+-                budget,
++                    .unwrap_or(&$report.request.initial),
++                $budget,
+             )?;
+-            budget.graph.charge(1)?;
+-            let mut options = self.options.native.clone();
+-            options.maximum_steps = usize::from(self.options.native.maximum_steps != 0);
++            $budget.graph.charge(1)?;
++            let mut options = $this.options.native.clone();
++            options.maximum_steps = usize::from($this.options.native.maximum_steps != 0);
+             options.maximum_step = cap.clone();
+             // The first native search validates times/cap before empty/identity shortcuts.
+-            let search = self.field.integrate(
++            let search = $this.field.integrate(
+                 EvolutionRequest {
+                     start,
+                     end,
+                     initial,
+                 },
+                 options,
+-                budget,
++                $budget,
+             );
+             let records = search.attempts().len().checked_add(search.segments().len());
+-            let a = report.attempts.len();
+-            report.attempts.push(AdaptiveTaylorAttempt {
++            let a = $report.attempts.len();
++            $report.attempts.push(AdaptiveTaylorAttempt {
+                 quality_halvings,
+                 search,
+                 refinements: Vec::new(),
+@@ -416,14 +387,14 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+             native_records = records
+                 .and_then(|n| native_records.checked_add(n))
+                 .ok_or(ExpressionError::SizeExhausted)?;
+-            report.check_records(native_records, refinements, 0, budget)?;
+-            match report.attempts[a].search.status() {
++            $report.check_records(native_records, refinements, 0, $budget)?;
++            match $report.attempts[a].search.status() {
+                 EvolutionStatus::Empty => {
+-                    budget.graph.charge(0)?;
++                    $budget.graph.charge(0)?;
+                     return Ok(AdaptiveTaylorStatus::Empty);
+                 }
+                 EvolutionStatus::Identity => {
+-                    budget.graph.charge(0)?;
++                    $budget.graph.charge(0)?;
+                     return Ok(AdaptiveTaylorStatus::Identity);
+                 }
+                 EvolutionStatus::Completed
+@@ -431,33 +402,33 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+                 EvolutionStatus::Stopped(e) => return Err(e.clone().into()),
+             }
+             let mut accepted = false;
+-            for order in self.options.minimum_order..=self.options.maximum_order {
+-                budget.graph.charge(
+-                    report
++            for $order in $this.options.minimum_order..=$this.options.maximum_order {
++                $budget.graph.charge(
++                    $report
+                         .programs
+                         .len()
+                         .checked_add(1)
+                         .ok_or(ExpressionError::SizeExhausted)?,
+                 )?;
+-                let program = match report.programs.iter().position(|p| p.order() == order) {
++                let program = match $report.programs.iter().position(|p| p.$order() == $order) {
+                     Some(i) => i,
+                     None => {
+-                        report.check_records(native_records, refinements, 1, budget)?;
+-                        let prepared = self.field.flow_taylor(order, budget)?;
+-                        budget.graph.charge(1)?;
+-                        let i = report.programs.len();
+-                        report.programs.push(prepared);
++                        $report.check_records(native_records, refinements, 1, $budget)?;
++                        let prepared = $prepare?;
++                        $budget.graph.charge(1)?;
++                        let i = $report.programs.len();
++                        $report.programs.push(prepared);
+                         i
+                     }
+                 };
+-                report.check_records(native_records, refinements, 1, budget)?;
+-                budget.graph.charge(1)?;
+-                let attempt = &mut report.attempts[a];
++                $report.check_records(native_records, refinements, 1, $budget)?;
++                $budget.graph.charge(1)?;
++                let attempt = &mut $report.attempts[a];
+                 let mut evidence = FlowTaylorEvidence::default();
+-                let status = match report.programs[program].verify(
++                let status = match $report.programs[program].verify(
+                     attempt.search.segment(0).expect("accepted native prefix"),
+                     &mut evidence,
+-                    budget,
++                    $budget,
+                 ) {
+                     Ok(status) => status,
+                     Err(e) => FlowTaylorStatus::Rejected(e),
+@@ -473,8 +444,8 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+                 refinements = refinements
+                     .checked_add(1)
+                     .ok_or(ExpressionError::SizeExhausted)?;
+-                report.check_records(native_records, refinements, 0, budget)?;
+-                let refinement = &mut report.attempts[a].refinements[r];
++                $report.check_records(native_records, refinements, 0, $budget)?;
++                let refinement = &mut $report.attempts[a].refinements[r];
+                 if let FlowTaylorStatus::Rejected(e) = &refinement.status {
+                     return Err(e.clone().into());
+                 }
+@@ -485,31 +456,31 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+                     .expect("positive-duration Taylor remainder")
+                     .lanes()
+                     .expect("nonempty remainder");
+-                budget.graph.check_entries(&[N, N])?;
+-                budget.graph.charge(N)?;
+-                let mut magnitudes = Vec::with_capacity(N);
++                $budget.graph.check_entries(&[$n, $n])?;
++                $budget.graph.charge($n)?;
++                let mut magnitudes = Vec::with_capacity($n);
+                 let mut quality = true;
+                 let zero = DyadicInterval::new(0.into(), 0.into(), 0)?;
+-                for (value, limit) in remainder.iter().zip(&self.options.remainder_limits) {
+-                    budget.graph.charge(1)?;
+-                    let magnitude = value.abs(&mut budget.arithmetic)?;
+-                    let allowed = zero.hull(limit, &mut budget.arithmetic)?;
+-                    quality &= magnitude.subset_of(&allowed, &mut budget.arithmetic)?;
++                for (value, limit) in remainder.iter().zip(&$this.options.remainder_limits) {
++                    $budget.graph.charge(1)?;
++                    let magnitude = value.abs(&mut $budget.arithmetic)?;
++                    let allowed = zero.hull(limit, &mut $budget.arithmetic)?;
++                    quality &= magnitude.subset_of(&allowed, &mut $budget.arithmetic)?;
+                     magnitudes.push(magnitude);
+                 }
+-                budget.graph.charge(1)?;
++                $budget.graph.charge(1)?;
+                 refinement.magnitudes =
+                     Some(magnitudes.try_into().expect("fixed coordinate count"));
+                 refinement.quality = Some(quality);
+                 if quality {
+-                    report.check_records(native_records, refinements, 1, budget)?;
+-                    budget.graph.charge(1)?;
+-                    report.segments.push((a, r));
++                    $report.check_records(native_records, refinements, 1, $budget)?;
++                    $budget.graph.charge(1)?;
++                    $report.segments.push((a, r));
+                     accepted = true;
+                     break;
+                 }
+             }
+-            let duration = report.attempts[a]
++            let duration = $report.attempts[a]
+                 .search
+                 .segment(0)
+                 .expect("accepted native prefix")
+@@ -517,33 +488,33 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+                 .duration()
+                 .expect("positive duration");
+             if accepted {
+-                match report
++                match $report
+                     .reached_time()
+-                    .compare_singleton(&report.request.end, &mut budget.arithmetic)?
++                    .compare_singleton(&$report.request.end, &mut $budget.arithmetic)?
+                 {
+                     Ordering::Equal => {
+-                        budget.graph.charge(0)?;
++                        $budget.graph.charge(0)?;
+                         return Ok(AdaptiveTaylorStatus::Completed);
+                     }
+                     Ordering::Greater => return Err(EvolutionFailure::NonProgress.into()),
+                     Ordering::Less => {}
+                 }
+                 let two = DyadicInterval::new(2.into(), 2.into(), 0)?;
+-                let grown = duration.mul(&two, &mut budget.arithmetic)?;
+-                cap = Some(match &self.options.native.maximum_step {
+-                    Some(maximum) => grown.min_image(maximum, &mut budget.arithmetic)?,
++                let grown = duration.mul(&two, &mut $budget.arithmetic)?;
++                cap = Some(match &$this.options.native.maximum_step {
++                    Some(maximum) => grown.min_image(maximum, &mut $budget.arithmetic)?,
+                     None => grown,
+                 });
+                 quality_halvings = 0;
+             } else {
+-                if quality_halvings == self.options.maximum_quality_halvings {
++                if quality_halvings == $this.options.maximum_quality_halvings {
+                     return Err(AdaptiveTaylorFailure::QualityHalvingLimit {
+-                        limit: self.options.maximum_quality_halvings,
++                        limit: $this.options.maximum_quality_halvings,
+                     });
+                 }
+                 let half = DyadicInterval::new(1.into(), 1.into(), -1)?;
+-                let smaller = duration.mul(&half, &mut budget.arithmetic)?;
+-                if smaller.compare_singleton(duration, &mut budget.arithmetic)? != Ordering::Less
++                let smaller = duration.mul(&half, &mut $budget.arithmetic)?;
++                if smaller.compare_singleton(duration, &mut $budget.arithmetic)? != Ordering::Less
+                     || smaller.signs() != hyperinterval::SignSet::Positive
+                 {
+                     return Err(EvolutionFailure::NonProgress.into());
+@@ -553,4 +524,63 @@ impl<const N: usize> AdaptiveTaylorField<N> {
+             }
+         }
+     }
++    };
+ }
++
++impl<const N: usize> AdaptiveTaylorField<N> {
++    /// Exact original field and its ordered time/state interpretation.
++    pub fn field(&self) -> &ExpressionField<N> {
++        &self.field
++    }
++    /// Original finite order/step/quality configuration.
++    pub fn options(&self) -> &AdaptiveTaylorOptions<N> {
++        &self.options
++    }
++    /// Integrate using first satisfactory ascending order, then bounded exact halving.
++    /// Accepted durations may double for the next proposal, capped exactly. A native
++    /// or Taylor mathematical/resource failure stops; it is never disguised as a
++    /// quality miss or weaker-method success. No minimum-cost/order optimality is claimed.
++    pub fn integrate(
++        &self,
++        request: EvolutionRequest<N>,
++        budget: &mut EnclosureBudget,
++    ) -> AdaptiveTaylorEvolution<N> {
++        let mut report = AdaptiveTaylorEvolution {
++            controller: self.clone(),
++            request,
++            policy: budget.policy(),
++            programs: Vec::new(),
++            attempts: Vec::new(),
++            segments: Vec::new(),
++            status: AdaptiveTaylorStatus::Identity,
++        };
++        report.status = match self.evolve(&mut report, budget) {
++            Ok(status) => status,
++            Err(error) => AdaptiveTaylorStatus::Stopped(error),
++        };
++        report
++    }
++    adaptive_evolution!(
++        evolve,
++        self,
++        report,
++        budget,
++        order,
++        N,
++        self.field.flow_taylor(order, budget)
++    );
++    adaptive_evolution!(evolve_shared, self, report, budget, order, N, {
++        match report.programs.last() {
++            Some(previous) => previous.extend_order(
++                order
++                    .checked_sub(previous.order())
++                    .expect("new ascending order exceeds every cached order"),
++                budget,
++            ),
++            None => self.field.flow_taylor(order, budget),
++        }
++    });
++}
++
++/// Explicit lazy cross-order preparation sharing with retained adaptive history.
++pub mod shared;
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/adaptive/shared.rs b/crates/hyperdynamics/src/field/taylor_flow/adaptive/shared.rs
+new file mode 100644
+index 000000000..1dccdf0b3
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/taylor_flow/adaptive/shared.rs
+@@ -0,0 +1,68 @@
++//! Explicit lazy sharing of coefficient preparation between adaptive orders.
++use super::*;
++
++/// An adaptive controller that extends already-demanded coefficient prefixes.
++///
++/// Native search, proof validation, ascending quality tests and halving/regrowth
++/// use the same algorithm as the independent controller. Only preparation changes:
++/// the first demanded order is built normally and later absent orders extend its
++/// exact prefix. No maximum order is prepared eagerly. Savings change cumulative
++/// work cutoffs; selecting this type explicitly selects that resource behavior.
++#[derive(Clone, Debug)]
++pub struct SharedAdaptiveTaylorField<const N: usize> {
++    controller: AdaptiveTaylorField<N>,
++}
++/// Adaptive history produced with lazy shared preparation, not a serialized proof.
++///
++/// The wrapper retains the preparation choice; the borrowed report retains the
++/// source, options, budget policy, attempted proofs and any certified prefix.
++/// Replay the original source/options/request through `share_preparation` to
++/// reproduce this strategy. A successful prefix never becomes whole-run success.
++#[derive(Clone, Debug)]
++pub struct SharedAdaptiveTaylorEvolution<const N: usize> {
++    report: AdaptiveTaylorEvolution<N>,
++}
++impl<const N: usize> AdaptiveTaylorField<N> {
++    /// Select lazy coefficient-prefix sharing for subsequent integrations.
++    /// The independent controller's options and algorithm remain available unchanged.
++    pub fn share_preparation(self) -> SharedAdaptiveTaylorField<N> {
++        SharedAdaptiveTaylorField { controller: self }
++    }
++}
++impl<const N: usize> SharedAdaptiveTaylorField<N> {
++    /// Original source and finite order/quality/search configuration.
++    pub fn controller(&self) -> &AdaptiveTaylorField<N> {
++        &self.controller
++    }
++    /// Integrate with lazy cross-order preparation under one caller-owned budget.
++    /// Failed extensions publish no new program; previous programs and completed
++    /// proof stages remain in the report. Domain/native failures still stop with
++    /// their original typed cause rather than trying a weaker certificate.
++    pub fn integrate(
++        &self,
++        request: EvolutionRequest<N>,
++        budget: &mut EnclosureBudget,
++    ) -> SharedAdaptiveTaylorEvolution<N> {
++        let mut report = AdaptiveTaylorEvolution {
++            controller: self.controller.clone(),
++            request,
++            policy: budget.policy(),
++            programs: Vec::new(),
++            attempts: Vec::new(),
++            segments: Vec::new(),
++            status: AdaptiveTaylorStatus::Identity,
++        };
++        report.status = match self.controller.evolve_shared(&mut report, budget) {
++            Ok(status) => status,
++            Err(error) => AdaptiveTaylorStatus::Stopped(error),
++        };
++        SharedAdaptiveTaylorEvolution { report }
++    }
++}
++impl<const N: usize> SharedAdaptiveTaylorEvolution<N> {
++    /// Borrow the full adaptive report, including stopped-prefix semantics.
++    /// The outer type records shared preparation; no conversion discards it by default.
++    pub fn report(&self) -> &AdaptiveTaylorEvolution<N> {
++        &self.report
++    }
++}
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/orders.rs b/crates/hyperdynamics/src/field/taylor_flow/orders.rs
+index d0022348b..2d038dbf4 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/orders.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/orders.rs
+@@ -86,3 +86,73 @@ impl<const N: usize> FlowTaylorProgram<N> {
+         Ok(result)
+     }
+ }
++
++impl<const N: usize> FlowTaylorProgram<N> {
++    /// Prepare additional polynomial orders while sharing every existing coefficient.
++    ///
++    /// `additional == 0` shares the complete program. Otherwise only the missing
++    /// normalized Lie stages are generated, through the new mandatory remainder
++    /// order. Source guards, time/state interpretation and derivative associations
++    /// stay authoritative. This is preparation, not a trajectory certificate.
++    ///
++    /// Prefix stage handles/output positions and new structural work spend the
++    /// supplied budget. Existing graph storage, exact scalar payload/refinement
++    /// and total heap bytes retain the exclusions of `EnclosureBudget`. Failure
++    /// leaves this input unchanged and publishes no partial program or cache.
++    pub fn extend_order(
++        &self,
++        additional: usize,
++        budget: &mut EnclosureBudget,
++    ) -> Result<Self, FlowTaylorError> {
++        budget.graph.charge(0)?;
++        if additional == 0 {
++            budget.graph.charge(1)?;
++            let result = self.clone();
++            budget.graph.charge(0)?;
++            return Ok(result);
++        }
++        let order = self
++            .order
++            .checked_add(additional)
++            .ok_or(FlowTaylorError::OrderOverflow)?;
++        let count = order.checked_add(1).ok_or(FlowTaylorError::OrderOverflow)?;
++        let columns = N.checked_add(1).ok_or(ExpressionError::SizeExhausted)?;
++        let requests_len = N
++            .checked_mul(columns)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        let outputs = count.checked_mul(N).ok_or(ExpressionError::SizeExhausted)?;
++        budget
++            .graph
++            .check_entries(&[count, outputs, N, columns, requests_len, requests_len])?;
++        let copy_work = N.checked_add(8).ok_or(ExpressionError::SizeExhausted)?;
++        let mut stages = Vec::with_capacity(count);
++        for stage in self.stages.iter() {
++            budget.graph.charge(copy_work)?;
++            stages.push(stage.clone());
++        }
++        let first = self
++            .stages
++            .len()
++            .checked_add(1)
++            .ok_or(FlowTaylorError::OrderOverflow)?;
++        let field = &self.field;
++        append_flow_stages!(
++            field,
++            stages,
++            first,
++            count,
++            columns,
++            requests_len,
++            budget,
++            N
++        );
++        budget.graph.charge(count)?;
++        let result = Self {
++            field: self.field.clone(),
++            order,
++            stages: stages.into(),
++        };
++        budget.graph.charge(0)?;
++        Ok(result)
++    }
++}
+diff --git a/crates/hyperdynamics/tests/adaptive_order_sharing.rs b/crates/hyperdynamics/tests/adaptive_order_sharing.rs
+new file mode 100644
+index 000000000..b24e63e87
+--- /dev/null
++++ b/crates/hyperdynamics/tests/adaptive_order_sharing.rs
+@@ -0,0 +1,427 @@
++#![cfg(feature = "adaptive-taylor")]
++use hyperdynamics::field::{
++    EnclosedVectorField, EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    FieldError,
++    evolution::{EvolutionFailure, EvolutionOptions, EvolutionRequest},
++    taylor_flow::{
++        FlowTaylorError,
++        adaptive::{
++            AdaptiveTaylorFailure as Failure, AdaptiveTaylorOptions, AdaptiveTaylorStatus as Status,
++        },
++    },
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionError, ExpressionProgram},
++};
++const T: SymbolId = SymbolId(10);
++const X: SymbolId = SymbolId(20);
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn field<const N: usize>(outputs: &[Expr], state: &[SymbolId]) -> ExpressionField<N> {
++    let bindings: Vec<_> = state.iter().rev().copied().chain([T]).collect();
++    let p = ExpressionProgram::compile(
++        outputs,
++        &bindings,
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    ExpressionField::from_definition(
++        FieldDefinition {
++            source: p.definition().clone(),
++            time: T,
++            state: state.to_vec(),
++        },
++        &mut budget(),
++    )
++    .unwrap()
++}
++fn request<const N: usize>(initial: [DyadicInterval; N]) -> EvolutionRequest<N> {
++    EvolutionRequest {
++        start: d(0, 0, 0),
++        end: d(1, 1, -2),
++        initial: BoxN::new(initial).unwrap(),
++    }
++}
++fn options<const N: usize>() -> AdaptiveTaylorOptions<N> {
++    AdaptiveTaylorOptions {
++        maximum_order: 3,
++        remainder_limits: std::array::from_fn(|_| d(1, 1, -10)),
++        native: EvolutionOptions {
++            maximum_step: Some(d(1, 1, -3)),
++            ..Default::default()
++        },
++        ..Default::default()
++    }
++}
++fn extension<const N: usize>(f: &ExpressionField<N>) {
++    for start in 0..=2 {
++        let p = f.flow_taylor(start, &mut budget()).unwrap();
++        for additional in 0..=2 {
++            let extended = p.extend_order(additional, &mut budget()).unwrap();
++            let fresh = f.flow_taylor(start + additional, &mut budget()).unwrap();
++            assert_eq!(format!("{extended:?}"), format!("{fresh:?}"));
++            for (a, b) in p.stages().iter().zip(extended.stages()) {
++                assert!(std::ptr::eq(
++                    a.program().definition(),
++                    b.program().definition()
++                ));
++            }
++            if additional == 0 {
++                assert!(std::ptr::eq(
++                    p.stages().as_ptr(),
++                    extended.stages().as_ptr()
++                ));
++            }
++            let lower = extended.restrict_order(start, &mut budget()).unwrap();
++            assert_eq!(format!("{lower:?}"), format!("{p:?}"));
++        }
++    }
++}
++#[test]
++fn incremental_recurrence_equals_fresh_for_all_prefixes_and_dimensions() {
++    extension(&field::<1>(&[Expr::int(2)], &[X]));
++    let x = Expr::anonymous_symbol(X);
++    extension(&field::<1>(&[x.clone() * x], &[X]));
++    extension(&field::<1>(
++        &[Expr::real(hyperreal::Real::from(2).sqrt().unwrap())],
++        &[X],
++    ));
++    const Y: SymbolId = SymbolId(30);
++    extension(&field::<2>(
++        &[Expr::anonymous_symbol(Y), -Expr::anonymous_symbol(X)],
++        &[X, Y],
++    ));
++    extension(&field::<0>(&[], &[]));
++}
++#[test]
++fn full_adaptive_proof_histories_match_and_generated_prefixes_share() {
++    for rhs in [
++        Expr::int(2),
++        Expr::anonymous_symbol(X),
++        Expr::anonymous_symbol(X).powi(2),
++    ] {
++        let f = field::<1>(&[rhs], &[X]);
++        let c = f.adaptive_taylor(options());
++        let req = request([d(1, 1, 0)]);
++        let mut independent = budget();
++        let expected = c.integrate(req.clone(), &mut independent);
++        let mut shared = budget();
++        let actual = c.clone().share_preparation().integrate(req, &mut shared);
++        let r = actual.report();
++        assert!(matches!(r.status(), Status::Completed), "{:?}", r.status());
++        assert_eq!(format!("{r:?}"), format!("{expected:?}"));
++        assert_eq!(
++            independent.remaining_scalar_work(),
++            shared.remaining_scalar_work()
++        );
++        for pair in r.programs().windows(2) {
++            for (a, b) in pair[0].stages().iter().zip(pair[1].stages()) {
++                assert!(std::ptr::eq(
++                    a.program().definition(),
++                    b.program().definition()
++                ));
++                if let (Some(a), Some(b)) = (a.derivatives(), b.derivatives()) {
++                    assert!(std::ptr::eq(
++                        a.program().definition(),
++                        b.program().definition()
++                    ));
++                }
++            }
++        }
++        if r.programs().len() > 2 {
++            assert!(shared.remaining_graph_work() > independent.remaining_graph_work());
++        }
++    }
++}
++#[test]
++fn lazy_orders_do_not_build_unrequested_maximum() {
++    let f = field::<1>(&[Expr::int(0)], &[X]);
++    let c = f
++        .adaptive_taylor(AdaptiveTaylorOptions {
++            maximum_order: usize::MAX - 1,
++            ..options()
++        })
++        .share_preparation();
++    let r = c.integrate(request([d(3, 4, 0)]), &mut budget());
++    assert!(matches!(r.report().status(), Status::Completed));
++    assert_eq!(r.report().programs().len(), 1);
++    assert_eq!(r.report().programs()[0].stages().len(), 1);
++    assert_eq!(
++        r.report().end_enclosure().unwrap().lanes(),
++        Some(&[d(3, 4, 0)])
++    );
++}
++#[test]
++fn independent_exact_polynomial_endpoints_continue_with_shared_controller() {
++    let f = field::<1>(&[Expr::int(2) * Expr::anonymous_symbol(T)], &[X]);
++    let c = f
++        .adaptive_taylor(AdaptiveTaylorOptions {
++            remainder_limits: [d(0, 0, 0)],
++            ..options()
++        })
++        .share_preparation();
++    let r = c.integrate(request([d(3, 4, 0)]), &mut budget());
++    assert!(matches!(r.report().status(), Status::Completed));
++    assert_eq!(
++        r.report().end_enclosure().unwrap().lanes(),
++        Some(&[d(49, 65, -4)])
++    );
++    let next = c.integrate(
++        EvolutionRequest {
++            start: d(1, 1, -2),
++            end: d(1, 1, -1),
++            initial: r.report().end_enclosure().unwrap().clone(),
++        },
++        &mut budget(),
++    );
++    assert!(matches!(next.report().status(), Status::Completed));
++    assert_eq!(
++        next.report().end_enclosure().unwrap().lanes(),
++        Some(&[d(13, 17, -2)])
++    );
++}
++#[test]
++fn resource_limits_all_graph_cutoffs_and_retry_preserve_valid_prefixes() {
++    let f = field::<1>(&[Expr::int(2)], &[X]);
++    let c = f.adaptive_taylor(options()).share_preparation();
++    let req = request([d(0, 0, 0)]);
++    let mut b = budget();
++    let full = c.integrate(req.clone(), &mut b);
++    assert!(matches!(full.report().status(), Status::Completed));
++    let work = b.policy().graph_work - b.remaining_graph_work();
++    let scalar = b.policy().scalar_work - b.remaining_scalar_work();
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: work,
++        scalar_work: scalar,
++        ..Default::default()
++    });
++    let r = c.integrate(req.clone(), &mut exact);
++    assert!(matches!(r.report().status(), Status::Completed));
++    assert_eq!(exact.remaining_graph_work(), 0);
++    assert_eq!(exact.remaining_scalar_work(), 0);
++    for graph_work in 0..work {
++        let r = c.integrate(
++            req.clone(),
++            &mut EnclosureBudget::new(EnclosurePolicy {
++                graph_work,
++                ..Default::default()
++            }),
++        );
++        assert!(
++            matches!(r.report().status(), Status::Stopped(_)),
++            "cutoff{graph_work}"
++        );
++        assert!(r.report().end_enclosure().is_none());
++        for p in r.report().programs() {
++            assert_eq!(p.stages().len(), p.order() + 1);
++            assert_eq!(p.identity(), f.identity());
++        }
++    }
++    for p in [
++        EnclosurePolicy {
++            scalar_work: scalar - 1,
++            ..Default::default()
++        },
++        EnclosurePolicy {
++            graph_entries: 1,
++            ..Default::default()
++        },
++    ] {
++        let r = c.integrate(req.clone(), &mut EnclosureBudget::new(p));
++        assert!(matches!(r.report().status(), Status::Stopped(_)));
++        assert!(r.report().end_enclosure().is_none());
++    }
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut stopped = budget();
++    stopped.set_cancellation(Some(token));
++    let r = c.integrate(req.clone(), &mut stopped);
++    assert!(matches!(
++        r.report().status(),
++        Status::Stopped(Failure::Search(EvolutionFailure::Field(
++            FieldError::Expression(ExpressionError::Cancelled)
++        )))
++    ));
++    let retry = c.integrate(req, &mut budget());
++    assert_eq!(
++        format!("{:?}", retry.report()),
++        format!("{:?}", full.report())
++    );
++}
++#[test]
++fn extension_overflow_limits_and_failed_attempt_do_not_mutate_input() {
++    let p = field::<1>(&[Expr::anonymous_symbol(X)], &[X])
++        .flow_taylor(1, &mut budget())
++        .unwrap();
++    let before = format!("{p:?}");
++    let mut b = budget();
++    let extended = p.extend_order(2, &mut b).unwrap();
++    let work = b.policy().graph_work - b.remaining_graph_work();
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: work,
++        ..Default::default()
++    });
++    assert_eq!(
++        format!("{:?}", p.extend_order(2, &mut exact).unwrap()),
++        format!("{extended:?}")
++    );
++    assert_eq!(exact.remaining_graph_work(), 0);
++    assert!(matches!(
++        p.extend_order(usize::MAX, &mut budget()),
++        Err(FlowTaylorError::OrderOverflow)
++    ));
++    for graph_work in 0..work {
++        assert!(
++            p.extend_order(
++                2,
++                &mut EnclosureBudget::new(EnclosurePolicy {
++                    graph_work,
++                    ..Default::default()
++                })
++            )
++            .is_err()
++        );
++    }
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut b = budget();
++    b.set_cancellation(Some(token));
++    assert!(matches!(
++        p.extend_order(2, &mut b),
++        Err(FlowTaylorError::Field(FieldError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    assert_eq!(format!("{p:?}"), before);
++    assert_eq!(p.extend_order(2, &mut budget()).unwrap().order(), 3);
++}
++#[test]
++fn quality_domain_invalid_and_empty_outcomes_match_independent() {
++    let f = field::<1>(&[Expr::int(2)], &[X]);
++    for (o, req) in [
++        (
++            AdaptiveTaylorOptions {
++                maximum_order: 0,
++                maximum_quality_halvings: 0,
++                remainder_limits: [d(0, 0, 0)],
++                ..options()
++            },
++            request([d(0, 0, 0)]),
++        ),
++        (
++            AdaptiveTaylorOptions {
++                minimum_order: 4,
++                ..options()
++            },
++            request([d(0, 0, 0)]),
++        ),
++        (
++            options(),
++            EvolutionRequest {
++                end: d(-1, -1, 0),
++                initial: BoxN::empty().unwrap(),
++                ..request([d(0, 0, 0)])
++            },
++        ),
++        (
++            options(),
++            EvolutionRequest {
++                initial: BoxN::empty().unwrap(),
++                ..request([d(0, 0, 0)])
++            },
++        ),
++        (
++            options(),
++            EvolutionRequest {
++                end: d(0, 0, 0),
++                ..request([d(0, 0, 0)])
++            },
++        ),
++    ] {
++        let c = f.adaptive_taylor(o);
++        let expected = c.integrate(req.clone(), &mut budget());
++        let actual = c.share_preparation().integrate(req, &mut budget());
++        assert_eq!(format!("{:?}", actual.report()), format!("{expected:?}"));
++    }
++    let f = field::<1>(&[Expr::int(0) / Expr::anonymous_symbol(X)], &[X]);
++    let c = f.adaptive_taylor(options());
++    let req = request([d(0, 0, 0)]);
++    let expected = c.integrate(req.clone(), &mut budget());
++    let actual = c.share_preparation().integrate(req, &mut budget());
++    assert!(matches!(actual.report().status(), Status::Stopped(_)));
++    assert_eq!(format!("{:?}", actual.report()), format!("{expected:?}"));
++    let c = field::<0>(&[], &[])
++        .adaptive_taylor(options())
++        .share_preparation();
++    let r = c.integrate(request([]), &mut budget());
++    assert!(matches!(r.report().status(), Status::Completed));
++    assert_eq!(r.report().end_enclosure().unwrap().lanes(), Some(&[]));
++}
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replay_retains_shared_strategy() {
++    const KEY: &str = "HYPERDYNAMICS_SHARED_PREPARATION_REPLAY";
++    if let Ok(encoded) = std::env::var(KEY) {
++        let (definition, req): (FieldDefinition, EvolutionRequest<1>) =
++            serde_json::from_str(&encoded).unwrap();
++        let c = ExpressionField::<1>::from_definition(definition, &mut budget())
++            .unwrap()
++            .adaptive_taylor(options())
++            .share_preparation();
++        let mut b = budget();
++        let r = c.integrate(req, &mut b);
++        assert!(matches!(r.report().status(), Status::Completed));
++        println!("REPLAY={r:?}");
++        println!(
++            "WORK={}:{}",
++            b.remaining_graph_work(),
++            b.remaining_scalar_work()
++        );
++        return;
++    }
++    let f = field::<1>(&[Expr::anonymous_symbol(X)], &[X]);
++    let id = f.identity();
++    let definition = FieldDefinition {
++        source: id.source().clone(),
++        time: id.time(),
++        state: id.state().to_vec(),
++    };
++    let encoded = serde_json::to_string(&(definition, request([d(1, 1, 0)]))).unwrap();
++    let mut previous = None;
++    for _ in 0..3 {
++        let out = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "fresh_process_replay_retains_shared_strategy",
++                "--nocapture",
++            ])
++            .env(KEY, &encoded)
++            .output()
++            .unwrap();
++        assert!(out.status.success());
++        let text = String::from_utf8(out.stdout).unwrap();
++        let value: Vec<_> = text
++            .lines()
++            .filter(|s| s.starts_with("REPLAY=") || s.starts_with("WORK="))
++            .map(str::to_owned)
++            .collect();
++        assert_eq!(value.len(), 2);
++        if let Some(p) = previous.as_ref() {
++            assert_eq!(&value, p);
++        }
++        previous = Some(value);
++    }
++}
++#[path = "../examples/adaptive_shared.rs"]
++mod consumer;
++#[test]
++fn actual_shared_controller_example() {
++    consumer::run().unwrap();
++}
+diff --git a/crates/hyperdynamics/tests/adaptive_preparation_baseline.rs b/crates/hyperdynamics/tests/adaptive_preparation_baseline.rs
+new file mode 100644
+index 000000000..808c168b0
+--- /dev/null
++++ b/crates/hyperdynamics/tests/adaptive_preparation_baseline.rs
+@@ -0,0 +1,102 @@
++#![cfg(all(feature = "adaptive-taylor", feature = "dispatch-trace"))]
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::adaptive::{AdaptiveTaylorOptions, AdaptiveTaylorStatus},
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hyperreal::dispatch_trace;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn budget() -> EnclosureBudget {
++    EnclosureBudget::new(EnclosurePolicy::default())
++}
++fn check(line: String) {
++    let key = line.split_once('=').unwrap().0;
++    let expected = include_str!("fixtures/adaptive_default_trace.txt")
++        .lines()
++        .find(|s| s.split_once('=').unwrap().0 == key)
++        .unwrap();
++    assert_eq!(line, expected);
++    println!("{line}");
++}
++#[test]
++fn baseline_default_preparation_artifacts() {
++    for case in 0..3 {
++        let t = SymbolId(0);
++        let x = SymbolId(1);
++        let v = Expr::anonymous_symbol(x);
++        let rhs = match case {
++            0 => Expr::int(2),
++            1 => v,
++            _ => v.clone() * v,
++        };
++        let source = ExpressionProgram::compile(
++            &[rhs],
++            &[x, t],
++            &mut ExpressionBudget::new(1_000_000, 100_000_000),
++        )
++        .unwrap();
++        let f = ExpressionField::<1>::from_definition(
++            FieldDefinition {
++                source: source.definition().clone(),
++                time: t,
++                state: vec![x],
++            },
++            &mut budget(),
++        )
++        .unwrap();
++        dispatch_trace::reset();
++        let mut b = budget();
++        let p = dispatch_trace::with_recording(|| f.flow_taylor(3, &mut b).unwrap());
++        println!("PREP{case}={p:?}");
++        check(format!(
++            "PREP_TRACE{case}={:?}",
++            dispatch_trace::take_trace()
++        ));
++        check(format!(
++            "PREP_WORK{case}={}:{}",
++            b.remaining_graph_work(),
++            b.remaining_scalar_work()
++        ));
++        let controller = f.adaptive_taylor(AdaptiveTaylorOptions {
++            maximum_order: 3,
++            remainder_limits: [d(1, 1, -10)],
++            native: EvolutionOptions {
++                maximum_step: Some(d(1, 1, -3)),
++                ..Default::default()
++            },
++            ..Default::default()
++        });
++        dispatch_trace::reset();
++        let mut b = budget();
++        let r = dispatch_trace::with_recording(|| {
++            controller.integrate(
++                EvolutionRequest {
++                    start: d(0, 0, 0),
++                    end: d(1, 1, -2),
++                    initial: BoxN::new([d(1, 1, 0)]).unwrap(),
++                },
++                &mut b,
++            )
++        });
++        assert!(
++            matches!(r.status(), AdaptiveTaylorStatus::Completed),
++            "{:?}",
++            r.status()
++        );
++        println!("REPORT{case}={r:?}");
++        check(format!("TRACE{case}={:?}", dispatch_trace::take_trace()));
++        check(format!(
++            "WORK{case}={}:{}",
++            b.remaining_graph_work(),
++            b.remaining_scalar_work()
++        ));
++    }
++}
+diff --git a/crates/hyperdynamics/tests/fixtures/adaptive_default_trace.txt b/crates/hyperdynamics/tests/fixtures/adaptive_default_trace.txt
+new file mode 100644
+index 000000000..45ed22788
+--- /dev/null
++++ b/crates/hyperdynamics/tests/fixtures/adaptive_default_trace.txt
+@@ -0,0 +1,12 @@
++PREP_TRACE0=TraceSnapshot { dispatch: [DispatchCount { layer: "real", operation: "constructor", path: "one", count: 3 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 3 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 3 }], rational: RationalTraceStats { temporary_rationals: 9, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++PREP_WORK0=99999548:1000000000000
++TRACE0=TraceSnapshot { dispatch: [DispatchCount { layer: "real", operation: "constructor", path: "one", count: 5 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 9 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 5 }], rational: RationalTraceStats { temporary_rationals: 27, reductions: 16, gcds: 0, common_factors: CommonFactorBuckets { none: 16, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 5 } }
++WORK0=99999051:999999330432
++PREP_TRACE1=TraceSnapshot { dispatch: [DispatchCount { layer: "real", operation: "constructor", path: "one", count: 9 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 19 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 21 }], rational: RationalTraceStats { temporary_rationals: 49, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++PREP_WORK1=99999366:1000000000000
++TRACE1=TraceSnapshot { dispatch: [DispatchCount { layer: "real", operation: "constructor", path: "one", count: 18 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 23 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 24 }], rational: RationalTraceStats { temporary_rationals: 77, reductions: 24, gcds: 0, common_factors: CommonFactorBuckets { none: 24, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 79 } }
++WORK1=99997610:999997130166
++PREP_TRACE2=TraceSnapshot { dispatch: [DispatchCount { layer: "real", operation: "constructor", path: "one", count: 29 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 71 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 77 }], rational: RationalTraceStats { temporary_rationals: 177, reductions: 0, gcds: 0, common_factors: CommonFactorBuckets { none: 0, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 0 } }
++PREP_WORK2=99998870:1000000000000
++TRACE2=TraceSnapshot { dispatch: [DispatchCount { layer: "rational", operation: "add", path: "wide-dyadic", count: 10 }, DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 4 }, DispatchCount { layer: "rational", operation: "mul", path: "wide-dyadic-cross-cancel", count: 10 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 4 }, DispatchCount { layer: "rational", operation: "retained-facts", path: "dyadic-hit", count: 20 }, DispatchCount { layer: "rational", operation: "word-result", path: "dyadic-fraction", count: 8 }, DispatchCount { layer: "rational_algorithm", operation: "multiplication-wide-dyadic", path: "backend-basecase", count: 10 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 14 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 128 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 331 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 311 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 14 }], rational: RationalTraceStats { temporary_rationals: 790, reductions: 56, gcds: 0, common_factors: CommonFactorBuckets { none: 56, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 636 } }
++WORK2=99989775:999215550298
