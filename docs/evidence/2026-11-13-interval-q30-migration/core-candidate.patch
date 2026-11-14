@@ -1,0 +1,267 @@
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index c59dc206a..239a037a6 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Preserve proved endpoint order during fixed arithmetic reconstruction and
++  exact storage conversion. Use native checked additive operations and explicit
++  checked narrowing without changing rounded bounds or failure outcomes.
++
+ - Add allocation-free signed integer quotient bounds and exact scalar images of
+   primitive integer ranges, including signed extremes and typed overflow. Share
+   directed quotient arithmetic with fixed-point operations.
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index cb9edc8ee..201452720 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -135,7 +135,7 @@ scalar. With either `integer` or `fixed`, `integer_quotient_bounds` returns the
+ integer floor and ceiling of an i128 ratio, with typed zero-denominator and
+ overflow errors; it does not replace the ratio by a discrete integer set.
+ 
+-Fixed arithmetic widens intermediates to i128. Products, quotients, reciprocals,
++Fixed products and fused arithmetic use i128 intermediates. Products, quotients, reciprocals,
+ squares, ratio ingress and fused affine images round outward; representational
+ overflow is an error, never saturation. Integer powers use a bounded sequence
+ of outward-rounded products and may be wider than the tight hull. Storage
+diff --git a/crates/hyperinterval/src/bounds.rs b/crates/hyperinterval/src/bounds.rs
+index 5a7eac7e7..1501c7fc8 100644
+--- a/crates/hyperinterval/src/bounds.rs
++++ b/crates/hyperinterval/src/bounds.rs
+@@ -66,6 +66,7 @@ impl<T: PartialOrd> Bounds<T> {
+     // constructor. Public ingress always uses new().
+     #[cfg(any(
+         feature = "integer",
++        feature = "fixed",
+         feature = "rational",
+         feature = "float-proposal",
+         feature = "float-enclosure"
+diff --git a/crates/hyperinterval/src/fixed.rs b/crates/hyperinterval/src/fixed.rs
+index 485243c8a..b71e8b8c3 100644
+--- a/crates/hyperinterval/src/fixed.rs
++++ b/crates/hyperinterval/src/fixed.rs
+@@ -45,6 +45,15 @@ pub struct FixedInterval<I: FixedEndpoint, const FRAC: u32> {
+ }
+ 
+ impl<I: FixedEndpoint, const FRAC: u32> FixedInterval<I, FRAC> {
++    // Arithmetic callers establish endpoint order before reaching this path.
++    // Scale validation remains mandatory; public ingress always uses new().
++    pub(crate) fn from_ordered(lower: I, upper: I) -> Result<Self, IntervalError> {
++        Self::validate_scale()?;
++        Ok(Self {
++            bounds: Some(Bounds::ordered(lower, upper)),
++        })
++    }
++
+     fn validate_scale() -> Result<(), IntervalError> {
+         if FRAC < I::BITS {
+             Ok(())
+@@ -88,7 +97,8 @@ impl<I: FixedEndpoint, const FRAC: u32> FixedInterval<I, FRAC> {
+     ) -> Result<FixedInterval<J, FRAC>, IntervalError> {
+         let empty = FixedInterval::<J, FRAC>::empty()?;
+         match self.bounds() {
+-            Some((lower, upper)) => FixedInterval::new(
++            // Successful integer conversion is exact and preserves order.
++            Some((lower, upper)) => FixedInterval::from_ordered(
+                 J::try_from(lower).map_err(|_| IntervalError::Overflow)?,
+                 J::try_from(upper).map_err(|_| IntervalError::Overflow)?,
+             ),
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index 1c536b975..9d9860d29 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -1,4 +1,4 @@
+-//! Widened arithmetic for the sealed i32/i64 fixed-point families.
++//! Checked arithmetic with widened products for the sealed i32/i64 fixed-point families.
+ 
+ use crate::integer_quotient::positive_quotient_bounds as quotient_bounds;
+ use crate::{DomainCoverage, FixedInterval, IntervalError, MidpointRounding, RangeEnclosure};
+@@ -41,9 +41,15 @@ macro_rules! arithmetic {
+             }
+ 
+             fn from_wide(lower: i128, upper: i128) -> Result<Self, IntervalError> {
+-                let lower = <$endpoint>::try_from(lower).map_err(|_| IntervalError::Overflow)?;
+-                let upper = <$endpoint>::try_from(upper).map_err(|_| IntervalError::Overflow)?;
+-                Self::new(lower, upper)
++                if lower < i128::from(<$endpoint>::MIN) || lower > i128::from(<$endpoint>::MAX) {
++                    return Err(IntervalError::Overflow);
++                }
++                if upper < i128::from(<$endpoint>::MIN) || upper > i128::from(<$endpoint>::MAX) {
++                    return Err(IntervalError::Overflow);
++                }
++                // Callers select ordered extrema before outward rounding.
++                // Exact narrowing preserves that established order.
++                Self::from_ordered(lower as $endpoint, upper as $endpoint)
+             }
+ 
+             /// Smallest outward lattice enclosure of an exact i64 ratio.
+@@ -190,20 +196,20 @@ macro_rules! arithmetic {
+             /// Exact Minkowski sum, or `Overflow` if an endpoint does not fit.
+             pub fn checked_add(&self, other: &Self) -> Result<Self, IntervalError> {
+                 match (self.bounds(), other.bounds()) {
+-                    (Some((a, b)), Some((c, d))) => Self::from_wide(
+-                        i128::from(a) + i128::from(c),
+-                        i128::from(b) + i128::from(d),
++                    (Some((a, b)), Some((c, d))) => Self::from_ordered(
++                        a.checked_add(c).ok_or(IntervalError::Overflow)?,
++                        b.checked_add(d).ok_or(IntervalError::Overflow)?,
+                     ),
+                     _ => Self::empty(),
+                 }
+             }
+ 
+-            /// Exact Minkowski difference, with widened intermediates and no saturation.
++            /// Exact Minkowski difference, with checked endpoints and no saturation.
+             pub fn checked_sub(&self, other: &Self) -> Result<Self, IntervalError> {
+                 match (self.bounds(), other.bounds()) {
+-                    (Some((a, b)), Some((c, d))) => Self::from_wide(
+-                        i128::from(a) - i128::from(d),
+-                        i128::from(b) - i128::from(c),
++                    (Some((a, b)), Some((c, d))) => Self::from_ordered(
++                        a.checked_sub(d).ok_or(IntervalError::Overflow)?,
++                        b.checked_sub(c).ok_or(IntervalError::Overflow)?,
+                     ),
+                     _ => Self::empty(),
+                 }
+@@ -212,7 +218,10 @@ macro_rules! arithmetic {
+             /// Exact reflected set, or `Overflow` at an unrepresentable negation.
+             pub fn checked_neg(&self) -> Result<Self, IntervalError> {
+                 match self.bounds() {
+-                    Some((lower, upper)) => Self::from_wide(-i128::from(upper), -i128::from(lower)),
++                    Some((lower, upper)) => Self::from_ordered(
++                        upper.checked_neg().ok_or(IntervalError::Overflow)?,
++                        lower.checked_neg().ok_or(IntervalError::Overflow)?,
++                    ),
+                     None => Self::empty(),
+                 }
+             }
+diff --git a/crates/hyperinterval/tests/fixed_additive.rs b/crates/hyperinterval/tests/fixed_additive.rs
+new file mode 100644
+index 000000000..5a7ab1b47
+--- /dev/null
++++ b/crates/hyperinterval/tests/fixed_additive.rs
+@@ -0,0 +1,122 @@
++#![cfg(feature = "fixed")]
++use hyperinterval::{FixedInterval, IntervalError};
++
++#[test]
++fn exact_storage_conversion_preserves_bounds_and_scale_validation() {
++    type Narrow = FixedInterval<i32, 30>;
++    let original = Narrow::new(i32::MIN, i32::MAX).unwrap();
++    let wide = original.convert::<i64>().unwrap();
++    assert_eq!(
++        wide.bounds(),
++        Some((i64::from(i32::MIN), i64::from(i32::MAX)))
++    );
++    assert_eq!(wide.convert::<i32>(), Ok(original));
++    assert_eq!(
++        wide.checked_add(&FixedInterval::<i64, 30>::point(1).unwrap())
++            .unwrap()
++            .convert::<i32>(),
++        Err(IntervalError::Overflow)
++    );
++    assert_eq!(
++        FixedInterval::<i64, 30>::empty().unwrap().convert::<i32>(),
++        Ok(Narrow::empty().unwrap())
++    );
++    assert_eq!(
++        FixedInterval::<i64, 63>::empty().unwrap().convert::<i32>(),
++        Err(IntervalError::InvalidScale)
++    );
++    assert_eq!(Narrow::new(1, 0), Err(IntervalError::ReversedEndpoints));
++}
++
++#[test]
++fn full_width_additive_images_preserve_order_and_checked_endpoints() {
++    macro_rules! check {
++        ($ty:ty, $frac:literal) => {{
++            type I = FixedInterval<$ty, $frac>;
++            let endpoints = [
++                <$ty>::MIN,
++                <$ty>::MIN + 1,
++                -3,
++                -1,
++                0,
++                1,
++                3,
++                <$ty>::MAX - 1,
++                <$ty>::MAX,
++            ];
++            let expected =
++                |lower: i128, upper: i128| match (<$ty>::try_from(lower), <$ty>::try_from(upper)) {
++                    (Ok(lower), Ok(upper)) => Ok(Some((lower, upper))),
++                    _ => Err(IntervalError::Overflow),
++                };
++            let empty = I::empty().unwrap();
++            for &a in &endpoints {
++                for &b in &endpoints {
++                    if a > b {
++                        continue;
++                    }
++                    let x = I::new(a, b).unwrap();
++                    assert_eq!(
++                        x.checked_neg().map(|x| x.bounds()),
++                        expected(-i128::from(b), -i128::from(a))
++                    );
++                    assert_eq!(x.checked_add(&empty), Ok(empty));
++                    assert_eq!(empty.checked_sub(&x), Ok(empty));
++                    assert_eq!(x.checked_sub(&empty), Ok(empty));
++                    for &c in &endpoints {
++                        for &d in &endpoints {
++                            if c > d {
++                                continue;
++                            }
++                            let y = I::new(c, d).unwrap();
++                            assert_eq!(
++                                x.checked_add(&y).map(|x| x.bounds()),
++                                expected(
++                                    i128::from(a) + i128::from(c),
++                                    i128::from(b) + i128::from(d)
++                                )
++                            );
++                            assert_eq!(
++                                x.checked_sub(&y).map(|x| x.bounds()),
++                                expected(
++                                    i128::from(a) - i128::from(d),
++                                    i128::from(b) - i128::from(c)
++                                )
++                            );
++                        }
++                    }
++                }
++            }
++        }};
++    }
++    check!(i32, 0);
++    check!(i32, 30);
++    check!(i32, 31);
++    check!(i64, 0);
++    check!(i64, 32);
++    check!(i64, 63);
++}
++
++#[cfg(all(feature = "hyperreal", feature = "dispatch-trace"))]
++#[test]
++fn additive_reconstruction_and_replay_have_no_scalar_dispatch() {
++    use hyperreal::dispatch_trace;
++    type I = FixedInterval<i64, 63>;
++    dispatch_trace::reset();
++    let image = dispatch_trace::with_recording(|| {
++        I::new(-7, 9)
++            .unwrap()
++            .checked_add(&I::new(3, 4).unwrap())
++            .unwrap()
++            .checked_sub(&I::new(-2, 3).unwrap())
++            .unwrap()
++            .checked_neg()
++            .unwrap()
++    });
++    assert_eq!(image.bounds(), Some((-15, 7)));
++    let (a, b) = image.bounds().unwrap();
++    assert_eq!(I::new(a, b), Ok(image));
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}

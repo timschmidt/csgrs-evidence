@@ -1,0 +1,85 @@
+diff --git a/crates/hyperinterval/src/bounds.rs b/crates/hyperinterval/src/bounds.rs
+index 5a7eac7e7..1501c7fc8 100644
+--- a/crates/hyperinterval/src/bounds.rs
++++ b/crates/hyperinterval/src/bounds.rs
+@@ -66,6 +66,7 @@ impl<T: PartialOrd> Bounds<T> {
+     // constructor. Public ingress always uses new().
+     #[cfg(any(
+         feature = "integer",
++        feature = "fixed",
+         feature = "rational",
+         feature = "float-proposal",
+         feature = "float-enclosure"
+diff --git a/crates/hyperinterval/src/fixed.rs b/crates/hyperinterval/src/fixed.rs
+index 485243c8a..d07a65c1c 100644
+--- a/crates/hyperinterval/src/fixed.rs
++++ b/crates/hyperinterval/src/fixed.rs
+@@ -45,6 +45,15 @@ pub struct FixedInterval<I: FixedEndpoint, const FRAC: u32> {
+ }
+ 
+ impl<I: FixedEndpoint, const FRAC: u32> FixedInterval<I, FRAC> {
++    // Arithmetic callers establish endpoint order before reaching this path.
++    // Scale validation remains mandatory; public ingress always uses new().
++    pub(crate) fn from_ordered(lower: I, upper: I) -> Result<Self, IntervalError> {
++        Self::validate_scale()?;
++        Ok(Self {
++            bounds: Some(Bounds::ordered(lower, upper)),
++        })
++    }
++
+     fn validate_scale() -> Result<(), IntervalError> {
+         if FRAC < I::BITS {
+             Ok(())
+diff --git a/crates/hyperinterval/src/fixed_arithmetic.rs b/crates/hyperinterval/src/fixed_arithmetic.rs
+index 1c536b975..075eb3e7e 100644
+--- a/crates/hyperinterval/src/fixed_arithmetic.rs
++++ b/crates/hyperinterval/src/fixed_arithmetic.rs
+@@ -43,7 +43,9 @@ macro_rules! arithmetic {
+             fn from_wide(lower: i128, upper: i128) -> Result<Self, IntervalError> {
+                 let lower = <$endpoint>::try_from(lower).map_err(|_| IntervalError::Overflow)?;
+                 let upper = <$endpoint>::try_from(upper).map_err(|_| IntervalError::Overflow)?;
+-                Self::new(lower, upper)
++                // Callers select ordered extrema before outward rounding.
++                // Exact narrowing preserves that established order.
++                Self::from_ordered(lower, upper)
+             }
+ 
+             /// Smallest outward lattice enclosure of an exact i64 ratio.
+@@ -190,9 +192,9 @@ macro_rules! arithmetic {
+             /// Exact Minkowski sum, or `Overflow` if an endpoint does not fit.
+             pub fn checked_add(&self, other: &Self) -> Result<Self, IntervalError> {
+                 match (self.bounds(), other.bounds()) {
+-                    (Some((a, b)), Some((c, d))) => Self::from_wide(
+-                        i128::from(a) + i128::from(c),
+-                        i128::from(b) + i128::from(d),
++                    (Some((a, b)), Some((c, d))) => Self::from_ordered(
++                        a.checked_add(c).ok_or(IntervalError::Overflow)?,
++                        b.checked_add(d).ok_or(IntervalError::Overflow)?,
+                     ),
+                     _ => Self::empty(),
+                 }
+@@ -201,9 +203,9 @@ macro_rules! arithmetic {
+             /// Exact Minkowski difference, with widened intermediates and no saturation.
+             pub fn checked_sub(&self, other: &Self) -> Result<Self, IntervalError> {
+                 match (self.bounds(), other.bounds()) {
+-                    (Some((a, b)), Some((c, d))) => Self::from_wide(
+-                        i128::from(a) - i128::from(d),
+-                        i128::from(b) - i128::from(c),
++                    (Some((a, b)), Some((c, d))) => Self::from_ordered(
++                        a.checked_sub(d).ok_or(IntervalError::Overflow)?,
++                        b.checked_sub(c).ok_or(IntervalError::Overflow)?,
+                     ),
+                     _ => Self::empty(),
+                 }
+@@ -212,7 +214,10 @@ macro_rules! arithmetic {
+             /// Exact reflected set, or `Overflow` at an unrepresentable negation.
+             pub fn checked_neg(&self) -> Result<Self, IntervalError> {
+                 match self.bounds() {
+-                    Some((lower, upper)) => Self::from_wide(-i128::from(upper), -i128::from(lower)),
++                    Some((lower, upper)) => Self::from_ordered(
++                        upper.checked_neg().ok_or(IntervalError::Overflow)?,
++                        lower.checked_neg().ok_or(IntervalError::Overflow)?,
++                    ),
+                     None => Self::empty(),
+                 }
+             }
