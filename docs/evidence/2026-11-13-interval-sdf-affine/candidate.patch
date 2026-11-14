@@ -1,0 +1,116 @@
+diff --git a/crates/hypersdf/CHANGELOG.md b/crates/hypersdf/CHANGELOG.md
+index 87aac7fb3..d12db13e0 100644
+--- a/crates/hypersdf/CHANGELOG.md
++++ b/crates/hypersdf/CHANGELOG.md
+@@ -12,6 +12,10 @@ Initial release.
+   parameter admission, retains algebraic centers and exact squares, and remains
+   consumable by native Jacobian/Taylor proofs and subsequent composition.
+ 
++- Affine enclosure compilation consumes the retained inverse coordinates and
++  preserves source qualification, parameter guards and native Taylor composition.
++  Nested frames retain shared graph coordinates without expanding source trees.
++
+ Hypersdf provides signed-distance and implicit-field expressions for the
+ Hyper geometry stack. It retains expression structure and exact parameters so
+ that inside, boundary, and outside questions are answered from the field
+diff --git a/crates/hypersdf/README.md b/crates/hypersdf/README.md
+index 2469c6eec..ef51aac63 100644
+--- a/crates/hypersdf/README.md
++++ b/crates/hypersdf/README.md
+@@ -46,10 +46,11 @@ expressions into Hypersolve programs. It certifies whole-cell dyadic images,
+ including sine/cosine/tangent, and optionally centered Taylor images with their
+ complete remainder. Source distance qualification is preserved; a range merely
+ containing zero does not certify a crossing. Constants, coordinates, linear
+-fields, scalar arithmetic, square root, complement, offset and translations are
++fields, scalar arithmetic, square root, complement, offset, translations and
++affine transforms are
+ supported, along with polynomial plane, sphere and torus fields. Their original
+ strict parameter checks retain invalid versus undecided outcomes. Other
+-primitive, piecewise and affine nodes have explicit unsupported results on this
++primitive and piecewise nodes have explicit unsupported results on this
+ optional path; existing queries remain available. Graph and
+ native arithmetic budgets are caller-owned; scalar refinement/payload and heap
+ exclusions remain explicit.
+diff --git a/crates/hypersdf/src/enclosure.rs b/crates/hypersdf/src/enclosure.rs
+index cf1bfc1a7..c349e5ba0 100644
+--- a/crates/hypersdf/src/enclosure.rs
++++ b/crates/hypersdf/src/enclosure.rs
+@@ -61,9 +61,13 @@ impl From<TaylorError> for SdfProgramError {
+ ///
+ /// Coordinates are always bound as x,y,z. Supported forms are constants,
+ /// coordinates, linear fields, add/subtract/multiply, sqrt, sin/cos/tan,
+-/// complement, offset, translation, and polynomial plane/sphere/torus fields.
+-/// Their original strict parameter checks remain mandatory. Other primitive,
+-/// piecewise and affine nodes return `Unsupported`; existing SDF APIs remain available.
++/// complement, offset, translation, affine transforms, and polynomial
++/// plane/sphere/torus fields. Their original strict parameter checks remain
++/// mandatory. Other primitive and piecewise nodes return `Unsupported`;
++/// existing SDF APIs remain available.
++/// Affine nodes consume the retained inverse's first three rows, exactly as
++/// `SdfTransform::inverse_point` does; compilation does not certify that a
++/// manually assembled transform's matrices are mutually inverse.
+ /// No metric-distance or zero-set topology guarantee follows from compilation.
+ /// Replay by compiling the original SDF again, never by adopting serialized
+ /// generated nodes or flags as proof of their association with that SDF.
+@@ -286,11 +290,12 @@ fn compile(
+                     transform: SdfTransform::Translation { .. },
+                     ..
+                 } => 7,
++                SdfExpr::Transform {
++                    transform: SdfTransform::Affine { .. },
++                    ..
++                } => 31,
+                 SdfExpr::Primitive(p) => primitive::entries(p),
+-                SdfExpr::Union(..)
+-                | SdfExpr::Intersection(..)
+-                | SdfExpr::Abs(_)
+-                | SdfExpr::Transform { .. } => 0,
++                SdfExpr::Union(..) | SdfExpr::Intersection(..) | SdfExpr::Abs(_) => 0,
+             },
+             Task::Unary(_) => 1,
+             Task::Binary(_) => 0,
+@@ -365,8 +370,15 @@ fn compile(
+                     return Err(SdfProgramError::Unsupported("intersection"));
+                 }
+                 SdfExpr::Abs(_) => return Err(SdfProgramError::Unsupported("absolute value")),
+-                SdfExpr::Transform { .. } => {
+-                    return Err(SdfProgramError::Unsupported("affine transform"));
++                SdfExpr::Transform {
++                    child,
++                    transform: SdfTransform::Affine { inverse, .. },
++                } => {
++                    let mut moved = xyz;
++                    for (i, row) in inverse.0[..3].iter().enumerate() {
++                        moved[i] = b.linear([&row[0], &row[1], &row[2]], &row[3], xyz)?;
++                    }
++                    tasks.push(Task::Visit(child, moved));
+                 }
+             },
+             Task::Unary(op) => {
+diff --git a/crates/hypersdf/tests/enclosure_program.rs b/crates/hypersdf/tests/enclosure_program.rs
+index fc3af9371..c3b08c007 100644
+--- a/crates/hypersdf/tests/enclosure_program.rs
++++ b/crates/hypersdf/tests/enclosure_program.rs
+@@ -440,3 +440,9 @@ fn constant_compilation_does_not_reserve_unrelated_linear_expansion() {
+ 
+ #[path = "support/enclosure_primitives.rs"]
+ mod primitive_acceptance;
++
++#[path = "support/uncertainty.rs"]
++mod uncertainty;
++
++#[path = "support/enclosure_affine.rs"]
++mod affine_acceptance;
+diff --git a/crates/hypersdf/tests/support/enclosure_primitives.rs b/crates/hypersdf/tests/support/enclosure_primitives.rs
+index e77058f5a..ff9d1fa28 100644
+--- a/crates/hypersdf/tests/support/enclosure_primitives.rs
++++ b/crates/hypersdf/tests/support/enclosure_primitives.rs
+@@ -2,8 +2,6 @@ use super::*;
+ use hyperlimit::{Plane3, PredicatePolicy, compare_reals};
+ use hypersdf::{SdfCoordinate, SdfEvaluationError};
+ use std::error::Error;
+-#[path = "uncertainty.rs"]
+-mod uncertainty;
+ 
+ #[test]
+ fn polynomial_primitives_match_independent_integer_geometry_on_every_axis() {
