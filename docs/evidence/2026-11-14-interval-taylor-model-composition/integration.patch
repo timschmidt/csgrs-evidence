@@ -1,0 +1,1223 @@
+diff --git a/crates/hypersolve/CHANGELOG.md b/crates/hypersolve/CHANGELOG.md
+index f5289ca9b..5117cc6a5 100644
+--- a/crates/hypersolve/CHANGELOG.md
++++ b/crates/hypersolve/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [0.4.0] - Unreleased
+ 
++- Add opt-in certified Taylor model composition, preserving both source proofs,
++  full outer-domain inclusion, generated polynomial/cross-remainder evidence and
++  the complete outer residual. Generated results accept subsequent model maps.
++
+ - Add opt-in exact QR coordinate construction with orthogonality and reconstruction evidence.
+ 
+ - Add opt-in exact source-bound coordinate transitions for direct chart transport.
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index a9a7ac597..8b1ab1e3e 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -49,6 +49,7 @@ coordinate-transition = ["coordinate-program"]
+ taylor-model = ["interval-program"]
+ taylor-affine = ["taylor-model"]
+ taylor-polynomial = ["taylor-affine"]
++taylor-composition = ["taylor-polynomial"]
+ float-proposal-program = ["expression-program"]
+ interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
+ interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+@@ -104,3 +105,8 @@ required-features = ["expression-program"]
+ name = "taylor_polynomial"
+ harness = false
+ required-features = ["taylor-polynomial"]
++
++[[bench]]
++name = "taylor_composition"
++harness = false
++required-features = ["taylor-composition"]
+diff --git a/crates/hypersolve/README.md b/crates/hypersolve/README.md
+index 697321428..9ab7160af 100644
+--- a/crates/hypersolve/README.md
++++ b/crates/hypersolve/README.md
+@@ -666,6 +666,20 @@ This does not implement division, transcendental model maps, or combination of
+ independently centered models. Use `taylor-affine` when composing linear maps
+ against the original residual coordinates is the intended operation.
+ 
++Enable `taylor-composition` to compose certified Taylor maps through
++`Arc<TaylorModel>::compose` or `TaylorPolynomialModel::compose`. The inner image
++must fit every outer input domain, including unused inputs. The inner parameter
++center/domain/order stay fixed; existing polynomial propagation accounts for all
++truncated terms and residual cross-products, then adds the outer model's entire
++remainder. Both original certificates remain shared, and generated output accepts
++further polynomial or certified-model maps. Result coefficients describe a
++polynomial plus residual, not necessarily the derivatives of the exact composite
++at the inner center. `model_map` exposes the retained outer certificate;
++`polynomial_map` supplies node indices for product evidence. Replay each original
++definition/request and the ordered map sequence. Existing stage resource limits
++and scalar/whole-heap exclusions apply; this does not merge independently based
++parameter models or automatically select centers, orders or subdivisions.
++
+ ### Exact coordinate programs
+ 
+ The opt-in `coordinate-program` feature certifies finite exact state charts
+diff --git a/crates/hypersolve/benches/taylor_composition.rs b/crates/hypersolve/benches/taylor_composition.rs
+new file mode 100644
+index 000000000..802711b25
+--- /dev/null
++++ b/crates/hypersolve/benches/taylor_composition.rs
+@@ -0,0 +1,257 @@
++//! Completed certified model composition versus fresh native Taylor construction.
++//! Both paths meet the same explicit range-width contract. Preparation is separate.
++use criterion::{Criterion, criterion_group, criterion_main};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperreal::{Rational, Real};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{
++        ExpressionBudget, ExpressionProgram, TaylorModel, TaylorPolynomialModel, TaylorRequest,
++    },
++};
++use std::{hint::black_box, sync::Arc};
++fn graph() -> ExpressionBudget {
++    ExpressionBudget::new(1_000_000, 100_000_000)
++}
++fn arithmetic() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000_000)
++}
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++struct Case {
++    name: &'static str,
++    inner: Arc<TaylorModel>,
++    outer: Arc<TaylorModel>,
++    native: ExpressionProgram,
++    request: TaylorRequest,
++    expected: [Real; 3],
++    // Exact extremum values, or their squares for the positive sqrt fixture.
++    extrema: [Rational; 2],
++    squared: bool,
++    width: DyadicInterval,
++}
++fn cases() -> Vec<Case> {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let reciprocal = Expr::int(1) / (Expr::int(1) - x.clone());
++    let root = Real::from(2).sqrt().unwrap();
++    let definitions = [
++        (
++            "nested_reciprocal",
++            reciprocal.clone(),
++            Expr::int(1) / (Expr::int(2) + u.clone()),
++            Expr::int(1) / (Expr::int(2) + reciprocal),
++            d(1, 1, 0),
++            d(7, 9, -3),
++            [
++                Real::from(Rational::from(1) / Rational::from(3)),
++                Real::from(Rational::from(-1) / Rational::from(9)),
++                Real::from(Rational::from(-2) / Rational::from(27)),
++            ],
++            [
++                Rational::from(15) / Rational::from(46),
++                Rational::from(17) / Rational::from(50),
++            ],
++            false,
++            d(1, 1, -5),
++        ),
++        (
++            "algebraic_sqrt",
++            x.clone(),
++            (Expr::int(2) + u).sqrt(),
++            (Expr::int(2) + x).sqrt(),
++            d(0, 0, 0),
++            d(-1, 1, -4),
++            [
++                root.clone(),
++                root.clone() * Real::from(Rational::from(1) / Rational::from(4)),
++                root * Real::from(Rational::from(-1) / Rational::from(32)),
++            ],
++            [
++                Rational::from(31) / Rational::from(16),
++                Rational::from(33) / Rational::from(16),
++            ],
++            true,
++            d(1, 1, -3),
++        ),
++    ];
++    definitions
++        .into_iter()
++        .map(
++            |(name, inner, outer, native, center, domain, expected, extrema, squared, width)| {
++                let request = TaylorRequest {
++                    center: vec![d(0, 0, 0)],
++                    domain: vec![d(-1, 1, -4)],
++                    order: 2,
++                    precision: -64,
++                };
++                let inner = Arc::new(
++                    ExpressionProgram::compile(&[inner], &[SymbolId(7)], &mut graph())
++                        .unwrap()
++                        .taylor_model(request.clone(), &mut graph(), &mut arithmetic())
++                        .unwrap(),
++                );
++                let outer = Arc::new(
++                    ExpressionProgram::compile(&[outer], &[SymbolId(20)], &mut graph())
++                        .unwrap()
++                        .taylor_model(
++                            TaylorRequest {
++                                center: vec![center],
++                                domain: vec![domain],
++                                order: 2,
++                                precision: -64,
++                            },
++                            &mut graph(),
++                            &mut arithmetic(),
++                        )
++                        .unwrap(),
++                );
++                let native =
++                    ExpressionProgram::compile(&[native], &[SymbolId(7)], &mut graph()).unwrap();
++                Case {
++                    name,
++                    inner,
++                    outer,
++                    native,
++                    request,
++                    expected,
++                    extrema,
++                    squared,
++                    width,
++                }
++            },
++        )
++        .collect()
++}
++fn reuse(case: &Case) -> TaylorPolynomialModel {
++    case.inner
++        .clone()
++        .compose(case.outer.clone(), &mut graph(), &mut arithmetic())
++        .unwrap()
++}
++fn fresh(case: &Case) -> TaylorModel {
++    case.native
++        .taylor_model(case.request.clone(), &mut graph(), &mut arithmetic())
++        .unwrap()
++}
++fn validate_range(case: &Case, range: &[DyadicInterval]) {
++    assert_eq!(range.len(), 1);
++    assert!(
++        range[0]
++            .width(&mut arithmetic())
++            .unwrap()
++            .subset_of(
++                &d(0, 1, if case.squared { -3 } else { -5 }),
++                &mut arithmetic()
++            )
++            .unwrap()
++    );
++    let r = range[0].to_rational(&mut arithmetic()).unwrap();
++    let (lo, hi) = (r.lower().unwrap(), r.upper().unwrap());
++    if case.squared {
++        assert!(lo > &0.into());
++        assert!(lo * lo <= case.extrema[0]);
++        assert!(hi * hi >= case.extrema[1]);
++    } else {
++        assert!(lo <= &case.extrema[0]);
++        assert!(hi >= &case.extrema[1]);
++    }
++    let allowed = case.width.to_rational(&mut arithmetic()).unwrap();
++    assert!(r.upper().unwrap() - r.lower().unwrap() <= allowed.upper().unwrap().clone());
++}
++fn validate(case: &Case) {
++    let reused = reuse(case);
++    let native = fresh(case);
++    validate_range(case, reused.range());
++    validate_range(case, native.image());
++    assert_eq!(reused.range(), native.image());
++    for (degree, expected) in case.expected.iter().enumerate() {
++        let powers = if degree == 0 {
++            vec![]
++        } else {
++            vec![(SymbolId(7), degree)]
++        };
++        let got = reused.terms(0).unwrap().get(&powers).unwrap();
++        let native_term = native
++            .terms()
++            .iter()
++            .find(|term| {
++                native.coefficient_program().requests()[term.request_index()].powers == powers
++            })
++            .unwrap();
++        for policy in [
++            hyperlimit::PredicatePolicy::STRICT,
++            hyperlimit::PredicatePolicy::APPROXIMATE_512,
++        ] {
++            assert!(matches!(
++                hyperlimit::classify_real_sign(
++                    &(native_term.coefficient().clone() - expected.clone()),
++                    policy
++                ),
++                hyperlimit::PredicateOutcome::Decided {
++                    value: hyperlimit::Sign::Zero,
++                    certainty: hyperlimit::Certainty::Exact | hyperlimit::Certainty::Filtered,
++                    ..
++                }
++            ));
++            assert!(matches!(
++                hyperlimit::classify_real_sign(&(got.clone() - expected.clone()), policy),
++                hyperlimit::PredicateOutcome::Decided {
++                    value: hyperlimit::Sign::Zero,
++                    certainty: hyperlimit::Certainty::Exact | hyperlimit::Certainty::Filtered,
++                    ..
++                }
++            ));
++        }
++    }
++    eprintln!(
++        "COMPLETED {} reuse_range {:?} fresh_range {:?}",
++        case.name,
++        reused.range(),
++        native.image()
++    );
++}
++fn benchmarks(c: &mut Criterion) {
++    for case in cases() {
++        validate(&case);
++        let mut group = c.benchmark_group(format!("taylor_composition/{}", case.name));
++        group.bench_function("reuse", |b| {
++            b.iter(|| drop(black_box(reuse(black_box(&case)))))
++        });
++        group.bench_function("redifferentiate", |b| {
++            b.iter(|| drop(black_box(fresh(black_box(&case)))))
++        });
++        group.bench_function("inner_preparation", |b| {
++            b.iter(|| {
++                drop(black_box(
++                    case.inner
++                        .source()
++                        .taylor_model(
++                            black_box(case.inner.request().clone()),
++                            &mut graph(),
++                            &mut arithmetic(),
++                        )
++                        .unwrap(),
++                ))
++            })
++        });
++        group.bench_function("outer_preparation", |b| {
++            b.iter(|| {
++                drop(black_box(
++                    case.outer
++                        .source()
++                        .taylor_model(
++                            black_box(case.outer.request().clone()),
++                            &mut graph(),
++                            &mut arithmetic(),
++                        )
++                        .unwrap(),
++                ))
++            })
++        });
++        group.finish();
++    }
++}
++criterion_group!(benches, benchmarks);
++criterion_main!(benches);
+diff --git a/crates/hypersolve/src/expression_program/taylor/model/polynomial.rs b/crates/hypersolve/src/expression_program/taylor/model/polynomial.rs
+index 25edf835b..8c4d05f04 100644
+--- a/crates/hypersolve/src/expression_program/taylor/model/polynomial.rs
++++ b/crates/hypersolve/src/expression_program/taylor/model/polynomial.rs
+@@ -85,21 +85,30 @@ struct Value {
+ #[derive(Debug)]
+ struct Stage {
+     map: ExpressionProgram,
++    #[cfg(feature = "taylor-composition")]
++    model: Option<Arc<TaylorModel>>,
+     // Flat retained proof nodes share repeated map edges. Stages have no owning
+     // parent link, so long composition chains do not recursively destroy parents.
+     values: Vec<Option<Arc<Value>>>,
+     outputs: Vec<Arc<Value>>,
+ }
+-/// A finite sequence of exact polynomial output maps over a retained Taylor model.
++/// A retained polynomial/remainder representation transported through exact maps.
+ ///
+ /// The original model supplies source guards, regularity, domain, center, order
+ /// and grid. Each map binds its variables, in order, to all immediate input
+-/// outputs. Supported reached nodes are constants, variables, negation, addition,
++/// outputs. Raw expression maps support constants, variables, negation, addition,
+ /// subtraction and multiplication. Unreached nodes are not evaluated. No new
+ /// derivatives are constructed. All truncated monomials and residual cross terms
+ /// remain evidence; residual intervals never assert independence or equality.
+ ///
+ /// Replay the original model definition/request and each `maps()` definition.
++/// With `taylor-composition`, `compose` also accepts certified Taylor maps. Their
++/// original definitions are exposed by `maps`, their certificates by `model_map`,
++/// and their generated polynomial graphs by `polynomial_map`. Retain each outer
++/// definition/request when replaying those stages. The resulting coefficients
++/// define an exact polynomial plus residual; they need not be the derivatives
++/// of the exact composite at the original center.
++///
+ /// These private certificates are not deserialized as proof. Shared stages retain
+ /// exact sources and generated objects without expanding them into expression
+ /// trees. A transform copies only the flat list of shared stage handles.
+@@ -137,9 +146,15 @@ impl TaylorPolynomialModel {
+     }
+     /// Exact map definitions in application order; bindings refer to immediate outputs.
+     pub fn maps(&self) -> impl Iterator<Item = &ExpressionProgram> {
+-        self.stages.iter().map(|s| &s.map)
++        self.stages.iter().map(|s| {
++            #[cfg(feature = "taylor-composition")]
++            if let Some(model) = &s.model {
++                return model.source();
++            }
++            &s.map
++        })
+     }
+-    /// Number of retained polynomial maps.
++    /// Number of retained map stages.
+     pub fn stage_count(&self) -> usize {
+         self.stages.len()
+     }
+@@ -163,7 +178,8 @@ impl TaylorPolynomialModel {
+             .get(output)
+             .map(|v| &v.remainder)
+     }
+-    /// Multiplication evidence at an original map node; absent for other/unreached nodes.
++    /// Multiplication evidence at a polynomial graph node; absent for other/unreached nodes.
++    /// For a composed-model stage, use `polynomial_map` to obtain those node indices.
+     pub fn product(&self, stage: usize, node: usize) -> Option<&TaylorPolynomialProduct> {
+         let stage = self.stages.get(stage)?;
+         if !matches!(
+@@ -312,6 +328,8 @@ impl TaylorPolynomialModel {
+         let mut stages = self.stages.to_vec();
+         stages.push(Arc::new(Stage {
+             map,
++            #[cfg(feature = "taylor-composition")]
++            model: None,
+             values,
+             outputs,
+         }));
+@@ -327,7 +345,7 @@ impl TaylorPolynomialModel {
+         context.graph.charge(0)?;
+         Ok(())
+     }
+-    /// Enclose a certified subdomain. Retain every global residual and original grid.
++    /// Enclose a certified subdomain using retained global residuals and grids.
+     /// The source domain is validated even for constant or zero-output maps.
+     pub fn enclose_on(
+         &self,
+@@ -352,12 +370,36 @@ impl TaylorPolynomialModel {
+                 previous = vec![DyadicInterval::empty(); outputs];
+                 continue;
+             }
+-            let independent = stage.map.eval_dyadic(
+-                &previous,
+-                self.source.request.precision,
+-                graph,
+-                arithmetic,
+-            )?;
++            #[cfg(feature = "taylor-composition")]
++            let model = stage.model.as_ref();
++            #[cfg(not(feature = "taylor-composition"))]
++            let model: Option<&Arc<TaylorModel>> = None;
++            let independent = if let Some(model) = model {
++                // The full-range inclusion was proved at composition. Intersect
++                // query enclosures with that retained domain before evaluation.
++                let mut inputs = Vec::new();
++                graph.check_entries(&[shifts.len(), previous.len(), outputs, previous.len()])?;
++                for (slot, (input, domain)) in
++                    previous.iter().zip(&model.request.domain).enumerate()
++                {
++                    graph.charge(1)?;
++                    let input = input.intersection(domain, arithmetic)?;
++                    if input.is_empty() {
++                        return Err(TaylorError::InconsistentEnclosure { output: slot }.into());
++                    }
++                    inputs.push(input);
++                }
++                model
++                    .source
++                    .eval_dyadic(&inputs, model.request.precision, graph, arithmetic)?
++            } else {
++                stage.map.eval_dyadic(
++                    &previous,
++                    self.source.request.precision,
++                    graph,
++                    arithmetic,
++                )?
++            };
+             let mut result = Vec::new();
+             for (output, (value, natural)) in stage.outputs.iter().zip(independent).enumerate() {
+                 graph.charge(1)?;
+@@ -610,3 +652,6 @@ fn bound(
+     }
+     Ok(result)
+ }
++
++#[cfg(feature = "taylor-composition")]
++mod composition;
+diff --git a/crates/hypersolve/src/expression_program/taylor/model/polynomial/composition.rs b/crates/hypersolve/src/expression_program/taylor/model/polynomial/composition.rs
+new file mode 100644
+index 000000000..67f84741a
+--- /dev/null
++++ b/crates/hypersolve/src/expression_program/taylor/model/polynomial/composition.rs
+@@ -0,0 +1,199 @@
++//! Substitute an already certified Taylor map through the existing polynomial engine.
++use super::*;
++
++impl TaylorModel {
++    /// Compose a certified outer model with these ordered outputs.
++    ///
++    /// Every input image must fit the outer model's certified domain, including
++    /// unused bindings. The inner center, domain and polynomial degree remain
++    /// authoritative. No derivatives of either model are regenerated. The outer
++    /// polynomial uses the existing truncation/cross-remainder engine, then its
++    /// complete residual is added. Both source definitions and proofs remain
++    /// shared. Replay both definitions/requests and this ordered composition;
++    /// serialized certificates are not accepted as proof.
++    ///
++    /// Structural graph/stage limits and native arithmetic share caller budgets;
++    /// scalar payload/refinement and total live-heap exclusions are unchanged.
++    pub fn compose(
++        self: Arc<Self>,
++        outer: Arc<TaylorModel>,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<TaylorPolynomialModel, TaylorPolynomialError> {
++        let mut model = TaylorPolynomialModel {
++            source: self,
++            stages: Arc::from([]),
++            range: Arc::from([]),
++        };
++        model.append_model(outer, graph, arithmetic)?;
++        Ok(model)
++    }
++}
++impl TaylorPolynomialModel {
++    /// Consume this generated model in another certified Taylor map.
++    /// See [`TaylorModel::compose`] for domain, remainder and replay contracts.
++    /// A failed attempt leaves this model and both source certificates unchanged.
++    pub fn compose(
++        &self,
++        outer: Arc<TaylorModel>,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<Self, TaylorPolynomialError> {
++        graph.charge(0)?;
++        let mut model = self.clone();
++        model.append_model(outer, graph, arithmetic)?;
++        Ok(model)
++    }
++    /// Retained outer certificate for a composed-model stage; None for a raw map.
++    pub fn model_map(&self, stage: usize) -> Option<&Arc<TaylorModel>> {
++        self.stages.get(stage)?.model.as_ref()
++    }
++    /// Generated polynomial graph whose node indices identify `product` evidence.
++    /// For raw polynomial stages this is the same definition returned by `maps`.
++    pub fn polynomial_map(&self, stage: usize) -> Option<&ExpressionProgram> {
++        self.stages.get(stage).map(|s| &s.map)
++    }
++    fn append_model(
++        &mut self,
++        outer: Arc<TaylorModel>,
++        graph: &mut ExpressionBudget,
++        arithmetic: &mut DyadicBudget,
++    ) -> Result<(), TaylorPolynomialError> {
++        graph.charge(0)?;
++        let image = if self.stages.is_empty() {
++            self.source.image()
++        } else {
++            &self.range
++        };
++        if outer.request.domain.len() != image.len() {
++            return Err(TaylorPolynomialError::InputCount {
++                expected: image.len(),
++                actual: outer.request.domain.len(),
++            });
++        }
++        if !self.is_empty() {
++            for (slot, (input, domain)) in image.iter().zip(&outer.request.domain).enumerate() {
++                graph.charge(1)?;
++                if !input.subset_of(domain, arithmetic)? {
++                    return Err(TaylorError::OutsideDomain { slot }.into());
++                }
++            }
++        }
++        let map = polynomial(&outer, graph, arithmetic)?;
++        self.append(map, graph, arithmetic)?;
++        let mut context = Context {
++            source: &self.source,
++            shifts: Vec::new(),
++            graph,
++            arithmetic,
++            entries: self.stages.len(),
++        };
++        let stages = Arc::get_mut(&mut self.stages).expect("append creates a new stage list");
++        let stage = Arc::get_mut(stages.last_mut().expect("appended stage"))
++            .expect("new last stage is uniquely owned");
++        context.reserve(stage.outputs.len())?;
++        for (output, remainder) in stage.outputs.iter_mut().zip(outer.remainder()) {
++            let mut terms = BTreeMap::new();
++            for (powers, coefficient) in &output.terms {
++                context.insert(&mut terms, powers, coefficient.clone())?;
++            }
++            let remainder = output.remainder.add(remainder, context.arithmetic)?;
++            context.reserve(2)?;
++            *output = Arc::new(Value {
++                terms,
++                remainder,
++                product: None,
++            });
++        }
++        context.reserve(1)?;
++        stage.model = Some(outer);
++        self.range = self
++            .enclose_on(
++                &self.source.request.domain,
++                context.graph,
++                context.arithmetic,
++            )?
++            .into_bounds()
++            .into();
++        context.graph.charge(0)?;
++        Ok(())
++    }
++}
++
++fn polynomial(
++    model: &TaylorModel,
++    graph: &mut ExpressionBudget,
++    arithmetic: &mut DyadicBudget,
++) -> Result<ExpressionProgram, TaylorPolynomialError> {
++    let source = model.source.definition();
++    let outputs = source.outputs.len();
++    graph.check_entries(&[source.variables.len(), source.variables.len(), outputs])?;
++    graph.charge(source.variables.len())?;
++    let mut builder = Builder {
++        definition: ExpressionDefinition {
++            variables: source.variables.clone(),
++            nodes: Vec::new(),
++            outputs: Vec::new(),
++        },
++        outputs,
++        budget: graph,
++    };
++    let zero = builder.push(ExpressionNode::Constant(Real::zero()))?;
++    builder.budget.charge(outputs)?;
++    builder.definition.outputs = vec![zero; outputs];
++    let mut shifts = BTreeMap::new();
++    for (&variable, center) in source.variables.iter().zip(&model.request.center) {
++        builder.budget.charge(1)?;
++        let input = builder.push(ExpressionNode::Variable(crate::SymbolRef::new(
++            variable, None,
++        )))?;
++        let rational = center.to_rational(arithmetic)?;
++        let center = builder.push(ExpressionNode::Constant(Real::from(
++            rational.lower().expect("point center").clone(),
++        )))?;
++        let shifted = builder.push(ExpressionNode::Binary {
++            operation: BinaryOperation::Sub,
++            left: input,
++            right: center,
++        })?;
++        shifts.insert(variable, shifted);
++    }
++    for term in model.terms() {
++        builder.budget.charge(1)?;
++        let request = &model.program.requests()[term.request];
++        let mut value = builder.push(ExpressionNode::Constant(term.coefficient.clone()))?;
++        for &(variable, mut exponent) in &request.powers {
++            let mut power = shifts[&variable];
++            // Exact graph exponentiation; each emitted multiply spends work and
++            // will be certified by the existing polynomial remainder engine.
++            while exponent != 0 {
++                builder.budget.charge(1)?;
++                if exponent & 1 != 0 {
++                    value = builder.push(ExpressionNode::Binary {
++                        operation: BinaryOperation::Mul,
++                        left: value,
++                        right: power,
++                    })?;
++                }
++                exponent >>= 1;
++                if exponent != 0 {
++                    power = builder.push(ExpressionNode::Binary {
++                        operation: BinaryOperation::Mul,
++                        left: power,
++                        right: power,
++                    })?;
++                }
++            }
++        }
++        let left = builder.definition.outputs[request.output];
++        builder.definition.outputs[request.output] = builder.push(ExpressionNode::Binary {
++            operation: BinaryOperation::Add,
++            left,
++            right: value,
++        })?;
++    }
++    Ok(ExpressionProgram::from_definition(
++        builder.definition,
++        builder.budget,
++    )?)
++}
+diff --git a/crates/hypersolve/tests/program_taylor_composition.rs b/crates/hypersolve/tests/program_taylor_composition.rs
+new file mode 100644
+index 000000000..f9ee363e3
+--- /dev/null
++++ b/crates/hypersolve/tests/program_taylor_composition.rs
+@@ -0,0 +1,555 @@
++#![cfg(feature = "taylor-composition")]
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram, TaylorModel, TaylorRequest},
++};
++use std::sync::Arc;
++fn g() -> ExpressionBudget {
++    ExpressionBudget::new(100_000, 10_000_000)
++}
++fn a() -> DyadicBudget {
++    DyadicBudget::new(16384, 1_000_000_000)
++}
++fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(l.into(), u.into(), e).unwrap()
++}
++fn model(
++    expr: Expr,
++    variable: SymbolId,
++    center: DyadicInterval,
++    domain: DyadicInterval,
++    order: usize,
++) -> Arc<TaylorModel> {
++    Arc::new(
++        ExpressionProgram::compile(&[expr], &[variable], &mut g())
++            .unwrap()
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![center],
++                    domain: vec![domain],
++                    order,
++                    precision: -64,
++                },
++                &mut g(),
++                &mut a(),
++            )
++            .unwrap(),
++    )
++}
++#[test]
++fn reciprocal_model_composes_without_redifferentiating_inner_source() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(Expr::int(1) + x, SymbolId(7), d(0, 0, 0), d(-1, 1, -2), 1);
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let outer = model(Expr::int(1) / u, SymbolId(20), d(1, 1, 0), d(3, 5, -2), 1);
++    let result = inner
++        .clone()
++        .compose(outer.clone(), &mut g(), &mut a())
++        .unwrap();
++    assert!(Arc::ptr_eq(result.source(), &inner));
++    assert!(Arc::ptr_eq(result.model_map(0).unwrap(), &outer));
++    assert_eq!(result.terms(0).unwrap().get(&vec![]), Some(&1.into()));
++    assert_eq!(
++        result.terms(0).unwrap().get(&vec![(SymbolId(7), 1)]),
++        Some(&(-1).into())
++    );
++    assert_eq!(result.remainder(0), Some(&outer.remainder()[0]));
++    assert_eq!(
++        result
++            .enclose_on(&[d(0, 0, 0)], &mut g(), &mut a())
++            .unwrap()
++            .bounds(),
++        &[d(1, 1, 0)]
++    );
++    let y = Expr::anonymous_symbol(SymbolId(30));
++    let square = ExpressionProgram::compile(&[y.clone() * y], &[SymbolId(30)], &mut g()).unwrap();
++    let next = result.transform(square, &mut g(), &mut a()).unwrap();
++    assert_eq!(next.stage_count(), 2);
++    assert_eq!(
++        next.enclose_on(&[d(0, 0, 0)], &mut g(), &mut a())
++            .unwrap()
++            .bounds(),
++        &[d(1, 1, 0)]
++    );
++}
++
++#[test]
++fn higher_outer_degree_is_charged_and_generated_models_compose_again() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(x, SymbolId(7), d(0, 0, 0), d(-1, 1, -1), 1);
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let square = model(u.clone() * u, SymbolId(20), d(0, 0, 0), d(-1, 1, -1), 2);
++    let squared = inner.compose(square.clone(), &mut g(), &mut a()).unwrap();
++    assert_eq!(squared.range(), &[d(0, 1, -2)]);
++    assert_eq!(squared.remainder(0), Some(&d(0, 1, -2)));
++    let polynomial = squared.polynomial_map(0).unwrap();
++    assert!(
++        polynomial
++            .definition()
++            .nodes
++            .iter()
++            .enumerate()
++            .any(|(n, _)| squared
++                .product(0, n)
++                .is_some_and(
++                    |p| p.discarded_terms().get(&vec![(SymbolId(7), 2)]) == Some(&1.into())
++                ))
++    );
++    assert_eq!(
++        squared.maps().next().unwrap().definition(),
++        square.source().definition()
++    );
++    let v = Expr::anonymous_symbol(SymbolId(30));
++    let reciprocal = model(
++        Expr::int(1) / (Expr::int(1) + v),
++        SymbolId(30),
++        d(0, 0, 0),
++        d(0, 1, -2),
++        1,
++    );
++    let final_model = squared
++        .compose(reciprocal.clone(), &mut g(), &mut a())
++        .unwrap();
++    assert_eq!(final_model.stage_count(), 2);
++    assert!(Arc::ptr_eq(final_model.model_map(1).unwrap(), &reciprocal));
++    for (x, numerator, denominator) in [
++        (d(0, 0, 0), 1, 1),
++        (d(1, 1, -1), 4, 5),
++        (d(-1, -1, -1), 4, 5),
++    ] {
++        let actual = final_model.enclose_on(&[x], &mut g(), &mut a()).unwrap();
++        let rational = actual.bounds()[0].to_rational(&mut a()).unwrap();
++        let exact = hyperreal::Rational::from(numerator) / hyperreal::Rational::from(denominator);
++        assert!(rational.lower().unwrap() <= &exact && &exact <= rational.upper().unwrap());
++    }
++}
++
++#[test]
++fn nonlinear_inner_residual_and_algebraic_outer_coefficients_survive() {
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(
++        Expr::int(1) / (Expr::int(1) - x),
++        SymbolId(7),
++        d(0, 0, 0),
++        d(-1, 1, -4),
++        1,
++    );
++    assert_ne!(inner.remainder()[0], d(0, 0, 0));
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let outer = model(
++        (u + Expr::int(1)).sqrt(),
++        SymbolId(20),
++        d(1, 1, 0),
++        d(3, 5, -2),
++        1,
++    );
++    let result = inner.compose(outer.clone(), &mut g(), &mut a()).unwrap();
++    assert!(Arc::ptr_eq(result.model_map(0).unwrap(), &outer));
++    // At x=0 the exact composite is sqrt(2). Positive endpoint squares are an
++    // independent rational check, without a floating-point reference.
++    let actual = result
++        .enclose_on(&[d(0, 0, 0)], &mut g(), &mut a())
++        .unwrap();
++    let interval = actual.bounds()[0].to_rational(&mut a()).unwrap();
++    let lo = interval.lower().unwrap();
++    let hi = interval.upper().unwrap();
++    assert!(lo > &0.into());
++    assert!(lo * lo <= 2.into());
++    assert!(hi * hi >= 2.into());
++    let terms = result.terms(0).unwrap();
++    let root = hyperreal::Real::from(2).sqrt().unwrap();
++    for policy in [
++        hyperlimit::PredicatePolicy::STRICT,
++        hyperlimit::PredicatePolicy::APPROXIMATE_512,
++    ] {
++        use hyperlimit::{Certainty, PredicateOutcome, Sign, classify_real_sign};
++        let difference = terms.get(&vec![]).unwrap().clone() - root.clone();
++        assert!(matches!(
++            classify_real_sign(&difference, policy),
++            PredicateOutcome::Decided {
++                value: Sign::Zero,
++                certainty: Certainty::Exact | Certainty::Filtered,
++                ..
++            }
++        ));
++    }
++}
++
++#[test]
++fn complete_outer_domain_and_dimensions_are_checked_even_for_unused_inputs() {
++    use hypersolve::expression_program::{TaylorError, TaylorPolynomialError as E};
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(x, SymbolId(7), d(0, 0, 0), d(-1, 1, 0), 1);
++    let narrow = model(Expr::int(3), SymbolId(20), d(0, 0, 0), d(-1, 1, -1), 0);
++    assert!(matches!(
++        inner.clone().compose(narrow, &mut g(), &mut a()),
++        Err(E::Taylor(TaylorError::OutsideDomain { slot: 0 }))
++    ));
++    let unit = Arc::new(
++        ExpressionProgram::compile(&[Expr::int(3)], &[], &mut g())
++            .unwrap()
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![],
++                    domain: vec![],
++                    order: 0,
++                    precision: -64,
++                },
++                &mut g(),
++                &mut a(),
++            )
++            .unwrap(),
++    );
++    assert!(matches!(
++        inner.clone().compose(unit, &mut g(), &mut a()),
++        Err(E::InputCount {
++            expected: 1,
++            actual: 0
++        })
++    ));
++    let outer = model(Expr::int(3), SymbolId(20), d(0, 0, 0), d(-1, 1, 0), 0);
++    let result = inner.compose(outer, &mut g(), &mut a()).unwrap();
++    assert_eq!(result.range(), &[d(3, 3, 0)]);
++    assert!(matches!(
++        result.enclose_on(&[d(-2, 2, 0)], &mut g(), &mut a()),
++        Err(E::Taylor(TaylorError::OutsideDomain { slot: 0 }))
++    ));
++}
++
++#[test]
++fn empty_unit_and_zero_output_products_keep_their_original_domain() {
++    use hypersolve::expression_program::TaylorPolynomialError as E;
++    let make = |variables: Vec<SymbolId>, domain: Vec<DyadicInterval>| {
++        Arc::new(
++            ExpressionProgram::compile(&[], &variables, &mut g())
++                .unwrap()
++                .taylor_model(
++                    TaylorRequest {
++                        center: domain
++                            .iter()
++                            .map(|v| {
++                                if v.is_empty() {
++                                    d(0, 0, 0)
++                                } else {
++                                    v.midpoint(&mut a()).unwrap()
++                                }
++                            })
++                            .collect(),
++                        domain,
++                        order: 1,
++                        precision: -64,
++                    },
++                    &mut g(),
++                    &mut a(),
++                )
++                .unwrap(),
++        )
++    };
++    let empty = make(vec![SymbolId(7)], vec![DyadicInterval::empty()]);
++    let unit = make(vec![], vec![]);
++    let outer = Arc::new(
++        ExpressionProgram::compile(&[Expr::int(4)], &[], &mut g())
++            .unwrap()
++            .taylor_model(
++                TaylorRequest {
++                    center: vec![],
++                    domain: vec![],
++                    order: 1,
++                    precision: -64,
++                },
++                &mut g(),
++                &mut a(),
++            )
++            .unwrap(),
++    );
++    let a_model = empty
++        .clone()
++        .compose(outer.clone(), &mut g(), &mut a())
++        .unwrap();
++    let b_model = unit.compose(outer, &mut g(), &mut a()).unwrap();
++    assert!(a_model.is_empty());
++    assert_eq!(a_model.range(), &[DyadicInterval::empty()]);
++    assert!(!b_model.is_empty());
++    assert_eq!(b_model.range(), &[d(4, 4, 0)]);
++    let wrong = model(Expr::int(3), SymbolId(20), d(0, 0, 0), d(-1, 1, 0), 0);
++    assert!(matches!(
++        empty.compose(wrong, &mut g(), &mut a()),
++        Err(E::InputCount {
++            expected: 0,
++            actual: 1
++        })
++    ));
++    let zero = make(vec![SymbolId(20)], vec![d(4, 4, 0)]);
++    let result = b_model.compose(zero, &mut g(), &mut a()).unwrap();
++    assert!(result.range().is_empty());
++    assert!(!result.is_empty());
++    assert!(
++        !result
++            .enclose_on(&[], &mut g(), &mut a())
++            .unwrap()
++            .is_empty()
++    );
++}
++
++#[test]
++fn work_size_native_cutoffs_and_cancelled_retry_preserve_shared_inputs() {
++    use hypersolve::{
++        expression_program::{ExpressionError, TaylorError, TaylorPolynomialError as E},
++        work_budget::CancellationToken,
++    };
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(Expr::int(1) + x, SymbolId(7), d(0, 0, 0), d(-1, 1, -2), 1);
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let outer = model(Expr::int(1) / u, SymbolId(20), d(1, 1, 0), d(3, 5, -2), 1);
++    let before = format!("{inner:?}{outer:?}");
++    let (mut graph, mut arithmetic) = (g(), a());
++    let complete = inner
++        .clone()
++        .compose(outer.clone(), &mut graph, &mut arithmetic)
++        .unwrap();
++    let graph_spent = g().remaining_work() - graph.remaining_work();
++    let native_spent = a().remaining_work() - arithmetic.remaining_work();
++    assert!(graph_spent > 0 && native_spent > 0);
++    for amount in [0, graph_spent - 1] {
++        assert!(matches!(
++            inner.clone().compose(
++                outer.clone(),
++                &mut ExpressionBudget::new(100_000, amount),
++                &mut a()
++            ),
++            Err(E::Taylor(TaylorError::Expression(
++                ExpressionError::WorkExhausted
++            )))
++        ));
++    }
++    assert!(matches!(
++        inner.clone().compose(
++            outer.clone(),
++            &mut ExpressionBudget::new(0, 10_000_000),
++            &mut a()
++        ),
++        Err(E::Taylor(TaylorError::Expression(
++            ExpressionError::SizeExhausted
++        )))
++    ));
++    for amount in [0, native_spent - 1] {
++        assert!(matches!(
++            inner.clone().compose(
++                outer.clone(),
++                &mut g(),
++                &mut DyadicBudget::new(16384, amount)
++            ),
++            Err(E::Taylor(TaylorError::Interval(
++                hyperinterval::IntervalError::WorkExhausted
++            )))
++        ));
++    }
++    let token = CancellationToken::new();
++    token.cancel();
++    let mut budget = g();
++    budget.cancellation = Some(token);
++    assert!(matches!(
++        inner.clone().compose(outer.clone(), &mut budget, &mut a()),
++        Err(E::Taylor(TaylorError::Expression(
++            ExpressionError::Cancelled
++        )))
++    ));
++    assert_eq!(format!("{inner:?}{outer:?}"), before);
++    let retried = inner.compose(outer, &mut g(), &mut a()).unwrap();
++    assert_eq!(format!("{retried:?}"), format!("{complete:?}"));
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn fresh_process_replay_rebuilds_both_certificates_and_generated_chain() {
++    use hypersolve::expression_program::ExpressionDefinition;
++    const KEY: &str = "HYPERSOLVE_TAYLOR_COMPOSITION_REPLAY";
++    if let Ok(encoded) = std::env::var(KEY) {
++        let (inner, inner_request, outer, outer_request, map): (
++            ExpressionDefinition,
++            TaylorRequest,
++            ExpressionDefinition,
++            TaylorRequest,
++            ExpressionDefinition,
++        ) = serde_json::from_str(&encoded).unwrap();
++        let (mut graph, mut arithmetic) = (g(), a());
++        let inner = Arc::new(
++            ExpressionProgram::from_definition(inner, &mut graph)
++                .unwrap()
++                .taylor_model(inner_request, &mut graph, &mut arithmetic)
++                .unwrap(),
++        );
++        let outer = Arc::new(
++            ExpressionProgram::from_definition(outer, &mut graph)
++                .unwrap()
++                .taylor_model(outer_request, &mut graph, &mut arithmetic)
++                .unwrap(),
++        );
++        let composed = inner.compose(outer, &mut graph, &mut arithmetic).unwrap();
++        let model = composed
++            .transform(
++                ExpressionProgram::from_definition(map, &mut graph).unwrap(),
++                &mut graph,
++                &mut arithmetic,
++            )
++            .unwrap();
++        assert_eq!(
++            model
++                .enclose_on(&[d(0, 0, 0)], &mut graph, &mut arithmetic)
++                .unwrap()
++                .bounds(),
++            &[d(1, 1, 0)]
++        );
++        println!(
++            "MODEL {model:?} work {} {}",
++            graph.remaining_work(),
++            arithmetic.remaining_work()
++        );
++        return;
++    }
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(Expr::int(1) + x, SymbolId(7), d(0, 0, 0), d(-1, 1, -2), 1);
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let outer = model(Expr::int(1) / u, SymbolId(20), d(1, 1, 0), d(3, 5, -2), 1);
++    let v = Expr::anonymous_symbol(SymbolId(30));
++    let square = ExpressionProgram::compile(&[v.clone() * v], &[SymbolId(30)], &mut g()).unwrap();
++    let encoded = serde_json::to_string(&(
++        inner.source().definition(),
++        inner.request(),
++        outer.source().definition(),
++        outer.request(),
++        square.definition(),
++    ))
++    .unwrap();
++    let mut previous = None;
++    for _ in 0..2 {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "fresh_process_replay_rebuilds_both_certificates_and_generated_chain",
++                "--nocapture",
++            ])
++            .env(KEY, &encoded)
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let stdout = String::from_utf8(output.stdout).unwrap();
++        let line = stdout
++            .lines()
++            .find(|x| x.starts_with("MODEL "))
++            .unwrap()
++            .to_owned();
++        if let Some(previous) = previous {
++            assert_eq!(previous, line);
++        }
++        previous = Some(line);
++    }
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn getters_preserve_proof_identity_without_new_predicate_dispatch() {
++    use hyperreal::dispatch_trace;
++    let x = Expr::anonymous_symbol(SymbolId(7));
++    let inner = model(Expr::int(1) + x, SymbolId(7), d(0, 0, 0), d(-1, 1, -2), 1);
++    let u = Expr::anonymous_symbol(SymbolId(20));
++    let outer = model(Expr::int(1) / u, SymbolId(20), d(1, 1, 0), d(3, 5, -2), 1);
++    let result = inner
++        .clone()
++        .compose(outer.clone(), &mut g(), &mut a())
++        .unwrap();
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| {
++        assert!(Arc::ptr_eq(result.source(), &inner));
++        assert!(Arc::ptr_eq(result.model_map(0).unwrap(), &outer));
++        assert!(result.model_map(1).is_none());
++        assert!(result.polynomial_map(1).is_none());
++        assert_eq!(result.maps().count(), 1);
++        assert_eq!(result.stage_count(), 1);
++        assert!(result.terms(0).is_some());
++        assert!(result.remainder(0).is_some());
++        assert!(!result.is_empty());
++        assert_eq!(result.range().len(), 1);
++        for (node, _) in result
++            .polynomial_map(0)
++            .unwrap()
++            .definition()
++            .nodes
++            .iter()
++            .enumerate()
++        {
++            let _ = result.product(0, node);
++        }
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
++
++#[test]
++fn mixed_terms_preserve_unsorted_binding_order_and_all_output_residuals() {
++    let x = Expr::anonymous_symbol(SymbolId(9));
++    let y = Expr::anonymous_symbol(SymbolId(2));
++    let inner = Arc::new(
++        ExpressionProgram::compile(
++            &[Expr::int(1) + x, Expr::int(2) + y],
++            &[SymbolId(9), SymbolId(2)],
++            &mut g(),
++        )
++        .unwrap()
++        .taylor_model(
++            TaylorRequest {
++                center: vec![d(0, 0, 0); 2],
++                domain: vec![d(-1, 1, -2); 2],
++                order: 1,
++                precision: -64,
++            },
++            &mut g(),
++            &mut a(),
++        )
++        .unwrap(),
++    );
++    let u = Expr::anonymous_symbol(SymbolId(90));
++    let v = Expr::anonymous_symbol(SymbolId(20));
++    let product = u * v;
++    let outer = Arc::new(
++        ExpressionProgram::compile(
++            &[product.clone(), -product],
++            &[SymbolId(90), SymbolId(20)],
++            &mut g(),
++        )
++        .unwrap()
++        .taylor_model(
++            TaylorRequest {
++                center: vec![d(1, 1, 0), d(2, 2, 0)],
++                domain: vec![d(3, 5, -2), d(7, 9, -2)],
++                order: 2,
++                precision: -64,
++            },
++            &mut g(),
++            &mut a(),
++        )
++        .unwrap(),
++    );
++    let result = inner.compose(outer, &mut g(), &mut a()).unwrap();
++    for (output, sign) in [(0, 1), (1, -1)] {
++        let terms = result.terms(output).unwrap();
++        assert_eq!(terms.get(&vec![]), Some(&(2 * sign).into()));
++        assert_eq!(terms.get(&vec![(SymbolId(9), 1)]), Some(&(2 * sign).into()));
++        assert_eq!(terms.get(&vec![(SymbolId(2), 1)]), Some(&sign.into()));
++        assert_eq!(result.remainder(output), Some(&d(-1, 1, -4)));
++    }
++    assert_eq!(result.range(), &[d(21, 45, -4), d(-45, -21, -4)]);
++    assert_eq!(
++        result
++            .enclose_on(&[d(1, 1, -2), d(-1, -1, -2)], &mut g(), &mut a())
++            .unwrap()
++            .bounds(),
++        &[d(35, 35, -4), d(-35, -35, -4)]
++    );
++}
