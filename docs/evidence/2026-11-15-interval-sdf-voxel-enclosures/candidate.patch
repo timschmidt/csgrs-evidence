@@ -1,0 +1,92 @@
+diff --git a/crates/hypersdf/CHANGELOG.md b/crates/hypersdf/CHANGELOG.md
+index 46a9de0a3..6f4f14a94 100644
+--- a/crates/hypersdf/CHANGELOG.md
++++ b/crates/hypersdf/CHANGELOG.md
+@@ -4,6 +4,12 @@
+ 
+ Initial release.
+ 
++- Native `SdfProgram` voxel classification now retains whole-cell range proofs
++  alongside exact Hypervoxel addresses and frames. Algebraic coordinate
++  enclosures, source transforms, unresolved signs and metric qualification are
++  preserved through conservative intake; capacity/work/cancellation failures
++  return no partial batch. Requires both existing enclosure and voxel features.
++
+ - Reject SDF voxel handoffs to a different origin, pitch or declared unit,
+   and reject rows outside their source grid. Exact frame comparisons remain
+   strict; undecided equality cannot authorize relocation of occupancy evidence.
+diff --git a/crates/hypersdf/Cargo.toml b/crates/hypersdf/Cargo.toml
+index 8ce947f04..af658d6e2 100644
+--- a/crates/hypersdf/Cargo.toml
++++ b/crates/hypersdf/Cargo.toml
+@@ -37,6 +37,10 @@ proptest = "1.7.0"
+ name = "classification"
+ harness = false
+ 
++[[example]]
++name = "voxel_enclosures"
++required-features = ["enclosure-program", "hypervoxel-adapter"]
++
+ [features]
+ default = []
+ enclosure-program = ["dep:hypersolve", "dep:hyperinterval", "hyperlattice/interval-dyadic"]
+diff --git a/crates/hypersdf/README.md b/crates/hypersdf/README.md
+index fc4de9143..26a50a96d 100644
+--- a/crates/hypersdf/README.md
++++ b/crates/hypersdf/README.md
+@@ -221,6 +221,22 @@ finite gradients, or shader evaluation into exact topology.
+   undecided equality return errors. Source dimensions and row indices must fit.
+   Partial batches can use sparse intake; exact materialization additionally
+   requires a complete target-frame cover without unknown or lossy cells.
++- With both `enclosure-program` and `hypervoxel-adapter`,
++  `SdfProgram::classify_voxel_grid` accepts a Hypervoxel `GridFrame` and retains
++  every native range proof, its source, cell address and frame units in an
++  immutable `SdfVoxelEnclosureBatch`. Its `continuous_field_batch` method
++  exports occupancy while the report keeps the source evidence. Outward
++  coordinate bounds support algebraic frames. Zero-containing ranges remain
++  unknown, and exact materialization rejects them. Cell capacity, graph
++  work/cancellation and dyadic arithmetic budgets are separate; scalar frame
++  construction, Hyperreal refinement and heap bytes retain the native budget
++  exclusions.
++
++Run the native voxel example from a source checkout:
++
++```sh
++cargo run -p hypersdf --features enclosure-program,hypervoxel-adapter --example voxel_enclosures
++```
+ 
+ ## Precision and guarantees
+ 
+diff --git a/crates/hypersdf/src/hypervoxel_adapter.rs b/crates/hypersdf/src/hypervoxel_adapter.rs
+index 60aa16b3f..69c17848b 100644
+--- a/crates/hypersdf/src/hypervoxel_adapter.rs
++++ b/crates/hypersdf/src/hypervoxel_adapter.rs
+@@ -16,6 +16,13 @@ use hypervoxel::{
+ use crate::policy::compare_reals_for_construction;
+ use crate::{SdfVoxelBatch, SdfVoxelLengthUnit, SdfVoxelOccupancy};
+ 
++#[cfg(feature = "enclosure-program")]
++mod enclosure;
++#[cfg(feature = "enclosure-program")]
++pub use enclosure::{
++    SdfVoxelEnclosureBatch, SdfVoxelEnclosureCell, SdfVoxelEnclosureError, SdfVoxelEnclosureOptions,
++};
++
+ /// Converts an SDF voxel batch into a `hypervoxel` continuous-field batch.
+ ///
+ /// The target must have exactly the source origin, cell pitches and declared
+diff --git a/crates/hypersdf/src/lib.rs b/crates/hypersdf/src/lib.rs
+index 4251f47cd..6eb8df92e 100644
+--- a/crates/hypersdf/src/lib.rs
++++ b/crates/hypersdf/src/lib.rs
+@@ -50,6 +50,10 @@ pub use gradient_contour::{
+ };
+ #[cfg(feature = "hypervoxel-adapter")]
+ pub use hypervoxel_adapter::{SdfHypervoxelAdapterError, continuous_field_batch_from_sdf};
++#[cfg(all(feature = "hypervoxel-adapter", feature = "enclosure-program"))]
++pub use hypervoxel_adapter::{
++    SdfVoxelEnclosureBatch, SdfVoxelEnclosureCell, SdfVoxelEnclosureError, SdfVoxelEnclosureOptions,
++};
+ pub use interval::{SdfInterval, SdfIntervalReport};
+ pub use lipschitz::SdfLipschitzReport;
+ pub use mesh::{
