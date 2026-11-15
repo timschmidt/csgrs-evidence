@@ -1,0 +1,330 @@
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index a82562c09..78bb3597a 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -1,5 +1,9 @@
+ # Changelog
+ 
++- Add an explicit borrowed prepared matrix with exact-zero support facts and
++  sparse products through the existing scalar kernels. Preserve source binding,
++  empty/unit semantics and typed failures; ordinary products remain unchanged.
++
+ ## 0.1.0 (unreleased)
+ 
+ - Add exact closed dyadic box bisection and outward grid transport, preserving
+diff --git a/crates/hyperlattice-interval/Cargo.toml b/crates/hyperlattice-interval/Cargo.toml
+index 86a426f4a..520e27c25 100644
+--- a/crates/hyperlattice-interval/Cargo.toml
++++ b/crates/hyperlattice-interval/Cargo.toml
+@@ -66,3 +66,8 @@ required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
+ name = "centered_cost"
+ path = "conformance/centered_cost.rs"
+ required-features = ["fixed", "rational", "dyadic", "float-enclosure"]
++
++[[example]]
++name = "prepared_cost"
++path = "conformance/prepared_cost.rs"
++required-features = ["fixed", "rational", "dyadic", "float-enclosure", "serde"]
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 3e2845ea5..4359f7618 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -101,3 +101,13 @@ Clarke/Park transforms through the shared fixed kernels, retaining Alumina's
+ rounding boundaries and typed errors. It includes independent exact corner
+ checks, transform chains and matched cost probes against the firmware routines.
+ Build it with its own manifest and the sibling `alumina-firmware` checkout.
++
++`IntervalMatrix::prepare()` borrows an immutable source and records its exact
++singleton-zero coefficients in `PreparedIntervalMatrix`. Repeated `mul_vector`
++and `mul_matrix` calls omit only those zero terms, retaining the original order
++and scalar kernels for every other coefficient. An interval merely containing
++zero is kept. Successful endpoints match the ordinary operations; skipped work
++can let a dyadic query finish under a smaller budget. Dense or small workloads
++can cost more, so preparation is explicit. The view holds inline support flags
++and no scalar copies. Serialize the source and prepare again after validated
++replay; no serialized support mask is accepted as proof.
+diff --git a/crates/hyperlattice-interval/src/lib.rs b/crates/hyperlattice-interval/src/lib.rs
+index d571b2885..fa036cf1a 100644
+--- a/crates/hyperlattice-interval/src/lib.rs
++++ b/crates/hyperlattice-interval/src/lib.rs
+@@ -139,3 +139,6 @@ fn dot<'a, I: IntervalArithmetic + 'a>(
+ 
+ #[cfg(feature = "dyadic")]
+ mod subdivision;
++
++mod prepared;
++pub use prepared::PreparedIntervalMatrix;
+diff --git a/crates/hyperlattice-interval/tests/cartesian.rs b/crates/hyperlattice-interval/tests/cartesian.rs
+index d1b19434a..ae161785b 100644
+--- a/crates/hyperlattice-interval/tests/cartesian.rs
++++ b/crates/hyperlattice-interval/tests/cartesian.rs
+@@ -473,3 +473,241 @@ fn vector_scale_shares_work_across_coordinates_and_retries() {
+         expected
+     );
+ }
++
++fn prepared_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
++    scalar: impl Fn(i32, i32) -> I,
++    mut context: impl FnMut() -> I::Context,
++) {
++    let mut seed = 0x1234_87ab_c992_u64;
++    for case in 0..512 {
++        let mut range = || {
++            seed ^= seed << 13;
++            seed ^= seed >> 7;
++            seed ^= seed << 17;
++            if seed % 3 == 0 {
++                (0, 0)
++            } else {
++                let a = (seed % 7) as i32 - 3;
++                (a, a + ((seed >> 16) % 4) as i32)
++            }
++        };
++        let aa: [[(i32, i32); 3]; 2] = core::array::from_fn(|_| core::array::from_fn(|_| range()));
++        let bb: [[(i32, i32); 2]; 3] = core::array::from_fn(|_| core::array::from_fn(|_| range()));
++        let a = IntervalMatrix::new(aa.map(|row| row.map(|(a, b)| scalar(a, b)))).unwrap();
++        let b = IntervalMatrix::new(bb.map(|row| row.map(|(a, b)| scalar(a, b)))).unwrap();
++        let prepared = a.prepare();
++        assert!(std::ptr::eq(prepared.source(), &a));
++        assert_eq!(
++            prepared.zero_entries(),
++            Some(&aa.map(|row| row.map(|pair| pair == (0, 0))))
++        );
++        let expected = IntervalMatrix::new(core::array::from_fn(|r| {
++            core::array::from_fn(|k| {
++                let col = bb.map(|row| row[k]);
++                let (lo, hi) = dot_bounds(&aa[r], &col);
++                scalar(lo, hi)
++            })
++        }))
++        .unwrap();
++        let actual = prepared.mul_matrix(&b, &mut context()).unwrap();
++        assert_eq!(actual, expected, "case {case}");
++        assert_eq!(actual, a.mul_matrix(&b, &mut context()).unwrap());
++        assert_eq!(
++            prepared.clone().mul_matrix(&b, &mut context()).unwrap(),
++            actual
++        );
++        for column in 0..2 {
++            let v = b.column(column, &mut context()).unwrap();
++            let actual = prepared.mul_vector(&v, &mut context()).unwrap();
++            assert_eq!(actual, expected.column(column, &mut context()).unwrap());
++            assert_eq!(actual, a.mul_vector(&v, &mut context()).unwrap());
++            // Generated output remains an ordinary operand, including after
++            // preparing a separately rebuilt source with the same values.
++            let next =
++                IntervalMatrix::new([[scalar(1, 1), scalar(0, 0)], [scalar(0, 0), scalar(-1, -1)]])
++                    .unwrap();
++            assert_eq!(
++                next.prepare().mul_vector(&actual, &mut context()).unwrap(),
++                next.mul_vector(&actual, &mut context()).unwrap()
++            );
++        }
++    }
++    let unit = IntervalMatrix::<I, 2, 0>::new([[], []]).unwrap();
++    let unit_vector = IntervalVector::<I, 0>::new([]).unwrap();
++    assert_eq!(unit.prepare().zero_entries(), Some(&[[], []]));
++    assert_eq!(
++        unit.prepare()
++            .mul_vector(&unit_vector, &mut context())
++            .unwrap()
++            .lanes(),
++        Some(&[scalar(0, 0), scalar(0, 0)])
++    );
++    let zero_rows = IntervalMatrix::<I, 0, 2>::new([]).unwrap();
++    let vector = IntervalVector::new([scalar(1, 1), scalar(2, 2)]).unwrap();
++    assert_eq!(
++        zero_rows
++            .prepare()
++            .mul_vector(&vector, &mut context())
++            .unwrap()
++            .lanes(),
++        Some(&[])
++    );
++    let empty = IntervalMatrix::<I, 2, 2>::empty().unwrap();
++    assert!(empty.prepare().zero_entries().is_none());
++    assert!(
++        empty
++            .prepare()
++            .mul_vector(&vector, &mut context())
++            .unwrap()
++            .is_empty()
++    );
++    assert!(
++        empty
++            .prepare()
++            .mul_matrix(&empty, &mut context())
++            .unwrap()
++            .is_empty()
++    );
++    assert!(
++        unit.prepare()
++            .mul_vector(&IntervalVector::empty().unwrap(), &mut context())
++            .unwrap()
++            .is_empty()
++    );
++}
++
++#[cfg(feature = "fixed")]
++#[test]
++fn prepared_fixed_products() {
++    use hyperlattice_interval::hyperinterval::FixedInterval;
++    prepared_products(|a, b| FixedInterval::<i32, 0>::new(a, b).unwrap(), || ());
++    prepared_products(
++        |a, b| FixedInterval::<i64, 16>::new(i64::from(a) << 16, i64::from(b) << 16).unwrap(),
++        || (),
++    );
++}
++#[cfg(feature = "float-enclosure")]
++#[test]
++fn prepared_ieee_products() {
++    use hyperlattice_interval::hyperinterval::{F32Enclosure, F64Enclosure};
++    if F32Enclosure::backend_supported() {
++        prepared_products(|a, b| F32Enclosure::new(a as f32, b as f32).unwrap(), || ());
++        prepared_products(
++            |a, b| F64Enclosure::new(f64::from(a), f64::from(b)).unwrap(),
++            || (),
++        );
++    }
++}
++#[cfg(feature = "rational")]
++#[test]
++fn prepared_rational_products() {
++    use hyperlattice_interval::hyperinterval::RationalInterval;
++    prepared_products(
++        |a, b| RationalInterval::new(a.into(), b.into()).unwrap(),
++        || (),
++    );
++}
++#[cfg(feature = "dyadic")]
++#[test]
++fn prepared_dyadic_products() {
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval};
++    prepared_products(
++        |a, b| DyadicInterval::new(a.into(), b.into(), 0).unwrap(),
++        || DyadicBudget::new(1024, 10_000_000),
++    );
++}
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn prepared_support_saves_shared_work_and_failed_queries_retry() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++    let zero = DyadicInterval::point(0.into(), 0).unwrap();
++    let one = DyadicInterval::point(1.into(), 0).unwrap();
++    let matrix = IntervalMatrix::new([core::array::from_fn::<_, 8, _>(|i| {
++        if i == 0 { one.clone() } else { zero.clone() }
++    })])
++    .unwrap();
++    let vector = IntervalVector::new(core::array::from_fn(|_| {
++        DyadicInterval::new(1234567.into(), 7654321.into(), -10).unwrap()
++    }))
++    .unwrap();
++    let mut ordinary = DyadicBudget::new(256, 10_000_000);
++    let expected = matrix.mul_vector(&vector, &mut ordinary).unwrap();
++    let prepared = matrix.prepare();
++    let mut native = DyadicBudget::new(256, 10_000_000);
++    assert_eq!(prepared.mul_vector(&vector, &mut native).unwrap(), expected);
++    let work = 10_000_000 - native.remaining_work();
++    assert!(native.remaining_work() > ordinary.remaining_work());
++    assert_eq!(
++        prepared
++            .mul_vector(&vector, &mut DyadicBudget::new(256, work))
++            .unwrap(),
++        expected
++    );
++    assert_eq!(
++        matrix.mul_vector(&vector, &mut DyadicBudget::new(256, work)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    assert_eq!(
++        prepared.mul_vector(&vector, &mut DyadicBudget::new(256, work - 1)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    assert_eq!(
++        prepared.mul_vector(&vector, &mut DyadicBudget::new(0, 10_000_000)),
++        Err(IntervalLatticeError::Scalar(IntervalError::SizeExhausted))
++    );
++    assert_eq!(
++        prepared
++            .mul_vector(&vector, &mut DyadicBudget::new(256, work))
++            .unwrap(),
++        expected
++    );
++    assert_eq!(matrix.prepare().zero_entries(), prepared.zero_entries());
++    // A zero-only row is an exact proof, not a failed or partial product.
++    let zeros = IntervalMatrix::new([[zero; 1]]).unwrap();
++    let vector = IntervalVector::new([one]).unwrap();
++    assert_eq!(
++        zeros
++            .prepare()
++            .mul_vector(&vector, &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .lanes()
++            .unwrap()[0]
++            .signs(),
++        hyperlattice_interval::hyperinterval::SignSet::Zero
++    );
++}
++
++#[cfg(feature = "fixed")]
++#[test]
++fn prepared_nonzero_overflow_and_empty_operands_stay_explicit() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{FixedInterval, IntervalError};
++    type I = FixedInterval<i32, 0>;
++    let matrix =
++        IntervalMatrix::new([[I::point(0).unwrap(), I::point(i32::MAX).unwrap()]]).unwrap();
++    let vector = IntervalVector::new([I::point(i32::MAX).unwrap(), I::point(2).unwrap()]).unwrap();
++    assert_eq!(
++        matrix.prepare().mul_vector(&vector, &mut ()),
++        Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++    );
++    assert_eq!(
++        matrix.prepare().mul_vector(&vector, &mut ()),
++        matrix.mul_vector(&vector, &mut ())
++    );
++    assert!(
++        matrix
++            .prepare()
++            .mul_vector(&IntervalVector::empty().unwrap(), &mut ())
++            .unwrap()
++            .is_empty()
++    );
++    assert!(
++        matrix
++            .prepare()
++            .mul_matrix(&IntervalMatrix::<I, 2, 3>::empty().unwrap(), &mut ())
++            .unwrap()
++            .is_empty()
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/no_alloc.rs b/crates/hyperlattice-interval/tests/no_alloc.rs
+index a02fa9f6d..0f28ae895 100644
+--- a/crates/hyperlattice-interval/tests/no_alloc.rs
++++ b/crates/hyperlattice-interval/tests/no_alloc.rs
+@@ -11,6 +11,10 @@ fn primitive_construction_composition_and_errors_do_not_allocate() {
+         let p = I::point(1 << 16).unwrap();
+         let x = IntervalVector::new([I::new(-(1 << 16), 1 << 16).unwrap(); 3]).unwrap();
+         let m = IntervalMatrix::new([[p; 3]; 3]).unwrap();
++        let prepared = m.prepare();
++        std::hint::black_box(prepared.zero_entries());
++        std::hint::black_box(prepared.clone().mul_vector(&x, &mut ()).unwrap());
++        std::hint::black_box(prepared.mul_matrix(&m, &mut ()).unwrap());
+         let result = m.affine_enclosure(&x, &x, &mut ()).unwrap();
+         assert_eq!(x.scale(&p, &mut ()).unwrap(), x);
+         std::hint::black_box(
+diff --git a/crates/hyperlattice/src/lib.rs b/crates/hyperlattice/src/lib.rs
+index a8f3993d7..77f378ce9 100644
+--- a/crates/hyperlattice/src/lib.rs
++++ b/crates/hyperlattice/src/lib.rs
+@@ -44,7 +44,7 @@ pub use hyperlattice_interval as interval;
+ pub use hyperlattice_interval::{
+     AffineBox, AffineChain, AffineImage, AffineMap, AffineSource, BoxN, CenteredMatrix,
+     CenteredVector, IntervalArithmetic, IntervalLatticeError, IntervalMatrix, IntervalVector,
+-    MidpointRadiusMatrix, MidpointRadiusVector, TranslatedBox,
++    MidpointRadiusMatrix, MidpointRadiusVector, PreparedIntervalMatrix, TranslatedBox,
+ };
+ 
+ pub use hyperreal::{
