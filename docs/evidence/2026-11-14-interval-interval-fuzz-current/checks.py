@@ -1,0 +1,7 @@
+from pathlib import Path
+import subprocess,json,os,time
+p=Path(__file__).parent;r=Path('/mnt/development/csgrs-interval-fuzz-current');env=dict(os.environ,CARGO_NET_OFFLINE='true',CARGO_BUILD_JOBS='3',CARGO_TARGET_DIR='/mnt/development/.interval-refactor-build/interval-fuzz-current-checks');results=[]
+commands=[('fuzz-default',['cargo','+1.95.0','check','--locked','--offline','--manifest-path','crates/hyperinterval/fuzz/Cargo.toml','--bins']),('fuzz-rational',['cargo','+1.95.0','check','--locked','--offline','--manifest-path','crates/hyperinterval/fuzz/Cargo.toml','--bins','--features','rational']),('fuzz-clippy',['cargo','+1.95.0','clippy','--locked','--offline','--manifest-path','crates/hyperinterval/fuzz/Cargo.toml','--bins','--all-features','--','-D','warnings']),('fuzz-format',['rustfmt','+1.95.0','--edition','2024','--check',*[str(x.relative_to(r)) for x in sorted((r/'crates/hyperinterval/fuzz/fuzz_targets').glob('*.rs'))]]),('workspace-format',['cargo','+1.95.0','fmt','--all','--','--check']),('owner-tests',['cargo','+1.95.0','test','--locked','--offline','-p','hyperinterval','--all-features']),('diff',['git','diff','--check'])]
+for name,cmd in commands:
+ t=time.monotonic();z=subprocess.run(cmd,cwd=r,env=env,stdout=(p/(name+'.log')).open('w'),stderr=subprocess.STDOUT);item={'name':name,'command':cmd,'returncode':z.returncode,'seconds':time.monotonic()-t};results.append(item);(p/'checks.json').write_text(json.dumps(results,indent=2)+'\n');print(item,flush=True)
+ if z.returncode:break

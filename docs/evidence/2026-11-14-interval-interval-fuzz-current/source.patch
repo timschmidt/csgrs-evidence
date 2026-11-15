@@ -1,0 +1,186 @@
+diff --git a/.github/workflows/hyperinterval.yml b/.github/workflows/hyperinterval.yml
+index 50b81c260..92f6954f5 100644
+--- a/.github/workflows/hyperinterval.yml
++++ b/.github/workflows/hyperinterval.yml
+@@ -147,3 +147,5 @@ jobs:
+           cargo +nightly fuzz run split_division "$RUNNER_TEMP/interval-split-division" -- -runs=100000 -max_len=16 -max_total_time=30 -seed=20261122
+           cargo +nightly fuzz run fractional_power "$RUNNER_TEMP/interval-fractional-power" -- -runs=10000 -max_len=12 -max_total_time=30 -seed=20261123
+           cargo +nightly fuzz run tangent --features rational "$RUNNER_TEMP/interval-tangent" -- -runs=10000 -max_len=8 -max_total_time=120 -seed=20261124
++          mkdir -p "$RUNNER_TEMP/interval-conversions"
++          cargo +nightly fuzz run conversions --features rational "$RUNNER_TEMP/interval-conversions" -- -runs=100000 -max_len=64 -max_total_time=30 -seed=20261125
+diff --git a/crates/hyperinterval/fuzz/Cargo.toml b/crates/hyperinterval/fuzz/Cargo.toml
+index 37c4d3ba2..3df0bad5b 100644
+--- a/crates/hyperinterval/fuzz/Cargo.toml
++++ b/crates/hyperinterval/fuzz/Cargo.toml
+@@ -132,3 +132,11 @@ required-features = ["rational"]
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "conversions"
++path = "fuzz_targets/conversions.rs"
++required-features = ["rational"]
++test = false
++doc = false
++bench = false
+diff --git a/crates/hyperinterval/fuzz/README.md b/crates/hyperinterval/fuzz/README.md
+index c558d187d..66a5a33ba 100644
+--- a/crates/hyperinterval/fuzz/README.md
++++ b/crates/hyperinterval/fuzz/README.md
+@@ -15,3 +15,18 @@ cargo +nightly fuzz run fixed_arithmetic /tmp/hyperinterval-arithmetic -- -runs=
+ Run from this crate's directory. Cargo-fuzz enables ASan by default. Preserve
+ the seed, toolchain, raw log and minimized failures outside the source tree;
+ promote each failure to a named deterministic regression before closing it.
++
++`conversions` exercises rational/dyadic conversion with full-width signed
++numerators and nonzero unsigned denominators, ordinary grids from -128 to 128,
++and explicit refusal at extreme grids. Independent GMP directed bounds check
++tightness and exact-grid admission. Generated empty, singleton and interval
++results pass through serialization, exact rational replay and another grid;
++exact work limits, exhausted attempts and fresh-budget retries are checked.
++Arbitrary binary64 bits also exercise exact finite ingress, including subnormals,
++and typed rejection of NaN/infinity before budget use. These finite campaigns do
++not establish arbitrary coefficient-size coverage or total-resource bounds.
++
++```sh
++mkdir -p /tmp/hyperinterval-conversions
++cargo +nightly fuzz run conversions --features rational /tmp/hyperinterval-conversions -- -runs=100000 -max_len=64 -max_total_time=30 -seed=20261125
++```
+diff --git a/crates/hyperinterval/fuzz/fuzz_targets/conversions.rs b/crates/hyperinterval/fuzz/fuzz_targets/conversions.rs
+new file mode 100644
+index 000000000..79a8bb5b5
+--- /dev/null
++++ b/crates/hyperinterval/fuzz/fuzz_targets/conversions.rs
+@@ -0,0 +1,131 @@
++#![no_main]
++use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError, RationalInterval};
++use hyperreal::Rational;
++use libfuzzer_sys::fuzz_target;
++use rug::Rational as Q;
++
++#[path = "../../tests/support/grid_oracle.rs"]
++mod grid;
++#[path = "../../tests/support/rational_oracle.rs"]
++mod rational_oracle;
++
++const WORK: u64 = 1_000_000_000;
++
++fn budget() -> DyadicBudget {
++    DyadicBudget::new(4096, WORK)
++}
++
++fn exact_bounds(value: &DyadicInterval) -> Option<(Q, Q)> {
++    value
++        .bounds()
++        .map(|(lo, hi, e)| (grid::q(lo, e), grid::q(hi, e)))
++}
++
++fuzz_target!(|data: [u64; 8]| {
++    let [a, b, c, d, p, q, ieee, mode] = data;
++    let a = Rational::fraction(a as i64, b.max(1)).unwrap();
++    let b = Rational::fraction(c as i64, d.max(1)).unwrap();
++    let (a, b) = if a <= b { (a, b) } else { (b, a) };
++    let source = if mode & 1 != 0 {
++        RationalInterval::empty()
++    } else if mode & 2 != 0 {
++        RationalInterval::point(a)
++    } else {
++        RationalInterval::new(a, b).unwrap()
++    };
++    let p = (p % 257) as i32 - 128;
++    let q = (q % 257) as i32 - 128;
++    let expected = source
++        .bounds()
++        .map(|(lo, hi)| grid::bounds(rational_oracle::mpq(lo), rational_oracle::mpq(hi), p));
++    let mut measured = budget();
++    let converted = source.to_dyadic(p, &mut measured).unwrap();
++    assert_eq!(exact_bounds(&converted), expected);
++    let work = WORK - measured.remaining_work();
++    assert_eq!(
++        source
++            .to_dyadic(p, &mut DyadicBudget::new(4096, work))
++            .unwrap(),
++        converted
++    );
++    if work != 0 {
++        assert_eq!(
++            source.to_dyadic(p, &mut DyadicBudget::new(4096, work - 1)),
++            Err(IntervalError::WorkExhausted)
++        );
++    }
++    assert_eq!(source.to_dyadic(p, &mut budget()).unwrap(), converted);
++
++    let encoded = serde_json::to_vec(&converted).unwrap();
++    let restored: DyadicInterval = serde_json::from_slice(&encoded).unwrap();
++    assert_eq!(restored, converted);
++    let rational = restored.to_rational(&mut budget()).unwrap();
++    assert!(source.subset_of(&rational));
++    assert_eq!(
++        rational
++            .bounds()
++            .map(|(lo, hi)| (rational_oracle::mpq(lo), rational_oracle::mpq(hi))),
++        expected
++    );
++    let regridded = restored.regrid(q, &mut budget()).unwrap();
++    assert_eq!(
++        exact_bounds(&regridded),
++        expected.clone().map(|(lo, hi)| grid::bounds(lo, hi, q))
++    );
++    assert_eq!(rational.to_dyadic(p, &mut budget()).unwrap(), restored);
++
++    if let Some((lo, hi)) = source.bounds() {
++        let admitted = DyadicInterval::from_grid_bounds(lo, hi, p, &mut budget());
++        if expected == Some((rational_oracle::mpq(lo), rational_oracle::mpq(hi))) {
++            assert_eq!(admitted.unwrap(), converted);
++        } else {
++            assert_eq!(admitted, Err(IntervalError::NonDyadicEndpoint));
++        }
++        let point = DyadicInterval::from_rational(lo, q, &mut budget()).unwrap();
++        assert_eq!(
++            exact_bounds(&point),
++            Some(grid::bounds(
++                rational_oracle::mpq(lo),
++                rational_oracle::mpq(lo),
++                q
++            ))
++        );
++        if lo < hi {
++            assert_eq!(
++                DyadicInterval::from_grid_bounds(hi, lo, p, &mut DyadicBudget::new(0, 0)),
++                Err(IntervalError::ReversedEndpoints)
++            );
++        }
++    }
++    for precision in [i32::MIN, i32::MAX] {
++        let extreme = source.to_dyadic(precision, &mut budget());
++        if source.is_empty() {
++            assert_eq!(extreme.unwrap(), DyadicInterval::empty());
++        } else {
++            assert_eq!(extreme, Err(IntervalError::SizeExhausted));
++        }
++    }
++
++    let value = f64::from_bits(ieee);
++    if let Some(exact) = Q::from_f64(value) {
++        let point = DyadicInterval::from_f64(value, &mut budget()).unwrap();
++        assert_eq!(exact_bounds(&point), Some((exact.clone(), exact)));
++        let exact = point.to_rational(&mut budget()).unwrap();
++        assert_eq!(
++            DyadicInterval::from_rational(
++                exact.lower().unwrap(),
++                point.bounds().unwrap().2,
++                &mut budget()
++            )
++            .unwrap(),
++            point
++        );
++    } else {
++        let mut denied = DyadicBudget::new(0, 0);
++        assert_eq!(
++            DyadicInterval::from_f64(value, &mut denied),
++            Err(IntervalError::NonFiniteEndpoint)
++        );
++        assert_eq!(denied.remaining_work(), 0);
++    }
++});
