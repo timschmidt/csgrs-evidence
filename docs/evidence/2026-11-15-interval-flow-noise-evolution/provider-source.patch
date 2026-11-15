@@ -1,0 +1,1412 @@
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index b67d7a7db..1d5ede730 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -22,6 +22,7 @@ coordinate-transition = ["coordinates", "hypersolve/coordinate-transition"]
+ taylor-model = ["field", "hypersolve/taylor-model"]
+ taylor-flow = ["taylor-model"]
+ flow-noise = ["taylor-flow", "taylor-noise"]
++flow-noise-evolution = ["flow-noise"]
+ taylor-evolution = ["taylor-flow"]
+ adaptive-taylor = ["taylor-flow"]
+ taylor-affine = ["taylor-model", "hypersolve/taylor-affine"]
+@@ -115,3 +116,12 @@ required-features = ["taylor-flow"]
+ name = "taylor_orders"
+ harness = false
+ required-features = ["taylor-flow"]
++
++[[example]]
++name = "flow_noise_evolution"
++required-features = ["flow-noise-evolution"]
++
++[[bench]]
++name = "flow_noise_evolution"
++harness = false
++required-features = ["flow-noise-evolution", "taylor-evolution"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index d3c816cef..b5b2df5b6 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -300,3 +300,30 @@ cancellation still apply.
+ ```sh
+ cargo run -p hyperdynamics --features flow-noise --example flow_noise
+ ```
++
++Enable `flow-noise-evolution` for
++`program.integrate_noise(initial, end, options, budget)`. The prepared trajectory
++program now searches bounded native step durations and tube candidates while
++carrying the complete affine outer endpoint into each next search. Accepted
++Picard proofs are reused once; analytic Taylor remainders, selected uncertainty
++columns and all discarded contributions remain authoritative. The final step
++is capped at the exact requested time.
++
++`FlowNoiseEvolutionOptions` selects the retained-column capacity and existing
++native search/segment limits. The report retains every native attempt and
++noise refinement. Only `Completed`, validated `Identity`, or `Empty` exposes
++`end_state`; `prefix_end_state` explicitly exposes a certified prefix after a
++later failure. Empty results retain the requested time and can enter another
++horizon. Invalid times/options are checked before empty or identity shortcuts.
++
++All calls share the supplied enclosure budget. Structural history checks and
++existing scalar counters do not bound total heap, all retained proof graphs,
++scalar payload/refinement or within-scalar cancellation. This controller uses
++a caller-selected Taylor order and retained-column capacity; it does not
++claim global error control, adaptive frame selection or optimal noise retention.
++Replay the original box, field/order history, horizon, options and policy;
++serialized result flags are not certificates.
++
++```sh
++cargo run -p hyperdynamics --features flow-noise-evolution --example flow_noise_evolution
++```
+diff --git a/crates/hyperdynamics/benches/flow_noise_evolution.rs b/crates/hyperdynamics/benches/flow_noise_evolution.rs
+new file mode 100644
+index 000000000..b85e79a02
+--- /dev/null
++++ b/crates/hyperdynamics/benches/flow_noise_evolution.rs
+@@ -0,0 +1,171 @@
++//! Same completed identity-map enclosure contract, including complete proof retention.
++use criterion::{Criterion, criterion_group, criterion_main};
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::{
++        FlowTaylorProgram,
++        evolution::{FlowTaylorEvolution, FlowTaylorEvolutionStatus},
++        noise::{
++            FlowNoiseState,
++            evolution::{FlowNoiseEvolution, FlowNoiseEvolutionOptions, FlowNoiseEvolutionStatus},
++        },
++    },
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++use std::{hint::black_box, sync::Arc};
++fn d(lo: i64, hi: i64, e: i32) -> DyadicInterval {
++    DyadicInterval::new(lo.into(), hi.into(), e).unwrap()
++}
++fn fields(constant: bool) -> [ExpressionField<2>; 2] {
++    let (time, x, y) = (SymbolId(10), SymbolId(20), SymbolId(30));
++    [1, -1].map(|sign| {
++        let rhs = Expr::int(sign)
++            * if constant {
++                Expr::int(1)
++            } else {
++                Expr::anonymous_symbol(y)
++            };
++        let source = ExpressionProgram::compile(
++            &[rhs, Expr::int(0)],
++            &[y, time, x],
++            &mut ExpressionBudget::new(100000, 1000000),
++        )
++        .unwrap();
++        ExpressionField::from_definition(
++            FieldDefinition {
++                source: source.definition().clone(),
++                time,
++                state: vec![x, y],
++            },
++            &mut EnclosureBudget::new(EnclosurePolicy::default()),
++        )
++        .unwrap()
++    })
++}
++struct Completed {
++    cover: Vec<BoxN<DyadicInterval, 2>>,
++    noise: Vec<FlowNoiseEvolution<2>>,
++    boxes: Vec<FlowTaylorEvolution<2>>,
++}
++fn complete(
++    programs: &[FlowTaylorProgram<2>; 2],
++    noise: bool,
++    constant: bool,
++    budget: &mut EnclosureBudget,
++) -> Completed {
++    let mut output = Completed {
++        cover: Vec::new(),
++        noise: Vec::new(),
++        boxes: Vec::new(),
++    };
++    let cells: usize = if noise || constant { 1 } else { 8 };
++    let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000);
++    let target = BoxN::new([d(-9, 9, -3), d(-1, 1, 0)]).unwrap();
++    for cell in 0..cells {
++        // These closed y intervals cover [-1,1] without gaps; x remains [-1,1].
++        let initial = BoxN::new([
++            d(-1, 1, 0),
++            d(
++                2 * cell as i64 - cells as i64,
++                2 * cell as i64 + 2 - cells as i64,
++                -(cells.ilog2() as i32),
++            ),
++        ])
++        .unwrap();
++        let options = EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            ..Default::default()
++        };
++        let end = if noise {
++            let mut state =
++                Arc::new(FlowNoiseState::new(d(0, 0, 0), initial.clone(), budget).unwrap());
++            for (index, program) in programs.iter().enumerate() {
++                let report = program.integrate_noise(
++                    state,
++                    d(3 * (index + 1) as i64, 3 * (index + 1) as i64, -3),
++                    FlowNoiseEvolutionOptions {
++                        maximum_noise: 2,
++                        native: options.clone(),
++                    },
++                    budget,
++                );
++                assert!(
++                    matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++                    "{:?}",
++                    report.status()
++                );
++                state = report.end_state().unwrap().clone();
++                output.noise.push(report);
++            }
++            assert_eq!(state.enclosure(), &initial);
++            state.enclosure().clone()
++        } else {
++            let mut state = initial.clone();
++            for (index, program) in programs.iter().enumerate() {
++                let report = program.integrate(
++                    EvolutionRequest {
++                        start: d(3 * index as i64, 3 * index as i64, -3),
++                        end: d(3 * (index + 1) as i64, 3 * (index + 1) as i64, -3),
++                        initial: state,
++                    },
++                    options.clone(),
++                    budget,
++                );
++                assert!(
++                    matches!(report.status(), FlowTaylorEvolutionStatus::Completed),
++                    "{:?}",
++                    report.status()
++                );
++                state = report.end_enclosure().unwrap().clone();
++                output.boxes.push(report);
++            }
++            state
++        };
++        // Independent map: forward translation/shear followed by its inverse is identity.
++        // Every exact initial cell is covered; the whole output stays within 1/8 of it.
++        assert!(initial.subset_of(&end, &mut arithmetic).unwrap());
++        assert!(end.subset_of(&target, &mut arithmetic).unwrap());
++        assert_eq!(end.lanes().unwrap()[1], initial.lanes().unwrap()[1]);
++        output.cover.push(end);
++    }
++    assert_eq!(output.cover.len(), cells);
++    assert_eq!(output.noise.len() + output.boxes.len(), 2 * cells);
++    output
++}
++fn benchmark(c: &mut Criterion) {
++    for constant in [true, false] {
++        let field = fields(constant);
++        let prepare = |budget: &mut EnclosureBudget| {
++            field.each_ref().map(|f| f.flow_taylor(1, budget).unwrap())
++        };
++        let prepared = prepare(&mut EnclosureBudget::new(EnclosurePolicy::default()));
++        for cold in [false, true] {
++            for noise in [false, true] {
++                let label = format!(
++                    "flow_noise_evolution/{}/{}/{}",
++                    if constant { "constant" } else { "shear" },
++                    if cold { "cold" } else { "warm" },
++                    if noise { "noise" } else { "boxes" }
++                );
++                c.bench_function(&label, |b| {
++                    b.iter(|| {
++                        let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++                        let local = cold.then(|| prepare(&mut budget));
++                        let programs = local.as_ref().unwrap_or(&prepared);
++                        let output = complete(black_box(programs), noise, constant, &mut budget);
++                        drop(black_box(output));
++                        drop(local);
++                    })
++                });
++            }
++        }
++    }
++}
++criterion_group!(benches, benchmark);
++criterion_main!(benches);
+diff --git a/crates/hyperdynamics/examples/flow_noise_evolution.rs b/crates/hyperdynamics/examples/flow_noise_evolution.rs
+new file mode 100644
+index 000000000..b6b2985d1
+--- /dev/null
++++ b/crates/hyperdynamics/examples/flow_noise_evolution.rs
+@@ -0,0 +1,70 @@
++//! Automatic forward and reverse shear horizons preserve shared uncertainty.
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::EvolutionOptions,
++    taylor_flow::noise::{
++        FlowNoiseState,
++        evolution::{FlowNoiseEvolutionOptions, FlowNoiseEvolutionStatus},
++    },
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++use std::sync::Arc;
++
++pub fn run() -> Result<(), Box<dyn std::error::Error>> {
++    let (time, x, y) = (SymbolId(10), SymbolId(20), SymbolId(30));
++    let d = |lo: i64, hi: i64, e| DyadicInterval::new(lo.into(), hi.into(), e);
++    let initial = BoxN::new([d(-1, 1, 0)?, d(-1, 1, 0)?])?;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let mut state = Arc::new(FlowNoiseState::new(
++        d(0, 0, 0)?,
++        initial.clone(),
++        &mut budget,
++    )?);
++    for (sign, end) in [(1, 3), (-1, 6)] {
++        let source = ExpressionProgram::compile(
++            &[Expr::int(sign) * Expr::anonymous_symbol(y), Expr::int(0)],
++            &[y, time, x],
++            &mut ExpressionBudget::new(100000, 1000000),
++        )?;
++        let field = ExpressionField::<2>::from_definition(
++            FieldDefinition {
++                source: source.definition().clone(),
++                time,
++                state: vec![x, y],
++            },
++            &mut budget,
++        )?;
++        let report = field.flow_taylor(1, &mut budget)?.integrate_noise(
++            state,
++            d(end, end, -3)?,
++            FlowNoiseEvolutionOptions {
++                maximum_noise: 2,
++                native: EvolutionOptions {
++                    maximum_step: Some(d(1, 1, -2)?),
++                    ..Default::default()
++                },
++            },
++            &mut budget,
++        );
++        assert!(
++            matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++            "{:?}",
++            report.status()
++        );
++        assert_eq!(report.segments().len(), 2);
++        state = report.end_state().expect("complete horizon").clone();
++        println!("time={:?} endpoint={:?}", state.time(), state.enclosure());
++    }
++    // Every pair (x,y) returns to itself; no independent copies of y are introduced.
++    assert_eq!(state.enclosure(), &initial);
++    Ok(())
++}
++#[allow(dead_code)]
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    run()
++}
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/noise.rs b/crates/hyperdynamics/src/field/taylor_flow/noise.rs
+index 4d7d72552..fc7d74943 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/noise.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/noise.rs
+@@ -303,36 +303,59 @@ impl<const N: usize> FlowTaylorProgram<N> {
+         request: FlowNoiseRequest<N>,
+         budget: &mut EnclosureBudget,
+     ) -> FlowNoiseReport<N> {
+-        let mut evidence = FlowNoiseEvidence {
+-            program: self.clone(),
+-            initial,
+-            request,
+-            flow: None,
+-            polynomial: None,
+-            composition: None,
+-            inputs: Vec::new(),
+-            noise: None,
+-            status: FlowNoiseStatus::Empty,
+-        };
+-        let result = advance(&mut evidence, budget);
+-        evidence.status = match &result {
+-            Ok((None, _)) => FlowNoiseStatus::Empty,
+-            Ok(_) => FlowNoiseStatus::Certified,
+-            Err(e) => FlowNoiseStatus::Rejected(e.clone()),
+-        };
+-        let evidence = Arc::new(evidence);
+-        let end = result.ok().map(|(form, enclosure)| {
+-            Arc::new(FlowNoiseState {
+-                time: evidence.request.end.clone(),
+-                form,
+-                enclosure,
+-                evidence: Some(evidence.clone()),
+-            })
+-        });
+-        FlowNoiseReport { evidence, end }
++        certify_from(self, initial, request, budget, |e, budget| {
++            Ok(e.program.certify_step(
++                PicardProposal {
++                    start: e.initial.time.clone(),
++                    end: e.request.end.clone(),
++                    initial: e.initial.enclosure.clone(),
++                    candidate: e.request.candidate.clone(),
++                },
++                budget,
++            ))
++        })
+     }
+ }
+ 
++fn certify_from<const N: usize>(
++    program: &FlowTaylorProgram<N>,
++    initial: Arc<FlowNoiseState<N>>,
++    request: FlowNoiseRequest<N>,
++    budget: &mut EnclosureBudget,
++    prove: impl FnOnce(
++        &FlowNoiseEvidence<N>,
++        &mut EnclosureBudget,
++    ) -> Result<FlowTaylorReport<N>, FlowNoiseError>,
++) -> FlowNoiseReport<N> {
++    let mut evidence = FlowNoiseEvidence {
++        program: program.clone(),
++        initial,
++        request,
++        flow: None,
++        polynomial: None,
++        composition: None,
++        inputs: Vec::new(),
++        noise: None,
++        status: FlowNoiseStatus::Empty,
++    };
++    let result = advance(&mut evidence, budget, prove);
++    evidence.status = match &result {
++        Ok((None, _)) => FlowNoiseStatus::Empty,
++        Ok(_) => FlowNoiseStatus::Certified,
++        Err(e) => FlowNoiseStatus::Rejected(e.clone()),
++    };
++    let evidence = Arc::new(evidence);
++    let end = result.ok().map(|(form, enclosure)| {
++        Arc::new(FlowNoiseState {
++            time: evidence.request.end.clone(),
++            form,
++            enclosure,
++            evidence: Some(evidence.clone()),
++        })
++    });
++    FlowNoiseReport { evidence, end }
++}
++
+ fn zero() -> DyadicInterval {
+     DyadicInterval::point(0.into(), 0).expect("zero")
+ }
+@@ -443,6 +466,10 @@ fn endpoint_polynomial<const N: usize>(
+ fn advance<const N: usize>(
+     e: &mut FlowNoiseEvidence<N>,
+     budget: &mut EnclosureBudget,
++    prove: impl FnOnce(
++        &FlowNoiseEvidence<N>,
++        &mut EnclosureBudget,
++    ) -> Result<FlowTaylorReport<N>, FlowNoiseError>,
+ ) -> Result<(Option<Form<N>>, BoxN<DyadicInterval, N>), FlowNoiseError> {
+     budget.graph.charge(0)?;
+     budget.graph.check_entries(&[N, N, N])?;
+@@ -451,15 +478,7 @@ fn advance<const N: usize>(
+             .and_then(|v| v.checked_add(2))
+             .ok_or(ExpressionError::SizeExhausted)?,
+     )?;
+-    e.flow = Some(e.program.certify_step(
+-        PicardProposal {
+-            start: e.initial.time.clone(),
+-            end: e.request.end.clone(),
+-            initial: e.initial.enclosure.clone(),
+-            candidate: e.request.candidate.clone(),
+-        },
+-        budget,
+-    ));
++    e.flow = Some(prove(e, budget)?);
+     let flow = e.flow.as_ref().expect("stored attempt");
+     match flow.status() {
+         FlowTaylorStatus::Rejected(error) => return Err(FlowNoiseError::Flow(error.clone())),
+@@ -707,3 +726,7 @@ fn enclose_coefficients<const N: usize>(
+         native.try_into().expect("N coefficients"),
+     )?)
+ }
++
++/// Automatic bounded horizons retaining affine endpoint uncertainty.
++#[cfg(feature = "flow-noise-evolution")]
++pub mod evolution;
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/noise/evolution.rs b/crates/hyperdynamics/src/field/taylor_flow/noise/evolution.rs
+new file mode 100644
+index 000000000..715614a6d
+--- /dev/null
++++ b/crates/hyperdynamics/src/field/taylor_flow/noise/evolution.rs
+@@ -0,0 +1,406 @@
++//! Bounded native searches whose accepted proofs retain affine endpoint uncertainty.
++use super::*;
++use crate::field::evolution::{
++    EvolutionFailure, EvolutionOptions, EvolutionReport, EvolutionRequest, EvolutionStatus,
++    copy_state,
++};
++use core::cmp::Ordering;
++
++/// Native search limits and the retained uncertainty-column capacity.
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub struct FlowNoiseEvolutionOptions {
++    /// Maximum retained columns per endpoint; all omitted terms remain in residuals.
++    pub maximum_noise: usize,
++    /// Outer segment limit and native duration/halving/expansion controls.
++    pub native: EvolutionOptions,
++}
++impl Default for FlowNoiseEvolutionOptions {
++    fn default() -> Self {
++        Self {
++            maximum_noise: 16,
++            native: EvolutionOptions::default(),
++        }
++    }
++}
++/// Original search, structural-resource, or correlated endpoint failure.
++#[derive(Clone, Debug)]
++pub enum FlowNoiseEvolutionFailure {
++    /// Original input validation, search, arithmetic or cancellation diagnostic.
++    Search(EvolutionFailure),
++    /// Original trajectory or affine endpoint construction diagnostic.
++    Noise(FlowNoiseError),
++}
++impl fmt::Display for FlowNoiseEvolutionFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "affine-noise evolution: {self:?}")
++    }
++}
++impl std::error::Error for FlowNoiseEvolutionFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Search(e) => Some(e),
++            Self::Noise(e) => Some(e),
++        }
++    }
++}
++impl From<EvolutionFailure> for FlowNoiseEvolutionFailure {
++    fn from(e: EvolutionFailure) -> Self {
++        Self::Search(e)
++    }
++}
++impl From<ExpressionError> for FlowNoiseEvolutionFailure {
++    fn from(e: ExpressionError) -> Self {
++        Self::Search(e.into())
++    }
++}
++impl From<IntervalError> for FlowNoiseEvolutionFailure {
++    fn from(e: IntervalError) -> Self {
++        Self::Search(e.into())
++    }
++}
++impl From<IntervalLatticeError> for FlowNoiseEvolutionFailure {
++    fn from(e: IntervalLatticeError) -> Self {
++        Self::Search(e.into())
++    }
++}
++impl From<FlowNoiseError> for FlowNoiseEvolutionFailure {
++    fn from(e: FlowNoiseError) -> Self {
++        Self::Noise(e)
++    }
++}
++/// Whole-horizon outcome, distinct from any retained certified prefix.
++#[derive(Clone, Debug)]
++pub enum FlowNoiseEvolutionStatus {
++    /// Every accepted endpoint reached the exact requested end time.
++    Completed,
++    /// Validated zero-duration identity; no ODE existence claim.
++    Identity,
++    /// Validated canonical empty set at the requested time.
++    Empty,
++    /// No whole-horizon endpoint is published.
++    Stopped(FlowNoiseEvolutionFailure),
++}
++/// One native search and its optional complete or rejected noise refinement.
++#[derive(Clone, Debug)]
++pub struct FlowNoiseEvolutionAttempt<const N: usize> {
++    search: EvolutionReport<N>,
++    noise: Option<FlowNoiseReport<N>>,
++}
++impl<const N: usize> FlowNoiseEvolutionAttempt<N> {
++    /// Every native candidate, including rejected expansions and halvings.
++    pub fn search(&self) -> &EvolutionReport<N> {
++        &self.search
++    }
++    /// None if search/bookkeeping failed before refinement; otherwise all proof stages.
++    pub fn noise(&self) -> Option<&FlowNoiseReport<N>> {
++        self.noise.as_ref()
++    }
++}
++/// Automatic composition of source-bound affine outer states.
++///
++/// Every next native search covers the full independent affine parameter image.
++/// Accepted native Picard proofs are reused, not evaluated a second time. The
++/// analytic Taylor and complete noise/residual proofs must finish before advancing.
++/// All attempts remain inspectable; only complete statuses expose `end_state`.
++///
++/// One shared budget covers nested calls and aggregate history-entry checks.
++/// These counts do not bound scalar payloads/refinement, vector capacities, all
++/// retained proof graphs, total heap bytes or within-scalar cancellation. Replay
++/// the original box, field/order history, horizon and options; no deserialized
++/// result flags or executable caches are certificates.
++#[derive(Clone, Debug)]
++pub struct FlowNoiseEvolution<const N: usize> {
++    program: FlowTaylorProgram<N>,
++    initial: Arc<FlowNoiseState<N>>,
++    end: DyadicInterval,
++    options: FlowNoiseEvolutionOptions,
++    policy: EnclosurePolicy,
++    attempts: Vec<FlowNoiseEvolutionAttempt<N>>,
++    segments: Vec<usize>,
++    status: FlowNoiseEvolutionStatus,
++}
++impl<const N: usize> FlowNoiseEvolution<N> {
++    /// Prepared source and mandatory Taylor remainder order.
++    pub fn program(&self) -> &FlowTaylorProgram<N> {
++        &self.program
++    }
++    /// Exact initial affine outer state, including its earlier proof history.
++    pub fn initial(&self) -> &Arc<FlowNoiseState<N>> {
++        &self.initial
++    }
++    /// Original requested exact end time, including when invalid.
++    pub fn requested_end(&self) -> &DyadicInterval {
++        &self.end
++    }
++    /// Native search and retained-column configuration.
++    pub fn options(&self) -> &FlowNoiseEvolutionOptions {
++        &self.options
++    }
++    /// Shared enclosure policy; counters are not reset between stages.
++    pub fn policy(&self) -> EnclosurePolicy {
++        self.policy
++    }
++    /// All searches and partial/complete refinements in execution order.
++    pub fn attempts(&self) -> &[FlowNoiseEvolutionAttempt<N>] {
++        &self.attempts
++    }
++    /// Contiguous certified positive-duration prefix, not whole-request success.
++    pub fn segments(&self) -> impl ExactSizeIterator<Item = &FlowNoiseReport<N>> {
++        self.segments.iter().map(|&i| {
++            self.attempts[i]
++                .noise
++                .as_ref()
++                .expect("accepted refinement")
++        })
++    }
++    /// Last accepted state, available even if a later search or refinement fails.
++    pub fn prefix_end_state(&self) -> Option<&Arc<FlowNoiseState<N>>> {
++        self.segments.last().and_then(|&i| {
++            self.attempts[i]
++                .noise
++                .as_ref()
++                .and_then(FlowNoiseReport::end_state)
++        })
++    }
++    /// Whole-horizon outcome.
++    pub fn status(&self) -> &FlowNoiseEvolutionStatus {
++        &self.status
++    }
++    /// Exact reached prefix time; validated empty success reaches the requested end.
++    pub fn reached_time(&self) -> &DyadicInterval {
++        if matches!(self.status, FlowNoiseEvolutionStatus::Empty) {
++            &self.end
++        } else {
++            self.prefix_end_state().unwrap_or(&self.initial).time()
++        }
++    }
++    /// Reusable final state only after complete, identity or empty success.
++    pub fn end_state(&self) -> Option<&Arc<FlowNoiseState<N>>> {
++        match self.status {
++            FlowNoiseEvolutionStatus::Completed => self.prefix_end_state(),
++            FlowNoiseEvolutionStatus::Identity => Some(&self.initial),
++            FlowNoiseEvolutionStatus::Empty => Some(
++                self.attempts
++                    .last()
++                    .and_then(|a| a.noise.as_ref())
++                    .and_then(FlowNoiseReport::end_state)
++                    .unwrap_or(&self.initial),
++            ),
++            FlowNoiseEvolutionStatus::Stopped(_) => None,
++        }
++    }
++}
++impl<const N: usize> FlowTaylorProgram<N> {
++    /// Search a bounded forward horizon while retaining correlated affine states.
++    /// Native input/options validation precedes empty, identity and zero-step exits.
++    /// A failed noise proof never falls back to a Cartesian-only endpoint.
++    pub fn integrate_noise(
++        &self,
++        initial: Arc<FlowNoiseState<N>>,
++        end: DyadicInterval,
++        options: FlowNoiseEvolutionOptions,
++        budget: &mut EnclosureBudget,
++    ) -> FlowNoiseEvolution<N> {
++        let mut report = FlowNoiseEvolution {
++            program: self.clone(),
++            initial,
++            end,
++            options,
++            policy: budget.policy(),
++            attempts: Vec::new(),
++            segments: Vec::new(),
++            status: FlowNoiseEvolutionStatus::Identity,
++        };
++        report.status = match evolve(&mut report, budget) {
++            Ok(status) => status,
++            Err(e) => FlowNoiseEvolutionStatus::Stopped(e),
++        };
++        report
++    }
++}
++
++fn refine<const N: usize>(
++    program: &FlowTaylorProgram<N>,
++    initial: Arc<FlowNoiseState<N>>,
++    request: FlowNoiseRequest<N>,
++    picard: &PicardReport<N>,
++    budget: &mut EnclosureBudget,
++) -> FlowNoiseReport<N> {
++    certify_from(program, initial, request, budget, |_, budget| {
++        // Copy fixed structural slots, sharing exact source identity. Scalar
++        // mantissa payload copying retains the documented budget exclusion.
++        let copies = N
++            .checked_mul(N)
++            .and_then(|v| N.checked_mul(5).and_then(|n| v.checked_add(n)))
++            .and_then(|v| v.checked_add(12))
++            .ok_or(ExpressionError::SizeExhausted)?;
++        budget.graph.check_entries(&[copies])?;
++        budget.graph.charge(copies)?;
++        let mut flow = FlowTaylorReport {
++            program: program.clone(),
++            picard: picard.clone(),
++            evidence: FlowTaylorEvidence::default(),
++            status: FlowTaylorStatus::Empty,
++        };
++        flow.status = match program.verify(&flow.picard, &mut flow.evidence, budget) {
++            Ok(status) => status,
++            Err(e) => FlowTaylorStatus::Rejected(e),
++        };
++        Ok(flow)
++    })
++}
++
++fn evolve<const N: usize>(
++    report: &mut FlowNoiseEvolution<N>,
++    budget: &mut EnclosureBudget,
++) -> Result<FlowNoiseEvolutionStatus, FlowNoiseEvolutionFailure> {
++    let mut search_entries = 0usize;
++    loop {
++        budget.graph.charge(0)?;
++        if !report.attempts.is_empty()
++            && report.segments.len() == report.options.native.maximum_steps
++        {
++            return Err(EvolutionFailure::StepLimit {
++                limit: report.options.native.maximum_steps,
++            }
++            .into());
++        }
++        let count = report
++            .attempts
++            .len()
++            .checked_add(1)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        budget
++            .graph
++            .check_entries(&[search_entries, count, report.segments.len()])?;
++        budget.graph.charge(1)?;
++        let initial = report.prefix_end_state().unwrap_or(&report.initial).clone();
++        let mut options = report.options.native.clone();
++        options.maximum_steps = usize::from(options.maximum_steps != 0);
++        if let Some(&i) = report.segments.last() {
++            options.maximum_step = Some(
++                report.attempts[i]
++                    .search
++                    .segment(0)
++                    .expect("accepted search")
++                    .evidence()
++                    .duration()
++                    .expect("positive duration")
++                    .checked_pow(1, &mut budget.arithmetic)?,
++            );
++        }
++        let search = report.program.field.integrate(
++            EvolutionRequest {
++                start: initial.time.checked_pow(1, &mut budget.arithmetic)?,
++                end: report.end.checked_pow(1, &mut budget.arithmetic)?,
++                initial: copy_state(initial.enclosure(), budget)?,
++            },
++            options,
++            budget,
++        );
++        let native_count = search.attempts().len().checked_add(search.segments().len());
++        let index = report.attempts.len();
++        report.attempts.push(FlowNoiseEvolutionAttempt {
++            search,
++            noise: None,
++        });
++        search_entries = native_count
++            .and_then(|n| search_entries.checked_add(n))
++            .ok_or(ExpressionError::SizeExhausted)?;
++        budget
++            .graph
++            .check_entries(&[search_entries, count, report.segments.len(), 1])?;
++        let attempt = &mut report.attempts[index];
++        match attempt.search.status() {
++            EvolutionStatus::Identity => {
++                budget.graph.charge(0)?;
++                return Ok(FlowNoiseEvolutionStatus::Identity);
++            }
++            EvolutionStatus::Empty => {
++                if initial
++                    .time
++                    .compare_singleton(&report.end, &mut budget.arithmetic)?
++                    == Ordering::Equal
++                {
++                    budget.graph.charge(0)?;
++                    return Ok(FlowNoiseEvolutionStatus::Empty);
++                }
++                // No Picard step was attempted for this native empty shortcut.
++                // Retain the empty time transfer through the ordinary empty-step proof.
++                let noise = report.program.certify_noise_step(
++                    initial,
++                    FlowNoiseRequest {
++                        end: report.end.checked_pow(1, &mut budget.arithmetic)?,
++                        candidate: BoxN::empty()?,
++                        maximum_noise: report.options.maximum_noise,
++                    },
++                    budget,
++                );
++                let status = noise.status().clone();
++                attempt.noise = Some(noise);
++                match status {
++                    FlowNoiseStatus::Empty => {
++                        budget.graph.charge(0)?;
++                        return Ok(FlowNoiseEvolutionStatus::Empty);
++                    }
++                    FlowNoiseStatus::Rejected(e) => return Err(e.into()),
++                    FlowNoiseStatus::Certified => {
++                        unreachable!("empty input has no nonempty trajectory proof")
++                    }
++                }
++            }
++            EvolutionStatus::Completed
++            | EvolutionStatus::Stopped(EvolutionFailure::StepLimit { limit: 1 }) => {}
++            EvolutionStatus::Stopped(e) => return Err(e.clone().into()),
++        }
++        let picard = attempt.search.segment(0).expect("accepted one-step search");
++        let request = FlowNoiseRequest {
++            end: picard
++                .proposal()
++                .end
++                .checked_pow(1, &mut budget.arithmetic)?,
++            candidate: copy_state(&picard.proposal().candidate, budget)?,
++            maximum_noise: report.options.maximum_noise,
++        };
++        let noise = refine(&report.program, initial.clone(), request, picard, budget);
++        let status = noise.status().clone();
++        attempt.noise = Some(noise);
++        if let FlowNoiseStatus::Rejected(e) = status {
++            return Err(e.into());
++        }
++        let next = attempt
++            .noise
++            .as_ref()
++            .expect("stored refinement")
++            .end_state()
++            .expect("complete endpoint");
++        if initial
++            .time
++            .compare_singleton(next.time(), &mut budget.arithmetic)?
++            != Ordering::Less
++        {
++            return Err(EvolutionFailure::NonProgress.into());
++        }
++        let order = next
++            .time()
++            .compare_singleton(&report.end, &mut budget.arithmetic)?;
++        if order == Ordering::Greater {
++            return Err(EvolutionFailure::NonProgress.into());
++        }
++        let accepted = report
++            .segments
++            .len()
++            .checked_add(1)
++            .ok_or(ExpressionError::SizeExhausted)?;
++        budget
++            .graph
++            .check_entries(&[search_entries, count, accepted])?;
++        budget.graph.charge(1)?;
++        report.segments.push(index);
++        budget.graph.charge(0)?;
++        if order == Ordering::Equal {
++            return Ok(FlowNoiseEvolutionStatus::Completed);
++        }
++    }
++}
+diff --git a/crates/hyperdynamics/tests/fixtures/flow_noise_trace.txt b/crates/hyperdynamics/tests/fixtures/flow_noise_trace.txt
+new file mode 100644
+index 000000000..4360b11dd
+--- /dev/null
++++ b/crates/hyperdynamics/tests/fixtures/flow_noise_trace.txt
+@@ -0,0 +1 @@
++TraceSnapshot { dispatch: [DispatchCount { layer: "rational", operation: "add", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "arithmetic-reuse", path: "first-observation", count: 1 }, DispatchCount { layer: "rational", operation: "div", path: "word-sized", count: 8 }, DispatchCount { layer: "rational", operation: "mul", path: "retained-product", count: 6 }, DispatchCount { layer: "rational", operation: "mul", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "mul-div", path: "proven-reduced-word-product", count: 8 }, DispatchCount { layer: "rational", operation: "powi", path: "retained-product-chain", count: 7 }, DispatchCount { layer: "rational", operation: "powi", path: "word-sized", count: 1 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-dyadic", count: 8 }, DispatchCount { layer: "rational", operation: "word-result", path: "cached-small-integer", count: 2 }, DispatchCount { layer: "rational", operation: "word-result", path: "zero", count: 1 }, DispatchCount { layer: "rational_algorithm", operation: "powering", path: "retained-binary-product-chain", count: 7 }, DispatchCount { layer: "rational_algorithm", operation: "powering", path: "word-checked-pow", count: 1 }, DispatchCount { layer: "real", operation: "add", path: "same-symbolic-basis", count: 28 }, DispatchCount { layer: "real", operation: "constructor", path: "one", count: 170 }, DispatchCount { layer: "real", operation: "constructor", path: "rational", count: 456 }, DispatchCount { layer: "real", operation: "constructor", path: "zero", count: 534 }, DispatchCount { layer: "real", operation: "div", path: "same-class", count: 8 }, DispatchCount { layer: "real", operation: "div", path: "zero", count: 4 }, DispatchCount { layer: "real", operation: "mul", path: "exact-rational", count: 48 }, DispatchCount { layer: "real", operation: "powi", path: "rational-exact", count: 8 }, DispatchCount { layer: "real", operation: "product_sum", path: "sum-products-generic", count: 12 }], rational: RationalTraceStats { temporary_rationals: 1170, reductions: 10, gcds: 0, common_factors: CommonFactorBuckets { none: 10, power_of_two: 0, small: 0, medium: 0, large: 0 }, gcd_operand_widths: GcdOperandWidthBuckets { both_u64: 0, mixed_u64_u128: 0, both_u128: 0, arbitrary_precision: 0 }, peak_operand_bits: 4 } }
+diff --git a/crates/hyperdynamics/tests/flow_noise_evolution.rs b/crates/hyperdynamics/tests/flow_noise_evolution.rs
+new file mode 100644
+index 000000000..18f41f3ab
+--- /dev/null
++++ b/crates/hyperdynamics/tests/flow_noise_evolution.rs
+@@ -0,0 +1,528 @@
++#![cfg(feature = "flow-noise-evolution")]
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::EvolutionOptions,
++    taylor_flow::noise::{
++        FlowNoiseState,
++        evolution::{FlowNoiseEvolutionOptions, FlowNoiseEvolutionStatus},
++    },
++};
++use hyperinterval::DyadicInterval;
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++use std::sync::Arc;
++
++fn d(lo: i64, hi: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(lo.into(), hi.into(), exponent).unwrap()
++}
++fn shear(sign: i64, budget: &mut EnclosureBudget) -> ExpressionField<2> {
++    let (time, x, y) = (SymbolId(10), SymbolId(20), SymbolId(30));
++    let source = ExpressionProgram::compile(
++        &[Expr::int(sign) * Expr::anonymous_symbol(y), Expr::int(0)],
++        &[y, time, x],
++        &mut ExpressionBudget::new(100_000, 1_000_000),
++    )
++    .unwrap();
++    ExpressionField::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![x, y],
++        },
++        budget,
++    )
++    .unwrap()
++}
++#[test]
++fn automatic_horizons_preserve_reversible_shear_correlation_and_exact_time() {
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let initial = BoxN::new([d(-1, 1, 0), d(-1, 1, 0)]).unwrap();
++    let mut state =
++        Arc::new(FlowNoiseState::new(d(0, 0, 0), initial.clone(), &mut budget).unwrap());
++    for (end, sign) in [(3, 1), (6, -1)] {
++        let program = shear(sign, &mut budget)
++            .flow_taylor(1, &mut budget)
++            .unwrap();
++        let report = program.integrate_noise(
++            state,
++            d(end, end, -3),
++            FlowNoiseEvolutionOptions {
++                maximum_noise: 2,
++                native: EvolutionOptions {
++                    maximum_step: Some(d(1, 1, -2)),
++                    ..Default::default()
++                },
++            },
++            &mut budget,
++        );
++        assert!(
++            matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++            "{:?}",
++            report.status()
++        );
++        assert_eq!(report.segments().len(), 2);
++        let next = report.end_state().unwrap().clone();
++        assert_eq!(next.time(), &d(end, end, -3));
++        assert!(next.evidence().is_some());
++        for segment in report.segments() {
++            assert!(segment.end_state().is_some());
++        }
++        state = next;
++    }
++    // Exact composition (x + 3*y/8) - 3*y/8 = x for every initial pair.
++    assert_eq!(state.enclosure(), &initial);
++}
++
++#[test]
++fn validation_precedes_empty_and_identity_and_empty_output_is_reusable() {
++    use hyperdynamics::field::evolution::EvolutionFailure;
++    use hyperdynamics::field::taylor_flow::noise::evolution::FlowNoiseEvolutionFailure;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let program = shear(1, &mut budget).flow_taylor(1, &mut budget).unwrap();
++    let mut state =
++        Arc::new(FlowNoiseState::new(d(0, 0, 0), BoxN::empty().unwrap(), &mut budget).unwrap());
++    for end in [d(0, 1, 0), d(-1, -1, 0)] {
++        let report = program.integrate_noise(state.clone(), end, Default::default(), &mut budget);
++        assert!(matches!(
++            report.status(),
++            FlowNoiseEvolutionStatus::Stopped(_)
++        ));
++        assert!(report.end_state().is_none());
++        assert_eq!(report.segments().len(), 0);
++    }
++    let invalid = program.integrate_noise(
++        state.clone(),
++        d(0, 0, 0),
++        FlowNoiseEvolutionOptions {
++            maximum_noise: 0,
++            native: EvolutionOptions {
++                maximum_step: Some(d(0, 0, 0)),
++                ..Default::default()
++            },
++        },
++        &mut budget,
++    );
++    assert!(matches!(
++        invalid.status(),
++        FlowNoiseEvolutionStatus::Stopped(FlowNoiseEvolutionFailure::Search(
++            EvolutionFailure::InvalidMaximumStep
++        ))
++    ));
++    assert!(invalid.end_state().is_none());
++    for end in [0, 1, 2] {
++        let report = program.integrate_noise(
++            state.clone(),
++            d(end, end, 0),
++            Default::default(),
++            &mut budget,
++        );
++        assert!(matches!(report.status(), FlowNoiseEvolutionStatus::Empty));
++        assert_eq!(report.segments().len(), 0);
++        let next = report.end_state().unwrap().clone();
++        assert_eq!(next.time(), &d(end, end, 0));
++        assert!(next.enclosure().is_empty());
++        if end > 0 {
++            assert!(Arc::ptr_eq(next.evidence().unwrap().initial(), &state));
++        }
++        state = next;
++    }
++    let point = Arc::new(
++        FlowNoiseState::new(
++            d(0, 0, 0),
++            BoxN::new([d(0, 0, 0), d(1, 1, 0)]).unwrap(),
++            &mut budget,
++        )
++        .unwrap(),
++    );
++    let report = program.integrate_noise(
++        point.clone(),
++        d(0, 0, 0),
++        FlowNoiseEvolutionOptions {
++            maximum_noise: 0,
++            native: EvolutionOptions {
++                maximum_steps: 0,
++                ..Default::default()
++            },
++        },
++        &mut budget,
++    );
++    assert!(matches!(
++        report.status(),
++        FlowNoiseEvolutionStatus::Identity
++    ));
++    assert!(Arc::ptr_eq(report.end_state().unwrap(), &point));
++}
++
++#[test]
++fn stopped_prefix_is_explicit_and_can_seed_a_later_horizon() {
++    use hyperdynamics::field::evolution::EvolutionFailure;
++    use hyperdynamics::field::taylor_flow::noise::evolution::FlowNoiseEvolutionFailure;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let program = shear(1, &mut budget).flow_taylor(1, &mut budget).unwrap();
++    let initial = Arc::new(
++        FlowNoiseState::new(
++            d(0, 0, 0),
++            BoxN::new([d(0, 0, 0), d(1, 1, 0)]).unwrap(),
++            &mut budget,
++        )
++        .unwrap(),
++    );
++    let options = FlowNoiseEvolutionOptions {
++        maximum_noise: 2,
++        native: EvolutionOptions {
++            maximum_steps: 1,
++            maximum_step: Some(d(1, 1, -2)),
++            ..Default::default()
++        },
++    };
++    let report = program.integrate_noise(initial, d(3, 3, -3), options, &mut budget);
++    assert!(matches!(
++        report.status(),
++        FlowNoiseEvolutionStatus::Stopped(FlowNoiseEvolutionFailure::Search(
++            EvolutionFailure::StepLimit { limit: 1 }
++        ))
++    ));
++    assert!(report.end_state().is_none());
++    assert_eq!(report.segments().len(), 1);
++    let prefix = report.prefix_end_state().unwrap().clone();
++    assert_eq!(prefix.time(), &d(1, 1, -2));
++    let resumed = program.integrate_noise(prefix, d(3, 3, -3), Default::default(), &mut budget);
++    assert!(
++        matches!(resumed.status(), FlowNoiseEvolutionStatus::Completed),
++        "{:?}",
++        resumed.status()
++    );
++    assert_eq!(
++        resumed.end_state().unwrap().enclosure().lanes(),
++        Some(&[d(3, 3, -3), d(1, 1, 0)])
++    );
++}
++
++#[test]
++fn publication_exhaustion_cancellation_and_retry_never_publish_partial_success() {
++    use hyperdynamics::field::taylor_flow::noise::FlowNoiseStatus;
++    let mut setup = EnclosureBudget::new(EnclosurePolicy::default());
++    let program = shear(1, &mut setup).flow_taylor(1, &mut setup).unwrap();
++    let initial = Arc::new(
++        FlowNoiseState::new(
++            d(0, 0, 0),
++            BoxN::new([d(-1, 1, 0), d(-1, 1, 0)]).unwrap(),
++            &mut setup,
++        )
++        .unwrap(),
++    );
++    let options = FlowNoiseEvolutionOptions {
++        maximum_noise: 2,
++        native: EvolutionOptions {
++            maximum_step: Some(d(1, 1, -2)),
++            ..Default::default()
++        },
++    };
++    let run = |budget: &mut EnclosureBudget| {
++        program.integrate_noise(initial.clone(), d(3, 3, -3), options.clone(), budget)
++    };
++    let policy = EnclosurePolicy::default();
++    let mut ordinary = EnclosureBudget::new(policy);
++    let complete = run(&mut ordinary);
++    assert!(matches!(
++        complete.status(),
++        FlowNoiseEvolutionStatus::Completed
++    ));
++    let work = policy.graph_work - ordinary.remaining_graph_work();
++    let mut short = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: work - 1,
++        ..policy
++    });
++    let failed = run(&mut short);
++    assert!(matches!(
++        failed.status(),
++        FlowNoiseEvolutionStatus::Stopped(_)
++    ));
++    assert!(failed.end_state().is_none());
++    assert_eq!(failed.segments().len(), 1);
++    assert!(matches!(
++        failed.attempts().last().unwrap().noise().unwrap().status(),
++        FlowNoiseStatus::Certified
++    ));
++    assert_eq!(failed.prefix_end_state().unwrap().time(), &d(1, 1, -2));
++    let mut exact = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: work,
++        ..policy
++    });
++    assert!(matches!(
++        run(&mut exact).status(),
++        FlowNoiseEvolutionStatus::Completed
++    ));
++    let mut zero = EnclosureBudget::new(EnclosurePolicy {
++        graph_work: 0,
++        ..policy
++    });
++    assert!(run(&mut zero).end_state().is_none());
++    let token = hypersolve::work_budget::CancellationToken::new();
++    token.cancel();
++    let mut cancelled = EnclosureBudget::new(policy);
++    cancelled.set_cancellation(Some(token));
++    let failed = run(&mut cancelled);
++    assert!(matches!(
++        failed.status(),
++        FlowNoiseEvolutionStatus::Stopped(_)
++    ));
++    assert!(failed.end_state().is_none());
++    assert!(failed.attempts().is_empty());
++    let retry = run(&mut EnclosureBudget::new(policy));
++    assert_eq!(
++        retry.end_state().unwrap().enclosure(),
++        complete.end_state().unwrap().enclosure()
++    );
++    assert_eq!(initial.time(), &d(0, 0, 0));
++    assert!(initial.evidence().is_none());
++}
++
++#[test]
++fn zero_dimensional_unit_remains_nonempty_through_the_horizon() {
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let time = SymbolId(10);
++    let source =
++        ExpressionProgram::compile(&[], &[time], &mut ExpressionBudget::new(1000, 10000)).unwrap();
++    let field = ExpressionField::<0>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![],
++        },
++        &mut budget,
++    )
++    .unwrap();
++    let program = field.flow_taylor(1, &mut budget).unwrap();
++    let initial =
++        Arc::new(FlowNoiseState::new(d(0, 0, 0), BoxN::new([]).unwrap(), &mut budget).unwrap());
++    let report = program.integrate_noise(initial, d(1, 1, 0), Default::default(), &mut budget);
++    assert!(
++        matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    assert!(!report.end_state().unwrap().enclosure().is_empty());
++    assert_eq!(report.end_state().unwrap().time(), &d(1, 1, 0));
++}
++
++#[test]
++fn nonlinear_horizon_keeps_fresh_residuals_and_contains_the_exact_riccati_flow() {
++    use hyperdynamics::field::taylor_flow::noise::FlowNoiseInput;
++    use hyperinterval::DyadicBudget;
++    use hyperreal::Rational;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let (time, x) = (SymbolId(10), SymbolId(20));
++    let value = Expr::anonymous_symbol(x);
++    let source = ExpressionProgram::compile(
++        &[value.clone() * value],
++        &[x, time],
++        &mut ExpressionBudget::new(100000, 1000000),
++    )
++    .unwrap();
++    let field = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![x],
++        },
++        &mut budget,
++    )
++    .unwrap();
++    let program = field.flow_taylor(2, &mut budget).unwrap();
++    let initial = Arc::new(
++        FlowNoiseState::new(d(0, 0, 0), BoxN::new([d(1, 2, -1)]).unwrap(), &mut budget).unwrap(),
++    );
++    let report = program.integrate_noise(
++        initial,
++        d(1, 1, -3),
++        FlowNoiseEvolutionOptions {
++            maximum_noise: 2,
++            native: EvolutionOptions {
++                maximum_step: Some(d(1, 1, -4)),
++                ..Default::default()
++            },
++        },
++        &mut budget,
++    );
++    assert!(
++        matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    assert_eq!(report.segments().len(), 2);
++    let mut arithmetic = DyadicBudget::new(16384, 1_000_000_000);
++    for (index, segment) in report.segments().enumerate() {
++        let e = segment.evidence();
++        let next = segment.end_state().unwrap();
++        assert_eq!(
++            &e.flow().unwrap().picard().proposal().initial,
++            e.initial().enclosure()
++        );
++        assert_eq!(e.flow().unwrap().evidence().end_terms().len(), 3);
++        if index > 0 {
++            assert!(e.inputs().contains(&FlowNoiseInput::Residual(0)));
++        }
++        let t = next
++            .time()
++            .to_rational(&mut arithmetic)
++            .unwrap()
++            .lower()
++            .unwrap()
++            .clone();
++        let actual = next.enclosure().lanes().unwrap()[0]
++            .to_rational(&mut arithmetic)
++            .unwrap();
++        // Monotone exact flow x0/(1-t*x0) on this initial interval and horizon.
++        for x0 in [
++            Rational::from(1) / Rational::from(2),
++            Rational::from(3) / Rational::from(4),
++            Rational::one(),
++        ] {
++            let exact = &x0 / (Rational::one() - &t * &x0);
++            assert!(actual.contains_point(&exact), "{actual:?} misses {exact:?}");
++        }
++    }
++}
++
++#[test]
++fn time_dependent_constant_state_derivative_is_integrated_exactly() {
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let (time, x) = (SymbolId(10), SymbolId(20));
++    let source = ExpressionProgram::compile(
++        &[Expr::anonymous_symbol(time)],
++        &[x, time],
++        &mut ExpressionBudget::new(10000, 100000),
++    )
++    .unwrap();
++    let field = ExpressionField::<1>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time,
++            state: vec![x],
++        },
++        &mut budget,
++    )
++    .unwrap();
++    let program = field.flow_taylor(2, &mut budget).unwrap();
++    let initial = Arc::new(
++        FlowNoiseState::new(d(1, 1, -2), BoxN::new([d(0, 0, 0)]).unwrap(), &mut budget).unwrap(),
++    );
++    let report = program.integrate_noise(
++        initial,
++        d(3, 3, -2),
++        FlowNoiseEvolutionOptions {
++            maximum_noise: 0,
++            native: EvolutionOptions {
++                maximum_step: Some(d(1, 1, -2)),
++                ..Default::default()
++            },
++        },
++        &mut budget,
++    );
++    assert!(
++        matches!(report.status(), FlowNoiseEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    // Integral from 1/4 to 3/4 of t dt is 1/4.
++    assert_eq!(
++        report.end_state().unwrap().enclosure().lanes(),
++        Some(&[d(1, 1, -2)])
++    );
++}
++
++#[cfg(feature = "serde")]
++type Replay = (
++    DyadicInterval,
++    BoxN<DyadicInterval, 2>,
++    Vec<(FieldDefinition, DyadicInterval, FlowNoiseEvolutionOptions)>,
++);
++#[cfg(feature = "serde")]
++fn replay(data: Replay) -> Vec<u8> {
++    let (start, initial, horizons) = data;
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let mut state = Arc::new(FlowNoiseState::new(start, initial.clone(), &mut budget).unwrap());
++    for (definition, end, options) in horizons {
++        let field = ExpressionField::<2>::from_definition(definition, &mut budget).unwrap();
++        let report = field.flow_taylor(1, &mut budget).unwrap().integrate_noise(
++            state,
++            end,
++            options,
++            &mut budget,
++        );
++        assert!(matches!(
++            report.status(),
++            FlowNoiseEvolutionStatus::Completed
++        ));
++        state = report.end_state().unwrap().clone();
++    }
++    assert_eq!(state.enclosure(), &initial);
++    serde_json::to_vec(&(state.time(), state.enclosure())).unwrap()
++}
++#[test]
++#[cfg(feature = "serde")]
++fn fresh_process_reconstructs_sources_and_replays_automatic_horizons() {
++    use hyperdynamics::field::EnclosedVectorField;
++    const KEY: &str = "HYPERDYNAMICS_AUTOMATIC_NOISE_REPLAY";
++    if let Ok(input) = std::env::var(KEY) {
++        let data: Replay = serde_json::from_str(&input).unwrap();
++        println!("REPLAY={}", String::from_utf8(replay(data)).unwrap());
++        return;
++    }
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let horizons = [(1, 3), (-1, 6)]
++        .map(|(sign, end)| {
++            let identity = shear(sign, &mut budget).identity();
++            (
++                FieldDefinition {
++                    source: identity.source().clone(),
++                    time: identity.time(),
++                    state: identity.state().to_vec(),
++                },
++                d(end, end, -3),
++                FlowNoiseEvolutionOptions {
++                    maximum_noise: 2,
++                    native: EvolutionOptions {
++                        maximum_step: Some(d(1, 1, -2)),
++                        ..Default::default()
++                    },
++                },
++            )
++        })
++        .to_vec();
++    let data = (
++        d(0, 0, 0),
++        BoxN::new([d(-1, 1, 0), d(-1, 1, 0)]).unwrap(),
++        horizons,
++    );
++    let expected = String::from_utf8(replay(data.clone())).unwrap();
++    let encoded = serde_json::to_string(&data).unwrap();
++    for _ in 0..2 {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "fresh_process_reconstructs_sources_and_replays_automatic_horizons",
++                "--nocapture",
++            ])
++            .env(KEY, &encoded)
++            .output()
++            .unwrap();
++        assert!(output.status.success(), "{output:?}");
++        let stdout = String::from_utf8(output.stdout).unwrap();
++        assert_eq!(
++            stdout.lines().find_map(|line| line.strip_prefix("REPLAY=")),
++            Some(expected.as_str())
++        );
++    }
++}
++
++#[path = "../examples/flow_noise_evolution.rs"]
++mod shipped_example;
++#[test]
++fn shipped_automatic_noise_example_completes() {
++    shipped_example::run().unwrap();
++}
+diff --git a/crates/hyperdynamics/tests/flow_noise_trace.rs b/crates/hyperdynamics/tests/flow_noise_trace.rs
+new file mode 100644
+index 000000000..0c61392d3
+--- /dev/null
++++ b/crates/hyperdynamics/tests/flow_noise_trace.rs
+@@ -0,0 +1,13 @@
++#![cfg(all(feature = "flow-noise", feature = "dispatch-trace"))]
++#[path = "../examples/flow_noise.rs"]
++mod shipped_example;
++
++#[test]
++fn manual_affine_noise_chain_preserves_numeric_dispatch_counts() {
++    use hyperreal::dispatch_trace;
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| shipped_example::run().unwrap());
++    let actual = format!("{:?}", dispatch_trace::take_trace());
++    println!("MANUAL_TRACE={actual}");
++    assert_eq!(actual, include_str!("fixtures/flow_noise_trace.txt").trim());
++}
