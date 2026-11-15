@@ -1,0 +1,294 @@
+diff --git a/crates/alumina-interface-core/src/machine_profile.rs b/crates/alumina-interface-core/src/machine_profile.rs
+index a43b4f4..4e2ba3c 100644
+--- a/crates/alumina-interface-core/src/machine_profile.rs
++++ b/crates/alumina-interface-core/src/machine_profile.rs
+@@ -16,6 +16,7 @@ use alumina_config::{
+ };
+ use alumina_motion::{AxisTiming, StepperTiming};
+ use alumina_protocol::Digest;
++use hyperinterval::{NonEmptyRationalInterval, PositiveRationalInterval};
+ use hyperlimit::{PredicatePolicy, compare_reals};
+ use hyperreal::{Problem, Rational, Real};
+ 
+@@ -31,23 +32,6 @@ pub struct ExactInterval {
+ }
+ 
+ impl ExactInterval {
+-    fn from_scalar(scalar: ExactScalar) -> MachineProfileResult<Self> {
+-        let nominal = convert_rational(scalar.value)?;
+-        let uncertainty = convert_rational(scalar.uncertainty)?;
+-        Ok(Self {
+-            lower: &nominal - &uncertainty,
+-            upper: &nominal + &uncertainty,
+-            nominal,
+-        })
+-    }
+-
+-    fn require_positive_lower(self, instance: u16, fact: ScalarFact) -> MachineProfileResult<Self> {
+-        if self.lower <= Rational::zero() {
+-            return Err(MachineProfileError::NonPositiveLowerBound { instance, fact });
+-        }
+-        Ok(self)
+-    }
+-
+     fn divided_by_positive_integer(&self, divisor: u64) -> Self {
+         let divisor = Rational::from(divisor);
+         Self {
+@@ -73,6 +57,24 @@ impl ExactInterval {
+     }
+ }
+ 
++// Private construction state: the public profile still owns its unchanged
++// ExactInterval layout, nominal value and physical-fact provenance.
++struct PositiveExactInterval {
++    nominal: Rational,
++    interval: PositiveRationalInterval,
++}
++
++impl PositiveExactInterval {
++    fn into_exact(self) -> ExactInterval {
++        let (lower, upper) = self.interval.into_bounds();
++        ExactInterval {
++            nominal: self.nominal,
++            lower,
++            upper,
++        }
++    }
++}
++
+ /// Exact resource, transmission, uncertainty, and dynamics facts for one axis.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct StepperAxisMachineProfile {
+@@ -121,31 +123,34 @@ impl StepperAxisMachineProfile {
+         };
+ 
+         let full_steps_per_turn =
+-            positive_scalar_interval(view, instance, ScalarFact::AxisFullStepsPerTurn)?;
+-        let microsteps = positive_scalar_interval(view, instance, ScalarFact::AxisMicrosteps)?;
++            positive_scalar_with_proof(view, instance, ScalarFact::AxisFullStepsPerTurn)?;
++        let microsteps = positive_scalar_with_proof(view, instance, ScalarFact::AxisMicrosteps)?;
+         let motor_turns_per_output_turn =
+-            positive_scalar_interval(view, instance, ScalarFact::AxisMotorTurnsPerOutputTurn)?;
++            positive_scalar_with_proof(view, instance, ScalarFact::AxisMotorTurnsPerOutputTurn)?;
+         let travel_metres_per_output_turn =
+-            positive_scalar_interval(view, instance, ScalarFact::AxisTravelMetresPerOutputTurn)?;
++            positive_scalar_with_proof(view, instance, ScalarFact::AxisTravelMetresPerOutputTurn)?;
+         let calibration_scale =
+-            positive_scalar_interval(view, instance, ScalarFact::AxisCalibrationScale)?;
++            positive_scalar_with_proof(view, instance, ScalarFact::AxisCalibrationScale)?;
+ 
+         let numerator_nominal = &full_steps_per_turn.nominal
+             * &microsteps.nominal
+             * &motor_turns_per_output_turn.nominal
+             * &calibration_scale.nominal;
+-        let numerator_lower = &full_steps_per_turn.lower
+-            * &microsteps.lower
+-            * &motor_turns_per_output_turn.lower
+-            * &calibration_scale.lower;
+-        let numerator_upper = &full_steps_per_turn.upper
+-            * &microsteps.upper
+-            * &motor_turns_per_output_turn.upper
+-            * &calibration_scale.upper;
++        let numerator = PositiveRationalInterval::product(&[
++            &full_steps_per_turn.interval,
++            &microsteps.interval,
++            &motor_turns_per_output_turn.interval,
++            &calibration_scale.interval,
++        ]);
++        // Preserve nominal division before lower and upper bound divisions.
++        let nominal = numerator_nominal / &travel_metres_per_output_turn.nominal;
++        let (lower, upper) = numerator
++            .quotient(&travel_metres_per_output_turn.interval)
++            .into_bounds();
+         let command_density_steps_per_metre = ExactInterval {
+-            nominal: numerator_nominal / &travel_metres_per_output_turn.nominal,
+-            lower: numerator_lower / &travel_metres_per_output_turn.upper,
+-            upper: numerator_upper / &travel_metres_per_output_turn.lower,
++            nominal,
++            lower,
++            upper,
+         };
+         let command_density_steps_per_millimetre =
+             command_density_steps_per_metre.divided_by_positive_integer(1_000);
+@@ -203,11 +208,11 @@ impl StepperAxisMachineProfile {
+             direction,
+             driver_control,
+             driver_control_action,
+-            full_steps_per_turn,
+-            microsteps,
+-            motor_turns_per_output_turn,
+-            travel_metres_per_output_turn,
+-            calibration_scale,
++            full_steps_per_turn: full_steps_per_turn.into_exact(),
++            microsteps: microsteps.into_exact(),
++            motor_turns_per_output_turn: motor_turns_per_output_turn.into_exact(),
++            travel_metres_per_output_turn: travel_metres_per_output_turn.into_exact(),
++            calibration_scale: calibration_scale.into_exact(),
+             command_density_steps_per_metre,
+             command_density_steps_per_millimetre,
+             position_minimum_metres,
+@@ -709,7 +714,14 @@ fn scalar_interval(
+     instance: u16,
+     fact: ScalarFact,
+ ) -> MachineProfileResult<ExactInterval> {
+-    ExactInterval::from_scalar(required_scalar(view, instance, fact)?)
++    construct_scalar_interval(view, instance, fact, |nominal, interval| {
++        let (lower, upper) = interval.into_bounds();
++        Ok(ExactInterval {
++            nominal,
++            lower,
++            upper,
++        })
++    })
+ }
+ 
+ fn positive_scalar_interval(
+@@ -717,7 +729,53 @@ fn positive_scalar_interval(
+     instance: u16,
+     fact: ScalarFact,
+ ) -> MachineProfileResult<ExactInterval> {
+-    scalar_interval(view, instance, fact)?.require_positive_lower(instance, fact)
++    construct_positive_scalar_interval(view, instance, fact, |nominal, interval| {
++        PositiveExactInterval { nominal, interval }.into_exact()
++    })
++}
++
++fn positive_scalar_with_proof(
++    view: ConfigurationDocumentView<'_>,
++    instance: u16,
++    fact: ScalarFact,
++) -> MachineProfileResult<PositiveExactInterval> {
++    construct_positive_scalar_interval(view, instance, fact, |nominal, interval| {
++        PositiveExactInterval { nominal, interval }
++    })
++}
++
++fn construct_positive_scalar_interval<T>(
++    view: ConfigurationDocumentView<'_>,
++    instance: u16,
++    fact: ScalarFact,
++    finish: impl FnOnce(Rational, PositiveRationalInterval) -> T,
++) -> MachineProfileResult<T> {
++    construct_scalar_interval(view, instance, fact, |nominal, interval| {
++        let interval = interval
++            .into_positive()
++            .ok_or(MachineProfileError::NonPositiveLowerBound { instance, fact })?;
++        Ok(finish(nominal, interval))
++    })
++}
++
++fn construct_scalar_interval<T>(
++    view: ConfigurationDocumentView<'_>,
++    instance: u16,
++    fact: ScalarFact,
++    finish: impl FnOnce(Rational, NonEmptyRationalInterval) -> MachineProfileResult<T>,
++) -> MachineProfileResult<T> {
++    let scalar = required_scalar(view, instance, fact)?;
++    let nominal = convert_rational(scalar.value)?;
++    let denominator = core::num::NonZeroU64::new(scalar.uncertainty.denominator)
++        .ok_or(MachineProfileError::Arithmetic(Problem::DivideByZero))?;
++    let numerator = u64::try_from(scalar.uncertainty.numerator)
++        .map_err(|_| MachineProfileError::Configuration(ConfigurationError::Scalar))?;
++    let interval = NonEmptyRationalInterval::from_nominal_unsigned_uncertainty(
++        &nominal,
++        numerator,
++        denominator,
++    )?;
++    finish(nominal, interval)
+ }
+ 
+ fn convert_rational(value: alumina_config::Rational) -> MachineProfileResult<Rational> {
+@@ -3225,4 +3283,93 @@ mod tests {
+             })
+         ));
+     }
++    #[test]
++    fn interval_finalizers_run_once_only_after_validated_ingress() {
++        use std::cell::Cell;
++        let calls = Cell::new(0);
++        let (bytes, digest) = document(&machine_records());
++        let view =
++            ConfigurationDocumentView::decode::<32>(&board_mks_tinybee::PACKAGE, &bytes, digest)
++                .unwrap();
++        let missing: MachineProfileResult<Rational> = construct_scalar_interval(
++            view,
++            0,
++            ScalarFact::AxisEncoderCountsPerTurn,
++            |nominal: Rational, _: NonEmptyRationalInterval| {
++                calls.set(calls.get() + 1);
++                Ok(nominal)
++            },
++        );
++        assert!(matches!(
++            missing,
++            Err(MachineProfileError::MissingScalar {
++                instance: 0,
++                fact: ScalarFact::AxisEncoderCountsPerTurn,
++            })
++        ));
++        assert_eq!(calls.get(), 0);
++        let valid = construct_scalar_interval(
++            view,
++            0,
++            ScalarFact::AxisMicrosteps,
++            |nominal: Rational, interval: NonEmptyRationalInterval| {
++                calls.set(calls.get() + 1);
++                assert_eq!(
++                    interval.into_bounds(),
++                    (Rational::from(16), Rational::from(16))
++                );
++                Ok(nominal)
++            },
++        )
++        .unwrap();
++        assert_eq!(valid, Rational::from(16));
++        assert_eq!(calls.get(), 1);
++        calls.set(0);
++        let valid_positive = construct_positive_scalar_interval(
++            view,
++            0,
++            ScalarFact::AxisMicrosteps,
++            |nominal: Rational, interval: PositiveRationalInterval| {
++                calls.set(calls.get() + 1);
++                assert_eq!(
++                    interval.into_bounds(),
++                    (Rational::from(16), Rational::from(16))
++                );
++                nominal
++            },
++        )
++        .unwrap();
++        assert_eq!(valid_positive, Rational::from(16));
++        assert_eq!(calls.get(), 1);
++        calls.set(0);
++        let mut records = machine_records();
++        for record in &mut records {
++            if let ConfigurationRecord::Scalar(scalar) = record
++                && scalar.instance == 0
++                && scalar.fact == ScalarFact::AxisCalibrationScale
++            {
++                scalar.uncertainty = wire_rational(1, 1);
++            }
++        }
++        let (bytes, digest) = document(&records);
++        let view =
++            ConfigurationDocumentView::decode::<32>(&board_mks_tinybee::PACKAGE, &bytes, digest)
++                .unwrap();
++        let invalid = construct_positive_scalar_interval(
++            view,
++            0,
++            ScalarFact::AxisCalibrationScale,
++            |_: Rational, _: PositiveRationalInterval| {
++                calls.set(calls.get() + 1);
++            },
++        );
++        assert!(matches!(
++            invalid,
++            Err(MachineProfileError::NonPositiveLowerBound {
++                instance: 0,
++                fact: ScalarFact::AxisCalibrationScale,
++            })
++        ));
++        assert_eq!(calls.get(), 0);
++    }
+ }
