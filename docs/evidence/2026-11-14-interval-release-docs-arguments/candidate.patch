@@ -1,0 +1,232 @@
+diff --git a/docs/RELEASE.md b/docs/RELEASE.md
+index c70a905e0..2be8dc619 100644
+--- a/docs/RELEASE.md
++++ b/docs/RELEASE.md
+@@ -118,8 +118,13 @@ Run these after the last change, in addition to the
+    to native bounds, and consumption by the native nonoverlap predicate.
+ 
+    Before unpacking, it also builds each crate's documentation from the
+-   workspace with its docs.rs feature configuration and `-D warnings`. This
+-   is not an archive-only documentation check. Add `--toolchain 1.95.0` to repeat
++   workspace with its docs.rs feature settings, per-crate `rustdoc-args` and
++   `-D warnings`. Arguments retain their boundaries (including spaces); flags
++   cannot leak between crates or be overridden by ambient rustdoc flags. A
++   compiled two-crate regression fixture checks these properties on the selected
++   compiler. Missing packages and metadata keys that the local helper does not
++   implement fail explicitly. This is a local workspace check, not an archive-only
++   check or the hosted docs.rs target, nightly-toolchain and environment matrix. Add `--toolchain 1.95.0` to repeat
+    everything on the minimum supported compiler. The `release` job of
+    `.github/workflows/rust.yml` runs it on stable and on 1.95.0.
+ 
+diff --git a/scripts/release-check.sh b/scripts/release-check.sh
+index 1a5bea46d..64dea9dec 100755
+--- a/scripts/release-check.sh
++++ b/scripts/release-check.sh
+@@ -77,26 +77,10 @@ echo "== packaging ${#crates[@]} crates"
+ CARGO_HOME="${work}/cargo-home" CARGO_TARGET_DIR="${target}" "${cargo_command[@]}" package --locked \
+   "${overlay[@]}" "${verify_args[@]}" "${dirty[@]}" "${package_args[@]}"
+ 
+-echo "== documenting each crate with its docs.rs configuration"
+-"${cargo_command[@]}" metadata --locked --no-deps --format-version 1 | python3 -c '
+-import json, sys
+-crates = set(sys.argv[1:])
+-for package in json.load(sys.stdin)["packages"]:
+-    if package["name"] not in crates:
+-        continue
+-    docs = ((package.get("metadata") or {}).get("docs") or {}).get("rs") or {}
+-    args = ["-p", package["name"]]
+-    if docs.get("all-features"):
+-        args.append("--all-features")
+-    if docs.get("no-default-features"):
+-        args.append("--no-default-features")
+-    if docs.get("features"):
+-        args += ["--features", ",".join(docs["features"])]
+-    print(" ".join(args))
+-' "${crates[@]}" | while read -r -a doc_args; do
+-  RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR="${target}" "${cargo_command[@]}" doc --locked \
+-    --no-deps "${overlay[@]}" "${doc_args[@]}"
+-done
++echo "== documenting local docs.rs feature and rustdoc configurations"
++python3 "${root}/scripts/test-release-docs.py" "${toolchain}"
++python3 "${root}/scripts/release-docs.py" --toolchain="${toolchain}" \
++  --target-dir "${target}" "${overlay[@]}" "${crates[@]}"
+ 
+ # Unpack exactly what would be uploaded.
+ declare -A version
+diff --git a/scripts/release-docs.py b/scripts/release-docs.py
+new file mode 100644
+index 000000000..1b536bf03
+--- /dev/null
++++ b/scripts/release-docs.py
+@@ -0,0 +1,78 @@
++#!/usr/bin/env python3
++"""Build local workspace docs with the release's declared docs.rs options.
++
++This checks the current metadata keys, not docs.rs's hosted target/toolchain
++matrix. Unhandled keys fail instead of silently weakening the qualification.
++"""
++
++import argparse
++import json
++import os
++import subprocess
++
++
++SUPPORTED = {"all-features", "no-default-features", "features", "rustdoc-args"}
++
++
++def documentation_plan(metadata, names):
++    packages = {package["name"]: package for package in metadata["packages"]}
++    missing = set(names) - packages.keys()
++    if missing:
++        raise ValueError(f"documentation packages missing: {sorted(missing)}")
++    plan = []
++    for name in names:
++        docs = ((packages[name].get("metadata") or {}).get("docs") or {}).get("rs") or {}
++        unsupported = docs.keys() - SUPPORTED
++        if unsupported:
++            raise ValueError(f"{name}: unsupported docs.rs keys: {sorted(unsupported)}")
++        args = ["-p", name]
++        for key in ("all-features", "no-default-features"):
++            value = docs.get(key, False)
++            if not isinstance(value, bool):
++                raise ValueError(f"{name}: {key} must be a boolean")
++            if value:
++                args.append("--" + key)
++        for key in ("features", "rustdoc-args"):
++            value = docs.get(key, [])
++            if not isinstance(value, list) or any(
++                not isinstance(item, str) or not item or "\x00" in item or "\x1f" in item
++                for item in value
++            ):
++                raise ValueError(f"{name}: {key} must be an array of nonempty arguments")
++        if docs.get("features"):
++            args += ["--features", ",".join(docs["features"])]
++        # Encoded flags preserve whitespace within individual manifest arguments.
++        # Override both ambient forms, just as the release owns its warning gate.
++        flags = [*docs.get("rustdoc-args", []), "-D", "warnings"]
++        plan.append((args, flags))
++    return plan
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--toolchain", default="")
++    parser.add_argument("--target-dir", required=True)
++    parser.add_argument("--config", action="append", default=[])
++    parser.add_argument("packages", nargs="+")
++    options = parser.parse_args()
++    cargo = ["cargo"] + ([options.toolchain] if options.toolchain else [])
++    config = [arg for value in options.config for arg in ("--config", value)]
++    metadata = json.loads(subprocess.check_output(
++        cargo + ["metadata", "--locked", "--no-deps", "--format-version", "1", *config]
++    ))
++    # Validate the entire requested set before building any of it.
++    plan = documentation_plan(metadata, options.packages)
++    for args, flags in plan:
++        command = cargo + ["doc", "--locked", "--no-deps", *config, *args]
++        print(json.dumps({"command": command, "rustdoc_args": flags}), flush=True)
++        env = dict(os.environ, CARGO_TARGET_DIR=options.target_dir,
++                   RUSTDOCFLAGS="", CARGO_ENCODED_RUSTDOCFLAGS="\x1f".join(flags))
++        subprocess.run(command, env=env, check=True)
++    print(f"local documentation configurations passed: {len(plan)}")
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except (ValueError, subprocess.CalledProcessError) as error:
++        raise SystemExit(str(error)) from error
+diff --git a/scripts/test-release-docs.py b/scripts/test-release-docs.py
+new file mode 100644
+index 000000000..dd1a8de05
+--- /dev/null
++++ b/scripts/test-release-docs.py
+@@ -0,0 +1,87 @@
++#!/usr/bin/env python3
++"""Compiled regressions for release documentation metadata and flag isolation."""
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++
++
++script = Path(__file__).with_name("release-docs.py")
++toolchain = sys.argv[1] if len(sys.argv) > 1 else ""
++cargo = ["cargo"] + ([toolchain] if toolchain else [])
++with tempfile.TemporaryDirectory(prefix="csgrs-release-docs.") as temporary:
++    root = Path(temporary)
++    (root / "Cargo.toml").write_text(
++        '[workspace]\nmembers = ["first", "second"]\nresolver = "3"\n'
++    )
++    header = root / "header with spaces.html"
++    header.write_text('<meta name="release-docs-fixture" content="argument preserved">')
++    for name in ("first", "second"):
++        package = root / name
++        (package / "src").mkdir(parents=True)
++        (package / "Cargo.toml").write_text(
++            f'[package]\nname = "docs-{name}-fixture"\nversion = "0.0.0"\n'
++            'edition = "2024"\n[features]\ndefault = ["default-marker"]\n'
++            'default-marker = []\nchosen = []\n[package.metadata.docs.rs]\n'
++            + ('all-features = true\nrustdoc-args = ["--cfg", "docsrs", '
++               '"--html-in-header", ' + json.dumps(str(header)) + ']\n'
++               if name == "first" else
++               'no-default-features = true\nfeatures = ["chosen"]\n')
++        )
++    first = root / "first/src/lib.rs"
++    first.write_text('''#[cfg(all(doc, not(docsrs)))]
++compile_error!("required documentation cfg was lost");
++#[cfg(all(doc, not(all(feature = "chosen", feature = "default-marker"))))]
++compile_error!("all-features was lost");
++/// Fixture with metadata flags.
++pub fn first() {}
++''')
++    (root / "second/src/lib.rs").write_text('''#[cfg(all(doc, docsrs))]
++compile_error!("documentation cfg leaked from previous crate");
++#[cfg(all(doc, any(feature = "default-marker", not(feature = "chosen"))))]
++compile_error!("explicit feature selection was lost");
++/// Fixture without metadata flags.
++pub fn second() {}
++''')
++    env = dict(os.environ, CARGO_NET_OFFLINE="true", RUSTDOCFLAGS="-A warnings",
++               CARGO_ENCODED_RUSTDOCFLAGS="-A\x1fwarnings")
++    subprocess.run(cargo + ["generate-lockfile", "--offline"], cwd=root,
++                   env=env, check=True)
++    command = [sys.executable, str(script), f"--toolchain={toolchain}",
++               "--target-dir", str(root / "target")]
++    names = ["docs-first-fixture", "docs-second-fixture"]
++
++    def run(packages, success=True, diagnostic=None):
++        result = subprocess.run(command + packages, cwd=root, env=env,
++                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++        if (result.returncode == 0) != success:
++            raise AssertionError(result.stdout)
++        if diagnostic is not None and diagnostic not in result.stdout:
++            raise AssertionError(result.stdout)
++        print(result.stdout, end="")
++        return result.stdout
++
++    run(names)
++    first_html = (root / "target/doc/docs_first_fixture/index.html").read_text()
++    second_html = (root / "target/doc/docs_second_fixture/index.html").read_text()
++    assert 'content="argument preserved"' in first_html
++    assert 'content="argument preserved"' not in second_html
++
++    # A successful Cargo run alone is insufficient: inspect its rendered output.
++    # The warning gate must survive even explicitly permissive ambient flags.
++    original = first.read_text()
++    first.write_text(original + '\n/// [missing_release_fixture_symbol]\npub fn broken_link() {}\n')
++    run(names, success=False, diagnostic="missing_release_fixture_symbol")
++    first.write_text(original)
++
++    output = run(names + ["missing-release-fixture"], success=False,
++                 diagnostic="documentation packages missing")
++    assert '"command":' not in output, "validation must precede every build"
++    manifest = root / "second/Cargo.toml"
++    manifest.write_text(manifest.read_text() + 'rustc-args = ["--cfg", "unhandled"]\n')
++    output = run(names, success=False, diagnostic="unsupported docs.rs keys")
++    assert '"command":' not in output, "must not partly document an invalid selection"
++    print("release documentation fixture passed: flags, HTML, isolation, features, failures")
