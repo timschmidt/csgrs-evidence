@@ -1,0 +1,119 @@
+diff --git a/crates/alumina-interface-client/src/worker.rs b/crates/alumina-interface-client/src/worker.rs
+index f249a38..7b19361 100644
+--- a/crates/alumina-interface-client/src/worker.rs
++++ b/crates/alumina-interface-client/src/worker.rs
+@@ -3170,6 +3170,14 @@ mod tests {
+         assert_eq!(WORKER_SCHEMA_VERSION, 15);
+     }
+ 
++    #[test]
++    fn browser_harness_uses_current_worker_schema() {
++        let harness = include_str!("../../../tests/browser/worker-clock-harness.html");
++        assert!(harness.contains(&format!(
++            "const WORKER_SCHEMA_VERSION = {WORKER_SCHEMA_VERSION};"
++        )));
++    }
++
+     #[test]
+     fn cached_job_snapshot_round_trip_revalidates_terminal_authority() {
+         let event = WorkerEventEnvelope::current(WorkerEvent::JobSnapshot {
+diff --git a/docs/LIVE-CONTROL-WORKER.md b/docs/LIVE-CONTROL-WORKER.md
+index e2eb1c7..448d5ae 100644
+--- a/docs/LIVE-CONTROL-WORKER.md
++++ b/docs/LIVE-CONTROL-WORKER.md
+@@ -65,13 +65,16 @@ terminal descriptor evidence and local start cycles only with no original UI
+ epoch and no new start authority. V8 and V9 add truthful completed-after-stop
+ and split-after-stop terminals; V10 carries the explicit attended versus
+ cached-autonomous policy. Schema V11 added each participant's reported lease,
+-greatest browser-authorized lease, and the complete renewal-round count. Current
+-schema V13 retains V12's reattached terminal fault with its authenticated
++greatest browser-authorized lease, and the complete renewal-round count.
++Schema V13 retains V12's reattached terminal fault with its authenticated
+ reported lease while requiring the unavailable prior browser-authority ceiling,
+ original UI epoch, and renewal-round history to remain absent. V13 adds
+ capability-bound visual progress and independently revalidated private
+-visual-document events. It does not retain a compatibility decoder for prior
+-schemas.
++visual-document events. Current schema V15 additionally carries typed graph
++controls and network provisioning. The browser acceptance harness uses V15 for
++commands and strictly rejects other event versions; a client test checks its
++version against `WORKER_SCHEMA_VERSION`. There is no compatibility decoder for
++prior schemas.
+ 
+ ## Lifecycle and recovery
+ 
+diff --git a/tests/browser/worker-clock-harness.html b/tests/browser/worker-clock-harness.html
+index 2e2c655..ddfb611 100644
+--- a/tests/browser/worker-clock-harness.html
++++ b/tests/browser/worker-clock-harness.html
+@@ -7,6 +7,7 @@
+   <body>
+     <pre id="result" data-status="starting">starting</pre>
+     <script type="module">
++      const WORKER_SCHEMA_VERSION = 15;
+       const output = document.querySelector("#result");
+       let worker;
+       let configured = false;
+@@ -313,7 +314,7 @@
+         cachedJobStaged = true;
+         worker.postMessage(
+           JSON.stringify({
+-            schema_version: 13,
++            schema_version: WORKER_SCHEMA_VERSION,
+             command: { kind: "stage_cached_job", request: cachedJobRequest },
+           }),
+         );
+@@ -332,7 +333,7 @@
+       const requestWaveform = (durationCycles) => {
+         worker.postMessage(
+           JSON.stringify({
+-            schema_version: 13,
++            schema_version: WORKER_SCHEMA_VERSION,
+             command: {
+               kind: "capture_waveform",
+               request: {
+@@ -382,7 +383,7 @@
+           finish("failed", { error: String(error) });
+           return;
+         }
+-        if (envelope.schema_version !== 13) {
++        if (envelope.schema_version !== WORKER_SCHEMA_VERSION) {
+           clearTimeout(timeout);
+           finish("failed", {
+             error: "worker schema version mismatch",
+@@ -427,7 +428,7 @@
+           for (let index = 0; index < simulatorCount; index += 1) {
+             worker.postMessage(
+               JSON.stringify({
+-                schema_version: 13,
++                schema_version: WORKER_SCHEMA_VERSION,
+                 command: {
+                   kind: "configure",
+                   request: {
+@@ -518,7 +519,7 @@
+             cachedJobStarted = true;
+             worker.postMessage(
+               JSON.stringify({
+-                schema_version: 13,
++                schema_version: WORKER_SCHEMA_VERSION,
+                 command: {
+                   kind: "start_cached_job",
+                   job_id: snapshot.job_id,
+@@ -542,7 +543,7 @@
+             cachedJobStopRequested = true;
+             worker.postMessage(
+               JSON.stringify({
+-                schema_version: 13,
++                schema_version: WORKER_SCHEMA_VERSION,
+                 command: {
+                   kind: "stop_cached_job",
+                   job_id: snapshot.job_id,
+@@ -1121,7 +1122,7 @@
+               cachedJobClearing = true;
+               worker.postMessage(
+                 JSON.stringify({
+-                  schema_version: 13,
++                  schema_version: WORKER_SCHEMA_VERSION,
+                   command: {
+                     kind: "clear_cached_job",
+                     job_id: snapshot.job_id,
