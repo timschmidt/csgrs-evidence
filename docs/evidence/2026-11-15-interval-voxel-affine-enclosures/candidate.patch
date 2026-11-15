@@ -1,0 +1,204 @@
+diff --git a/crates/hyperlattice-interval/Cargo.toml b/crates/hyperlattice-interval/Cargo.toml
+index 86a426f4a..ec7add89c 100644
+--- a/crates/hyperlattice-interval/Cargo.toml
++++ b/crates/hyperlattice-interval/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ fixed = ["hyperinterval/fixed"]
++hyperreal = ["dyadic", "hyperinterval/hyperreal"]
+ dyadic = ["hyperinterval/dyadic"]
+ rational = ["hyperinterval/rational"]
+ float-enclosure = ["hyperinterval/float-enclosure"]
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 3e2845ea5..0db77aa89 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -28,6 +28,8 @@ Build and test with `cargo test -p hyperlattice-interval --features fixed`.
+ No scalar backend is enabled by default. `fixed` and `float-enclosure` require
+ no allocator. `dyadic` uses allocation with explicit Hyperinterval work/size
+ accounting. `rational` enables Hyperreal, std and its Rust 1.95 requirement.
++`hyperreal` enables the native certified Real-to-dyadic conversion bridge,
++including std and the same Rust 1.95 requirement.
+ `serde` validates scalar endpoints, dimensions and fixed scales on replay.
+ 
+ Implemented: canonical empty/unit products, component hull/intersection and
+diff --git a/crates/hyperlattice/Cargo.toml b/crates/hyperlattice/Cargo.toml
+index a80579783..215343a57 100644
+--- a/crates/hyperlattice/Cargo.toml
++++ b/crates/hyperlattice/Cargo.toml
+@@ -37,6 +37,7 @@ arbitrary = ["dep:arbitrary"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperlattice-interval?/serde"]
+ interval = ["dep:hyperlattice-interval"]
+ interval-fixed = ["interval", "hyperlattice-interval/fixed"]
++interval-hyperreal = ["interval", "hyperlattice-interval/hyperreal"]
+ interval-dyadic = ["interval", "hyperlattice-interval/dyadic"]
+ interval-rational = ["interval", "hyperlattice-interval/rational"]
+ interval-float-enclosure = ["interval", "hyperlattice-interval/float-enclosure"]
+diff --git a/crates/hyperlattice/README.md b/crates/hyperlattice/README.md
+index 97ef642ff..16ccaca88 100644
+--- a/crates/hyperlattice/README.md
++++ b/crates/hyperlattice/README.md
+@@ -354,6 +354,8 @@ requirements shared by the Hyper crates.
+ 
+ Enable `interval-fixed`, `interval-dyadic`, `interval-rational`, or
+ `interval-float-enclosure` for `IntervalVector`, `IntervalMatrix` and `BoxN`.
++`interval-hyperreal` additionally exposes certified exact-Real-to-dyadic
++conversion through the same scalar re-export.
+ These are Cartesian enclosures with explicit empty sets, checked scalar
+ arithmetic and shared dyadic budgets. Scalar backends are available under
+ `hyperlattice::interval::hyperinterval`. The same implementation is available
+diff --git a/crates/hypervoxel/Cargo.lock b/crates/hypervoxel/Cargo.lock
+index 781b5928c..9dbbe6177 100644
+--- a/crates/hypervoxel/Cargo.lock
++++ b/crates/hypervoxel/Cargo.lock
+@@ -2949,13 +2949,31 @@ dependencies = [
+  "smartstring",
+ ]
+ 
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "hyperlattice"
+ version = "0.7.0"
+ dependencies = [
++ "hyperlattice-interval",
+  "hyperreal",
+ ]
+ 
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
+ [[package]]
+ name = "hyperlimit"
+ version = "0.5.0"
+diff --git a/crates/hypervoxel/Cargo.toml b/crates/hypervoxel/Cargo.toml
+index 07808b7d1..2891aae61 100644
+--- a/crates/hypervoxel/Cargo.toml
++++ b/crates/hypervoxel/Cargo.toml
+@@ -41,10 +41,15 @@ proptest = "1.7.0"
+ 
+ [features]
+ default = []
++interval-enclosure = ["hyperlattice/interval-hyperreal"]
+ dispatch-trace = ["hyperreal/dispatch-trace"]
+ hypermesh-adapter = ["dep:hypermesh"]
+ legacy-voxelis = ["dep:voxelis", "dep:glam"]
+ 
++[[example]]
++name = "affine_enclosure"
++required-features = ["interval-enclosure"]
++
+ [[bench]]
+ name = "grid_frame"
+ harness = false
+diff --git a/crates/hypervoxel/README.md b/crates/hypervoxel/README.md
+index 0732ea3aa..9ccad4ff6 100644
+--- a/crates/hypervoxel/README.md
++++ b/crates/hypervoxel/README.md
+@@ -34,6 +34,20 @@ This README describes `hypervoxel` version `0.3.0`.
+ | `VoxelizationReport`, `VoxelPredicateCertificateReport` | Classification and exact-readiness evidence |
+ | `VoxelSideTables` | Material, field-sample, and process-state domain records |
+ 
++## Conservative transformed bounds
++
++The optional `interval-enclosure` feature adds
++`ExactAffineTransform::enclose_bounds`. It returns an immutable
++`AffineBoundsEnclosure` containing a certified dyadic Cartesian box and the
++original exact transform and source endpoints. It can succeed when exact term
++ordering is undecided. The box is conservative; it does not establish occupancy
++or the exact correlated image. Native conversion and lattice arithmetic share
++one dyadic budget, with Hyperreal refinement and exact clone/drop excluded.
++
++```sh
++cargo run --manifest-path crates/hypervoxel/Cargo.toml -p hypervoxel --features interval-enclosure --example affine_enclosure
++```
++
+ ## Install
+ 
+ ```toml
+diff --git a/crates/hypervoxel/src/error.rs b/crates/hypervoxel/src/error.rs
+index 44fe496ea..20a1be52c 100644
+--- a/crates/hypervoxel/src/error.rs
++++ b/crates/hypervoxel/src/error.rs
+@@ -8,6 +8,9 @@ pub type HypervoxelResult<T> = Result<T, HypervoxelError>;
+ /// Validation failures surfaced before a grid can be treated as exact.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum HypervoxelError {
++    /// Native transformed-box enclosure failure with the original scalar cause.
++    #[cfg(feature = "interval-enclosure")]
++    IntervalEnclosure(hyperlattice::IntervalLatticeError),
+     /// A grid depth exceeded the current bounded integer address model.
+     DepthTooLarge { depth: u8, max_supported: u8 },
+     /// A grid cell axis was structurally non-positive.
+@@ -54,6 +57,8 @@ pub enum HypervoxelError {
+ impl fmt::Display for HypervoxelError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            #[cfg(feature = "interval-enclosure")]
++            Self::IntervalEnclosure(error) => write!(f, "affine enclosure: {error}"),
+             Self::DepthTooLarge {
+                 depth,
+                 max_supported,
+@@ -111,4 +116,26 @@ impl fmt::Display for HypervoxelError {
+     }
+ }
+ 
+-impl std::error::Error for HypervoxelError {}
++impl std::error::Error for HypervoxelError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        #[cfg(feature = "interval-enclosure")]
++        if let Self::IntervalEnclosure(error) = self {
++            return Some(error);
++        }
++        None
++    }
++}
++
++#[cfg(feature = "interval-enclosure")]
++impl From<hyperlattice::IntervalLatticeError> for HypervoxelError {
++    fn from(error: hyperlattice::IntervalLatticeError) -> Self {
++        Self::IntervalEnclosure(error)
++    }
++}
++
++#[cfg(feature = "interval-enclosure")]
++impl From<hyperlattice::interval::hyperinterval::IntervalError> for HypervoxelError {
++    fn from(error: hyperlattice::interval::hyperinterval::IntervalError) -> Self {
++        Self::IntervalEnclosure(error.into())
++    }
++}
+diff --git a/crates/hypervoxel/src/lib.rs b/crates/hypervoxel/src/lib.rs
+index b072a1d0e..5330a6085 100644
+--- a/crates/hypervoxel/src/lib.rs
++++ b/crates/hypervoxel/src/lib.rs
+@@ -18,6 +18,8 @@
+ mod aabb;
+ mod address;
+ mod affine;
++#[cfg(feature = "interval-enclosure")]
++mod affine_enclosure;
+ mod aggregate;
+ mod batch;
+ mod cell;
+@@ -67,6 +69,8 @@ mod voxelize;
+ pub use aabb::{ExactAabb3, GridAabbHandoff, LatticeAabbHandoff};
+ pub use address::{CellBounds, VoxelAddress};
+ pub use affine::ExactAffineTransform;
++#[cfg(feature = "interval-enclosure")]
++pub use affine_enclosure::AffineBoundsEnclosure;
+ pub use aggregate::{AggregateCertainty, VoxelAggregateFacts, VoxelOccupancyInterval};
+ pub use batch::{VoxelEdit, VoxelEditBatch};
+ pub use cell::{

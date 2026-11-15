@@ -1,0 +1,621 @@
+commit 3366c48c36eb48c30613f9facffdf6e05b6f5b3d
+Author:     Timothy Schmidt <tim@ai.replimat.org>
+AuthorDate: Sun Nov 15 05:49:33 2026 -0500
+Commit:     Timothy Schmidt <tim@ai.replimat.org>
+CommitDate: Sun Nov 15 05:49:33 2026 -0500
+
+    feat(hypervoxel): retain exact sources in affine box enclosures
+
+diff --git a/crates/hyperlattice-interval/Cargo.toml b/crates/hyperlattice-interval/Cargo.toml
+index 86a426f4a..ec7add89c 100644
+--- a/crates/hyperlattice-interval/Cargo.toml
++++ b/crates/hyperlattice-interval/Cargo.toml
+@@ -16,6 +16,7 @@ all-features = true
+ [features]
+ default = []
+ fixed = ["hyperinterval/fixed"]
++hyperreal = ["dyadic", "hyperinterval/hyperreal"]
+ dyadic = ["hyperinterval/dyadic"]
+ rational = ["hyperinterval/rational"]
+ float-enclosure = ["hyperinterval/float-enclosure"]
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 3e2845ea5..0db77aa89 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -28,6 +28,8 @@ Build and test with `cargo test -p hyperlattice-interval --features fixed`.
+ No scalar backend is enabled by default. `fixed` and `float-enclosure` require
+ no allocator. `dyadic` uses allocation with explicit Hyperinterval work/size
+ accounting. `rational` enables Hyperreal, std and its Rust 1.95 requirement.
++`hyperreal` enables the native certified Real-to-dyadic conversion bridge,
++including std and the same Rust 1.95 requirement.
+ `serde` validates scalar endpoints, dimensions and fixed scales on replay.
+ 
+ Implemented: canonical empty/unit products, component hull/intersection and
+diff --git a/crates/hyperlattice/Cargo.toml b/crates/hyperlattice/Cargo.toml
+index a80579783..215343a57 100644
+--- a/crates/hyperlattice/Cargo.toml
++++ b/crates/hyperlattice/Cargo.toml
+@@ -37,6 +37,7 @@ arbitrary = ["dep:arbitrary"]
+ serde = ["dep:serde", "hyperreal/serde", "hyperlattice-interval?/serde"]
+ interval = ["dep:hyperlattice-interval"]
+ interval-fixed = ["interval", "hyperlattice-interval/fixed"]
++interval-hyperreal = ["interval", "hyperlattice-interval/hyperreal"]
+ interval-dyadic = ["interval", "hyperlattice-interval/dyadic"]
+ interval-rational = ["interval", "hyperlattice-interval/rational"]
+ interval-float-enclosure = ["interval", "hyperlattice-interval/float-enclosure"]
+diff --git a/crates/hyperlattice/README.md b/crates/hyperlattice/README.md
+index 97ef642ff..16ccaca88 100644
+--- a/crates/hyperlattice/README.md
++++ b/crates/hyperlattice/README.md
+@@ -354,6 +354,8 @@ requirements shared by the Hyper crates.
+ 
+ Enable `interval-fixed`, `interval-dyadic`, `interval-rational`, or
+ `interval-float-enclosure` for `IntervalVector`, `IntervalMatrix` and `BoxN`.
++`interval-hyperreal` additionally exposes certified exact-Real-to-dyadic
++conversion through the same scalar re-export.
+ These are Cartesian enclosures with explicit empty sets, checked scalar
+ arithmetic and shared dyadic budgets. Scalar backends are available under
+ `hyperlattice::interval::hyperinterval`. The same implementation is available
+diff --git a/crates/hypervoxel/Cargo.lock b/crates/hypervoxel/Cargo.lock
+index 781b5928c..9dbbe6177 100644
+--- a/crates/hypervoxel/Cargo.lock
++++ b/crates/hypervoxel/Cargo.lock
+@@ -2949,13 +2949,31 @@ dependencies = [
+  "smartstring",
+ ]
+ 
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "hyperlattice"
+ version = "0.7.0"
+ dependencies = [
++ "hyperlattice-interval",
+  "hyperreal",
+ ]
+ 
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
+ [[package]]
+ name = "hyperlimit"
+ version = "0.5.0"
+diff --git a/crates/hypervoxel/Cargo.toml b/crates/hypervoxel/Cargo.toml
+index 07808b7d1..2891aae61 100644
+--- a/crates/hypervoxel/Cargo.toml
++++ b/crates/hypervoxel/Cargo.toml
+@@ -41,10 +41,15 @@ proptest = "1.7.0"
+ 
+ [features]
+ default = []
++interval-enclosure = ["hyperlattice/interval-hyperreal"]
+ dispatch-trace = ["hyperreal/dispatch-trace"]
+ hypermesh-adapter = ["dep:hypermesh"]
+ legacy-voxelis = ["dep:voxelis", "dep:glam"]
+ 
++[[example]]
++name = "affine_enclosure"
++required-features = ["interval-enclosure"]
++
+ [[bench]]
+ name = "grid_frame"
+ harness = false
+diff --git a/crates/hypervoxel/README.md b/crates/hypervoxel/README.md
+index 0732ea3aa..9ccad4ff6 100644
+--- a/crates/hypervoxel/README.md
++++ b/crates/hypervoxel/README.md
+@@ -34,6 +34,20 @@ This README describes `hypervoxel` version `0.3.0`.
+ | `VoxelizationReport`, `VoxelPredicateCertificateReport` | Classification and exact-readiness evidence |
+ | `VoxelSideTables` | Material, field-sample, and process-state domain records |
+ 
++## Conservative transformed bounds
++
++The optional `interval-enclosure` feature adds
++`ExactAffineTransform::enclose_bounds`. It returns an immutable
++`AffineBoundsEnclosure` containing a certified dyadic Cartesian box and the
++original exact transform and source endpoints. It can succeed when exact term
++ordering is undecided. The box is conservative; it does not establish occupancy
++or the exact correlated image. Native conversion and lattice arithmetic share
++one dyadic budget, with Hyperreal refinement and exact clone/drop excluded.
++
++```sh
++cargo run --manifest-path crates/hypervoxel/Cargo.toml -p hypervoxel --features interval-enclosure --example affine_enclosure
++```
++
+ ## Install
+ 
+ ```toml
+diff --git a/crates/hypervoxel/examples/affine_enclosure.rs b/crates/hypervoxel/examples/affine_enclosure.rs
+new file mode 100644
+index 000000000..0b8095760
+--- /dev/null
++++ b/crates/hypervoxel/examples/affine_enclosure.rs
+@@ -0,0 +1,24 @@
++//! A conservative box with its exact source retained.
++use hyperlattice::interval::hyperinterval::DyadicBudget;
++use hyperreal::Real;
++use hypervoxel::{CellBounds, ExactAffineTransform};
++
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let transform = ExactAffineTransform::new(
++        [
++            [Real::from(2).sqrt()?, 0.into(), 0.into()],
++            [0.into(), 1.into(), 0.into()],
++            [0.into(), 0.into(), 1.into()],
++        ],
++        [3.into(), 0.into(), 0.into()],
++    );
++    let source = CellBounds {
++        min: [0.into(), 0.into(), 0.into()],
++        max: [1.into(), 1.into(), 1.into()],
++    };
++    let report =
++        transform.enclose_bounds(&source, -32, &mut DyadicBudget::new(4096, 10_000_000))?;
++    assert_eq!(report.source(), &source);
++    println!("conservative bounds: {:?}", report.bounds());
++    Ok(())
++}
+diff --git a/crates/hypervoxel/src/affine_enclosure.rs b/crates/hypervoxel/src/affine_enclosure.rs
+new file mode 100644
+index 000000000..f68f9e32a
+--- /dev/null
++++ b/crates/hypervoxel/src/affine_enclosure.rs
+@@ -0,0 +1,88 @@
++//! Conservative transformed boxes retaining their original exact definition.
++use hyperlattice::interval::hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice::{BoxN, IntervalMatrix, IntervalVector};
++
++use crate::{CellBounds, ExactAffineTransform, HypervoxelResult};
++
++/// Certified Cartesian enclosure of an exact affine image of a source box.
++///
++/// Source endpoints denote their coordinatewise closed hull, including reversed
++/// or singleton coordinates. The enclosure can contain points outside the exact
++/// correlated image. It does not establish occupancy, surface or topology.
++/// Original endpoints and transform remain immutable and authoritative.
++#[derive(Clone, Debug)]
++pub struct AffineBoundsEnclosure {
++    transform: ExactAffineTransform,
++    source: CellBounds,
++    precision: i32,
++    bounds: BoxN<DyadicInterval, 3>,
++}
++impl AffineBoundsEnclosure {
++    /// Original exact map, including any shared scalar expressions.
++    pub fn transform(&self) -> &ExactAffineTransform {
++        &self.transform
++    }
++    /// Original exact endpoint pairs, without rounding or reordered storage.
++    pub fn source(&self) -> &CellBounds {
++        &self.source
++    }
++    /// Requested scalar enclosure spacing exponent; not an output-width promise.
++    pub fn precision(&self) -> i32 {
++        self.precision
++    }
++    /// A containing Cartesian box, for conservative downstream queries.
++    pub fn bounds(&self) -> &BoxN<DyadicInterval, 3> {
++        &self.bounds
++    }
++}
++
++impl ExactAffineTransform {
++    /// Enclose the affine image without requiring exact term ordering.
++    ///
++    /// Outward scalar conversions and Cartesian matrix/vector operations share
++    /// one dyadic budget. All dimensions and loops are fixed at three. Native
++    /// scalar, size and work failures abort the report and retain their causes.
++    /// A later independent budget can retry. Hyperreal refinement, original
++    /// exact-value cloning/destruction and heap bytes retain the native budget's
++    /// exclusions; this is not a total-work or cancellation guarantee.
++    ///
++    /// This preserves the source rather than replacing it by rounded geometry.
++    /// Use `map_bounds` when exact corner extrema are required. Reversed source
++    /// endpoints denote their closed hull here, as in that exact construction.
++    /// Singular maps and singleton source boxes are valid.
++    pub fn enclose_bounds(
++        &self,
++        source: &CellBounds,
++        precision: i32,
++        budget: &mut DyadicBudget,
++    ) -> HypervoxelResult<AffineBoundsEnclosure> {
++        let mut lanes: [DyadicInterval; 3] = core::array::from_fn(|_| DyadicInterval::empty());
++        for (axis, lane) in lanes.iter_mut().enumerate() {
++            let a = DyadicInterval::from_real(&source.min[axis], precision, budget)?;
++            let b = DyadicInterval::from_real(&source.max[axis], precision, budget)?;
++            *lane = a.hull(&b, budget)?;
++        }
++        let source_box = IntervalVector::new(lanes)?;
++        let mut rows: [[DyadicInterval; 3]; 3] =
++            core::array::from_fn(|_| core::array::from_fn(|_| DyadicInterval::empty()));
++        for (row, values) in rows.iter_mut().enumerate() {
++            for (column, value) in values.iter_mut().enumerate() {
++                *value = DyadicInterval::from_real(&self.matrix[row][column], precision, budget)?;
++            }
++        }
++        let matrix = IntervalMatrix::new(rows)?;
++        let mut translation = core::array::from_fn(|_| DyadicInterval::empty());
++        for (axis, value) in translation.iter_mut().enumerate() {
++            *value = DyadicInterval::from_real(&self.translation[axis], precision, budget)?;
++        }
++        let bounds = matrix
++            .mul_vector(&source_box, budget)?
++            .add(&IntervalVector::new(translation)?, budget)?;
++        Ok(AffineBoundsEnclosure {
++            transform: self.clone(),
++            source: source.clone(),
++            precision,
++            bounds,
++        })
++    }
++}
+diff --git a/crates/hypervoxel/src/error.rs b/crates/hypervoxel/src/error.rs
+index 44fe496ea..20a1be52c 100644
+--- a/crates/hypervoxel/src/error.rs
++++ b/crates/hypervoxel/src/error.rs
+@@ -8,6 +8,9 @@ pub type HypervoxelResult<T> = Result<T, HypervoxelError>;
+ /// Validation failures surfaced before a grid can be treated as exact.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum HypervoxelError {
++    /// Native transformed-box enclosure failure with the original scalar cause.
++    #[cfg(feature = "interval-enclosure")]
++    IntervalEnclosure(hyperlattice::IntervalLatticeError),
+     /// A grid depth exceeded the current bounded integer address model.
+     DepthTooLarge { depth: u8, max_supported: u8 },
+     /// A grid cell axis was structurally non-positive.
+@@ -54,6 +57,8 @@ pub enum HypervoxelError {
+ impl fmt::Display for HypervoxelError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
++            #[cfg(feature = "interval-enclosure")]
++            Self::IntervalEnclosure(error) => write!(f, "affine enclosure: {error}"),
+             Self::DepthTooLarge {
+                 depth,
+                 max_supported,
+@@ -111,4 +116,26 @@ impl fmt::Display for HypervoxelError {
+     }
+ }
+ 
+-impl std::error::Error for HypervoxelError {}
++impl std::error::Error for HypervoxelError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        #[cfg(feature = "interval-enclosure")]
++        if let Self::IntervalEnclosure(error) = self {
++            return Some(error);
++        }
++        None
++    }
++}
++
++#[cfg(feature = "interval-enclosure")]
++impl From<hyperlattice::IntervalLatticeError> for HypervoxelError {
++    fn from(error: hyperlattice::IntervalLatticeError) -> Self {
++        Self::IntervalEnclosure(error)
++    }
++}
++
++#[cfg(feature = "interval-enclosure")]
++impl From<hyperlattice::interval::hyperinterval::IntervalError> for HypervoxelError {
++    fn from(error: hyperlattice::interval::hyperinterval::IntervalError) -> Self {
++        Self::IntervalEnclosure(error.into())
++    }
++}
+diff --git a/crates/hypervoxel/src/lib.rs b/crates/hypervoxel/src/lib.rs
+index b072a1d0e..5330a6085 100644
+--- a/crates/hypervoxel/src/lib.rs
++++ b/crates/hypervoxel/src/lib.rs
+@@ -18,6 +18,8 @@
+ mod aabb;
+ mod address;
+ mod affine;
++#[cfg(feature = "interval-enclosure")]
++mod affine_enclosure;
+ mod aggregate;
+ mod batch;
+ mod cell;
+@@ -67,6 +69,8 @@ mod voxelize;
+ pub use aabb::{ExactAabb3, GridAabbHandoff, LatticeAabbHandoff};
+ pub use address::{CellBounds, VoxelAddress};
+ pub use affine::ExactAffineTransform;
++#[cfg(feature = "interval-enclosure")]
++pub use affine_enclosure::AffineBoundsEnclosure;
+ pub use aggregate::{AggregateCertainty, VoxelAggregateFacts, VoxelOccupancyInterval};
+ pub use batch::{VoxelEdit, VoxelEditBatch};
+ pub use cell::{
+diff --git a/crates/hypervoxel/tests/affine_enclosures.rs b/crates/hypervoxel/tests/affine_enclosures.rs
+new file mode 100644
+index 000000000..68ee351cd
+--- /dev/null
++++ b/crates/hypervoxel/tests/affine_enclosures.rs
+@@ -0,0 +1,279 @@
++use hyperreal::Real;
++use hypervoxel::{CellBounds, ExactAffineTransform, HypervoxelError};
++
++#[test]
++fn finite_coefficient_can_have_undecided_exact_order() {
++    // Independent sine addition identity, deliberately outside the scalar
++    // normal form. Keep this fixture self-contained for packaged tests.
++    let zero = (Real::e() + Real::one()).sin()
++        - Real::e().sin() * Real::one().cos()
++        - Real::e().cos() * Real::one().sin();
++    assert!(zero.certified_dyadic_interval(-16).is_some());
++    let transform = ExactAffineTransform::new(
++        [
++            [zero, 0.into(), 0.into()],
++            [0.into(), 1.into(), 0.into()],
++            [0.into(), 0.into(), 1.into()],
++        ],
++        [0.into(), 0.into(), 0.into()],
++    );
++    let bounds = CellBounds {
++        min: [1.into(), 1.into(), 1.into()],
++        max: [2.into(), 2.into(), 2.into()],
++    };
++    assert!(matches!(
++        transform.map_bounds(&bounds),
++        Err(HypervoxelError::UnknownScalarOrdering {
++            field: "affine term order"
++        })
++    ));
++    #[cfg(feature = "interval-enclosure")]
++    {
++        use hyperlattice::interval::hyperinterval::{DyadicBudget, DyadicInterval};
++        let mut transform = transform;
++        transform.translation[0] = Real::from(3);
++        let source = bounds;
++        let mut arithmetic = DyadicBudget::new(4096, 1_000_000_000);
++        let result = transform
++            .enclose_bounds(&source, -16, &mut arithmetic)
++            .unwrap();
++        let lanes = result.bounds().lanes().unwrap();
++        // The exact x image is {3}; its certified enclosure can be wider.
++        assert!(
++            DyadicInterval::new(3.into(), 3.into(), 0)
++                .unwrap()
++                .subset_of(&lanes[0], &mut arithmetic)
++                .unwrap()
++        );
++        assert!(
++            lanes[0]
++                .subset_of(
++                    &DyadicInterval::new(2.into(), 4.into(), 0).unwrap(),
++                    &mut arithmetic
++                )
++                .unwrap()
++        );
++        assert_eq!(
++            lanes[1],
++            DyadicInterval::new(1.into(), 2.into(), 0).unwrap()
++        );
++        assert_eq!(
++            lanes[2],
++            DyadicInterval::new(1.into(), 2.into(), 0).unwrap()
++        );
++        assert_eq!(result.precision(), -16);
++    }
++}
++
++#[cfg(feature = "interval-enclosure")]
++mod native {
++    use super::*;
++    use hyperlattice::interval::hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
++    use hyperlattice::{IntervalLatticeError, IntervalMatrix, IntervalVector};
++
++    fn budget() -> DyadicBudget {
++        DyadicBudget::new(4096, 1_000_000_000)
++    }
++    fn interval(lo: i64, hi: i64, exponent: i32) -> DyadicInterval {
++        DyadicInterval::new(lo.into(), hi.into(), exponent).unwrap()
++    }
++    fn unit() -> CellBounds {
++        CellBounds {
++            min: [0.into(), 0.into(), 0.into()],
++            max: [1.into(), 1.into(), 1.into()],
++        }
++    }
++
++    #[test]
++    fn generated_integer_maps_match_independent_corner_extrema() {
++        for seed in -8_i64..=8 {
++            let coefficients = core::array::from_fn::<_, 3, _>(|r| {
++                core::array::from_fn::<_, 3, _>(|c| (seed + 3 * r as i64 - 2 * c as i64) % 5)
++            });
++            let translation = [seed, -seed, 2 * seed];
++            let lo = [-3, 1, -2];
++            let hi = [2, 4, 5];
++            let transform = ExactAffineTransform::new(
++                coefficients.map(|row| row.map(Real::from)),
++                translation.map(Real::from),
++            );
++            let source = CellBounds {
++                min: lo.map(Real::from),
++                max: hi.map(Real::from),
++            };
++            let result = transform.enclose_bounds(&source, 0, &mut budget()).unwrap();
++            for axis in 0..3 {
++                let values: Vec<i64> = (0..8)
++                    .map(|corner| {
++                        translation[axis]
++                            + (0..3)
++                                .map(|j| {
++                                    coefficients[axis][j]
++                                        * if corner & (1 << j) == 0 { lo[j] } else { hi[j] }
++                                })
++                                .sum::<i64>()
++                    })
++                    .collect();
++                assert_eq!(
++                    result.bounds().lanes().unwrap()[axis],
++                    interval(
++                        *values.iter().min().unwrap(),
++                        *values.iter().max().unwrap(),
++                        0
++                    ),
++                    "seed {seed}, axis {axis}"
++                );
++            }
++            let reversed = CellBounds {
++                min: source.max.clone(),
++                max: source.min.clone(),
++            };
++            assert_eq!(
++                transform
++                    .enclose_bounds(&reversed, 0, &mut budget())
++                    .unwrap()
++                    .bounds(),
++                result.bounds()
++            );
++            assert_eq!(result.source(), &source);
++        }
++    }
++
++    #[test]
++    fn rational_algebraic_and_singular_images_keep_exact_sources() {
++        let q = Real::from(hyperreal::Rational::fraction(1, 3).unwrap());
++        let sqrt2 = Real::from(2).sqrt().unwrap();
++        let transform = ExactAffineTransform::new(
++            [
++                [sqrt2.clone(), 0.into(), 0.into()],
++                [0.into(), q.clone(), 0.into()],
++                [0.into(), 0.into(), 0.into()],
++            ],
++            [0.into(), 0.into(), q.clone()],
++        );
++        let result = transform
++            .enclose_bounds(&unit(), -12, &mut budget())
++            .unwrap();
++        let a = result.bounds().lanes().unwrap();
++        // 5792^2 < 2*4096^2 < 5793^2 and 1365/4096 < 1/3 < 1366/4096.
++        // Hyperreal's certified enclosure need not be the tightest grid hull.
++        // The independently squared rational upper bound encloses sqrt(2).
++        assert!(
++            interval(0, 5793, -12)
++                .subset_of(&a[0], &mut budget())
++                .unwrap()
++        );
++        assert!(a[0].subset_of(&interval(0, 3, -1), &mut budget()).unwrap());
++        assert_eq!(a[1], interval(0, 1366, -12));
++        assert_eq!(a[2], interval(1365, 1366, -12));
++        assert_eq!(result.transform().matrix[0][0], sqrt2);
++        assert_eq!(result.transform().translation[2], q);
++        let point = CellBounds {
++            min: [0.into(), 0.into(), 0.into()],
++            max: [0.into(), 0.into(), 0.into()],
++        };
++        assert_eq!(
++            transform
++                .enclose_bounds(&point, -12, &mut budget())
++                .unwrap()
++                .bounds()
++                .lanes()
++                .unwrap()[0],
++            interval(0, 0, 0)
++        );
++    }
++
++    #[test]
++    fn retained_definition_is_immutable_and_output_is_composable() {
++        let mut transform = ExactAffineTransform::identity();
++        let mut source = unit();
++        let result = transform.enclose_bounds(&source, 0, &mut budget()).unwrap();
++        transform.translation[0] = 50.into();
++        source.min[0] = 25.into();
++        assert_eq!(result.source(), &unit());
++        assert_eq!(result.transform().translation[0], Real::zero());
++        let map = IntervalMatrix::new([
++            [interval(1, 1, 0), interval(-2, -2, 0), interval(0, 0, 0)],
++            [interval(0, 0, 0), interval(1, 1, 0), interval(0, 0, 0)],
++            [interval(0, 0, 0), interval(0, 0, 0), interval(0, 0, 0)],
++        ])
++        .unwrap();
++        let next = map
++            .mul_vector(result.bounds(), &mut budget())
++            .unwrap()
++            .add(
++                &IntervalVector::new([interval(3, 3, 0), interval(0, 0, 0), interval(7, 7, 0)])
++                    .unwrap(),
++                &mut budget(),
++            )
++            .unwrap();
++        assert_eq!(
++            next.lanes().unwrap(),
++            &[interval(1, 4, 0), interval(0, 1, 0), interval(7, 7, 0)]
++        );
++    }
++
++    #[test]
++    fn budget_failures_preserve_typed_causes_and_independent_retry() {
++        let transform = ExactAffineTransform::identity();
++        let mut ample = budget();
++        let start = ample.remaining_work();
++        let expected = transform.enclose_bounds(&unit(), -16, &mut ample).unwrap();
++        let used = start - ample.remaining_work();
++        let mut exact = DyadicBudget::new(4096, used);
++        assert_eq!(
++            transform
++                .enclose_bounds(&unit(), -16, &mut exact)
++                .unwrap()
++                .bounds(),
++            expected.bounds()
++        );
++        assert_eq!(exact.remaining_work(), 0);
++        let error = transform
++            .enclose_bounds(&unit(), -16, &mut DyadicBudget::new(4096, used - 1))
++            .unwrap_err();
++        assert!(matches!(
++            error,
++            HypervoxelError::IntervalEnclosure(IntervalLatticeError::Scalar(
++                IntervalError::WorkExhausted
++            ))
++        ));
++        assert!(
++            std::error::Error::source(&error)
++                .unwrap()
++                .source()
++                .is_some()
++        );
++        assert!(matches!(
++            transform.enclose_bounds(&unit(), i32::MIN, &mut budget()),
++            Err(HypervoxelError::IntervalEnclosure(
++                IntervalLatticeError::Scalar(IntervalError::SizeExhausted)
++            ))
++        ));
++        assert_eq!(
++            transform
++                .enclose_bounds(&unit(), -16, &mut budget())
++                .unwrap()
++                .bounds(),
++            expected.bounds()
++        );
++    }
++
++    #[test]
++    fn fresh_process_reconstructs_the_definition_and_bounds() {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "native::rational_algebraic_and_singular_images_keep_exact_sources",
++                "--nocapture",
++            ])
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
++    }
++}
