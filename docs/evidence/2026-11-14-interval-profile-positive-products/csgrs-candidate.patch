@@ -1,0 +1,469 @@
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 1296048ff..eef2e39a8 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -83,7 +83,7 @@ pub use integer_quotient::integer_quotient_bounds;
+ #[cfg(feature = "float-proposal")]
+ pub use proposal::{F32ProposalInterval, F64ProposalInterval};
+ #[cfg(feature = "rational")]
+-pub use rational::RationalInterval;
++pub use rational::{PositiveRationalInterval, RationalInterval};
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ pub use rational_admission::RationalArithmetic;
+ #[cfg(feature = "real-ball")]
+diff --git a/crates/hyperinterval/src/rational.rs b/crates/hyperinterval/src/rational.rs
+index 03bb89ea3..542a50da1 100644
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -2,6 +2,9 @@ use crate::bounds::Bounds;
+ use crate::{IntervalError, SignSet};
+ use hyperreal::Rational;
+ 
++mod positive;
++pub use positive::PositiveRationalInterval;
++
+ /// An exact closed real interval with rational endpoints, or the empty set.
+ ///
+ /// Arithmetic uses Hyperreal's arbitrary-precision rationals. It has no implicit
+@@ -40,7 +43,31 @@ impl RationalInterval {
+         if uncertainty.is_negative() {
+             return Err(IntervalError::NegativeRadius);
+         }
+-        Ok(Self::ordered(nominal - uncertainty, nominal + uncertainty))
++        Ok(Self::centered(nominal, uncertainty))
++    }
++
++    /// The exact set `nominal ± numerator/denominator` with nonnegative uncertainty.
++    ///
++    /// The input types establish nonnegativity and exclude division by zero.
++    /// Scalar construction diagnostics retain [`hyperreal::Problem`]. No sign
++    /// predicate is repeated on the converted uncertainty.
++    #[inline]
++    pub fn from_nominal_unsigned_uncertainty(
++        nominal: &Rational,
++        numerator: u64,
++        denominator: core::num::NonZeroU64,
++    ) -> Result<Self, hyperreal::Problem> {
++        let uncertainty = if let Ok(numerator) = i64::try_from(numerator) {
++            Rational::fraction(numerator, denominator.get())?
++        } else {
++            Rational::from(numerator) / Rational::from(denominator.get())
++        };
++        Ok(Self::centered(nominal, &uncertainty))
++    }
++
++    // Both callers establish nonnegative uncertainty before endpoint arithmetic.
++    fn centered(nominal: &Rational, uncertainty: &Rational) -> Self {
++        Self::ordered(nominal - uncertainty, nominal + uncertainty)
+     }
+ 
+     // Every caller proves ordering from already ordered inputs.
+diff --git a/crates/hyperinterval/src/rational/positive.rs b/crates/hyperinterval/src/rational/positive.rs
+new file mode 100644
+index 000000000..dae2bc0a9
+--- /dev/null
++++ b/crates/hyperinterval/src/rational/positive.rs
+@@ -0,0 +1,89 @@
++//! Retained nonempty positivity for monotone rational interval arithmetic.
++use super::{Bounds, IntervalError, Rational, RationalInterval};
++
++/// A nonempty exact rational interval whose lower endpoint is strictly positive.
++///
++/// Construction validates this refinement once. Products and quotients preserve
++/// it algebraically and do not repeat sign predicates. This is a specialization;
++/// the general [`RationalInterval`] retains its empty and signed domains.
++/// Arbitrary-precision arithmetic has the same resource exclusions as that type.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct PositiveRationalInterval {
++    bounds: Bounds<Rational>,
++}
++
++impl RationalInterval {
++    /// Refine a nonempty interval to a retained strict-positivity proof.
++    ///
++    /// Empty is [`IntervalError::EmptyDomain`]; a nonpositive lower endpoint is
++    /// [`IntervalError::NonPositiveLowerBound`]. The lower bound is compared to
++    /// exact zero once, preserving this decision separately from sign-bit tests.
++    pub fn into_positive(self) -> Result<PositiveRationalInterval, IntervalError> {
++        let bounds = self.bounds.ok_or(IntervalError::EmptyDomain)?;
++        if bounds.as_refs().endpoints().0 <= &Rational::zero() {
++            return Err(IntervalError::NonPositiveLowerBound);
++        }
++        Ok(PositiveRationalInterval { bounds })
++    }
++}
++
++impl PositiveRationalInterval {
++    /// Borrow the exact ordered endpoints of this nonempty interval.
++    pub fn bounds(&self) -> (&Rational, &Rational) {
++        self.bounds.as_refs().endpoints()
++    }
++
++    /// Transfer the exact endpoints without cloning or revalidation.
++    pub fn into_bounds(self) -> (Rational, Rational) {
++        self.bounds.endpoints()
++    }
++
++    /// Return the same set in the general interval carrier without revalidation.
++    pub fn into_interval(self) -> RationalInterval {
++        RationalInterval {
++            bounds: Some(self.bounds),
++        }
++    }
++
++    /// Exact product of a finite sequence of positive interval sets.
++    ///
++    /// Zero factors give `[1,1]`; one factor is copied. Otherwise lower products
++    /// run in input order, followed by upper products in input order. No sign
++    /// predicate or extra multiplication by one is performed. Input factors are
++    /// independently ranged; repeated references do not assert correlation.
++    pub fn product(factors: &[&Self]) -> Self {
++        let Some((first, rest)) = factors.split_first() else {
++            return Self {
++                bounds: Bounds::point(Rational::one()),
++            };
++        };
++        let Some((second, tail)) = rest.split_first() else {
++            return (*first).clone();
++        };
++        let lower = tail
++            .iter()
++            .fold(first.bounds().0 * second.bounds().0, |value, factor| {
++                value * factor.bounds().0
++            });
++        let upper = tail
++            .iter()
++            .fold(first.bounds().1 * second.bounds().1, |value, factor| {
++                value * factor.bounds().1
++            });
++        Self {
++            bounds: Bounds::ordered(lower, upper),
++        }
++    }
++
++    /// Exact quotient by a positive interval, retaining the nonempty proof.
++    ///
++    /// The divisor's positive lower endpoint excludes zero. The numerator is
++    /// consumed; lower/upper divisions run in that order with no new predicates.
++    pub fn quotient(self, divisor: &Self) -> Self {
++        let (lower, upper) = self.into_bounds();
++        let (denominator_lower, denominator_upper) = divisor.bounds();
++        Self {
++            bounds: Bounds::ordered(lower / denominator_upper, upper / denominator_lower),
++        }
++    }
++}
+diff --git a/crates/hyperinterval/tests/positive_product_chain.rs b/crates/hyperinterval/tests/positive_product_chain.rs
+new file mode 100644
+index 000000000..c1a021d3c
+--- /dev/null
++++ b/crates/hyperinterval/tests/positive_product_chain.rs
+@@ -0,0 +1,230 @@
++#![cfg(feature = "rational")]
++
++use hyperinterval::{IntervalError, PositiveRationalInterval, RationalInterval};
++use hyperreal::Rational;
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/rational_oracle.rs"]
++mod rational_oracle;
++
++#[test]
++fn retained_positive_product_and_quotient_consumes_generated_results() {
++    let first = RationalInterval::new(Rational::from(2), Rational::from(3))
++        .unwrap()
++        .into_positive()
++        .unwrap();
++    let second = RationalInterval::new(Rational::from(5), Rational::from(7))
++        .unwrap()
++        .into_positive()
++        .unwrap();
++    let result = PositiveRationalInterval::product(&[&first, &second]).quotient(&first);
++    assert_eq!(
++        result.bounds(),
++        (
++            &(Rational::from(10) / Rational::from(3)),
++            &(Rational::from(21) / Rational::from(2))
++        )
++    );
++    assert_eq!(
++        PositiveRationalInterval::product(&[]).into_bounds(),
++        (Rational::one(), Rational::one())
++    );
++    assert_eq!(PositiveRationalInterval::product(&[&result]), result);
++    assert_eq!(
++        RationalInterval::empty().into_positive(),
++        Err(IntervalError::EmptyDomain)
++    );
++    assert_eq!(
++        RationalInterval::point(Rational::zero()).into_positive(),
++        Err(IntervalError::NonPositiveLowerBound)
++    );
++}
++
++#[test]
++fn four_factor_transmission_chain_matches_independent_integer_extrema() {
++    for a in 1_i64..=5 {
++        for b in 1_i64..=5 {
++            for c in 1_i64..=5 {
++                for d in 1_i64..=5 {
++                    let numerators = [a, b, c, d];
++                    let denominators = [2_u64, 3, 5, 7];
++                    let factors: [_; 4] = std::array::from_fn(|i| {
++                        RationalInterval::new(
++                            Rational::fraction(numerators[i], denominators[i]).unwrap(),
++                            Rational::fraction(numerators[i] + 1, denominators[i]).unwrap(),
++                        )
++                        .unwrap()
++                        .into_positive()
++                        .unwrap()
++                    });
++                    let divisor = RationalInterval::new(
++                        Rational::fraction(11, 13).unwrap(),
++                        Rational::fraction(17, 13).unwrap(),
++                    )
++                    .unwrap()
++                    .into_positive()
++                    .unwrap();
++                    let result =
++                        PositiveRationalInterval::product(&factors.each_ref()).quotient(&divisor);
++                    let mut extrema = Vec::new();
++                    for corner in 0..16 {
++                        let product: i64 = numerators
++                            .iter()
++                            .enumerate()
++                            .map(|(i, n)| n + ((corner >> i) & 1))
++                            .product();
++                        extrema.push(product);
++                    }
++                    let lower =
++                        Rational::fraction(*extrema.iter().min().unwrap() * 13, 210 * 17).unwrap();
++                    let upper =
++                        Rational::fraction(*extrema.iter().max().unwrap() * 13, 210 * 11).unwrap();
++                    assert_eq!(result.bounds(), (&lower, &upper));
++                    assert_eq!(
++                        result.clone().into_interval().into_positive().unwrap(),
++                        result
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn refinement_rejects_empty_nonpositive_and_reversed_inputs() {
++    for (lo, hi) in [(-7, -3), (-7, 3), (0, 0), (0, 7)] {
++        assert_eq!(
++            RationalInterval::new(Rational::from(lo), Rational::from(hi))
++                .unwrap()
++                .into_positive(),
++            Err(IntervalError::NonPositiveLowerBound)
++        );
++    }
++    assert_eq!(
++        RationalInterval::empty().into_positive(),
++        Err(IntervalError::EmptyDomain)
++    );
++    assert_eq!(
++        RationalInterval::new(Rational::from(2), Rational::from(1)),
++        Err(IntervalError::ReversedEndpoints)
++    );
++    // The general empty carrier and its arithmetic retain their existing domain.
++    assert!(
++        RationalInterval::empty()
++            .positive_product(&RationalInterval::point(Rational::one()))
++            .unwrap()
++            .is_empty()
++    );
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn arbitrary_rational_coefficients_match_independent_gmp_products() {
++    let large: Rational = format!("1{}7/91", "0".repeat(1200)).parse().unwrap();
++    let values = [
++        large.clone(),
++        Rational::fraction(11, 13).unwrap(),
++        Rational::fraction(7, 29).unwrap(),
++        large,
++    ];
++    let factors = values.each_ref().map(|lower| {
++        RationalInterval::new(lower.clone(), lower + Rational::one())
++            .unwrap()
++            .into_positive()
++            .unwrap()
++    });
++    let product = PositiveRationalInterval::product(&factors.each_ref());
++    let actual = product.quotient(&factors[2]);
++    let mut expected_lower = rug::Rational::from(1);
++    let mut expected_upper = rug::Rational::from(1);
++    for factor in &factors {
++        expected_lower *= rational_oracle::mpq(factor.bounds().0);
++        expected_upper *= rational_oracle::mpq(factor.bounds().1);
++    }
++    expected_lower /= rational_oracle::mpq(factors[2].bounds().1);
++    expected_upper /= rational_oracle::mpq(factors[2].bounds().0);
++    assert_eq!(rational_oracle::mpq(actual.bounds().0), expected_lower);
++    assert_eq!(rational_oracle::mpq(actual.bounds().1), expected_upper);
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn retained_proof_chain_preserves_original_dispatch_in_fresh_processes() {
++    use hyperreal::dispatch_trace;
++    const KEY: &str = "POSITIVE_PRODUCT_TRACE_SIDE";
++    const TEST: &str = "retained_proof_chain_preserves_original_dispatch_in_fresh_processes";
++    if let Ok(side) = std::env::var(KEY) {
++        assert!(side == "original" || side == "shared");
++        for large in [false, true] {
++            let offset: Rational = if large {
++                "123456789012345678901234567890123456789/9876543210987654321"
++                    .parse()
++                    .unwrap()
++            } else {
++                Rational::zero()
++            };
++            let input: [_; 5] = std::array::from_fn(|i| {
++                RationalInterval::new(
++                    &offset + Rational::fraction(2 * i as i64 + 1, 13).unwrap(),
++                    &offset + Rational::fraction(2 * i as i64 + 2, 13).unwrap(),
++                )
++                .unwrap()
++            });
++            for warm in [false, true] {
++                dispatch_trace::reset();
++                dispatch_trace::reset_rational_stats();
++                let result = dispatch_trace::with_recording(|| {
++                    let owned = input.clone();
++                    if side == "original" {
++                        for factor in &owned {
++                            let nonpositive = factor.lower().unwrap() <= &Rational::zero();
++                            assert!(!nonpositive, "positive source");
++                        }
++                        let [a, b, c, d, e] = owned;
++                        let lower = a.lower().unwrap()
++                            * b.lower().unwrap()
++                            * c.lower().unwrap()
++                            * d.lower().unwrap();
++                        let upper = a.upper().unwrap()
++                            * b.upper().unwrap()
++                            * c.upper().unwrap()
++                            * d.upper().unwrap();
++                        (lower / e.upper().unwrap(), upper / e.lower().unwrap())
++                    } else {
++                        let factors = owned.map(|factor| factor.into_positive().unwrap());
++                        PositiveRationalInterval::product(&factors.each_ref()[..4])
++                            .quotient(&factors[4])
++                            .into_bounds()
++                    }
++                });
++                println!(
++                    "TRACE large={large} warm={warm} {:?} {result:?}",
++                    dispatch_trace::take_trace()
++                );
++            }
++        }
++        return;
++    }
++    let run = |side| {
++        let child = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", TEST, "--nocapture"])
++            .env(KEY, side)
++            .output()
++            .unwrap();
++        assert!(
++            child.status.success(),
++            "{}",
++            String::from_utf8_lossy(&child.stderr)
++        );
++        String::from_utf8(child.stdout)
++            .unwrap()
++            .lines()
++            .filter(|line| line.starts_with("TRACE "))
++            .map(str::to_owned)
++            .collect::<Vec<_>>()
++    };
++    let original = run("original");
++    let shared = run("shared");
++    assert_eq!(original.len(), 4);
++    assert_eq!(shared, original);
++}
+diff --git a/crates/hyperinterval/tests/fraction_uncertainty.rs b/crates/hyperinterval/tests/fraction_uncertainty.rs
+new file mode 100644
+index 000000000..15c029ea0
+--- /dev/null
++++ b/crates/hyperinterval/tests/fraction_uncertainty.rs
+@@ -0,0 +1,72 @@
++#![cfg(feature = "rational")]
++
++use core::num::NonZeroU64;
++use hyperinterval::{IntervalError, RationalInterval as I};
++use hyperreal::Rational as R;
++
++#[test]
++fn fraction_uncertainty_has_independent_exact_endpoints_and_composes() {
++    for n in -8..=8_i64 {
++        for d in 1..=7_u64 {
++            for radius in 0..=8_i64 {
++                for scale in 1..=7_u64 {
++                    let nominal = R::fraction(n, d).unwrap();
++                    let interval = I::from_nominal_unsigned_uncertainty(
++                        &nominal,
++                        radius as u64,
++                        NonZeroU64::new(scale).unwrap(),
++                    )
++                    .unwrap();
++                    let low = R::fraction(n * scale as i64 - radius * d as i64, d * scale).unwrap();
++                    let high =
++                        R::fraction(n * scale as i64 + radius * d as i64, d * scale).unwrap();
++                    assert_eq!(interval.bounds(), Some((&low, &high)));
++                    assert!(interval.contains_point(&nominal));
++                    assert_eq!(interval.add(&interval.neg()).lower(), Some(&(&low - &high)));
++                    assert_eq!(interval.width(), Some(high - low));
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn unsigned_radius_covers_full_width_and_signed_radius_stays_checked() {
++    for numerator in [0, 1, 2, 17, i64::MAX as u64, 1_u64 << 63, u64::MAX] {
++        for denominator in [1, 2, 17, 1_u64 << 63, u64::MAX] {
++            let radius: R = format!("{numerator}/{denominator}").parse().unwrap();
++            let interval = I::from_nominal_unsigned_uncertainty(
++                &R::one(),
++                numerator,
++                NonZeroU64::new(denominator).unwrap(),
++            )
++            .unwrap();
++            let original = I::from_nominal_uncertainty(&R::one(), &radius).unwrap();
++            assert_eq!(interval, original);
++            assert_eq!(format!("{interval:?}"), format!("{original:?}"));
++            assert_eq!(interval.width(), Some(&radius + &radius));
++        }
++    }
++    assert_eq!(
++        I::from_nominal_uncertainty(&R::one(), &R::from(-1)),
++        Err(IntervalError::NegativeRadius)
++    );
++}
++
++#[test]
++fn arbitrary_nominal_and_large_fraction_remain_exact() {
++    let nominal: R = format!("1{}7", "0".repeat(1200)).parse().unwrap();
++    let interval = I::from_nominal_unsigned_uncertainty(
++        &nominal,
++        i64::MAX as u64,
++        NonZeroU64::new(u64::MAX).unwrap(),
++    )
++    .unwrap();
++    let radius = R::fraction(i64::MAX, u64::MAX).unwrap();
++    assert_eq!(interval.lower(), Some(&(&nominal - &radius)));
++    assert_eq!(interval.upper(), Some(&(&nominal + &radius)));
++    assert_eq!(
++        I::from_nominal_unsigned_uncertainty(&nominal, 0, NonZeroU64::new(17).unwrap()).unwrap(),
++        I::point(nominal)
++    );
++}

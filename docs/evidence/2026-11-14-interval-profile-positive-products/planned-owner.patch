@@ -1,0 +1,45 @@
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -1,6 +1,9 @@
+ use crate::bounds::Bounds;
+ use crate::{IntervalError, SignSet};
+ use hyperreal::Rational;
++
++mod positive;
++pub use positive::PositiveRationalInterval;
+ 
+ /// An exact closed real interval with rational endpoints, or the empty set.
+ ///
+@@ -40,7 +43,31 @@
+         if uncertainty.is_negative() {
+             return Err(IntervalError::NegativeRadius);
+         }
+-        Ok(Self::ordered(nominal - uncertainty, nominal + uncertainty))
++        Ok(Self::centered(nominal, uncertainty))
++    }
++
++    /// The exact set `nominal ± numerator/denominator` with nonnegative uncertainty.
++    ///
++    /// The input types establish nonnegativity and exclude division by zero.
++    /// Scalar construction diagnostics retain [`hyperreal::Problem`]. No sign
++    /// predicate is repeated on the converted uncertainty.
++    #[inline]
++    pub fn from_nominal_unsigned_uncertainty(
++        nominal: &Rational,
++        numerator: u64,
++        denominator: core::num::NonZeroU64,
++    ) -> Result<Self, hyperreal::Problem> {
++        let uncertainty = if let Ok(numerator) = i64::try_from(numerator) {
++            Rational::fraction(numerator, denominator.get())?
++        } else {
++            Rational::from(numerator) / Rational::from(denominator.get())
++        };
++        Ok(Self::centered(nominal, &uncertainty))
++    }
++
++    // Both callers establish nonnegative uncertainty before endpoint arithmetic.
++    fn centered(nominal: &Rational, uncertainty: &Rational) -> Self {
++        Self::ordered(nominal - uncertainty, nominal + uncertainty)
+     }
+ 
+     // Every caller proves ordering from already ordered inputs.
