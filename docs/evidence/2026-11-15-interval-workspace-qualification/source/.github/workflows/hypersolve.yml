@@ -1,0 +1,120 @@
+name: hypersolve
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "crates/hypersolve/**"
+      - "crates/hyperinterval/**"
+      - "crates/hyperlattice/**"
+      - "crates/hyperlimit/**"
+      - "crates/hyperreal/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/hypersolve.yml"
+  pull_request:
+    paths:
+      - "crates/hypersolve/**"
+      - "crates/hyperinterval/**"
+      - "crates/hyperlattice/**"
+      - "crates/hyperlimit/**"
+      - "crates/hyperreal/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/hypersolve.yml"
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  HYPERSOLVE_SKIP_BENCHMARK_REPORTS: "1"
+
+defaults:
+  run:
+    working-directory: crates/hypersolve
+
+jobs:
+  quality:
+    name: Tests, representations, fuzz build, lint, and docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Check formatting
+        run: |
+          cargo fmt -- --check
+          rustfmt --edition 2024 --check fuzz/fuzz_targets/hyperreal_representations.rs
+
+      - name: Check every target
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Test without features
+        run: cargo test --locked --no-default-features
+
+      - name: Test all targets and features
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Test every Real representation and cache layout
+        run: scripts/representation_coverage.sh
+
+      - name: Check steady-state allocation lifetimes
+        env:
+          HYPERSOLVE_ALLOCATION_ITERATIONS: "4"
+        run: scripts/allocation_profile.sh
+
+      - name: Compile sanitizer fuzz targets
+        run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
+
+      - name: Lint the Real-representation fuzz target
+        run: >-
+          cargo clippy --locked --manifest-path fuzz/Cargo.toml
+          --bin hyperreal_representations -- -D warnings
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+  coverage:
+    name: Production line coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust with LLVM coverage tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: crates/hypersolve -> target/coverage
+
+      - name: Enforce production coverage threshold
+        run: scripts/coverage.sh
