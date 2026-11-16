@@ -1,0 +1,129 @@
+commit 182b9d072c28d3121e99228d5b21e09f2446e1d5
+Author:     Timothy Schmidt <tim@ai.replimat.org>
+AuthorDate: Sun Nov 15 23:35:18 2026 -0500
+Commit:     Timothy Schmidt <tim@ai.replimat.org>
+CommitDate: Sun Nov 15 23:35:18 2026 -0500
+
+    docs(interval): audit clock ownership and counter publication
+
+diff --git a/docs/research/firmware-clock-interval-audit.md b/docs/research/firmware-clock-interval-audit.md
+new file mode 100644
+index 000000000..608792a61
+--- /dev/null
++++ b/docs/research/firmware-clock-interval-audit.md
+@@ -0,0 +1,89 @@
++# Firmware clock interval ownership and publication
++
++This Phase 0/9 audit covers the clock interval path at firmware commit
++`2d68e82b7341db7b747b20e4ad1455a4c1113a00`, source `crates/alumina-clock/src/lib.rs`,
++SHA-256 `343434a6947fcf91aef655cba8e36a4788d03d43b7dee9bc063ae1512e94fa50`. It updates two old lexical clock inventory rows
++and adds eleven omitted state/report/operation declarations. The other 50 original
++firmware candidates remain unreviewed in the inventory. This is not completion
++of the firmware audit, migration, HIL qualification or interval plan.
++
++## Authority and ownership
++
++`ClockEstimator` stores a boot-scoped affine outer envelope: `u128` scaled rate
++bounds, `i128` scaled offset bounds, and exact integer timestamps/cycle counts.
++It is a fixed-size `Copy` value with no allocation. `alumina-clock` is `no_std`
++and enables Hyperinterval's integer feature; no arbitrary-precision backend is
++needed. Model and prediction structs have no serde or native replay codec.
++Canonical heartbeat inputs retain their checked wire representation. Rebuilding
++the model from accepted observations establishes the envelope; a copied midpoint
++or serialized status is not a substitute for that evidence.
++
++| Declaration | Retained domain role / generic owner |
++| --- | --- |
++| `ClockEstimationPolicy` | Clock-specific drift, round-trip, freshness, sample-count and deadline constraints |
++| `ClockEstimator` | Causal intersection, boot/sample identity, health/deadline evidence and publication |
++| `ClockPrediction` | Future-start enclosure and admitted integer schedule; selected point retains its bounds |
++| `ClockInstantEstimate` | Instant enclosure; midpoint is a display representative |
++| `ClockUiEstimate` | Inverse-cycle enclosure with original cycle and boot/probe identity |
++| `observe` | Validates heartbeat and sequence, constructs causal sample, delegates offset intersection to `IntegerRange`, publishes atomically |
++| `predict` | Checks health/freshness and host/device lead/horizon; delegates integer midpoint/radius |
++| `estimate_at` | Retains instant/freshness semantics without claiming future-start admission |
++| `estimate_ui_for_cycle_interval` | Validates ordered cycle inputs and inverse uncertainty; delegates midpoint/radius |
++| `cycle_bounds` | Uses `IntegerRange` scaling/addition and `integer_quotient_bounds`; retains units and checked narrowing |
++| `earliest_ui_for_cycle` | Uses upper rate/offset and directed integer quotient; retains nonnegative browser-time domain |
++| `latest_ui_for_cycle` | Uses lower rate/offset and directed integer quotient; retains checked output conversion |
++| `scaled_offset` | Checked exact point arithmetic in clock units, not a generic interval implementation |
++
++The declarations above and complete estimator implementation were reviewed.
++Selected consumers were read at Interface `f5341f368`: client
++`DeviceClockModel::accept_response`, prediction/inverse wrappers, and browser
++clock qualification/lease-estimate consumption. The distributed simulator's
++clock fixture and prediction consumer were reviewed. This does not claim an
++exhaustive transitive call graph or a review of every firmware byte/storage
++range matched by the original lexical scan.
++
++## Reproduced failure and repair
++
++At the accepted-sample counter limit, `observe` previously returned `Arithmetic`
++after assigning the new sample's identity, timestamps and other model fields.
++The regression reproduces this on `b9ecf8df5`: the failed observation changes
++sample 2's metadata to sample 3 while the accepted counter stays at its maximum.
++The client publishes its latest heartbeat only after `observe` succeeds, so
++partial estimator publication violates the boundary between those owners.
++
++The fix computes the prospective accepted count after existing validation and
++intersection, before the first state assignment. It preserves the last legal
++increment, earlier rejection ordering, existing typed error and diagnostic
++rejection-counter semantics. It does not saturate the count or accept overflow.
++The regression checks the whole estimator, published estimate, repeated failure,
++earlier boot validation, and reset/reconstruction. It sets the private counter
++to the boundary to avoid billions of otherwise ordinary exchanges; this is not
++a full-duration endurance test.
++
++## Reproduced qualification
++
++Rust 1.88 passes all 602 native firmware tests/doctests (55 suites), strict
++all-target Clippy and workspace formatting. The isolated Interface client passes
++90 tests/doctests (3 suites) on Rust 1.95 and its WASM check. The clock crate builds
++for WASM and Thumb with Rust 1.88, and Xtensa ESP32 with the installed ESP Rust
++1.90 toolchain. Existing canonical heartbeat tests remain unchanged.
++
++The existing clock-owner probe covers 24 frequency/offset/delay combinations,
++including observation, prediction, instant and inverse queries. All 481 output/
++wire/query/rejection records and zero-allocation measurements are identical to
++the pre-fix baseline. Its release executable remains 423,712 bytes with 267,100
++text bytes. The host `observe` symbol shrinks by 7 bytes. Eight CPU-0 ABBA blocks,
++ASLR disabled, contain 960 timing samples / 5,898,240 completed probe operations.
++Medians are 586.094 ns before and 584.945 ns after; this small difference supports
++no observed median regression, not a claimed speedup or MCU-cycle result.
++
++| Target | `observe` bytes before → after | Local frame before → after |
++| --- | ---: | ---: |
++| Thumb v7em hard-float | 1,862 → 1,814 | 408 → 408 bytes |
++| Xtensa ESP32 | 3,193 → 3,159 | 464 → 464 bytes |
++
++Target symbol sizes come from assembling compiler-emitted assembly, since the
++Cargo LTO objects contain bitcode. Frame measurements cover this function's
++own prologue only. They exclude callee/interrupt stack, final firmware linking,
++flash fit, hardware cycles and HIL. Those broader release gates remain open;
++no deployment or hardware safety claim follows from these local checks.
+diff --git a/interval-inventory.tsv b/interval-inventory.tsv
+index d1ba1c585..9945b7f9d 100644
+--- a/interval-inventory.tsv
++++ b/interval-inventory.tsv
+@@ -1466,8 +1466,19 @@ alumina-firmware	crates/alumina-capability/src/lib.rs	2207	RangeSink	struct	requ
+ alumina-firmware	crates/alumina-capability/src/lib.rs	3949	board_explorer_decoder_fails_closed_on_bounds_and_trailing_or_bad_records	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-capability	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-capability (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ alumina-firmware	crates/alumina-capability/src/lib.rs	4250	verified_ranges_require_the_compiled_digest	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-capability	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-capability (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ alumina-firmware	crates/alumina-capability/src/lib.rs	4278	no_output_at_exact_end_is_a_complete_range	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-capability	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-capability (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-alumina-firmware	crates/alumina-clock/src/lib.rs	738	estimate_ui_for_cycle_interval	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	pub	requires derive/codec review	requires call-site review	alumina-clock	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-clock (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+-alumina-firmware	crates/alumina-clock/src/lib.rs	803	cycle_bounds	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-clock	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-clock (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
++alumina-firmware	crates/alumina-clock/src/lib.rs	361	ClockEstimationPolicy	struct	u64/u32/u8 integer limits	domain policy; no uncertain point carrier	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain clock-specific causality, drift, health and deadline policy	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	403	ClockPrediction	struct	u64 integer cycle endpoints, selected midpoint and radius	source/boot-bound prediction report; scheduled point does not replace bounds	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain proof/report; generic endpoint arithmetic already delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	422	ClockInstantEstimate	struct	u64 integer cycle endpoints, display midpoint and radius	boot/probe-bound instant enclosure; midpoint is display-only	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain proof/report	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	443	ClockUiEstimate	struct	u64 integer browser-time and cycle endpoints	boot/probe-bound inverse-clock enclosure	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain proof/report	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	468	ClockEstimator	struct	u128 scaled rate bounds; i128 scaled offset bounds; u64 times/cycles	nonempty causal affine outer envelope with boot/sample identity; no heap	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain estimator; IntegerRange owns intersections/images and integer_quotient_bounds owns directed quotients; counter publication repaired	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	531	observe	fn	exact scaled rate/offset integer bounds and four timestamps	checked causal intersection; publish only after all fallible checks	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain causal/boot/sequence policy and atomic publication; generic intersection delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	618	predict	fn	u64 time/cycle intervals and rounded integer representative	future-start admission with health, freshness, lead and uncertainty gates	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain admission and report; midpoint/radius delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	689	estimate_at	fn	u64 time/cycle interval and integer representative	current/past instant enclosure with model freshness and uncertainty	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain domain semantics; endpoint mapping/midpoint/radius delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	739	estimate_ui_for_cycle_interval	fn	u64 cycle/time endpoints	inverse mapping of ordered cycle interval with typed validation	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	pub	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain causal inverse-domain policy/report; directed quotient and midpoint/radius delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	804	cycle_bounds	fn	i128 scaled affine image; u64 integer cycle endpoints	exact rate-range scale plus offset-range addition and directed quotient	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	private	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain units/checked narrowing wrapper; IntegerRange and integer_quotient_bounds own generic operations	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	835	earliest_ui_for_cycle	fn	u128/i128 exact intermediate; u64 integer time endpoint	inverse lower integer-time bound using upper rate/offset; nonnegative time domain	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	private	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain unit transformation and nonnegative-domain boundary; quotient delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	854	latest_ui_for_cycle	fn	u128/i128 exact intermediate; u64 integer time endpoint	inverse upper integer-time bound using lower rate/offset	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	private	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain unit transformation and checked narrowing; quotient delegated	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
++alumina-firmware	crates/alumina-clock/src/lib.rs	894	scaled_offset	fn	u128 products checked into signed i128 difference	exact point-valued scaled offset construction, not a set carrier	fixed primitive storage; Copy carrier where applicable; no heap	no_std; Rust1.88 native/Thumb/WASM; ESP1.90 Xtensa build	private	no serde/native codec on model/report; rebuild from validated canonical heartbeat bytes	DeviceClockModel accept_response/predict/inverse; browser clock qualification/lease estimates; distributed simulator (selected bodies reviewed)	alumina-clock	retain clock-unit point arithmetic; not a duplicated generic interval kernel	8 clock tests including reproduced count-limit failure;602 firmware and90 Interface-client tests pass; native/WASM/Thumb/Xtensa checks	24-case clock-owner-probe:481 identical records,zero allocations;960 pinned samples; host size unchanged; target local-frame/body audit; HIL/whole-call stack open	body audited at firmware 2d68e82b7; selected callers at Interface f5341f368; see firmware-clock-interval-audit.md
+ alumina-firmware	crates/alumina-config/src/lib.rs	7739	incomplete_axis_wrong_range_and_wrong_digest_are_rejected	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-config	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-config (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ alumina-firmware	crates/alumina-diagnostics/src/lib.rs	1790	validate_retained_interval	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-diagnostics	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-diagnostics (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
+ alumina-firmware	crates/alumina-diagnostics/src/lib.rs	2193	overview_rejects_order_provenance_ratio_bounds_and_trailing_bytes	fn	requires body review	domain set / evidence	requires body review	requires manifest/feature review	private	requires derive/codec review	requires call-site review	alumina-diagnostics	retain wrapper; review fixed arithmetic for delegation	cargo test -p alumina-diagnostics (select features after review)	requires benchmark mapping	lexical candidate; not yet audited
