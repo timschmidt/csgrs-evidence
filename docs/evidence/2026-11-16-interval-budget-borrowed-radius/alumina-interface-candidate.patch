@@ -1,0 +1,136 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 2d198e8..d89e7aa 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,7 +38,7 @@ serde_json = "1"
+ csgrs = { path = "../csgrs", default-features = false }
+ hypercurve = { path = "../csgrs/crates/hypercurve", default-features = false }
+ hypergraphics = { path = "../csgrs/crates/hypergraphics" }
+-hyperinterval = { path = "../csgrs/crates/hyperinterval", default-features = false, features = ["rational"] }
++hyperinterval = { path = "../csgrs/crates/hyperinterval", default-features = false, features = ["rational", "real-radius"] }
+ hyperlimit = { path = "../csgrs/crates/hyperlimit", default-features = false }
+ hyperpath = { path = "../csgrs/crates/hyperpath", default-features = false }
+ hyperreal = { path = "../csgrs/crates/hyperreal", default-features = false, features = ["serde"] }
+diff --git a/crates/alumina-interface-core/src/machine_profile.rs b/crates/alumina-interface-core/src/machine_profile.rs
+index 8c76250..54f9aab 100644
+--- a/crates/alumina-interface-core/src/machine_profile.rs
++++ b/crates/alumina-interface-core/src/machine_profile.rs
+@@ -16,6 +16,7 @@ use alumina_config::{
+ };
+ use alumina_motion::{AxisTiming, StepperTiming};
+ use alumina_protocol::Digest;
++use hyperinterval::{RationalRadiusRef, RealRadius};
+ use hyperlimit::{PredicatePolicy, compare_reals};
+ use hyperreal::{Problem, Rational, Real};
+ 
+@@ -502,15 +503,17 @@ impl MachineResolutionBudget2 {
+     pub fn certify(
+         profile: &MachineDynamicsProfile2,
+         requested_total_error_mm: Rational,
+-        source_curve_allocation_mm: Rational,
+-        controller_interpolation_allocation_mm: Rational,
++        source_curve_allocation_mm_exact: Rational,
++        controller_interpolation_allocation_mm_exact: Rational,
+     ) -> MachineProfileResult<Self> {
+-        if requested_total_error_mm <= Rational::zero()
+-            || source_curve_allocation_mm < Rational::zero()
+-            || controller_interpolation_allocation_mm < Rational::zero()
+-        {
++        if requested_total_error_mm <= Rational::zero() {
+             return Err(MachineProfileError::InvalidErrorBudget);
+         }
++        let source_curve_allocation_mm = RationalRadiusRef::new(&source_curve_allocation_mm_exact)
++            .map_err(|_| MachineProfileError::InvalidErrorBudget)?;
++        let controller_interpolation_allocation_mm =
++            RationalRadiusRef::new(&controller_interpolation_allocation_mm_exact)
++                .map_err(|_| MachineProfileError::InvalidErrorBudget)?;
+ 
+         let mut endpoint_lattice_axis = Vec::with_capacity(2);
+         let mut step_event_axis = Vec::with_capacity(2);
+@@ -544,24 +547,25 @@ impl MachineResolutionBudget2 {
+             ));
+         }
+ 
+-        let endpoint_quantization_error_mm = vector_norm2(&endpoint_lattice_axis)?;
+-        let step_event_tracking_error_mm = vector_norm2(&step_event_axis)?;
++        let endpoint_quantization_error_mm = RealRadius::euclidean_norm(&endpoint_lattice_axis)?;
++        let step_event_tracking_error_mm = RealRadius::euclidean_norm(&step_event_axis)?;
+         let command_lattice_error_mm =
+             endpoint_quantization_error_mm.clone() + step_event_tracking_error_mm.clone();
+-        let calibration_error_mm = vector_norm2(&calibration_axis)?;
+-        let following_error_mm = vector_norm2(&following_axis)?;
+-        let maximum_vector_velocity_mm_per_second = vector_norm2(&velocity_axis_mm)?;
+-        let output_quantum_seconds = (Real::from(profile.output_quantum_cycles())
+-            / Real::from(profile.timer_ticks_per_second()))?;
++        let calibration_error_mm = RealRadius::euclidean_norm(&calibration_axis)?;
++        let following_error_mm = RealRadius::euclidean_norm(&following_axis)?;
++        let maximum_vector_velocity_mm_per_second = RealRadius::euclidean_norm(&velocity_axis_mm)?;
++        let output_quantum_seconds = RealRadius::from_unsigned_ratio(
++            profile.output_quantum_cycles(),
++            core::num::NonZeroU64::new(profile.timer_ticks_per_second())
++                .expect("validated positive machine timer"),
++        )?;
+         let output_grid_position_error_mm =
+             maximum_vector_velocity_mm_per_second * output_quantum_seconds;
+         let requested_total_error_mm_exact = requested_total_error_mm;
+-        let source_curve_allocation_mm_exact = source_curve_allocation_mm;
+-        let controller_interpolation_allocation_mm_exact = controller_interpolation_allocation_mm;
+         let requested_total_error_mm = Real::from(requested_total_error_mm_exact.clone());
+-        let source_curve_allocation_mm = Real::from(source_curve_allocation_mm_exact.clone());
++        let source_curve_allocation_mm = RealRadius::from(source_curve_allocation_mm);
+         let controller_interpolation_allocation_mm =
+-            Real::from(controller_interpolation_allocation_mm_exact.clone());
++            RealRadius::from(controller_interpolation_allocation_mm);
+         let required_total_error_mm = source_curve_allocation_mm.clone()
+             + controller_interpolation_allocation_mm.clone()
+             + command_lattice_error_mm.clone()
+@@ -569,7 +573,7 @@ impl MachineResolutionBudget2 {
+             + following_error_mm.clone()
+             + output_grid_position_error_mm.clone();
+         match compare_reals(
+-            &required_total_error_mm,
++            required_total_error_mm.as_real(),
+             &requested_total_error_mm,
+             PredicatePolicy::STRICT,
+         )
+@@ -582,15 +586,16 @@ impl MachineResolutionBudget2 {
+                 source_curve_allocation_mm_exact,
+                 controller_interpolation_allocation_mm_exact,
+                 requested_total_error_mm,
+-                source_curve_allocation_mm,
+-                controller_interpolation_allocation_mm,
+-                endpoint_quantization_error_mm,
+-                step_event_tracking_error_mm,
+-                command_lattice_error_mm,
+-                calibration_error_mm,
+-                following_error_mm,
+-                output_grid_position_error_mm,
+-                required_total_error_mm,
++                source_curve_allocation_mm: source_curve_allocation_mm.into_real(),
++                controller_interpolation_allocation_mm: controller_interpolation_allocation_mm
++                    .into_real(),
++                endpoint_quantization_error_mm: endpoint_quantization_error_mm.into_real(),
++                step_event_tracking_error_mm: step_event_tracking_error_mm.into_real(),
++                command_lattice_error_mm: command_lattice_error_mm.into_real(),
++                calibration_error_mm: calibration_error_mm.into_real(),
++                following_error_mm: following_error_mm.into_real(),
++                output_grid_position_error_mm: output_grid_position_error_mm.into_real(),
++                required_total_error_mm: required_total_error_mm.into_real(),
+             }),
+             Some(Ordering::Greater) => Err(MachineProfileError::ErrorBudgetExceeded),
+             None => Err(MachineProfileError::ErrorBudgetPredicateUnresolved),
+@@ -678,14 +683,6 @@ impl MachineResolutionBudget2 {
+     }
+ }
+ 
+-fn vector_norm2(components: &[Real]) -> Result<Real, Problem> {
+-    let mut squared = Real::zero();
+-    for component in components {
+-        squared += component * component;
+-    }
+-    squared.sqrt()
+-}
+-
+ fn required_binding(
+     view: ConfigurationDocumentView<'_>,
+     instance: u16,

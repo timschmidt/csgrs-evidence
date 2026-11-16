@@ -1,0 +1,1 @@
+The inherited timing harness labels case 4 "typed invalid input" in its raw summary metadata. Its actual returned outcome and RESULT transcript are ErrorBudgetExceeded after full budget calculation. timing-summary.json records the precise outcome; no measurements or raw transcripts have been edited. Cases 2 and 3 return InvalidErrorBudget immediately.
