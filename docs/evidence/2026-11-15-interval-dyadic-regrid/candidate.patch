@@ -1,0 +1,127 @@
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 291330bd2..faa15f271 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -367,22 +367,32 @@ impl DyadicInterval {
+         exponent: i32,
+         budget: &mut DyadicBudget,
+     ) -> Result<Option<Bounds<BigInt>>, IntervalError> {
+-        let Some((a, b, e)) = self.bounds() else {
++        let Some((a, b, _)) = self.bounds() else {
+             return Ok(None);
+         };
++        let shift = self.reserve_alignment(exponent, budget)?;
++        Ok(Some(Bounds::new(a << shift, b << shift)?))
++    }
++
++    // Keep the conservative accounting of materialized alignment, including
++    // when a caller can consume the normalized source directly.
++    fn reserve_alignment(
++        &self,
++        exponent: i32,
++        budget: &mut DyadicBudget,
++    ) -> Result<usize, IntervalError> {
+         let bits = self.bits();
+         if bits == 0 {
+             budget.reserve(0, 2, false)?;
+-            return Ok(Some(Bounds::new(a.clone(), b.clone())?));
++            return Ok(0);
+         }
+-        let shift = u64::try_from(i64::from(e) - i64::from(exponent))
++        let shift = u64::try_from(i64::from(self.exponent) - i64::from(exponent))
+             .map_err(|_| IntervalError::InvalidScale)?;
+         let bits = bits
+             .checked_add(shift)
+             .ok_or(IntervalError::SizeExhausted)?;
+         budget.reserve(bits, 2, false)?;
+-        let shift = usize::try_from(shift).map_err(|_| IntervalError::Overflow)?;
+-        Ok(Some(Bounds::new(a << shift, b << shift)?))
++        usize::try_from(shift).map_err(|_| IntervalError::Overflow)
+     }
+ 
+     /// Outward enclosure on the grid `2^precision`; finer grids preserve the set.
+@@ -394,11 +404,10 @@ impl DyadicInterval {
+             return Ok(Self::empty());
+         };
+         if precision <= e {
+-            let (a, b) = self
+-                .align(precision, budget)?
+-                .expect("nonempty input")
+-                .endpoints();
+-            return Self::new(a, b, precision);
++            self.reserve_alignment(precision, budget)?;
++            // Every endpoint already lies on this finer grid. Normalizing a
++            // materialized alignment would reproduce this canonical source.
++            return Ok(self.clone());
+         }
+         budget.reserve(self.bits(), 4, false)?;
+         let shift = usize::try_from(i64::from(precision) - i64::from(e))
+diff --git a/crates/hyperinterval/tests/dyadic.rs b/crates/hyperinterval/tests/dyadic.rs
+index 1e2e6d5f7..1e00e28b9 100644
+--- a/crates/hyperinterval/tests/dyadic.rs
++++ b/crates/hyperinterval/tests/dyadic.rs
+@@ -9,6 +9,41 @@ fn budget() -> DyadicBudget {
+     DyadicBudget::new(4096, 1_000_000_000)
+ }
+ 
++#[test]
++fn identity_regrid_preserves_conservative_reservations_and_retries() {
++    let source = d(-7, 9, -3);
++    // A finer grid reserves 4 source bits plus 17 alignment bits, twice.
++    for (bits, work, expected) in [
++        (20, 42, Err(IntervalError::SizeExhausted)),
++        (21, 41, Err(IntervalError::WorkExhausted)),
++        (21, 42, Ok(source.clone())),
++    ] {
++        let mut budget = DyadicBudget::new(bits, work);
++        let actual = source.regrid(-20, &mut budget);
++        assert_eq!(actual, expected);
++        assert_eq!(
++            budget.remaining_work(),
++            if actual.is_ok() { 0 } else { work }
++        );
++    }
++    let capped = d(4, 12, i32::MAX);
++    let mut budget = DyadicBudget::new(5, 10);
++    assert_eq!(capped.regrid(i32::MAX - 1, &mut budget).unwrap(), capped);
++    assert_eq!(budget.remaining_work(), 0);
++    let mut budget = DyadicBudget::new(0, 2);
++    assert_eq!(
++        d(0, 0, 0).regrid(i32::MIN, &mut budget).unwrap(),
++        d(0, 0, 0)
++    );
++    assert_eq!(budget.remaining_work(), 0);
++    assert!(
++        DyadicInterval::empty()
++            .regrid(i32::MIN, &mut budget)
++            .unwrap()
++            .is_empty()
++    );
++}
++
+ #[test]
+ fn nonnegative_powers_match_independent_integer_images() {
+     for a in -6i64..=6 {
+@@ -569,3 +604,22 @@ fn checked_dyadic_replay_normalizes_and_rejects_reversed_input() {
+         d(1, 2, 1)
+     );
+ }
++
++#[cfg(all(feature = "hyperreal", feature = "dispatch-trace"))]
++#[test]
++fn regridding_and_alignment_have_no_scalar_dispatch() {
++    use hyperreal::dispatch_trace;
++    dispatch_trace::reset();
++    dispatch_trace::with_recording(|| {
++        for source in [d(-7, 9, -3), d(0, 0, 0), DyadicInterval::empty()] {
++            for precision in [-64, -3, 0, 8] {
++                let result = source.regrid(precision, &mut budget()).unwrap();
++                assert!(source.subset_of(&result, &mut budget()).unwrap());
++                assert_eq!(source.add(&d(0, 0, 0), &mut budget()).unwrap(), source);
++            }
++        }
++    });
++    let trace = dispatch_trace::take_trace();
++    assert!(trace.dispatch.is_empty());
++    assert_eq!(trace.rational, Default::default());
++}
