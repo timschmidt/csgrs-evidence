@@ -1,0 +1,55 @@
+diff --git a/crates/alumina-machine-ir/src/lib.rs b/crates/alumina-machine-ir/src/lib.rs
+index 9c0705a..ec513f6 100644
+--- a/crates/alumina-machine-ir/src/lib.rs
++++ b/crates/alumina-machine-ir/src/lib.rs
+@@ -3143,3 +3143,50 @@ mod tests {
+         ));
+     }
+ }
++
++#[cfg(test)]
++#[test]
++fn qualification_discrete_bounds_match_independent_recurrences() {
++    let mut cases = 0_u32;
++    let mut points = 0_u32;
++    for coefficients in [
++        [-3, -2, -1, 0, 1, 2, 3],
++        [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX],
++    ] {
++        for first in coefficients {
++            for second in coefficients {
++                for third in coefficients {
++                    for count in 1..=32 {
++                        let axis = FiniteDifferenceAxis {
++                            initial_position: 0,
++                            first_difference: first,
++                            second_difference: second,
++                            third_difference: third,
++                        };
++                        // Enumerate the machine recurrence. Do not reuse its
++                        // closed-form evaluator, vertex test or binary search.
++                        let mut value = i128::from(first);
++                        let mut change = i128::from(second);
++                        let mut expected_minimum = value;
++                        let mut expected_maximum = value;
++                        for _ in 0..count {
++                            expected_minimum = expected_minimum.min(value);
++                            expected_maximum = expected_maximum.max(value);
++                            value += change;
++                            change += i128::from(third);
++                            points += 1;
++                        }
++                        assert_eq!(
++                            finite_difference_first_bounds(axis, count),
++                            Ok((expected_minimum, expected_maximum)),
++                            "first={first}, second={second}, third={third}, count={count}"
++                        );
++                        cases += 1;
++                    }
++                }
++            }
++        }
++    }
++    assert_eq!(cases, 21_952);
++    assert_eq!(points, 362_208);
++}
