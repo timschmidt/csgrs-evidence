@@ -1,0 +1,297 @@
+diff --git a/crates/hyperpath/src/routing.rs b/crates/hyperpath/src/routing.rs
+index 360f47430..23251c560 100644
+--- a/crates/hyperpath/src/routing.rs
++++ b/crates/hyperpath/src/routing.rs
+@@ -447,61 +447,9 @@ pub enum MeanderError {
+ }
+ 
+ /// Errors while certifying exact route-level continuous parameters.
+-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub enum RouteCertificationError {
+-    /// At least one route had no retained path segments to measure.
+-    EmptyRoute,
+-    /// A segment could not provide a certified axis-aligned length.
+-    UnsupportedRouteGeometry,
+-    /// Feed rate was structurally negative.
+-    NegativeFeedRate,
+-    /// Feed rate was structurally zero.
+-    ZeroFeedRate,
+-    /// Acceleration limit was structurally negative.
+-    NegativeAcceleration,
+-    /// Acceleration limit was structurally zero.
+-    ZeroAcceleration,
+-    /// Candidate traversal time was structurally negative.
+-    NegativeTime,
+-    /// Candidate traversal time was structurally zero where positive time is required.
+-    ZeroTime,
+-    /// Exact comparison could not choose the acceleration-limited profile.
+-    UnknownFeedProfile,
+-    /// Jerk limit was structurally negative.
+-    NegativeJerk,
+-    /// Jerk limit was structurally zero.
+-    ZeroJerk,
+-    /// Exact scalar division failed while deriving feed-profile facts.
+-    UnsupportedDivision,
+-    /// Corner radius was structurally negative.
+-    NegativeCornerRadius,
+-    /// Corner radius was structurally zero.
+-    ZeroCornerRadius,
+-    /// Lookahead schedule vectors do not match the retained route shape.
+-    ScheduleShapeMismatch,
+-    /// An exact square-root construction failed during lookahead planning.
+-    UnsupportedRadical,
+-    /// Independent replay rejected the internally generated lookahead proposal.
+-    LookaheadProposalUncertified,
+-    /// Both boundary feeds were zero for a transition that requires motion.
+-    ZeroBoundaryFeeds,
+-    /// Independent replay rejected an internally generated jerk proposal.
+-    JerkProposalUncertified,
+-    /// Exact power-of-two jerk refinement exhausted its caller-owned bound.
+-    JerkRefinementBudgetExceeded,
+-    /// No affine spans or no dense axis limits were supplied for projection.
+-    EmptyAxisProjection,
+-    /// An affine projection vector did not match the dense axis-limit count.
+-    AxisProjectionShapeMismatch,
+-    /// An absolute affine axis derivative was structurally negative.
+-    NegativeAxisProjection,
+-    /// An affine span had no structurally positive machine-axis derivative.
+-    DegenerateAxisProjection,
+-    /// Independent replay rejected internally selected affine axis limits.
+-    AxisProjectionProposalUncertified,
+-    /// The selected predicate policy could not certify a scalar sign.
+-    PredicateUnresolved,
+-}
++///
++/// This compatibility name retains the dynamics owner's exact failure variants.
++pub use hyperdynamics::DynamicsError as RouteCertificationError;
+ 
+ /// Create a one-bump rectangular meander from an exact extra length.
+ ///
+@@ -1001,7 +949,6 @@ pub fn certify_constant_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric acceleration-limited feed traversal time.
+@@ -1032,7 +979,6 @@ pub fn certify_acceleration_limited_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ fn build_nonuniform_detour_meander_with_side(
+diff --git a/crates/hyperpath/src/routing/axis_projection.rs b/crates/hyperpath/src/routing/axis_projection.rs
+index 398f86d80..a54d1c957 100644
+--- a/crates/hyperpath/src/routing/axis_projection.rs
++++ b/crates/hyperpath/src/routing/axis_projection.rs
+@@ -18,7 +18,6 @@ pub fn plan_axis_projected_motion_limits(
+     policy: PredicatePolicy,
+ ) -> Result<PlannedAxisProjectedMotionLimits, RouteCertificationError> {
+     hyperdynamics::plan_axis_projected_motion_limits(projections, axis_limits, policy)
+-        .map_err(Into::into)
+ }
+ 
+ /// Compatibility wrapper for [`hyperdynamics::certify_axis_projected_motion_limits`].
+@@ -42,5 +41,4 @@ pub fn certify_axis_projected_motion_limits(
+         maximum_path_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+diff --git a/crates/hyperpath/src/routing/dynamics.rs b/crates/hyperpath/src/routing/dynamics.rs
+index b5da8fd5e..3564a861e 100644
+--- a/crates/hyperpath/src/routing/dynamics.rs
++++ b/crates/hyperpath/src/routing/dynamics.rs
+@@ -1,91 +1,12 @@
+ //! Geometry-owned metric input and lossless legacy error conversion.
+-use super::{
+-    RouteCertificationError,
+-    feed::{FeedPathElement, element_length},
+-};
++use super::feed::{FeedPathElement, element_length};
+ use hyperdynamics::{DynamicsError, MetricSpan, SpanDynamicsClass};
+ use hyperlimit::PredicatePolicy;
+ use hyperreal::Real;
+ 
+-impl From<DynamicsError> for RouteCertificationError {
+-    fn from(error: DynamicsError) -> Self {
+-        match error {
+-            DynamicsError::EmptyRoute => Self::EmptyRoute,
+-            DynamicsError::UnsupportedRouteGeometry => Self::UnsupportedRouteGeometry,
+-            DynamicsError::NegativeFeedRate => Self::NegativeFeedRate,
+-            DynamicsError::ZeroFeedRate => Self::ZeroFeedRate,
+-            DynamicsError::NegativeAcceleration => Self::NegativeAcceleration,
+-            DynamicsError::ZeroAcceleration => Self::ZeroAcceleration,
+-            DynamicsError::NegativeTime => Self::NegativeTime,
+-            DynamicsError::ZeroTime => Self::ZeroTime,
+-            DynamicsError::UnknownFeedProfile => Self::UnknownFeedProfile,
+-            DynamicsError::NegativeJerk => Self::NegativeJerk,
+-            DynamicsError::ZeroJerk => Self::ZeroJerk,
+-            DynamicsError::UnsupportedDivision => Self::UnsupportedDivision,
+-            DynamicsError::NegativeCornerRadius => Self::NegativeCornerRadius,
+-            DynamicsError::ZeroCornerRadius => Self::ZeroCornerRadius,
+-            DynamicsError::ScheduleShapeMismatch => Self::ScheduleShapeMismatch,
+-            DynamicsError::UnsupportedRadical => Self::UnsupportedRadical,
+-            DynamicsError::LookaheadProposalUncertified => Self::LookaheadProposalUncertified,
+-            DynamicsError::ZeroBoundaryFeeds => Self::ZeroBoundaryFeeds,
+-            DynamicsError::JerkProposalUncertified => Self::JerkProposalUncertified,
+-            DynamicsError::JerkRefinementBudgetExceeded => Self::JerkRefinementBudgetExceeded,
+-            DynamicsError::EmptyAxisProjection => Self::EmptyAxisProjection,
+-            DynamicsError::AxisProjectionShapeMismatch => Self::AxisProjectionShapeMismatch,
+-            DynamicsError::NegativeAxisProjection => Self::NegativeAxisProjection,
+-            DynamicsError::DegenerateAxisProjection => Self::DegenerateAxisProjection,
+-            DynamicsError::AxisProjectionProposalUncertified => {
+-                Self::AxisProjectionProposalUncertified
+-            }
+-            DynamicsError::PredicateUnresolved => Self::PredicateUnresolved,
+-        }
+-    }
+-}
+-
+-impl From<RouteCertificationError> for DynamicsError {
+-    fn from(error: RouteCertificationError) -> Self {
+-        match error {
+-            RouteCertificationError::EmptyRoute => Self::EmptyRoute,
+-            RouteCertificationError::UnsupportedRouteGeometry => Self::UnsupportedRouteGeometry,
+-            RouteCertificationError::NegativeFeedRate => Self::NegativeFeedRate,
+-            RouteCertificationError::ZeroFeedRate => Self::ZeroFeedRate,
+-            RouteCertificationError::NegativeAcceleration => Self::NegativeAcceleration,
+-            RouteCertificationError::ZeroAcceleration => Self::ZeroAcceleration,
+-            RouteCertificationError::NegativeTime => Self::NegativeTime,
+-            RouteCertificationError::ZeroTime => Self::ZeroTime,
+-            RouteCertificationError::UnknownFeedProfile => Self::UnknownFeedProfile,
+-            RouteCertificationError::NegativeJerk => Self::NegativeJerk,
+-            RouteCertificationError::ZeroJerk => Self::ZeroJerk,
+-            RouteCertificationError::UnsupportedDivision => Self::UnsupportedDivision,
+-            RouteCertificationError::NegativeCornerRadius => Self::NegativeCornerRadius,
+-            RouteCertificationError::ZeroCornerRadius => Self::ZeroCornerRadius,
+-            RouteCertificationError::ScheduleShapeMismatch => Self::ScheduleShapeMismatch,
+-            RouteCertificationError::UnsupportedRadical => Self::UnsupportedRadical,
+-            RouteCertificationError::LookaheadProposalUncertified => {
+-                Self::LookaheadProposalUncertified
+-            }
+-            RouteCertificationError::ZeroBoundaryFeeds => Self::ZeroBoundaryFeeds,
+-            RouteCertificationError::JerkProposalUncertified => Self::JerkProposalUncertified,
+-            RouteCertificationError::JerkRefinementBudgetExceeded => {
+-                Self::JerkRefinementBudgetExceeded
+-            }
+-            RouteCertificationError::EmptyAxisProjection => Self::EmptyAxisProjection,
+-            RouteCertificationError::AxisProjectionShapeMismatch => {
+-                Self::AxisProjectionShapeMismatch
+-            }
+-            RouteCertificationError::NegativeAxisProjection => Self::NegativeAxisProjection,
+-            RouteCertificationError::DegenerateAxisProjection => Self::DegenerateAxisProjection,
+-            RouteCertificationError::AxisProjectionProposalUncertified => {
+-                Self::AxisProjectionProposalUncertified
+-            }
+-            RouteCertificationError::PredicateUnresolved => Self::PredicateUnresolved,
+-        }
+-    }
+-}
+-
+ impl MetricSpan for FeedPathElement {
+     fn exact_length(&self, policy: PredicatePolicy) -> Result<Real, DynamicsError> {
+-        element_length(self, policy).map_err(Into::into)
++        element_length(self, policy)
+     }
+     fn dynamics_class(&self) -> SpanDynamicsClass {
+         match self {
+diff --git a/crates/hyperpath/src/routing/feed.rs b/crates/hyperpath/src/routing/feed.rs
+index 5bdb98cb7..89e8f7011 100644
+--- a/crates/hyperpath/src/routing/feed.rs
++++ b/crates/hyperpath/src/routing/feed.rs
+@@ -52,7 +52,6 @@ pub fn certify_constant_feed_time_for_path(
+     policy: PredicatePolicy,
+ ) -> Result<ConstantFeedTimeReport, RouteCertificationError> {
+     hyperdynamics::certify_constant_feed_time(route, feed_rate, target_time, policy)
+-        .map_err(Into::into)
+ }
+ 
+ /// Certify symmetric acceleration-limited traversal for a mixed line/arc route.
+@@ -80,7 +79,6 @@ pub fn certify_acceleration_limited_feed_time_for_path(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric four-phase jerk-limited feed profile for a mixed route.
+@@ -109,7 +107,6 @@ pub fn certify_symmetric_jerk_limited_feed_time_for_path(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a symmetric four-phase jerk-limited feed traversal time.
+@@ -143,7 +140,6 @@ pub fn certify_symmetric_jerk_limited_feed_time(
+         target_time,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify exact lookahead corner-speed limits for retained tangent spans.
+@@ -181,7 +177,6 @@ pub fn certify_corner_lookahead_limits(
+         corner_radius,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ pub(crate) fn element_length(
+diff --git a/crates/hyperpath/src/routing/jerk_schedule.rs b/crates/hyperpath/src/routing/jerk_schedule.rs
+index ad250073c..6fb101b68 100644
+--- a/crates/hyperpath/src/routing/jerk_schedule.rs
++++ b/crates/hyperpath/src/routing/jerk_schedule.rs
+@@ -31,7 +31,6 @@ pub fn plan_monotonic_jerk_transition(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Compatibility wrapper for [`hyperdynamics::certify_jerk_ramp_feed_schedule`].
+@@ -55,7 +54,6 @@ pub fn certify_jerk_ramp_feed_schedule(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Compatibility wrapper for [`hyperdynamics::certify_multi_phase_jerk_ramp_feed_schedule`].
+@@ -79,5 +77,4 @@ pub fn certify_multi_phase_jerk_ramp_feed_schedule(
+         max_jerk,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+diff --git a/crates/hyperpath/src/routing/lookahead.rs b/crates/hyperpath/src/routing/lookahead.rs
+index 1ff9b9eab..5ef42fccd 100644
+--- a/crates/hyperpath/src/routing/lookahead.rs
++++ b/crates/hyperpath/src/routing/lookahead.rs
+@@ -51,7 +51,6 @@ pub fn plan_lookahead_feed_schedule(
+         max_acceleration,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Plan exact lookahead nodes and conservatively refine them until every
+@@ -96,7 +95,6 @@ pub fn plan_jerk_feasible_lookahead_schedule(
+         maximum_component_halvings,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
+ 
+ /// Certify a local lookahead feed schedule for a retained mixed path.
+@@ -129,5 +127,4 @@ pub fn certify_lookahead_feed_schedule(
+         max_acceleration,
+         policy,
+     )
+-    .map_err(Into::into)
+ }
