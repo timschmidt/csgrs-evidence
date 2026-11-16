@@ -1,0 +1,232 @@
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 1296048ff..9b624c0ab 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -59,6 +59,8 @@ mod proposal;
+ mod rational;
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ mod rational_admission;
++#[cfg(all(feature = "rational", feature = "dyadic"))]
++mod rational_sqrt;
+ #[cfg(feature = "real-ball")]
+ mod real_ball;
+ mod split;
+@@ -86,6 +88,8 @@ pub use proposal::{F32ProposalInterval, F64ProposalInterval};
+ pub use rational::RationalInterval;
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ pub use rational_admission::RationalArithmetic;
++#[cfg(all(feature = "rational", feature = "dyadic"))]
++pub use rational_sqrt::rational_sqrt_bound;
+ #[cfg(feature = "real-ball")]
+ pub use real_ball::{BallRelation, RealBall};
+ pub use state::{DomainCoverage, IntervalError, MidpointRounding, RangeEnclosure, SignSet};
+diff --git a/crates/hyperinterval/src/rational_sqrt.rs b/crates/hyperinterval/src/rational_sqrt.rs
+new file mode 100644
+index 000000000..d1c51c526
+--- /dev/null
++++ b/crates/hyperinterval/src/rational_sqrt.rs
+@@ -0,0 +1,45 @@
++use crate::IntervalError;
++use hyperreal::Rational;
++use num_bigint::{BigInt, BigUint, Sign};
++use num_integer::Integer;
++use num_traits::{One, Zero};
++
++/// One tight rational bound for `sqrt(value)` on a fractional binary grid.
++///
++/// `precision <= 0` selects spacing `2^precision`; `lower` chooses the floor
++/// when true and ceiling otherwise. Negative values return `EmptyDomain`, and
++/// positive precisions return `InvalidScale`, in that validation order.
++///
++/// This exact integer-arithmetic adapter preserves the one-bound contract of
++/// rational proof consumers. Input construction, integer division/root work,
++/// coefficient growth and heap usage have no separate budget or cancellation
++/// bound. The caller must admit the input size and requested precision. The
++/// existing interval `sqrt` operations retain their caller-owned budgets.
++#[inline]
++pub fn rational_sqrt_bound(
++    value: &Rational,
++    precision: i32,
++    lower: bool,
++) -> Result<Rational, IntervalError> {
++    if value.sign() == Sign::Minus {
++        return Err(IntervalError::EmptyDomain);
++    }
++    if precision > 0 {
++        return Err(IntervalError::InvalidScale);
++    }
++    let shift = usize::try_from(precision.unsigned_abs()).map_err(|_| IntervalError::Overflow)?;
++    let scaled = value.numerator() << shift.checked_mul(2).ok_or(IntervalError::Overflow)?;
++    let (quotient, remainder) = scaled.div_rem(value.denominator());
++    let root = quotient.sqrt();
++    let exact = remainder.is_zero() && &root * &root == quotient;
++    let grid = if lower || exact {
++        root
++    } else {
++        root + BigUint::one()
++    };
++    Rational::from_bigint_fraction(
++        BigInt::from_biguint(Sign::Plus, grid),
++        BigUint::one() << shift,
++    )
++    .map_err(IntervalError::Scalar)
++}
+diff --git a/crates/hyperinterval/src/state.rs b/crates/hyperinterval/src/state.rs
+index ec8bceb3e..07d495947 100644
+--- a/crates/hyperinterval/src/state.rs
++++ b/crates/hyperinterval/src/state.rs
+@@ -17,7 +17,7 @@ pub enum IntervalError {
+     NonSingletonEndpoint,
+     /// A requested finite carrier cannot represent an unbounded image.
+     UnboundedImage,
+-    /// A fixed-point scale is outside its endpoint family's supported range.
++    /// A fixed-point or grid scale is outside the operation's supported range.
+     InvalidScale,
+     /// A radius or measurement uncertainty is negative.
+     #[cfg(feature = "rational")]
+diff --git a/crates/hyperinterval/tests/rational_sqrt_bound.rs b/crates/hyperinterval/tests/rational_sqrt_bound.rs
+new file mode 100644
+index 000000000..de0af497c
+--- /dev/null
++++ b/crates/hyperinterval/tests/rational_sqrt_bound.rs
+@@ -0,0 +1,79 @@
++#![cfg(all(feature = "rational", feature = "dyadic"))]
++use hyperinterval::{IntervalError, rational_sqrt_bound};
++use hyperreal::Rational;
++
++#[test]
++fn one_sided_root_preserves_domain_order_and_exact_grid_squares() {
++    for lower in [true, false] {
++        for precision in [i32::MIN, -32, 0, i32::MAX] {
++            assert_eq!(
++                rational_sqrt_bound(&Rational::from(-1), precision, lower),
++                Err(IntervalError::EmptyDomain)
++            );
++        }
++        for precision in [1, i32::MAX] {
++            assert_eq!(
++                rational_sqrt_bound(&Rational::zero(), precision, lower),
++                Err(IntervalError::InvalidScale)
++            );
++        }
++        for precision in [-512, -32, -1] {
++            assert_eq!(
++                rational_sqrt_bound(&Rational::fraction(9, 4).unwrap(), precision, lower),
++                Ok(Rational::fraction(3, 2).unwrap())
++            );
++            assert_eq!(
++                rational_sqrt_bound(&Rational::zero(), precision, lower),
++                Ok(Rational::zero())
++            );
++        }
++    }
++    assert_eq!(rational_sqrt_bound(&2.into(), 0, true), Ok(1.into()));
++    assert_eq!(rational_sqrt_bound(&2.into(), 0, false), Ok(2.into()));
++}
++
++#[cfg(not(target_env = "msvc"))]
++#[path = "../../hyperreal/tests/support/mpfr.rs"]
++mod mpfr_cache;
++#[cfg(not(target_env = "msvc"))]
++#[path = "support/sqrt_oracle.rs"]
++mod sqrt_oracle;
++
++#[cfg(not(target_env = "msvc"))]
++#[test]
++fn one_sided_bounds_are_tight_by_independent_squared_inequalities() {
++    use hyperinterval::{DyadicBudget, RationalInterval};
++    use rug::Rational as Q;
++    let mut cases = 0;
++    for numerator in 0..=64 {
++        for denominator in 1..=17 {
++            for precision in [-40, -8, 0] {
++                let input = Rational::fraction(numerator, denominator).unwrap();
++                let lo = rational_sqrt_bound(&input, precision, true).unwrap();
++                let hi = rational_sqrt_bound(&input, precision, false).unwrap();
++                let bounds = RationalInterval::new(lo, hi).unwrap();
++                let mut budget = DyadicBudget::new(16384, 100_000_000_000);
++                let dyadic = bounds.to_dyadic(precision, &mut budget).unwrap();
++                // Conversion cannot hide an off-grid result from the tightness oracle.
++                assert_eq!(dyadic.to_rational(&mut budget).unwrap(), bounds);
++                sqrt_oracle::verify(
++                    &dyadic,
++                    Q::from((numerator, denominator)),
++                    Q::from((numerator, denominator)),
++                    precision,
++                );
++                // Generated one-sided outputs form an interval consumable by
++                // the existing two-sided operation without changing authority.
++                let square = dyadic.square(&mut budget).unwrap();
++                assert!(
++                    square
++                        .to_rational(&mut budget)
++                        .unwrap()
++                        .contains_point(&input)
++                );
++                cases += 1;
++            }
++        }
++    }
++    assert_eq!(cases, 3315);
++}
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 8deaf5bce..0823a5ce9 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -25,10 +25,8 @@ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features =
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+ serde = { version = "1.0", features = ["derive"], optional = true }
+-hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, optional = true }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational", "dyadic"] }
+ [dev-dependencies]
+-# Test-only interval migration candidates; production remains gated by cost.
+-hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
+ # Fresh-process selected-field replay exercises validated exact scalar interchange.
+ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = false, features = ["serde"] }
+ criterion = "0.5"
+@@ -52,9 +50,9 @@ taylor-noise = ["taylor-affine"]
+ taylor-polynomial = ["taylor-affine"]
+ taylor-composition = ["taylor-polynomial"]
+ float-proposal-program = ["expression-program"]
+-interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++interval-program = ["expression-program", "hyperinterval/hyperreal"]
+ interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+-serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
++serde = ["dep:serde", "hyperreal/serde", "hyperinterval/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+diff --git a/crates/hypersolve/src/real_interval.rs b/crates/hypersolve/src/real_interval.rs
+index e95403477..2b00b65cf 100644
+--- a/crates/hypersolve/src/real_interval.rs
++++ b/crates/hypersolve/src/real_interval.rs
+@@ -428,27 +428,7 @@ fn rational_dyadic_square_root_bound(
+     precision: i32,
+     lower: bool,
+ ) -> Option<HyperRational> {
+-    use num::bigint::{BigInt, BigUint, Sign};
+-    use num::{Integer, One, Zero};
+-    if value.sign() == Sign::Minus || precision > 0 {
+-        return None;
+-    }
+-    let shift = usize::try_from(precision.unsigned_abs()).ok()?;
+-    // floor(sqrt(n / d) * 2^shift) = floor(sqrt(floor(n * 4^shift / d))).
+-    let scaled = value.numerator() << shift.checked_mul(2)?;
+-    let (quotient, remainder) = scaled.div_rem(value.denominator());
+-    let root = quotient.sqrt();
+-    let exact = remainder.is_zero() && &root * &root == quotient;
+-    let grid = if lower || exact {
+-        root
+-    } else {
+-        root + BigUint::one()
+-    };
+-    HyperRational::from_bigint_fraction(
+-        BigInt::from_biguint(Sign::Plus, grid),
+-        BigUint::one() << shift,
+-    )
+-    .ok()
++    hyperinterval::rational_sqrt_bound(value, precision, lower).ok()
+ }
+ 
+ #[cfg(test)]

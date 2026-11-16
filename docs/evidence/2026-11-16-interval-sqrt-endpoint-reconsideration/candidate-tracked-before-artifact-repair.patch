@@ -1,0 +1,96 @@
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 1296048ff..9b624c0ab 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -59,6 +59,8 @@ mod proposal;
+ mod rational;
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ mod rational_admission;
++#[cfg(all(feature = "rational", feature = "dyadic"))]
++mod rational_sqrt;
+ #[cfg(feature = "real-ball")]
+ mod real_ball;
+ mod split;
+@@ -86,6 +88,8 @@ pub use proposal::{F32ProposalInterval, F64ProposalInterval};
+ pub use rational::RationalInterval;
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ pub use rational_admission::RationalArithmetic;
++#[cfg(all(feature = "rational", feature = "dyadic"))]
++pub use rational_sqrt::rational_sqrt_bound;
+ #[cfg(feature = "real-ball")]
+ pub use real_ball::{BallRelation, RealBall};
+ pub use state::{DomainCoverage, IntervalError, MidpointRounding, RangeEnclosure, SignSet};
+diff --git a/crates/hyperinterval/src/state.rs b/crates/hyperinterval/src/state.rs
+index ec8bceb3e..07d495947 100644
+--- a/crates/hyperinterval/src/state.rs
++++ b/crates/hyperinterval/src/state.rs
+@@ -17,7 +17,7 @@ pub enum IntervalError {
+     NonSingletonEndpoint,
+     /// A requested finite carrier cannot represent an unbounded image.
+     UnboundedImage,
+-    /// A fixed-point scale is outside its endpoint family's supported range.
++    /// A fixed-point or grid scale is outside the operation's supported range.
+     InvalidScale,
+     /// A radius or measurement uncertainty is negative.
+     #[cfg(feature = "rational")]
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 8deaf5bce..0823a5ce9 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -25,10 +25,8 @@ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features =
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+ serde = { version = "1.0", features = ["derive"], optional = true }
+-hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, optional = true }
++hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational", "dyadic"] }
+ [dev-dependencies]
+-# Test-only interval migration candidates; production remains gated by cost.
+-hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
+ # Fresh-process selected-field replay exercises validated exact scalar interchange.
+ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = false, features = ["serde"] }
+ criterion = "0.5"
+@@ -52,9 +50,9 @@ taylor-noise = ["taylor-affine"]
+ taylor-polynomial = ["taylor-affine"]
+ taylor-composition = ["taylor-polynomial"]
+ float-proposal-program = ["expression-program"]
+-interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++interval-program = ["expression-program", "hyperinterval/hyperreal"]
+ interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+-serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
++serde = ["dep:serde", "hyperreal/serde", "hyperinterval/serde"]
+ dispatch-trace = [
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+diff --git a/crates/hypersolve/src/real_interval.rs b/crates/hypersolve/src/real_interval.rs
+index e95403477..2b00b65cf 100644
+--- a/crates/hypersolve/src/real_interval.rs
++++ b/crates/hypersolve/src/real_interval.rs
+@@ -428,27 +428,7 @@ fn rational_dyadic_square_root_bound(
+     precision: i32,
+     lower: bool,
+ ) -> Option<HyperRational> {
+-    use num::bigint::{BigInt, BigUint, Sign};
+-    use num::{Integer, One, Zero};
+-    if value.sign() == Sign::Minus || precision > 0 {
+-        return None;
+-    }
+-    let shift = usize::try_from(precision.unsigned_abs()).ok()?;
+-    // floor(sqrt(n / d) * 2^shift) = floor(sqrt(floor(n * 4^shift / d))).
+-    let scaled = value.numerator() << shift.checked_mul(2)?;
+-    let (quotient, remainder) = scaled.div_rem(value.denominator());
+-    let root = quotient.sqrt();
+-    let exact = remainder.is_zero() && &root * &root == quotient;
+-    let grid = if lower || exact {
+-        root
+-    } else {
+-        root + BigUint::one()
+-    };
+-    HyperRational::from_bigint_fraction(
+-        BigInt::from_biguint(Sign::Plus, grid),
+-        BigUint::one() << shift,
+-    )
+-    .ok()
++    hyperinterval::rational_sqrt_bound(value, precision, lower).ok()
+ }
+ 
+ #[cfg(test)]
