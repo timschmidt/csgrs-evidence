@@ -1,0 +1,5 @@
+# Matched clock comparison
+
+Before observing baseline images: compare the complete current firmware with a clean isolated qualification snapshot that restores only crates/alumina-clock/src/lib.rs from 2d68e82b's parent. All other source, path layout, lock, toolchain, board features, assets and release settings stay identical. This isolates the publication repair at final link and prevents treating historical cross-layout image changes as causal measurements. Retain the restoration patch and commit identity; restore current HEAD after builds.
+
+The existing exact software/counter tests are not rerun without a source change. This comparison addresses missing final-link measurements only. Prospective diagnostic bounds for any positive linked code/application growth are 1024 bytes AND 0.1% per board, never pooled between boards. No size exception/account is adopted by this screen: the absent board partition/reserve contract and existing 4 MiB failures prevent completed flash admission. Stack/cycles/HIL remain separate.
