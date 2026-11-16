@@ -1,0 +1,1145 @@
+diff --git a/docs/research/validated-dynamics-comparison.md b/docs/research/validated-dynamics-comparison.md
+new file mode 100644
+index 000000000..f6d24b272
+--- /dev/null
++++ b/docs/research/validated-dynamics-comparison.md
+@@ -0,0 +1,111 @@
++# External validated-dynamics comparison
++
++The maintained [runner and acceptance contract](../../scripts/validated-dynamics/README.md)
++compare Hyperdynamics with CAPD::DynSys on eight exact initial-value problems.
++Both complete every case and enclose the independent analytic endpoint and
++whole-horizon extrema. In the recorded configuration, CAPD has a lower median
++latency in every row and narrower nonconstant point enclosures. This establishes
++a concrete performance gap for the current Hyperdynamics path, not general
++superiority across representations, resource contracts or dynamical systems.
++
++The Hyper source is the clean accepted revision
++`e4d12c6f91ea197cf1153d8c5f5ce626a6eeb6c1`; the pending path-dynamics extraction is
++excluded from these measurements. No production mathematics changed. CAPD 6.1.0
++is pinned at `37057e5899bccaa6cd5701057b7e6ea5e232ef8b`, using its native interval
++backend in a separate process. Its [interval ODE documentation](https://capd.sourceforge.net/capdDynSys/docs/html/a05233.html)
++describes the validated solver and retained solution-curve interfaces used here.
++The pinned source, rather than the older online documentation version, controls
++the recorded build and behavior.
++
++All inputs and time boundaries are exact dyadics. The horizon is `[0,1/4]` and
++every actual step is positive and at most `1/16`. Point initial states are `1`
++or `(1,0)`; box states add coordinate uncertainty `[-2^-10,2^-10]`. Hyperdynamics
++uses Taylor order 3 and its default grid `2^-64`; CAPD uses Taylor order 12 and
++its default step controller. The common endpoint width limit is `1/64` and
++the whole-tube width limit is `1`, per coordinate. The algorithms may produce
++stronger enclosures, whose actual widths remain visible below and in raw data.
++
++## Recorded latency
++
++Microseconds per completed operation, median of ten samples of 100 operations
++for each row/mode. Two blocks per solver run in Hyperdynamics/CAPD/CAPD/Hyperdynamics
++order, pinned to CPU 0 with ASLR disabled on an Intel Xeon E5-2680 v2 host.
++The Rust compiler is 1.95.0; GCC 14 and CAPD's `-O2 -frounding-math` compile the
++external adapter. Build/test work completed before timing. Every operation
++materializes endpoint and tube output, retains its native evidence, and destroys
++that output/evidence before the timer stops. Serialization and analytic oracle
++checks are outside the timer. Both adapters check their structural completion and
++step durations inside it. Raw samples and compiler/build flags are archived.
++
++| Case | Hyper reuse | CAPD reuse | Hyper fresh | CAPD fresh |
++| --- | ---: | ---: | ---: | ---: |
++| constant point | 299.773 | 29.393 | 311.527 | 58.778 |
++| constant box | 287.713 | 27.687 | 308.325 | 59.054 |
++| exponential point | 519.166 | 32.175 | 557.514 | 49.645 |
++| exponential box | 510.894 | 32.026 | 558.506 | 49.836 |
++| Riccati point | 859.172 | 155.590 | 939.651 | 205.255 |
++| Riccati box | 864.080 | 155.935 | 946.496 | 205.245 |
++| oscillator point | 1191.731 | 55.738 | 1333.611 | 100.494 |
++| oscillator box | 1186.522 | 55.550 | 1340.585 | 100.201 |
++
++Reuse excludes field/solver/coefficient preparation. Fresh includes it. These
++are warmed process measurements, not first-process startup costs. There are
++320 raw timing samples, representing 32,000 completed timed integrations. The
++full native proof objects differ: Hyperdynamics retains exact source-bound graphs
++and rejected attempts, while CAPD retains its solution curve. The comparison
++requires the common mathematical result; it does not assert interchangeable
++proof serialization or equal resource/cancellation APIs.
++
++## Endpoint quality
++
++Largest coordinate width, rounded here only for display. The oracle uses exact
++rationals derived from raw dyadic/IEEE bounds. Both constant cases have identical
++widths. Hyperdynamics uses four accepted segments in all cases; CAPD uses four
++except Riccati, which uses twelve. The whole-tube oracle checks continuous
++extrema, including the oscillator's interior maximum, not selected samples.
++
++| Case | Hyper width | CAPD width |
++| --- | ---: | ---: |
++| constant point | 0 | 0 |
++| constant box | 0.001953125 | 0.001953125 |
++| exponential point | 2.156908e-7 | 2.6645353e-15 |
++| exponential box | 0.0025080783 | 0.0025078621 |
++| Riccati point | 7.231771e-5 | 7.9936058e-15 |
++| Riccati box | 0.0035452773 | 0.0034744842 |
++| oscillator point | 1.6876511e-7 | 1.3322676e-15 |
++| oscillator box | 0.0025080318 | 0.0023756179 |
++
++## Acceptance and limits
++
++All sixteen solver/case outcomes pass independent analytic containment, width,
++input and horizon checks. Outputs stay identical within each adapter across
++fresh/reused preparation and every measured block. Nine corrupted-corpus controls
++are rejected, including an endpoint used as a whole tube, an oversized step,
++wrong inputs/time, missing/duplicate cases, and a too-wide result. Exact square-root
++controls cover 1,500 rational inputs; three series identities at zero also pass.
++The standalone Rust adapter passes MSRV Clippy with warnings denied and formatting;
++the C++ adapter passes GCC warnings-as-errors with external headers marked as system
++headers. CAPD's complete native test build passes all 42 tests.
++
++Earlier adapter campaigns are retained as ineligible for the declared configuration:
++CAPD's time-map implementation overwrote a maximum-step setting, producing two
++pieces in six cases. Exact checkpoints and checks of every piece repair that
++adapter error; only `campaign-step-cap` supplies the tables above. A metadata key
++collision in the first campaign was corrected; explicit timing commands always
++recorded CPU 0. An early upstream test invocation raced its final executable link;
++the complete post-build rerun passed. No test or width threshold was weakened.
++
++The upstream CAPD build emits a GCC array-copy warning in its static-array
++initialization test. That test is separate from this adapter's dynamically sized
++interval vectors. It was not edited or silently suppressed; the build log is
++retained. Passing these tests is not a universal audit of the external library.
++The external source and Boost packages are recorded by revision/package hashes,
++not copied into the project or evidence archive.
++
++This corpus does not establish stiff/long-time behavior, resource-exhaustion
++equivalence, high-degree symbolic support, allocation superiority or universal
++completeness. The binary sizes are recorded but are not old/new refactor gates:
++the compared programs implement different proof/report formats. Broader competitive
++workloads, profiling the measured Hyperdynamics costs, and the remaining plan phases
++are still open. The archive row for `2026-11-15-interval-external-dynamics` in
++`docs/evidence-archive.tsv` binds the source, logs and raw measurements.
+diff --git a/scripts/validated-dynamics/.gitignore b/scripts/validated-dynamics/.gitignore
+new file mode 100644
+index 000000000..06d02c68e
+--- /dev/null
++++ b/scripts/validated-dynamics/.gitignore
+@@ -0,0 +1,2 @@
++/__pycache__/
++/target/
+diff --git a/scripts/validated-dynamics/Cargo.lock b/scripts/validated-dynamics/Cargo.lock
+new file mode 100644
+index 000000000..2665df9c7
+--- /dev/null
++++ b/scripts/validated-dynamics/Cargo.lock
+@@ -0,0 +1,248 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "autocfg"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
++
++[[package]]
++name = "hyperdynamics"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++ "hyperlattice-interval",
++ "hyperreal",
++ "hypersolve",
++]
++
++[[package]]
++name = "hyperinterval"
++version = "0.1.0"
++dependencies = [
++ "hyperreal",
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "hyperlattice"
++version = "0.7.0"
++dependencies = [
++ "hyperreal",
++]
++
++[[package]]
++name = "hyperlattice-interval"
++version = "0.1.0"
++dependencies = [
++ "hyperinterval",
++]
++
++[[package]]
++name = "hyperlimit"
++version = "0.5.0"
++dependencies = [
++ "hyperlattice",
++ "hyperreal",
++]
++
++[[package]]
++name = "hyperreal"
++version = "0.14.0"
++dependencies = [
++ "num",
++]
++
++[[package]]
++name = "hypersolve"
++version = "0.4.0"
++dependencies = [
++ "hyperinterval",
++ "hyperlattice",
++ "hyperlimit",
++ "hyperreal",
++ "num",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "memchr"
++version = "2.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
++
++[[package]]
++name = "num"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
++dependencies = [
++ "num-bigint",
++ "num-complex",
++ "num-integer",
++ "num-iter",
++ "num-rational",
++ "num-traits",
++]
++
++[[package]]
++name = "num-bigint"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-complex"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-integer"
++version = "0.1.46"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
++dependencies = [
++ "num-traits",
++]
++
++[[package]]
++name = "num-iter"
++version = "0.1.45"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
++dependencies = [
++ "autocfg",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-rational"
++version = "0.4.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
++dependencies = [
++ "num-bigint",
++ "num-integer",
++ "num-traits",
++]
++
++[[package]]
++name = "num-traits"
++version = "0.2.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
++dependencies = [
++ "autocfg",
++]
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.106"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.45"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.228"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.149"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.117"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.24"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
++
++[[package]]
++name = "validated-dynamics-comparison"
++version = "0.0.0"
++dependencies = [
++ "hyperdynamics",
++ "hyperinterval",
++ "hyperlattice-interval",
++ "hypersolve",
++ "serde_json",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+diff --git a/scripts/validated-dynamics/Cargo.toml b/scripts/validated-dynamics/Cargo.toml
+new file mode 100644
+index 000000000..30b4abd3e
+--- /dev/null
++++ b/scripts/validated-dynamics/Cargo.toml
+@@ -0,0 +1,14 @@
++[package]
++name = "validated-dynamics-comparison"
++version = "0.0.0"
++edition = "2024"
++publish = false
++
++[workspace]
++
++[dependencies]
++hyperdynamics = { path = "../../crates/hyperdynamics", features = ["taylor-evolution"] }
++hyperinterval = { path = "../../crates/hyperinterval", features = ["dyadic"] }
++hyperlattice-interval = { path = "../../crates/hyperlattice-interval", features = ["dyadic"] }
++hypersolve = { path = "../../crates/hypersolve" }
++serde_json = "1.0"
+diff --git a/scripts/validated-dynamics/README.md b/scripts/validated-dynamics/README.md
+new file mode 100644
+index 000000000..7ed1c6f2f
+--- /dev/null
++++ b/scripts/validated-dynamics/README.md
+@@ -0,0 +1,96 @@
++# Validated dynamics comparison
++
++This standalone benchmark compares Hyperdynamics with CAPD::DynSys on the same
++finite IVP, endpoint and whole-horizon tube contract. CAPD is an external process;
++it is not a Hyper stack dependency or a replacement for its exact source/proof
++receipts. No third-party implementation is vendored here.
++
++The corpus has four autonomous fields: `x'=2`, `x'=x`, `x'=x²`, and
++`(x',y')=(y,-x)`. Each uses a point initial state and a box initial state.
++The scalar state starts at `1`, or `1±2^-10`; the oscillator starts at `(1,0)`,
++or that point plus `[-2^-10,2^-10]²`. The horizon is exactly `[0,1/4]`.
++All input values have identical exact meanings in both backends.
++
++Success requires the complete certified horizon, an endpoint enclosure of width
++at most `1/64` per coordinate, and a whole-horizon tube hull of width at most `1`
++per coordinate. The retained native trajectory certificates supply the tube;
++sampling is not used. `validate.py` checks every output against independent
++rational analytic bounds. Exponential uses its positive series and a geometric
++tail bound; sine/cosine use alternating-series bounds; Riccati has an exact
++rational solution. Oscillator extrema over the complete initial rectangle and
++time interval are checked, including the interior maximum of the first coordinate.
++Square-root bounds for that extremum use integer square roots with exact rational
++verification. Every actual endpoint and tube width is recorded.
++
++Hyperdynamics uses prepared order 3 with the existing default enclosure policy.
++CAPD uses order 12, `IOdeSolver`, `C0Rect2Set`, and an interval `SolutionCurve`.
++Both cap a step at `1/16`. These are explicit configurations, not a claim of
++optimal tuning or identical internal algorithms. Both must pass the same quality
++limits; stronger output is reported rather than rounded to the limit.
++CAPD's `TimeMap` replaces its solver's maximum-step setting, so its adapter
++advances through four exact checkpoints. Both adapters check every retained
++piece duration, and the independent validator checks the published time domains.
++
++`reuse` excludes source parsing/compilation and solver/coefficient preparation.
++`fresh` includes those costs. Both include integration, retained native evidence,
++materialized endpoint/tube output, and destruction of that evidence/output.
++The full Hyperdynamics source and rejected-attempt receipts remain in the report;
++CAPD retains its native solution-curve certificate. These are different evidence
++and resource APIs. Serialization and the independent oracle run outside timed
++loops. Eight warmups precede each mode. Results must remain byte-identical across
++fresh/reused preparation and all measured blocks within each adapter.
++
++The adapters emit exact dyadic triples or exact IEEE hexadecimal endpoints.
++The Python oracle converts both to rational numbers without decimal rounding.
++Graph/scalar work counters describe Hyperdynamics integration only; they exclude
++preparation and the separate tube-publication budget. CAPD has no equivalent
++counters in this adapter. Neither counters nor the runner timeout are a universal
++memory/total-work bound. The runner has a 600-second process timeout; failures are
++not included as successful timing samples. No allocation comparison is implied.
++
++## Build and run
++
++Use Rust 1.95.0, Python 3 with assertions enabled, GCC with C++17, CMake, and Linux
++`taskset`/`setarch`. Choose an output directory that does not already exist.
++Build the official [CAPD repository](https://github.com/CAPDGroup/CAPD) at commit
++`37057e5899bccaa6cd5701057b7e6ea5e232ef8b` (version 6.1.0):
++
++```sh
++cmake -S "$CAPD_SOURCE" -B "$CAPD_BUILD" \
++  -DCMAKE_BUILD_TYPE=Release -DCAPD_INTERVAL_TYPE=NATIVE -DCAPD_BUILD_TESTS=ON
++cmake --build "$CAPD_BUILD" --parallel 20
++ctest --test-dir "$CAPD_BUILD" --output-on-failure --parallel 20
++```
++
++The upstream tests require Boost headers and `unit_test_framework`. The recorded
++run used Debian packages extracted into a local directory and explicit
++`BOOST_ROOT`/`BOOST_LIBRARYDIR`; it did not install system packages. CMake 3.31
++also used `CMAKE_POLICY_DEFAULT_CMP0167=OLD`, `CMAKE_POLICY_DEFAULT_CMP0144=NEW`,
++`Boost_NO_SYSTEM_PATHS=ON`, and `Boost_NO_BOOST_CMAKE=ON`. The evidence records
++exact commands and package hashes. Follow the upstream build documentation for
++other environments; do not disable the tests to hide failures.
++
++From the CSGRS root:
++
++```sh
++python3 scripts/validated-dynamics/run.py \
++  --capd-source "$CAPD_SOURCE" --capd-build "$CAPD_BUILD" \
++  --cargo-target "$COMPARISON_TARGET" --output "$COMPARISON_OUTPUT" \
++  --iterations 100 --samples 5
++python3 scripts/validated-dynamics/check_rejections.py \
++  "$COMPARISON_OUTPUT/hyperdynamics-preflight.log"
++cargo +1.95.0 clippy --locked --manifest-path scripts/validated-dynamics/Cargo.toml \
++  --all-targets -- -D warnings
++```
++
++The runner keeps CAPD's required `-frounding-math` and native interval definition,
++uses external headers as system headers, and compiles the adapter with warnings
++denied. Separate processes isolate CAPD's rounding environment. It pins one CPU,
++disables ASLR, and runs Hyperdynamics/CAPD/CAPD/Hyperdynamics blocks. Each block
++validates the complete corpus before accepting its samples. Avoid other workloads
++during measurement. The runner records compiler versions, source/binary hashes,
++CPU information, affinity, commands, raw samples and exact certificate transcripts.
++
++This small corpus does not establish broad competitiveness, long-time stability,
++stiff-system behavior, high-degree symbolic support, or equal replay interfaces.
++See the [recorded comparison](../../docs/research/validated-dynamics-comparison.md).
+diff --git a/scripts/validated-dynamics/capd.cpp b/scripts/validated-dynamics/capd.cpp
+new file mode 100644
+index 000000000..7a67d3512
+--- /dev/null
++++ b/scripts/validated-dynamics/capd.cpp
+@@ -0,0 +1,147 @@
++// Separate-process CAPD adapter. Exact dyadic IVPs; no sampled trajectory is a tube.
++#include "capd/capdlib.h"
++#include <cmath>
++#include <chrono>
++#include <sstream>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++static void bounds(const capd::interval& value) {
++  if (!std::isfinite(value.leftBound()) || !std::isfinite(value.rightBound()))
++    throw std::runtime_error("nonfinite enclosure");
++  std::cout << "[\"" << std::hexfloat << value.leftBound() << "\",\""
++            << value.rightBound() << "\"]";
++}
++static void vector(const capd::IVector& value) {
++  std::cout << '[';
++  for (unsigned i = 0; i < value.dimension(); ++i) {
++    if (i) std::cout << ',';
++    bounds(value[i]);
++  }
++  std::cout << ']';
++}
++struct Prepared {
++  capd::IMap field;
++  capd::IOdeSolver solver;
++  capd::ITimeMap integrate;
++  explicit Prepared(const std::string& name)
++      : field(name == "constant" ? "var:x;fun:2;"
++            : name == "exponential" ? "var:x;fun:x;"
++            : name == "riccati" ? "var:x;fun:x*x;" : "var:x,y;fun:y,-x;"),
++        solver(field, 12), integrate(solver) {
++    solver.setMaxStep(1.0 / 16.0);
++  }
++};
++struct AuditedCurve : capd::ITimeMap::SolutionCurve {
++  AuditedCurve() : capd::ITimeMap::SolutionCurve(0) {}
++  const Domain& timeDomains() const { return domain; }
++  void checkStepCap() const {
++    if (domain.size() != getNumberOfPieces() + 1)
++      throw std::runtime_error("missing piece domain");
++    for (unsigned i = 1; i < domain.size(); ++i) {
++      const auto duration = domain[i] - domain[i - 1];
++      if (duration.leftBound() <= 0 || duration.rightBound() > 1.0 / 16.0)
++        throw std::runtime_error("invalid piece duration or exceeded step cap");
++    }
++  }
++};
++struct Outcome {
++  capd::IVector initial, end, tube;
++  AuditedCurve solution;
++  Outcome(Prepared& prepared, bool oscillator, bool uncertain)
++      : initial(oscillator ? 2 : 1), end(oscillator ? 2 : 1),
++        tube(oscillator ? 2 : 1) {
++    const double radius = uncertain ? 1.0 / 1024.0 : 0;
++    initial[0] = capd::interval(1 - radius, 1 + radius);
++    if (oscillator) initial[1] = capd::interval(-radius, radius);
++    capd::C0Rect2Set set(initial, 0);
++    // TimeMap replaces the solver's maxStep with the remaining horizon.
++    // Exact checkpoints enforce the common cap without disabling adaptation.
++    for (unsigned checkpoint = 1; checkpoint <= 4; ++checkpoint)
++      end = prepared.integrate(capd::interval(checkpoint / 16.0), set, solution);
++    if (solution.getLeftDomain() != 0 || solution.getRightDomain() != 0.25)
++      throw std::runtime_error("incomplete horizon");
++    tube = solution(capd::interval(0, 0.25));
++    solution.checkStepCap();
++  }
++};
++static void record(const std::string& name, bool uncertain, const Outcome& result) {
++  std::cout << "{\"kind\":\"certificate\",\"solver\":\"capd\",\"case\":\"" << name
++            << (uncertain ? "_box" : "_point")
++            << "\",\"status\":\"certified\",\"encoding\":\"ieee_hex\",\"order\":12,\"initial\":";
++  vector(result.initial);
++  std::cout << ",\"start\":"; bounds(capd::interval(0));
++  std::cout << ",\"end_time\":"; bounds(capd::interval(0.25));
++  std::cout << ",\"end\":"; vector(result.end);
++  std::cout << ",\"tube\":"; vector(result.tube);
++  std::cout << ",\"time_domains\":[";
++  bool first = true;
++  for (const auto& time : result.solution.timeDomains()) {
++    if (!first) std::cout << ',';
++    bounds(time);
++    first = false;
++  }
++  std::cout << "],\"pieces\":" << result.solution.getNumberOfPieces() << "}\n";
++}
++static bool same(const capd::IVector& a, const capd::IVector& b) {
++  if (a.dimension() != b.dimension()) return false;
++  for (unsigned i = 0; i < a.dimension(); ++i)
++    if (a[i].leftBound() != b[i].leftBound() || a[i].rightBound() != b[i].rightBound())
++      return false;
++  return true;
++}
++static void benchmark(const std::string& name, bool uncertain, unsigned iterations, unsigned samples) {
++  Prepared prepared(name);
++  const bool oscillator = name == "oscillator";
++  capd::IVector referenceEnd(oscillator ? 2 : 1), referenceTube(oscillator ? 2 : 1);
++  {
++    Outcome expected(prepared, oscillator, uncertain);
++    record(name, uncertain, expected);
++    referenceEnd = expected.end;
++    referenceTube = expected.tube;
++  }
++  for (const std::string mode : {"reuse", "fresh"}) {
++    auto run = [&] {
++      if (mode == "fresh") {
++        Prepared fresh(name);
++        Outcome result(fresh, oscillator, uncertain);
++        asm volatile("" : : "g"(&result) : "memory");
++      } else {
++        Outcome result(prepared, oscillator, uncertain);
++        asm volatile("" : : "g"(&result) : "memory");
++      }
++    };
++    for (unsigned i = 0; i < 8; ++i) run();
++    for (unsigned sample = 0; sample < samples; ++sample) {
++      auto start = std::chrono::steady_clock::now();
++      for (unsigned i = 0; i < iterations; ++i) run();
++      auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
++          std::chrono::steady_clock::now() - start).count();
++      std::cout << "{\"kind\":\"timing\",\"solver\":\"capd\",\"case\":\"" << name
++                << (uncertain ? "_box" : "_point") << "\",\"mode\":\"" << mode
++                << "\",\"sample\":" << sample << ",\"iterations\":" << iterations
++                << ",\"total_ns\":" << elapsed << "}\n";
++    }
++    Outcome repeated(prepared, oscillator, uncertain);
++    Prepared fresh(name);
++    Outcome recreated(fresh, oscillator, uncertain);
++    if (!same(repeated.end, referenceEnd) || !same(repeated.tube, referenceTube)
++        || !same(recreated.end, referenceEnd) || !same(recreated.tube, referenceTube))
++      throw std::runtime_error("history-dependent output: " + name);
++  }
++}
++int main(int argc, char** argv) {
++  try {
++    if (argc != 1 && argc != 3) throw std::runtime_error("usage: [iterations samples]");
++    const unsigned iterations = argc == 3 ? std::stoul(argv[1]) : 1;
++    const unsigned samples = argc == 3 ? std::stoul(argv[2]) : 0;
++    if (iterations < 1 || iterations > 100000 || samples > 100)
++      throw std::runtime_error("invalid measurement bounds");
++    for (const std::string name : {"constant", "exponential", "riccati", "oscillator"})
++      for (bool uncertain : {false, true}) benchmark(name, uncertain, iterations, samples);
++  } catch (const std::exception& error) {
++    std::cerr << error.what() << '\n';
++    return 1;
++  }
++}
+diff --git a/scripts/validated-dynamics/check_rejections.py b/scripts/validated-dynamics/check_rejections.py
+new file mode 100644
+index 000000000..17efc1a48
+--- /dev/null
++++ b/scripts/validated-dynamics/check_rejections.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""Verify that completed corpus records cannot hide incomplete or incorrect work."""
++import copy
++import json
++from pathlib import Path
++import sys
++
++from validate import validate
++
++if not __debug__:
++    raise RuntimeError("validation requires Python assertions enabled")
++
++rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
++rows = [row for row in rows if row.get("kind", "certificate") == "certificate"]
++validate(rows)
++assert rows[0]["case"] == "constant_point" and rows[0]["encoding"] == "dyadic"
++mutations = {
++    "wrong_initial_set": lambda r: r[0]["initial"].__setitem__(0, ["0", "0", 0]),
++    "wrong_endpoint": lambda r: r[0]["end"].__setitem__(0, ["1", "1", 0]),
++    "endpoint_only_tube": lambda r: r[0]["tube"].__setitem__(0, ["3", "3", -1]),
++    "too_wide_endpoint": lambda r: r[0]["end"].__setitem__(0, ["0", "100", 0]),
++    "wrong_horizon": lambda r: r[0].__setitem__("end_time", ["1", "1", 0]),
++    "no_segments": lambda r: r[0].__setitem__("pieces", 0),
++    "missing_case": lambda r: r.pop(),
++    "duplicate_case": lambda r: r.__setitem__(0, copy.deepcopy(r[1])),
++    "oversized_step": lambda r: (r[0].__setitem__("pieces", 2), r[0].__setitem__(
++        "time_domains", [["0", "0", 0], ["1", "1", -3], ["1", "1", -2]])),
++}
++for name, mutate in mutations.items():
++    incorrect = copy.deepcopy(rows)
++    mutate(incorrect)
++    try:
++        validate(incorrect)
++    except AssertionError:
++        print(f"rejected {name}")
++    else:
++        raise RuntimeError(f"incorrect workload accepted: {name}")
+diff --git a/scripts/validated-dynamics/run.py b/scripts/validated-dynamics/run.py
+new file mode 100644
+index 000000000..b2c29e1c4
+--- /dev/null
++++ b/scripts/validated-dynamics/run.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""Build and compare the pinned, separate-process validated ODE adapters."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import platform
++import shlex
++import statistics
++import subprocess
++import time
++
++from validate import validate
++
++CAPD_REVISION = "37057e5899bccaa6cd5701057b7e6ea5e232ef8b"
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--capd-source", required=True, type=Path)
++    parser.add_argument("--capd-build", required=True, type=Path)
++    parser.add_argument("--cargo-target", required=True, type=Path)
++    parser.add_argument("--output", required=True, type=Path)
++    parser.add_argument("--cpu", type=int, default=min(os.sched_getaffinity(0)))
++    parser.add_argument("--iterations", type=int, default=100)
++    parser.add_argument("--samples", type=int, default=5)
++    args = parser.parse_args()
++    assert 1 <= args.iterations <= 100000 and 1 <= args.samples <= 100
++    assert args.cpu in os.sched_getaffinity(0)
++    output = args.output.resolve()
++    output.mkdir(parents=True, exist_ok=False)
++    here = Path(__file__).resolve().parent
++    repo = here.parent.parent
++    commands = []
++
++    def run(label, command, env=None, timeout=600):
++        start = time.monotonic()
++        with (output / f"{label}.log").open("w") as log:
++            result = subprocess.run(command, cwd=repo, env=env, stdout=log,
++                                    stderr=subprocess.STDOUT, timeout=timeout)
++        commands.append({"label": label, "command": list(map(str, command)),
++                         "cwd": str(repo), "seconds": time.monotonic() - start,
++                         "exit_code": result.returncode})
++        (output / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
++        assert result.returncode == 0, f"{label}: see {output / (label + '.log')}"
++
++    revision = subprocess.check_output(
++        ["git", "-C", str(args.capd_source), "rev-parse", "HEAD"], text=True).strip()
++    assert revision == CAPD_REVISION
++    assert not subprocess.check_output(["git", "-C", str(args.capd_source), "diff", "HEAD"])
++    flags = shlex.split(subprocess.check_output(
++        [str(args.capd_build.resolve() / "bin/capd-config"), "--cflags", "--libs"], text=True))
++    assert "-frounding-math" in flags and "-D__USE_NATIVE__" in flags
++    # Keep upstream compiler options; mark only external headers as system headers.
++    flags = ["-isystem" + flag[2:] if flag.startswith("-I") else flag for flag in flags]
++    capd = args.cargo_target.resolve() / "capd-comparison"
++    env = os.environ | {"CARGO_TARGET_DIR": str(args.cargo_target.resolve()),
++                        "CARGO_BUILD_JOBS": "16", "CARGO_NET_OFFLINE": "true"}
++    run("hyper-build", ["cargo", "+1.95.0", "build", "--locked", "--release",
++                        "--manifest-path", str(here / "Cargo.toml")], env=env)
++    run("capd-build", ["g++", "-Wall", "-Wextra", "-Werror", str(here / "capd.cpp"),
++                       *flags, "-o", str(capd)])
++    hyper = args.cargo_target.resolve() / "release/validated-dynamics-comparison"
++    executables = {"hyperdynamics": hyper, "capd": capd}
++    metadata = {"capd_revision": revision, "cpu": args.cpu, "platform": platform.platform(),
++                "source_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, cwd=repo).strip(),
++                "environment": {k: env[k] for k in ("CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_NET_OFFLINE")},
++                "source_sha256": {str(p.relative_to(here)): hashlib.sha256(p.read_bytes()).hexdigest()
++                                  for p in here.rglob("*") if p.is_file() and "__pycache__" not in p.parts},
++                "binaries": {name: {"path": str(p), "bytes": p.stat().st_size,
++                                     "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
++                             for name, p in executables.items()}}
++    for tool, command in [("rustc", ["rustc", "+1.95.0", "-Vv"]), ("g++", ["g++", "--version"]),
++                          ("cpu_info", ["lscpu"])]:
++        metadata[tool] = subprocess.check_output(command, text=True)
++    (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
++    accepted = {}
++    for name, binary in executables.items():
++        run(name + "-preflight", [str(binary)])
++        rows = [json.loads(line) for line in (output / (name + "-preflight.log")).read_text().splitlines()]
++        accepted[name] = rows
++        (output / (name + "-validation.json")).write_text(json.dumps(validate(rows), indent=2) + "\n")
++    for process in ("rustc", "cc1plus"):
++        assert subprocess.run(["pgrep", "-x", process], stdout=subprocess.DEVNULL).returncode == 1
++    timing = []
++    for block, name in enumerate(("hyperdynamics", "capd", "capd", "hyperdynamics")):
++        label = f"{block}-{name}"
++        run(label, ["setarch", platform.machine(), "-R", "taskset", "-c", str(args.cpu),
++                    str(executables[name]), str(args.iterations), str(args.samples)])
++        rows = [json.loads(line) for line in (output / (label + ".log")).read_text().splitlines()]
++        certificates = [row for row in rows if row["kind"] == "certificate"]
++        assert certificates == accepted[name], "measurement changed certified outputs"
++        validate(certificates)
++        samples = [row | {"block": block} for row in rows if row["kind"] == "timing"]
++        assert len(samples) == 8 * 2 * args.samples
++        timing.extend(samples)
++    (output / "raw-timing.json").write_text(json.dumps(timing, indent=2) + "\n")
++    summary = []
++    for name in executables:
++        for case in [r["case"] for r in accepted[name]]:
++            for mode in ("reuse", "fresh"):
++                values = [r["total_ns"] / r["iterations"] for r in timing
++                          if (r["solver"], r["case"], r["mode"]) == (name, case, mode)]
++                summary.append({"solver": name, "case": case, "mode": mode,
++                                "samples": len(values), "median_ns": statistics.median(values),
++                                "min_ns": min(values), "max_ns": max(values)})
++    (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
++    print(f"Validated all 16 outcomes; saved {len(timing)} timing samples to {output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/validated-dynamics/src/main.rs b/scripts/validated-dynamics/src/main.rs
+new file mode 100644
+index 000000000..4b452b92f
+--- /dev/null
++++ b/scripts/validated-dynamics/src/main.rs
+@@ -0,0 +1,191 @@
++//! External comparison adapter. No numerical approximation enters the IVP.
++use hyperdynamics::field::{
++    EnclosureBudget, EnclosurePolicy, ExpressionField, FieldDefinition,
++    evolution::{EvolutionOptions, EvolutionRequest},
++    taylor_flow::{
++        FlowTaylorProgram,
++        evolution::{FlowTaylorEvolution, FlowTaylorEvolutionStatus},
++    },
++};
++use hyperinterval::{DyadicBudget, DyadicInterval};
++use hyperlattice_interval::BoxN;
++use hypersolve::{
++    Expr, SymbolId,
++    expression_program::{ExpressionBudget, ExpressionProgram},
++};
++use serde_json::{Value, json};
++use std::{hint::black_box, time::Instant};
++
++fn d(lo: i64, hi: i64, exponent: i32) -> DyadicInterval {
++    DyadicInterval::new(lo.into(), hi.into(), exponent).unwrap()
++}
++fn exact(value: &DyadicInterval) -> Value {
++    let (lo, hi, exponent) = value.bounds().expect("nonempty output");
++    json!([lo.to_string(), hi.to_string(), exponent])
++}
++fn prepare<const N: usize>(case: &str) -> FlowTaylorProgram<N> {
++    let t = SymbolId(0);
++    let x = SymbolId(1);
++    let y = SymbolId(2);
++    let v = Expr::anonymous_symbol(x);
++    let outputs = match case {
++        "constant" => vec![Expr::int(2)],
++        "exponential" => vec![v],
++        "riccati" => vec![v.clone() * v],
++        "oscillator" => vec![Expr::anonymous_symbol(y), -v],
++        _ => unreachable!(),
++    };
++    let states = [x, y][..N].to_vec();
++    let bindings: Vec<_> = std::iter::once(t).chain(states.iter().copied()).collect();
++    let source = ExpressionProgram::compile(
++        &outputs,
++        &bindings,
++        &mut ExpressionBudget::new(1_000_000, 100_000_000),
++    )
++    .unwrap();
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let field = ExpressionField::<N>::from_definition(
++        FieldDefinition {
++            source: source.definition().clone(),
++            time: t,
++            state: states,
++        },
++        &mut budget,
++    )
++    .unwrap();
++    field.flow_taylor(3, &mut budget).unwrap()
++}
++struct Outcome<const N: usize> {
++    report: FlowTaylorEvolution<N>,
++    tube: [DyadicInterval; N],
++    graph_work: usize,
++    scalar_work: u64,
++}
++fn complete<const N: usize>(program: &FlowTaylorProgram<N>, uncertain: bool) -> Outcome<N> {
++    let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++    let radius = i64::from(uncertain);
++    let initial = BoxN::new(std::array::from_fn(|i| {
++        let center = if i == 0 { 1024 } else { 0 };
++        d(center - radius, center + radius, -10)
++    }))
++    .unwrap();
++    let report = program.integrate(
++        EvolutionRequest {
++            start: d(0, 0, 0),
++            end: d(1, 1, -2),
++            initial: initial.clone(),
++        },
++        EvolutionOptions {
++            maximum_step: Some(d(1, 1, -4)),
++            ..Default::default()
++        },
++        &mut budget,
++    );
++    assert!(
++        matches!(report.status(), FlowTaylorEvolutionStatus::Completed),
++        "{:?}",
++        report.status()
++    );
++    assert_eq!(report.reached_time(), &d(1, 1, -2));
++    let mut tube = initial.lanes().unwrap().clone();
++    let mut publication = DyadicBudget::new(16384, 1_000_000_000);
++    let mut time = d(0, 0, 0);
++    for segment in report.segments() {
++        let proposal = segment.picard().proposal();
++        assert_eq!(proposal.start, time);
++        assert_ne!(proposal.end, time);
++        assert!(
++            proposal
++                .end
++                .sub(&time, &mut publication)
++                .unwrap()
++                .subset_of(&d(0, 1, -4), &mut publication)
++                .unwrap()
++        );
++        time = proposal.end.clone();
++        for (total, piece) in tube.iter_mut().zip(segment.tube().lanes().unwrap()) {
++            *total = total.hull(piece, &mut publication).unwrap();
++        }
++    }
++    assert_eq!(time, d(1, 1, -2));
++    Outcome {
++        report,
++        tube,
++        graph_work: budget.policy().graph_work - budget.remaining_graph_work(),
++        scalar_work: budget.policy().scalar_work - budget.remaining_scalar_work(),
++    }
++}
++fn record<const N: usize>(case: &str, uncertain: bool, out: &Outcome<N>) -> Value {
++    let report = &out.report;
++    json!({
++        "kind": "certificate", "solver": "hyperdynamics", "case": format!("{case}_{}", if uncertain {"box"} else {"point"}),
++        "status": "certified", "encoding": "dyadic", "order": 3,
++        "initial": report.request().initial.lanes().unwrap().iter().map(exact).collect::<Vec<_>>(),
++        "start": exact(&d(0,0,0)), "end_time": exact(report.reached_time()),
++        "end": report.end_enclosure().unwrap().lanes().unwrap().iter().map(exact).collect::<Vec<_>>(),
++        "tube": out.tube.iter().map(exact).collect::<Vec<_>>(), "pieces": report.segments().len(),
++        "time_domains": std::iter::once(exact(&d(0,0,0))).chain(report.segments().map(|s|exact(&s.picard().proposal().end))).collect::<Vec<_>>(),
++        "graph_work": out.graph_work,
++        "scalar_work": out.scalar_work,
++    })
++}
++fn benchmark<const N: usize>(case: &str, uncertain: bool, iterations: usize, samples: usize) {
++    let prepared = prepare::<N>(case);
++    let expected = record(case, uncertain, &complete(&prepared, uncertain));
++    println!("{expected}");
++    for mode in ["reuse", "fresh"] {
++        let run = || {
++            if mode == "fresh" {
++                let program = prepare::<N>(black_box(case));
++                drop(black_box(complete(&program, uncertain)));
++                drop(black_box(program));
++            } else {
++                drop(black_box(complete(&prepared, uncertain)));
++            }
++        };
++        for _ in 0..8 {
++            run();
++        }
++        for sample in 0..samples {
++            let start = Instant::now();
++            for _ in 0..iterations {
++                run();
++            }
++            let ns = start.elapsed().as_nanos();
++            println!(
++                "{}",
++                json!({"kind":"timing", "solver":"hyperdynamics",
++                "case":expected["case"], "mode":mode, "sample":sample,
++                "iterations":iterations, "total_ns":ns})
++            );
++        }
++        // Exact outputs must remain stable across warm reuse and fresh preparation.
++        assert_eq!(
++            record(case, uncertain, &complete(&prepared, uncertain)),
++            expected
++        );
++        assert_eq!(
++            record(case, uncertain, &complete(&prepare::<N>(case), uncertain)),
++            expected
++        );
++    }
++}
++fn main() {
++    let args: Vec<_> = std::env::args().skip(1).collect();
++    assert!(
++        args.is_empty() || args.len() == 2,
++        "usage: [iterations samples]"
++    );
++    let iterations = args.first().map_or(1, |s| s.parse::<usize>().unwrap());
++    let samples = args.get(1).map_or(0, |s| s.parse::<usize>().unwrap());
++    assert!((1..=100000).contains(&iterations) && samples <= 100);
++    for case in ["constant", "exponential", "riccati", "oscillator"] {
++        for uncertain in [false, true] {
++            if case == "oscillator" {
++                benchmark::<2>(case, uncertain, iterations, samples);
++            } else {
++                benchmark::<1>(case, uncertain, iterations, samples);
++            }
++        }
++    }
++}
+diff --git a/scripts/validated-dynamics/validate.py b/scripts/validated-dynamics/validate.py
+new file mode 100644
+index 000000000..c58600492
+--- /dev/null
++++ b/scripts/validated-dynamics/validate.py
+@@ -0,0 +1,126 @@
++#!/usr/bin/env python3
++"""Exact analytic acceptance for the external IVP corpus; no solver-to-solver oracle."""
++import argparse
++from fractions import Fraction as Q
++import json
++import math
++from pathlib import Path
++
++CASES = [(kind, box) for kind in ("constant", "exponential", "riccati", "oscillator")
++         for box in (False, True)]
++END_WIDTH = Q(1, 64)
++TUBE_WIDTH = Q(1)
++
++
++def series(kind, x):
++    """Rational bounds from a positive-series tail or the alternating-series theorem."""
++    if kind == "exp":
++        term = total = Q(1)
++        for k in range(1, 50):
++            term *= x / k
++            total += term
++        first = term * x / 50
++        return total, total + first / (1 - x / 51)
++    term = Q(1) if kind == "cos" else x
++    total = term
++    for k in range(1, 40):
++        a = 2 * k if kind == "cos" else 2 * k + 1
++        term *= -x * x / (a * (a - 1))
++        total += term
++    a = 80 if kind == "cos" else 81
++    following = term * -x * x / (a * (a - 1))
++    return min(total, total + following), max(total, total + following)
++
++
++def sqrt_bounds(x):
++    scale = 1 << 180
++    lower = math.isqrt(x.numerator * scale * scale // x.denominator)
++    lo = Q(lower, scale)
++    return lo, lo if lo * lo == x else Q(lower + 1, scale)
++
++
++def oracle(kind, box):
++    radius = Q(1, 1024) if box else Q(0)
++    a, b, t = 1 - radius, 1 + radius, Q(1, 4)
++    initial = [(a, b)]
++    if kind == "constant":
++        end = [(a + 2 * t, b + 2 * t)]
++        tube = [(a, end[0][1])]
++    elif kind == "exponential":
++        lo, hi = series("exp", t)
++        end = [(a * lo, b * hi)]
++        tube = [(a, end[0][1])]
++    elif kind == "riccati":
++        end = [(a / (1 - t * a), b / (1 - t * b))]
++        tube = [(a, end[0][1])]
++    else:
++        initial.append((-radius, radius))
++        cl, cu = series("cos", t)
++        sl, su = series("sin", t)
++        end = [(a * cl - radius * su, b * cu + radius * su),
++               (-b * su - radius * cu, -a * sl + radius * cu)]
++        # x extrema: minimum at T, maximum at atan(radius/b), in [0,T].
++        # y decreases throughout [0,T] for this entire initial rectangle.
++        tube = [(end[0][0], sqrt_bounds(b * b + radius * radius)[1]),
++                (end[1][0], radius)]
++    return initial, end, tube
++
++
++def decode(row, pair):
++    if row["encoding"] == "dyadic":
++        lo, hi, exponent = pair
++        assert isinstance(exponent, int) and -10000 <= exponent <= 10000
++        scale = Q(2) ** exponent
++        result = Q(int(lo)) * scale, Q(int(hi)) * scale
++    else:
++        assert row["encoding"] == "ieee_hex"
++        result = tuple(Q.from_float(float.fromhex(v)) for v in pair)
++    assert result[0] <= result[1]
++    return result
++
++
++def validate(rows):
++    names = {f"{kind}_{'box' if box else 'point'}": (kind, box) for kind, box in CASES}
++    assert len(rows) == len(names), "missing/duplicate corpus records"
++    assert {row["case"] for row in rows} == set(names), "wrong corpus"
++    result = []
++    for row in rows:
++        kind, box = names[row["case"]]
++        assert row["status"] == "certified"
++        assert 0 < row["pieces"] <= 256
++        assert decode(row, row["start"]) == (0, 0)
++        assert decode(row, row["end_time"]) == (Q(1, 4), Q(1, 4))
++        times = [decode(row, value) for value in row["time_domains"]]
++        assert len(times) == row["pieces"] + 1
++        assert times[0] == (0, 0) and times[-1] == (Q(1, 4), Q(1, 4))
++        for left, right in zip(times, times[1:]):
++            assert 0 < right[0] - left[1] <= right[1] - left[0] <= Q(1, 16)
++        initial, expected_end, expected_tube = oracle(kind, box)
++        assert [decode(row, v) for v in row["initial"]] == initial
++        widths = {}
++        for label, expected, limit in [("end", expected_end, END_WIDTH),
++                                        ("tube", expected_tube, TUBE_WIDTH)]:
++            actual = [decode(row, v) for v in row[label]]
++            assert len(actual) == len(expected)
++            for lane, ((lo, hi), (el, eh)) in enumerate(zip(actual, expected)):
++                assert lo <= el <= eh <= hi, (row["case"], label, lane, "analytic containment")
++                assert hi - lo <= limit, (row["case"], label, lane, "width limit")
++            widths[label] = [str(hi - lo) for lo, hi in actual]
++        result.append({"case": row["case"], "solver": row["solver"],
++                       "analytic_containment": True, "exact_widths": widths})
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("records", type=Path, nargs="+")
++    args = parser.parse_args()
++    output = []
++    for path in args.records:
++        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
++        output.extend(validate([row for row in rows if row.get("kind", "certificate") == "certificate"]))
++    print(json.dumps(output, indent=2))
++
++
++if __name__ == "__main__":
++    main()
