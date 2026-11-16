@@ -1,0 +1,124 @@
+diff --git a/crates/alumina-foc/src/lib.rs b/crates/alumina-foc/src/lib.rs
+index 640f58b..265bcd6 100644
+--- a/crates/alumina-foc/src/lib.rs
++++ b/crates/alumina-foc/src/lib.rs
+@@ -1071,17 +1071,13 @@ pub enum FocError {
+ }
+ 
+ fn interval_max(left: Q30Interval, right: Q30Interval) -> Q30Interval {
+-    Q30Interval {
+-        lower: left.lower.max(right.lower),
+-        upper: left.upper.max(right.upper),
+-    }
++    Q30Interval::from_fixed(Ok(left.fixed().max_image(&right.fixed())))
++        .expect("order images preserve nonempty Q30 intervals")
+ }
+ 
+ fn interval_min(left: Q30Interval, right: Q30Interval) -> Q30Interval {
+-    Q30Interval {
+-        lower: left.lower.min(right.lower),
+-        upper: left.upper.min(right.upper),
+-    }
++    Q30Interval::from_fixed(Ok(left.fixed().min_image(&right.fixed())))
++        .expect("order images preserve nonempty Q30 intervals")
+ }
+ 
+ fn vector_within_limit(value: DqPoint, limit: Q30) -> bool {
+@@ -1573,3 +1569,6 @@ mod tests {
+         assert_eq!(command.validate(&snapshot), Err(FocError::Configuration));
+     }
+ }
++
++#[cfg(test)]
++mod order_image_migration;
+diff --git a/crates/alumina-foc/src/order_image_migration.rs b/crates/alumina-foc/src/order_image_migration.rs
+new file mode 100644
+index 0000000..577fc2d
+--- /dev/null
++++ b/crates/alumina-foc/src/order_image_migration.rs
+@@ -0,0 +1,85 @@
++//! Independent closed-set witnesses for FOC's shared order-image boundary.
++use super::*;
++
++fn interval(lower: i32, upper: i32) -> Q30Interval {
++    Q30Interval::new(Q30::from_bits(lower), Q30::from_bits(upper)).unwrap()
++}
++
++#[test]
++fn order_images_match_every_member_of_reduced_cartesian_products() {
++    let mut cases = 0;
++    for a in -3..=3 {
++        for b in a..=3 {
++            for c in -3..=3 {
++                for d in c..=3 {
++                    let left = interval(a, b);
++                    let right = interval(c, d);
++                    let mut minima = [false; 7];
++                    let mut maxima = [false; 7];
++                    for x in a..=b {
++                        for y in c..=d {
++                            let (small, large) = if x < y { (x, y) } else { (y, x) };
++                            minima[(small + 3) as usize] = true;
++                            maxima[(large + 3) as usize] = true;
++                        }
++                    }
++                    let minimum = interval_min(left, right);
++                    let maximum = interval_max(left, right);
++                    for value in -3..=3 {
++                        assert_eq!(
++                            minimum.contains(Q30::from_bits(value)),
++                            minima[(value + 3) as usize]
++                        );
++                        assert_eq!(
++                            maximum.contains(Q30::from_bits(value)),
++                            maxima[(value + 3) as usize]
++                        );
++                    }
++                    assert_eq!(
++                        minimum.checked_neg().unwrap(),
++                        interval_max(left.checked_neg().unwrap(), right.checked_neg().unwrap())
++                    );
++                    cases += 1;
++                }
++            }
++        }
++    }
++    assert_eq!(cases, 784);
++}
++
++#[test]
++fn generated_order_images_feed_modulation_and_further_interval_arithmetic() {
++    let mut cases = 0;
++    for a in -3..=0 {
++        for b in 0..=3 {
++            for c in -3..=0 {
++                for d in 0..=3 {
++                    let left = interval(a, b);
++                    let right = interval(c, d);
++                    let result = space_vector_modulate(
++                        AlphaBeta {
++                            alpha: interval_min(left, right),
++                            beta: interval_max(left, right),
++                        },
++                        Q30::ONE,
++                    )
++                    .unwrap();
++                    // Both generated images include zero, so the exact zero
++                    // voltage solution must survive all subsequent enclosures.
++                    assert!(result.common_mode.contains(Q30::ZERO));
++                    for duty in [result.duties.a, result.duties.b, result.duties.c] {
++                        assert!(duty.contains(Q30::HALF));
++                        assert!(duty.lower() >= Q30::ZERO && duty.upper() <= Q30::ONE);
++                        assert!(
++                            duty.checked_square()
++                                .unwrap()
++                                .contains(Q30::from_bits(1 << 28))
++                        );
++                    }
++                    cases += 1;
++                }
++            }
++        }
++    }
++    assert_eq!(cases, 256);
++}
