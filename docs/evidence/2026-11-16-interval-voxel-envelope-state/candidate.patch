@@ -1,0 +1,94 @@
+diff --git a/crates/hypervoxel/src/field.rs b/crates/hypervoxel/src/field.rs
+index 0778c6544..1f2d1dbde 100644
+--- a/crates/hypervoxel/src/field.rs
++++ b/crates/hypervoxel/src/field.rs
+@@ -150,21 +150,27 @@ impl FieldEnvelopeFacts {
+         vectors: impl IntoIterator<Item = &'a CertifiedVectorInterval>,
+         tensors: impl IntoIterator<Item = &'a CertifiedTensorInterval>,
+     ) -> HypervoxelResult<Self> {
+-        let mut vector_count = 0_usize;
+-        let mut tensor_count = 0_usize;
+-        let mut incompatible_shapes = 0_usize;
+-        let mut vector_interval = None::<CertifiedVectorInterval>;
+-        let mut tensor_interval = None::<CertifiedTensorInterval>;
++        let mut facts = Self {
++            vector_count: 0,
++            tensor_count: 0,
++            envelope_count: 0,
++            has_envelopes: false,
++            vector_interval: None,
++            tensor_interval: None,
++            incompatible_shapes: 0,
++            certainty: AggregateCertainty::Unknown,
++            certified_envelope_ready: false,
++        };
+ 
+         for vector in vectors {
+             validate_components(&vector.components)?;
+-            vector_count += 1;
+-            match &mut vector_interval {
++            facts.vector_count += 1;
++            match &mut facts.vector_interval {
+                 Some(current) if current.components.len() == vector.components.len() => {
+                     merge_components(&mut current.components, &vector.components)?;
+                 }
+-                Some(_) => incompatible_shapes += 1,
+-                None => vector_interval = Some(vector.clone()),
++                Some(_) => facts.incompatible_shapes += 1,
++                None => facts.vector_interval = Some(vector.clone()),
+             }
+         }
+ 
+@@ -175,8 +181,8 @@ impl FieldEnvelopeFacts {
+                 });
+             }
+             validate_components(&tensor.components)?;
+-            tensor_count += 1;
+-            match &mut tensor_interval {
++            facts.tensor_count += 1;
++            match &mut facts.tensor_interval {
+                 Some(current)
+                     if current.rows == tensor.rows
+                         && current.cols == tensor.cols
+@@ -184,30 +190,20 @@ impl FieldEnvelopeFacts {
+                 {
+                     merge_components(&mut current.components, &tensor.components)?;
+                 }
+-                Some(_) => incompatible_shapes += 1,
+-                None => tensor_interval = Some(tensor.clone()),
++                Some(_) => facts.incompatible_shapes += 1,
++                None => facts.tensor_interval = Some(tensor.clone()),
+             }
+         }
+ 
+-        let envelope_count = vector_count + tensor_count;
+-        let has_envelopes = envelope_count > 0;
+-        let certified_envelope_ready = has_envelopes && incompatible_shapes == 0;
+-
+-        Ok(Self {
+-            vector_count,
+-            tensor_count,
+-            envelope_count,
+-            has_envelopes,
+-            vector_interval,
+-            tensor_interval,
+-            incompatible_shapes,
+-            certainty: if certified_envelope_ready {
+-                AggregateCertainty::Certified
+-            } else {
+-                AggregateCertainty::Unknown
+-            },
+-            certified_envelope_ready,
+-        })
++        facts.envelope_count = facts.vector_count + facts.tensor_count;
++        facts.has_envelopes = facts.envelope_count > 0;
++        facts.certified_envelope_ready = facts.has_envelopes && facts.incompatible_shapes == 0;
++        facts.certainty = if facts.certified_envelope_ready {
++            AggregateCertainty::Certified
++        } else {
++            AggregateCertainty::Unknown
++        };
++        Ok(facts)
+     }
+ }
+ 
