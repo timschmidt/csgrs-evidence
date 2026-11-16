@@ -1,0 +1,187 @@
+diff --git a/crates/hyperdynamics/Cargo.toml b/crates/hyperdynamics/Cargo.toml
+index b67d7a7db..1d5ede730 100644
+--- a/crates/hyperdynamics/Cargo.toml
++++ b/crates/hyperdynamics/Cargo.toml
+@@ -22,6 +22,7 @@ coordinate-transition = ["coordinates", "hypersolve/coordinate-transition"]
+ taylor-model = ["field", "hypersolve/taylor-model"]
+ taylor-flow = ["taylor-model"]
+ flow-noise = ["taylor-flow", "taylor-noise"]
++flow-noise-evolution = ["flow-noise"]
+ taylor-evolution = ["taylor-flow"]
+ adaptive-taylor = ["taylor-flow"]
+ taylor-affine = ["taylor-model", "hypersolve/taylor-affine"]
+@@ -115,3 +116,12 @@ required-features = ["taylor-flow"]
+ name = "taylor_orders"
+ harness = false
+ required-features = ["taylor-flow"]
++
++[[example]]
++name = "flow_noise_evolution"
++required-features = ["flow-noise-evolution"]
++
++[[bench]]
++name = "flow_noise_evolution"
++harness = false
++required-features = ["flow-noise-evolution", "taylor-evolution"]
+diff --git a/crates/hyperdynamics/README.md b/crates/hyperdynamics/README.md
+index d3c816cef..b5b2df5b6 100644
+--- a/crates/hyperdynamics/README.md
++++ b/crates/hyperdynamics/README.md
+@@ -300,3 +300,30 @@ cancellation still apply.
+ ```sh
+ cargo run -p hyperdynamics --features flow-noise --example flow_noise
+ ```
++
++Enable `flow-noise-evolution` for
++`program.integrate_noise(initial, end, options, budget)`. The prepared trajectory
++program now searches bounded native step durations and tube candidates while
++carrying the complete affine outer endpoint into each next search. Accepted
++Picard proofs are reused once; analytic Taylor remainders, selected uncertainty
++columns and all discarded contributions remain authoritative. The final step
++is capped at the exact requested time.
++
++`FlowNoiseEvolutionOptions` selects the retained-column capacity and existing
++native search/segment limits. The report retains every native attempt and
++noise refinement. Only `Completed`, validated `Identity`, or `Empty` exposes
++`end_state`; `prefix_end_state` explicitly exposes a certified prefix after a
++later failure. Empty results retain the requested time and can enter another
++horizon. Invalid times/options are checked before empty or identity shortcuts.
++
++All calls share the supplied enclosure budget. Structural history checks and
++existing scalar counters do not bound total heap, all retained proof graphs,
++scalar payload/refinement or within-scalar cancellation. This controller uses
++a caller-selected Taylor order and retained-column capacity; it does not
++claim global error control, adaptive frame selection or optimal noise retention.
++Replay the original box, field/order history, horizon, options and policy;
++serialized result flags are not certificates.
++
++```sh
++cargo run -p hyperdynamics --features flow-noise-evolution --example flow_noise_evolution
++```
+diff --git a/crates/hyperdynamics/src/field/taylor_flow/noise.rs b/crates/hyperdynamics/src/field/taylor_flow/noise.rs
+index 4d7d72552..fc7d74943 100644
+--- a/crates/hyperdynamics/src/field/taylor_flow/noise.rs
++++ b/crates/hyperdynamics/src/field/taylor_flow/noise.rs
+@@ -303,36 +303,59 @@ impl<const N: usize> FlowTaylorProgram<N> {
+         request: FlowNoiseRequest<N>,
+         budget: &mut EnclosureBudget,
+     ) -> FlowNoiseReport<N> {
+-        let mut evidence = FlowNoiseEvidence {
+-            program: self.clone(),
+-            initial,
+-            request,
+-            flow: None,
+-            polynomial: None,
+-            composition: None,
+-            inputs: Vec::new(),
+-            noise: None,
+-            status: FlowNoiseStatus::Empty,
+-        };
+-        let result = advance(&mut evidence, budget);
+-        evidence.status = match &result {
+-            Ok((None, _)) => FlowNoiseStatus::Empty,
+-            Ok(_) => FlowNoiseStatus::Certified,
+-            Err(e) => FlowNoiseStatus::Rejected(e.clone()),
+-        };
+-        let evidence = Arc::new(evidence);
+-        let end = result.ok().map(|(form, enclosure)| {
+-            Arc::new(FlowNoiseState {
+-                time: evidence.request.end.clone(),
+-                form,
+-                enclosure,
+-                evidence: Some(evidence.clone()),
+-            })
+-        });
+-        FlowNoiseReport { evidence, end }
++        certify_from(self, initial, request, budget, |e, budget| {
++            Ok(e.program.certify_step(
++                PicardProposal {
++                    start: e.initial.time.clone(),
++                    end: e.request.end.clone(),
++                    initial: e.initial.enclosure.clone(),
++                    candidate: e.request.candidate.clone(),
++                },
++                budget,
++            ))
++        })
+     }
+ }
+ 
++fn certify_from<const N: usize>(
++    program: &FlowTaylorProgram<N>,
++    initial: Arc<FlowNoiseState<N>>,
++    request: FlowNoiseRequest<N>,
++    budget: &mut EnclosureBudget,
++    prove: impl FnOnce(
++        &FlowNoiseEvidence<N>,
++        &mut EnclosureBudget,
++    ) -> Result<FlowTaylorReport<N>, FlowNoiseError>,
++) -> FlowNoiseReport<N> {
++    let mut evidence = FlowNoiseEvidence {
++        program: program.clone(),
++        initial,
++        request,
++        flow: None,
++        polynomial: None,
++        composition: None,
++        inputs: Vec::new(),
++        noise: None,
++        status: FlowNoiseStatus::Empty,
++    };
++    let result = advance(&mut evidence, budget, prove);
++    evidence.status = match &result {
++        Ok((None, _)) => FlowNoiseStatus::Empty,
++        Ok(_) => FlowNoiseStatus::Certified,
++        Err(e) => FlowNoiseStatus::Rejected(e.clone()),
++    };
++    let evidence = Arc::new(evidence);
++    let end = result.ok().map(|(form, enclosure)| {
++        Arc::new(FlowNoiseState {
++            time: evidence.request.end.clone(),
++            form,
++            enclosure,
++            evidence: Some(evidence.clone()),
++        })
++    });
++    FlowNoiseReport { evidence, end }
++}
++
+ fn zero() -> DyadicInterval {
+     DyadicInterval::point(0.into(), 0).expect("zero")
+ }
+@@ -443,6 +466,10 @@ fn endpoint_polynomial<const N: usize>(
+ fn advance<const N: usize>(
+     e: &mut FlowNoiseEvidence<N>,
+     budget: &mut EnclosureBudget,
++    prove: impl FnOnce(
++        &FlowNoiseEvidence<N>,
++        &mut EnclosureBudget,
++    ) -> Result<FlowTaylorReport<N>, FlowNoiseError>,
+ ) -> Result<(Option<Form<N>>, BoxN<DyadicInterval, N>), FlowNoiseError> {
+     budget.graph.charge(0)?;
+     budget.graph.check_entries(&[N, N, N])?;
+@@ -451,15 +478,7 @@ fn advance<const N: usize>(
+             .and_then(|v| v.checked_add(2))
+             .ok_or(ExpressionError::SizeExhausted)?,
+     )?;
+-    e.flow = Some(e.program.certify_step(
+-        PicardProposal {
+-            start: e.initial.time.clone(),
+-            end: e.request.end.clone(),
+-            initial: e.initial.enclosure.clone(),
+-            candidate: e.request.candidate.clone(),
+-        },
+-        budget,
+-    ));
++    e.flow = Some(prove(e, budget)?);
+     let flow = e.flow.as_ref().expect("stored attempt");
+     match flow.status() {
+         FlowTaylorStatus::Rejected(error) => return Err(FlowNoiseError::Flow(error.clone())),
+@@ -707,3 +726,7 @@ fn enclose_coefficients<const N: usize>(
+         native.try_into().expect("N coefficients"),
+     )?)
+ }
++
++/// Automatic bounded horizons retaining affine endpoint uncertainty.
++#[cfg(feature = "flow-noise-evolution")]
++pub mod evolution;
