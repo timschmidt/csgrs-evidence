@@ -1,0 +1,52 @@
+diff --git a/crates/alumina-interface-core/src/machine_profile.rs b/crates/alumina-interface-core/src/machine_profile.rs
+index a43b4f4..8c76250 100644
+--- a/crates/alumina-interface-core/src/machine_profile.rs
++++ b/crates/alumina-interface-core/src/machine_profile.rs
+@@ -2110,6 +2110,19 @@ mod tests {
+         assert_eq!(projection.acceleration_bottleneck.axis_index, 1);
+         assert_eq!(projection.jerk_bottleneck.axis_index, 1);
+         assert!(projection.all_satisfied());
++        // Frozen from the pre-Hyperdynamics projection implementation. The
++        // transcript binds exact axis limits, bottlenecks and solver replay.
++        let transcript =
++            crate::schedule_evidence::build_canonical_planner_digests(&schedule).unwrap();
++        assert_eq!(transcript.planner_transcript_byte_len, 41795);
++        assert_eq!(
++            transcript.planner_transcript_digest.0,
++            [
++                223, 137, 61, 248, 62, 144, 230, 181, 52, 82, 225, 133, 134, 255, 202, 162, 82, 74,
++                2, 22, 49, 163, 149, 212, 166, 82, 59, 225, 98, 99, 102, 156
++            ]
++        );
++
+         assert_ne!(schedule.lookahead().corner_feeds[0], Real::zero());
+         assert!(schedule.lookahead_plan().all_satisfied());
+         assert!(schedule.jerk_report().all_satisfied());
+diff --git a/docs/INTERVAL-MIGRATION.md b/docs/INTERVAL-MIGRATION.md
+index d783a4f..5c1dd58 100644
+--- a/docs/INTERVAL-MIGRATION.md
++++ b/docs/INTERVAL-MIGRATION.md
+@@ -27,3 +27,23 @@ Machine-profile `ExactInterval`, positive products/quotients, named error-budget
+ composition and full application browser/schedule qualification remain separate
+ parts of the migration. Their implementations and canonical encodings are not
+ changed by this constructor delegation.
++
++The existing diagonal G1 profile test additionally fixes the canonical planner
++transcript at 41,795 bytes with digest
++`df893df83e90e6b53452e18586ffcaa2524a021631a395d4a6523be16263669c`.
++This witness predates the unaccepted path-dynamics extraction and is retained
++independently of that production migration. It supplements the existing exact
++axis limits, bottlenecks, solver reports and terminal-step assertions; a digest
++alone is not a geometry correctness proof.
++
++Qualification against Interface `f5341f3`, firmware `2d68e82` and CSGRS's fixed
++`c9f1f9ac`/current `e835617c` dependency graphs: all 201 core tests/doctests,
++199 configured-release core tests, strict core Clippy and workspace formatting
++pass. The final release test binary grows by 432 bytes and its complete `.text`
++section by 224 bytes, within the recorded byte/percentage limits. Configured
++release stripping is preserved; a symbol-preserving diagnostic changed generated
++code and is excluded from acceptance measurements. This is a test-only assertion,
++not acceptance of the archived production extraction or a full release/HIL claim.
++The cumulative account and raw evidence are maintained in CSGRS
++`docs/research/interval-size-accounts.json` and
++`docs/evidence/2026-11-16-interval-path-dynamics-current-admission`.

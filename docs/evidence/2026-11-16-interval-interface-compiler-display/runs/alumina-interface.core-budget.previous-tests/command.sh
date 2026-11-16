@@ -1,0 +1,3 @@
+/tmp/interval-refactor/coordinated-ci/interface-core-budget/previous/test-binary --exact partition::tests::representative_program_packages_deterministically_into_real_schemas --test-threads=1
+/tmp/interval-refactor/coordinated-ci/interface-core-budget/previous/test-binary --exact machine_profile::tests::stop_to_stop_line_lowers_to_certified_direct_finite_differences --test-threads=1
+/tmp/interval-refactor/coordinated-ci/interface-core-budget/previous/test-binary --exact servo_motion::tests::exact_two_span_program_splits_horizons_and_returns_to_rest --test-threads=1

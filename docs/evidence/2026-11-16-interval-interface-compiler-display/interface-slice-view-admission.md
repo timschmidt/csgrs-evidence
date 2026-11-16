@@ -1,0 +1,5 @@
+# Execution-block slice-view comparison
+
+Owner and contract remain the existing partition admission: Interface core, P31/P32/P33 and P36/P37, finite internally encoded512-byte execution blocks for servo, finite-difference and motion partitions. Preserve all byte copies, decoder/validator calls, errors and their order. Original stable full-bin lint failures are retained.
+
+The Hypercurve driver comparison demonstrated that explicitly retaining a slice view can preserve the previous optimized code while meeting fixed-chunk Clippy. Evaluate the same type-preserving conversion here, starting in the qualification checkout only. This is an evidence-driven compiler compatibility candidate, not an assumption of equivalence or a rejection of the authorized bounded-growth exception. Preserve the first candidate's completed artifacts and107-byte Brotli increase. First compare optimized core code, then rerun affected tests and final native/WASM builds before any retention. No allowance is silently reset or expanded.

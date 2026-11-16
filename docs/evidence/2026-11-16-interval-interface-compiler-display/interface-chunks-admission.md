@@ -1,0 +1,7 @@
+# Fixed-size execution block iteration
+
+Owner: Alumina Interface machine partition construction (partition.rs). P31/P32/P33 and P36/P37. Domain: internally built finite servo, finite-difference stepper, and motion streams, appended only in EXECUTION_BLOCK_BYTES units. Current stable Clippy on 32a59de0d69436427e5b97297c4929fd908bf326 rejects three chunks_exact loops on native and WASM (runs/alumina-interface.build-and-deploy.19 and .20).
+
+Candidate: replace only those three iterator expressions with as_chunks::<EXECUTION_BLOCK_BYTES>().0. This preserves order, exact byte slices, the existing copy into owned blocks, decoder/validator calls, completion checks and error propagation. No change to remainder handling: both traverse all complete fixed-size blocks; these internal buffers are built in exact block multiples. No new API, predicate, arithmetic, policy, receipt or serialization changes.
+
+Validation before retention: unchanged full workspace tests and native/WASM strict Clippy; formatting and source policy; optimized native core IR/assembly and final desktop/WASM artifact comparison using the same source layout and toolchains; retain any cost difference rather than claiming an unmeasured equivalence. No growth allowance is invoked for this compiler-lint compatibility repair. Baseline Trunk build is running; do not mutate its checkout until all baseline commands terminate and baseline artifacts are retained.

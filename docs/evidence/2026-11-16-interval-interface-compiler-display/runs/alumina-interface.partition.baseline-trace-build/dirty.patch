@@ -1,0 +1,74 @@
+diff --git a/crates/alumina-interface-core/src/partition.rs b/crates/alumina-interface-core/src/partition.rs
+index c9b82fc..c6cb252 100644
+--- a/crates/alumina-interface-core/src/partition.rs
++++ b/crates/alumina-interface-core/src/partition.rs
+@@ -594,11 +594,22 @@ pub fn package_canonical_servo_program<const AXES: usize>(
+         program.initial_position(),
+         admission.limits,
+     )?;
++    #[cfg(test)]
++    let chunk_recording = hyperreal::dispatch_trace::recording_scope();
++    #[cfg(test)]
++    let chunk_dispatch_before = hyperreal::dispatch_trace::snapshot();
+     for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         validator.accept(&ExecutionBlock::decode(owned)?)?;
+     }
++    #[cfg(test)]
++    {
++        assert_eq!(hyperreal::dispatch_trace::snapshot(), chunk_dispatch_before,
++                   "execution block validation must not dispatch scalar predicates");
++        drop(chunk_recording);
++        eprintln!("PARTITION_TRACE kind=0 blocks={} scalar_events=0", bytes.len() / EXECUTION_BLOCK_BYTES);
++    }
+     let servo_progress = validator.finish()?;
+     let expected_end_tick = segments
+         .last()
+@@ -836,11 +847,22 @@ fn package_canonical_finite_difference_segments(
+         },
+         limits,
+     )?;
++    #[cfg(test)]
++    let chunk_recording = hyperreal::dispatch_trace::recording_scope();
++    #[cfg(test)]
++    let chunk_dispatch_before = hyperreal::dispatch_trace::snapshot();
+     for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         validator.accept(&ExecutionBlock::decode(owned)?)?;
+     }
++    #[cfg(test)]
++    {
++        assert_eq!(hyperreal::dispatch_trace::snapshot(), chunk_dispatch_before,
++                   "execution block validation must not dispatch scalar predicates");
++        drop(chunk_recording);
++        eprintln!("PARTITION_TRACE kind=1 blocks={} scalar_events=0", bytes.len() / EXECUTION_BLOCK_BYTES);
++    }
+     let direct_progress = validator.finish()?;
+     let final_position = [
+         initial_position[0]
+@@ -1053,12 +1075,23 @@ fn package_canonical_segments(
+         },
+         policy.block_limits,
+     )?;
++    #[cfg(test)]
++    let chunk_recording = hyperreal::dispatch_trace::recording_scope();
++    #[cfg(test)]
++    let chunk_dispatch_before = hyperreal::dispatch_trace::snapshot();
+     for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         let block = ExecutionBlock::decode(owned)?;
+         validator.accept(&block)?;
+     }
++    #[cfg(test)]
++    {
++        assert_eq!(hyperreal::dispatch_trace::snapshot(), chunk_dispatch_before,
++                   "execution block validation must not dispatch scalar predicates");
++        drop(chunk_recording);
++        eprintln!("PARTITION_TRACE kind=2 blocks={} scalar_events=0", bytes.len() / EXECUTION_BLOCK_BYTES);
++    }
+     let terminal_progress = validator.finish()?;
+ 
+     let final_position = [

@@ -1,0 +1,100 @@
+diff --git a/crates/alumina-interface-core/src/partition.rs b/crates/alumina-interface-core/src/partition.rs
+index c9b82fc..53cedab 100644
+--- a/crates/alumina-interface-core/src/partition.rs
++++ b/crates/alumina-interface-core/src/partition.rs
+@@ -594,7 +594,7 @@ pub fn package_canonical_servo_program<const AXES: usize>(
+         program.initial_position(),
+         admission.limits,
+     )?;
+-    for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
++    for encoded in bytes.as_chunks::<EXECUTION_BLOCK_BYTES>().0 {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         validator.accept(&ExecutionBlock::decode(owned)?)?;
+@@ -836,7 +836,7 @@ fn package_canonical_finite_difference_segments(
+         },
+         limits,
+     )?;
+-    for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
++    for encoded in bytes.as_chunks::<EXECUTION_BLOCK_BYTES>().0 {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         validator.accept(&ExecutionBlock::decode(owned)?)?;
+@@ -1053,7 +1053,7 @@ fn package_canonical_segments(
+         },
+         policy.block_limits,
+     )?;
+-    for encoded in bytes.chunks_exact(EXECUTION_BLOCK_BYTES) {
++    for encoded in bytes.as_chunks::<EXECUTION_BLOCK_BYTES>().0 {
+         let mut owned = [0_u8; EXECUTION_BLOCK_BYTES];
+         owned.copy_from_slice(encoded);
+         let block = ExecutionBlock::decode(owned)?;
+diff --git a/src/control_graph_ui.rs b/src/control_graph_ui.rs
+index c6b054c..4e0eddc 100644
+--- a/src/control_graph_ui.rs
++++ b/src/control_graph_ui.rs
+@@ -14449,6 +14449,64 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn graph_wire_midpoints_preserve_large_finite_projected_coordinates() {
++        let workspace = ExactControlWorkspace::try_new().unwrap();
++        let document = workspace.workspace.graph();
++        let wire = document
++            .wires()
++            .iter()
++            .find(|wire| workspace.presentation.wires[&wire.id()].feedback_lane.is_none())
++            .unwrap();
++        // Exact +/-2^127: adding two such coordinates overflows, while their
++        // midpoint is the original finite coordinate. Ordinary port offsets
++        // are smaller than one ulp here and round back to that coordinate.
++        for origin_x in [f32::from_bits(0x7f00_0000), f32::from_bits(0xff00_0000)] {
++            for hierarchy_root in [false, true] {
++                let context = egui::Context::default();
++                let frame = context.run(egui::RawInput::default(), |context| {
++                    let painter = context.layer_painter(egui::LayerId::background());
++                    let origin = egui::vec2(origin_x, 0.0);
++                    if hierarchy_root {
++                        paint_hierarchy_root_wire(
++                            &painter,
++                            origin,
++                            document,
++                            &workspace.presentation,
++                            HierarchyRootCanvasFocus::default(),
++                            wire,
++                        );
++                    } else {
++                        ExactControlWorkspace::paint_wire(
++                            &painter,
++                            origin,
++                            document,
++                            &workspace.presentation,
++                            None,
++                            None,
++                            wire,
++                        );
++                    }
++                });
++                let paths: Vec<_> = frame
++                    .shapes
++                    .iter()
++                    .filter_map(|clipped| match &clipped.shape {
++                        egui::Shape::Path(path) if !path.closed && path.points.len() == 4 => {
++                            Some(path)
++                        }
++                        _ => None,
++                    })
++                    .collect();
++                assert_eq!(paths.len(), 1);
++                for point in &paths[0].points {
++                    assert_eq!(point.x, origin_x, "hierarchy_root={hierarchy_root}");
++                    assert!(point.y.is_finite());
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn representative_layout_is_bounded_acyclic_and_keeps_feedback_visible() {
+         let workspace = ExactControlWorkspace::try_new().unwrap();

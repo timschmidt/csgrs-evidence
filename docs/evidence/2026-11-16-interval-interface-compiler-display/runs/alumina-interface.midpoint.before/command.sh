@@ -1,0 +1,1 @@
+cargo test --locked -p alumina-interface --lib graph_wire_midpoints_preserve_large_finite_projected_coordinates -- --exact control_graph_ui::tests::graph_wire_midpoints_preserve_large_finite_projected_coordinates --nocapture

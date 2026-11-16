@@ -1,0 +1,3 @@
+# Additional Interface stable-Clippy findings
+
+Reproduced on 32a59de plus the three partition iterator edits, with all other files unchanged: runs/alumina-interface.build-and-deploy.19.chunks-candidate. Core compilation proceeds; UI reports five manual floating midpoint expressions, a hex-decoder chunks_exact loop, and 21 test-only empty/nonempty assertions. These are separate from the three core execution-block loops. No lint suppression or assertion removal is authorized as a fix. Native and WASM workflow checks remain failing until their repairs are qualified. UI midpoint changes require a display-domain contract and independent extreme finite-value witness; they must not be claimed as a behavior-identical change for overflow inputs.
