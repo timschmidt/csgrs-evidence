@@ -1,0 +1,119 @@
+//! Nonnegative exact error radii with construction proofs, not new decisions.
+use crate::IntervalError;
+use core::{num::NonZeroU64, ops::{Add, Mul}};
+use hyperreal::{Problem, Rational, Real};
+
+/// A nonnegative exact rational error radius.
+///
+/// It bounds an absolute scalar error by this magnitude; units, named error
+/// sources and provenance belong to the consumer. No allocation or work bound
+/// beyond the underlying arbitrary-precision Rational contract is implied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RationalRadius(Rational);
+
+impl RationalRadius {
+    /// Check nonnegativity by comparing to exact zero once.
+    ///
+    /// This preserves an ordered comparison, rather than substituting a
+    /// different structural sign query. Zero is a valid radius.
+    pub fn new(value: Rational) -> Result<Self, IntervalError> {
+        if value < Rational::zero() {
+            Err(IntervalError::NegativeRadius)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Borrow the exact radius without a new decision or conversion.
+    pub const fn as_rational(&self) -> &Rational {
+        &self.0
+    }
+
+    /// Transfer the exact value, forgetting only its nonnegativity witness.
+    pub fn into_rational(self) -> Rational {
+        self.0
+    }
+}
+
+/// A nonnegative exact Real error radius with a retained construction proof.
+///
+/// Rational ingress, successful Euclidean norm construction, nonnegative
+/// unsigned ratios, sums and products establish nonnegativity algebraically.
+/// No arbitrary Real input or serialized positivity flag is trusted. The exact
+/// Real remains authoritative; this is not a rounded or rational enclosure.
+/// Addition composes absolute error bounds by the triangle inequality without
+/// asserting independence or cancellation. Multiplication multiplies the
+/// nonnegative magnitudes; consumers retain the resulting physical units.
+///
+/// Construction has the same scalar domain failures, cancellation behavior and
+/// unbounded arithmetic/cache costs as the delegated Hyperreal operations.
+/// This host-only carrier does not establish a total resource bound.
+///
+/// ```compile_fail
+/// use hyperinterval::RealRadius;
+/// let forged = RealRadius(hyperreal::Real::from(-1));
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct RealRadius(Real);
+
+impl From<RationalRadius> for RealRadius {
+    #[inline]
+    fn from(value: RationalRadius) -> Self {
+        Self(Real::from(value.0))
+    }
+}
+
+impl RealRadius {
+    /// Euclidean aggregation with an exact zero seed, then input-order squares.
+    ///
+    /// Each square uses borrowed scalar multiplication and the running sum uses
+    /// AddAssign, followed by native fallible sqrt. This deliberately preserves
+    /// that evaluation sequence rather than choosing a balanced sum or a
+    /// specialized dot-product dispatcher. Empty input gives zero. Components
+    /// need not be nonnegative; successful sqrt selects the nonnegative root.
+    pub fn euclidean_norm(components: &[Real]) -> Result<Self, Problem> {
+        let mut squared = Real::zero();
+        for component in components {
+            squared += component * component;
+        }
+        squared.sqrt().map(Self)
+    }
+
+    /// Exact nonnegative ratio with a u32 numerator and nonzero u64 denominator.
+    ///
+    /// Both native Real conversions and the native fallible division are
+    /// retained in that order; the unsigned types establish the sign relation.
+    pub fn from_unsigned_ratio(numerator: u32, denominator: NonZeroU64) -> Result<Self, Problem> {
+        (Real::from(numerator) / Real::from(denominator.get())).map(Self)
+    }
+
+    /// Borrow the authoritative exact radius without revalidation.
+    pub const fn as_real(&self) -> &Real {
+        &self.0
+    }
+
+    /// Transfer the exact radius, forgetting only its nonnegativity witness.
+    pub fn into_real(self) -> Real {
+        self.0
+    }
+}
+
+impl Add for RealRadius {
+    type Output = Self;
+
+    /// Add owned radii without additional decisions or implicit clones.
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl Mul for RealRadius {
+    type Output = Self;
+
+    /// Multiply owned nonnegative radii without additional decisions.
+    #[inline]
+    fn mul(self, other: Self) -> Self {
+        Self(self.0 * other.0)
+    }
+}

@@ -1,0 +1,145 @@
+#![cfg(feature = "real-radius")]
+use core::num::NonZeroU64;
+use hyperinterval::{IntervalError, RationalRadius, RealRadius};
+use hyperreal::{Problem, Rational, Real};
+
+#[test]
+fn rational_ingress_preserves_exact_values_and_rejects_negative_radius() {
+    assert_eq!(
+        RationalRadius::new(Rational::from(-1)),
+        Err(IntervalError::NegativeRadius)
+    );
+    for text in ["0", "1/3", "18446744073709551615/17"] {
+        let value: Rational = text.parse().unwrap();
+        let radius = RationalRadius::new(value.clone()).unwrap();
+        assert_eq!(radius.as_rational(), &value);
+        assert_eq!(radius.clone().into_rational(), value);
+        assert_eq!(RealRadius::from(radius).into_real(), Real::from(value));
+    }
+    let large: Rational = format!("1{}7/91", "0".repeat(1200)).parse().unwrap();
+    assert_eq!(
+        RationalRadius::new(large.clone()).unwrap().into_rational(),
+        large
+    );
+}
+
+#[test]
+fn generated_exact_radii_remain_composable_without_rational_demotion() {
+    assert_eq!(
+        RealRadius::euclidean_norm(&[]).unwrap().into_real(),
+        Real::zero()
+    );
+    assert_eq!(
+        RealRadius::euclidean_norm(&[Real::from(-3), Real::from(4)])
+            .unwrap()
+            .into_real(),
+        Real::from(5)
+    );
+    let root_two = RealRadius::euclidean_norm(&[Real::one(), Real::one()]).unwrap();
+    assert_eq!(root_two.as_real() * root_two.as_real(), Real::from(2));
+    assert!(!root_two.as_real().is_rational());
+    let composed = (root_two.clone() + root_two)
+        * RealRadius::from_unsigned_ratio(1, NonZeroU64::new(2).unwrap()).unwrap();
+    assert_eq!(composed.as_real() * composed.as_real(), Real::from(2));
+    let repeated = RealRadius::euclidean_norm(&[composed.into_real(), Real::from(1)]).unwrap();
+    assert_eq!(repeated.as_real() * repeated.as_real(), Real::from(3));
+    for numerator in [0, 1, 17, u32::MAX] {
+        for denominator in [1, 1000, u64::MAX] {
+            let radius =
+                RealRadius::from_unsigned_ratio(numerator, NonZeroU64::new(denominator).unwrap())
+                    .unwrap();
+            assert_eq!(
+                radius.into_real() * Real::from(denominator),
+                Real::from(numerator)
+            );
+        }
+    }
+}
+
+fn legacy(
+    source: Rational,
+    controller: Rational,
+    components: &[Real],
+) -> Result<Option<Real>, Problem> {
+    if source < Rational::zero() || controller < Rational::zero() {
+        return Ok(None);
+    }
+    let mut squared = Real::zero();
+    for component in components {
+        squared += component * component;
+    }
+    let norm = squared.sqrt()?;
+    let ratio = (Real::from(17_u32) / Real::from(1000_u64))?;
+    let product = norm.clone() * ratio;
+    let source = Real::from(source);
+    let controller = Real::from(controller);
+    Ok(Some(source + controller + norm + product))
+}
+
+fn shared(
+    source: Rational,
+    controller: Rational,
+    components: &[Real],
+) -> Result<Option<Real>, Problem> {
+ legacy(source, controller, components)
+}
+
+#[test]
+fn ordered_composition_preserves_complete_scalar_dispatch_and_serialized_definition() {
+    for (source, controller) in [(-1, -1), (0, -1), (0, 0), (1, 2)] {
+        for components in [
+            vec![],
+            vec![Real::from(3), Real::from(4)],
+            vec![Real::one(), Real::one()],
+        ] {
+            for _warm in [false, true] {
+                #[cfg(feature = "dispatch-trace")]
+                let (old, expected) = {
+                    hyperreal::dispatch_trace::reset();
+                    hyperreal::dispatch_trace::reset_rational_stats();
+                    let value = hyperreal::dispatch_trace::with_recording(|| {
+                        legacy(
+                            Rational::from(source),
+                            Rational::from(controller),
+                            &components,
+                        )
+                    });
+                    (value, hyperreal::dispatch_trace::take_trace())
+                };
+                #[cfg(not(feature = "dispatch-trace"))]
+                let old = legacy(
+                    Rational::from(source),
+                    Rational::from(controller),
+                    &components,
+                );
+                #[cfg(feature = "dispatch-trace")]
+                let (new, actual) = {
+                    hyperreal::dispatch_trace::reset();
+                    hyperreal::dispatch_trace::reset_rational_stats();
+                    let value = hyperreal::dispatch_trace::with_recording(|| {
+                        shared(
+                            Rational::from(source),
+                            Rational::from(controller),
+                            &components,
+                        )
+                    });
+                    (value, hyperreal::dispatch_trace::take_trace())
+                };
+                #[cfg(not(feature = "dispatch-trace"))]
+                let new = shared(
+                    Rational::from(source),
+                    Rational::from(controller),
+                    &components,
+                );
+                #[cfg(feature = "dispatch-trace")]
+                assert_eq!(actual, expected, "source={source}, controller={controller}");
+                assert_eq!(new, old);
+                #[cfg(feature = "serde")]
+                assert_eq!(
+                    serde_json::to_vec(&new.as_ref().unwrap()).unwrap(),
+                    serde_json::to_vec(&old.as_ref().unwrap()).unwrap()
+                );
+            }
+        }
+    }
+}

@@ -1,0 +1,425 @@
+diff --git a/crates/hyperinterval/CHANGELOG.md b/crates/hyperinterval/CHANGELOG.md
+index b8d11b58b..d6a16de59 100644
+--- a/crates/hyperinterval/CHANGELOG.md
++++ b/crates/hyperinterval/CHANGELOG.md
+@@ -6,6 +6,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add exact rational and generated Real error radii behind `real-radius`.
++  Preserve native validation, norm and arithmetic sequences while composing
++  nonnegative magnitudes without repeating their construction proofs.
++
+ - Qualify the allocation-free integer IEEE enclosure backend on
+   `wasm32-unknown-unknown`, with exact-bit oracle execution and generated-code
+   checks. Other previously unsupported targets still fail closed. Proposal
+diff --git a/crates/hyperinterval/Cargo.toml b/crates/hyperinterval/Cargo.toml
+index 317c620da..9cd44413c 100644
+--- a/crates/hyperinterval/Cargo.toml
++++ b/crates/hyperinterval/Cargo.toml
+@@ -27,6 +27,7 @@ dyadic = ["bigint"]
+ rational = ["std", "dep:hyperreal"]
+ hyperreal = ["rational", "dyadic"]
+ real-ball = ["hyperreal"]
++real-radius = ["rational"]
+ serde = ["dep:serde", "hyperreal?/serde", "num-bigint?/serde"]
+ dispatch-trace = ["hyperreal?/dispatch-trace"]
+ 
+diff --git a/crates/hyperinterval/README.md b/crates/hyperinterval/README.md
+index 6b6dea238..a68029906 100644
+--- a/crates/hyperinterval/README.md
++++ b/crates/hyperinterval/README.md
+@@ -182,6 +182,14 @@ bits for a shift. An interval that merely contains zero still uses ordinary
+ alignment accounting. `hyperreal` enables both carriers and their certified Real bridge;
+ `real-ball` adds exact symbolic centers with nonnegative rational radii.
+ 
++The host-only `real-radius` feature adds `RationalRadius` and `RealRadius` for
++exact nonnegative error magnitudes. Checked rational ingress and native
++Euclidean norms retain nonnegativity through owned sums and products, including
++irrational radii. The caller keeps units, named sources and the evidence that
++each physical error obeys its bound. Conversion back to `Real` transfers the
++exact value without rounding. This feature requires Rust 1.95 and inherits
++Hyperreal's arithmetic and resource contracts; it adds no total-work bound.
++
+ Dyadic width, midpoint and radius return exact singleton intervals, or empty
+ for an empty input. They never round an unrepresentable half. Pointwise square
+ preserves dependence across zero, while multiplication treats its operands as
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 1296048ff..b07f138a7 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -55,6 +55,8 @@ mod inverse_functions;
+ mod logarithm;
+ #[cfg(feature = "float-proposal")]
+ mod proposal;
++#[cfg(feature = "real-radius")]
++mod radius;
+ #[cfg(feature = "rational")]
+ mod rational;
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+@@ -92,3 +94,6 @@ pub use state::{DomainCoverage, IntervalError, MidpointRounding, RangeEnclosure,
+ 
+ #[cfg(feature = "float-enclosure")]
+ pub use float::{F32Enclosure, F32Width, F64Enclosure, F64Width};
++
++#[cfg(feature = "real-radius")]
++pub use radius::{RationalRadius, RealRadius};
+diff --git a/crates/hyperinterval/src/radius.rs b/crates/hyperinterval/src/radius.rs
+new file mode 100644
+index 000000000..5040f4f1d
+--- /dev/null
++++ b/crates/hyperinterval/src/radius.rs
+@@ -0,0 +1,122 @@
++//! Nonnegative exact error radii with construction proofs, not new decisions.
++use crate::IntervalError;
++use core::{
++    num::NonZeroU64,
++    ops::{Add, Mul},
++};
++use hyperreal::{Problem, Rational, Real};
++
++/// A nonnegative exact rational error radius.
++///
++/// It bounds an absolute scalar error by this magnitude; units, named error
++/// sources and provenance belong to the consumer. No allocation or work bound
++/// beyond the underlying arbitrary-precision Rational contract is implied.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct RationalRadius(Rational);
++
++impl RationalRadius {
++    /// Check nonnegativity by comparing to exact zero once.
++    ///
++    /// This preserves an ordered comparison, rather than substituting a
++    /// different structural sign query. Zero is a valid radius.
++    pub fn new(value: Rational) -> Result<Self, IntervalError> {
++        if value < Rational::zero() {
++            Err(IntervalError::NegativeRadius)
++        } else {
++            Ok(Self(value))
++        }
++    }
++
++    /// Borrow the exact radius without a new decision or conversion.
++    pub const fn as_rational(&self) -> &Rational {
++        &self.0
++    }
++
++    /// Transfer the exact value, forgetting only its nonnegativity witness.
++    pub fn into_rational(self) -> Rational {
++        self.0
++    }
++}
++
++/// A nonnegative exact Real error radius with a retained construction proof.
++///
++/// Rational ingress, successful Euclidean norm construction, nonnegative
++/// unsigned ratios, sums and products establish nonnegativity algebraically.
++/// No arbitrary Real input or serialized positivity flag is trusted. The exact
++/// Real remains authoritative; this is not a rounded or rational enclosure.
++/// Addition composes absolute error bounds by the triangle inequality without
++/// asserting independence or cancellation. Multiplication multiplies the
++/// nonnegative magnitudes; consumers retain the resulting physical units.
++///
++/// Construction has the same scalar domain failures, cancellation behavior and
++/// unbounded arithmetic/cache costs as the delegated Hyperreal operations.
++/// This host-only carrier does not establish a total resource bound.
++///
++/// ```compile_fail
++/// use hyperinterval::RealRadius;
++/// let forged = RealRadius(hyperreal::Real::from(-1));
++/// ```
++#[derive(Clone, Debug, PartialEq)]
++pub struct RealRadius(Real);
++
++impl From<RationalRadius> for RealRadius {
++    #[inline]
++    fn from(value: RationalRadius) -> Self {
++        Self(Real::from(value.0))
++    }
++}
++
++impl RealRadius {
++    /// Euclidean aggregation with an exact zero seed, then input-order squares.
++    ///
++    /// Each square uses borrowed scalar multiplication and the running sum uses
++    /// AddAssign, followed by native fallible sqrt. This deliberately preserves
++    /// that evaluation sequence rather than choosing a balanced sum or a
++    /// specialized dot-product dispatcher. Empty input gives zero. Components
++    /// need not be nonnegative; successful sqrt selects the nonnegative root.
++    pub fn euclidean_norm(components: &[Real]) -> Result<Self, Problem> {
++        let mut squared = Real::zero();
++        for component in components {
++            squared += component * component;
++        }
++        squared.sqrt().map(Self)
++    }
++
++    /// Exact nonnegative ratio with a u32 numerator and nonzero u64 denominator.
++    ///
++    /// Both native Real conversions and the native fallible division are
++    /// retained in that order; the unsigned types establish the sign relation.
++    pub fn from_unsigned_ratio(numerator: u32, denominator: NonZeroU64) -> Result<Self, Problem> {
++        (Real::from(numerator) / Real::from(denominator.get())).map(Self)
++    }
++
++    /// Borrow the authoritative exact radius without revalidation.
++    pub const fn as_real(&self) -> &Real {
++        &self.0
++    }
++
++    /// Transfer the exact radius, forgetting only its nonnegativity witness.
++    pub fn into_real(self) -> Real {
++        self.0
++    }
++}
++
++impl Add for RealRadius {
++    type Output = Self;
++
++    /// Add owned radii without additional decisions or implicit clones.
++    #[inline]
++    fn add(self, other: Self) -> Self {
++        Self(self.0 + other.0)
++    }
++}
++
++impl Mul for RealRadius {
++    type Output = Self;
++
++    /// Multiply owned nonnegative radii without additional decisions.
++    #[inline]
++    fn mul(self, other: Self) -> Self {
++        Self(self.0 * other.0)
++    }
++}
+diff --git a/crates/hyperinterval/tests/radius_composition.rs b/crates/hyperinterval/tests/radius_composition.rs
+new file mode 100644
+index 000000000..8b7daae91
+--- /dev/null
++++ b/crates/hyperinterval/tests/radius_composition.rs
+@@ -0,0 +1,225 @@
++#![cfg(feature = "real-radius")]
++use core::num::NonZeroU64;
++use hyperinterval::{IntervalError, RationalRadius, RealRadius};
++use hyperreal::{Problem, Rational, Real};
++
++#[test]
++fn rational_ingress_preserves_exact_values_and_rejects_negative_radius() {
++    assert_eq!(
++        RationalRadius::new(Rational::from(-1)),
++        Err(IntervalError::NegativeRadius)
++    );
++    for text in ["0", "1/3", "18446744073709551615/17"] {
++        let value: Rational = text.parse().unwrap();
++        let radius = RationalRadius::new(value.clone()).unwrap();
++        assert_eq!(radius.as_rational(), &value);
++        assert_eq!(radius.clone().into_rational(), value);
++        assert_eq!(RealRadius::from(radius).into_real(), Real::from(value));
++    }
++    let large: Rational = format!("1{}7/91", "0".repeat(1200)).parse().unwrap();
++    assert_eq!(
++        RationalRadius::new(large.clone()).unwrap().into_rational(),
++        large
++    );
++}
++
++#[test]
++fn generated_exact_radii_remain_composable_without_rational_demotion() {
++    assert_eq!(
++        RealRadius::euclidean_norm(&[]).unwrap().into_real(),
++        Real::zero()
++    );
++    assert_eq!(
++        RealRadius::euclidean_norm(&[Real::from(-3), Real::from(4)])
++            .unwrap()
++            .into_real(),
++        Real::from(5)
++    );
++    let root_two = RealRadius::euclidean_norm(&[Real::one(), Real::one()]).unwrap();
++    assert_eq!(root_two.as_real() * root_two.as_real(), Real::from(2));
++    assert!(!root_two.as_real().is_rational());
++    let composed = (root_two.clone() + root_two)
++        * RealRadius::from_unsigned_ratio(1, NonZeroU64::new(2).unwrap()).unwrap();
++    assert_eq!(composed.as_real() * composed.as_real(), Real::from(2));
++    let repeated = RealRadius::euclidean_norm(&[composed.into_real(), Real::from(1)]).unwrap();
++    assert_eq!(repeated.as_real() * repeated.as_real(), Real::from(3));
++    for numerator in [0, 1, 17, u32::MAX] {
++        for denominator in [1, 1000, u64::MAX] {
++            let radius =
++                RealRadius::from_unsigned_ratio(numerator, NonZeroU64::new(denominator).unwrap())
++                    .unwrap();
++            assert_eq!(
++                radius.into_real() * Real::from(denominator),
++                Real::from(numerator)
++            );
++        }
++    }
++}
++
++fn legacy(
++    source: Rational,
++    controller: Rational,
++    components: &[Real],
++) -> Result<Option<Real>, Problem> {
++    if source < Rational::zero() || controller < Rational::zero() {
++        return Ok(None);
++    }
++    let mut squared = Real::zero();
++    for component in components {
++        squared += component * component;
++    }
++    let norm = squared.sqrt()?;
++    let ratio = (Real::from(17_u32) / Real::from(1000_u64))?;
++    let product = norm.clone() * ratio;
++    let source = Real::from(source);
++    let controller = Real::from(controller);
++    Ok(Some(source + controller + norm + product))
++}
++
++fn shared(
++    source: Rational,
++    controller: Rational,
++    components: &[Real],
++) -> Result<Option<Real>, Problem> {
++    let Ok(source) = RationalRadius::new(source) else {
++        return Ok(None);
++    };
++    let Ok(controller) = RationalRadius::new(controller) else {
++        return Ok(None);
++    };
++    let norm = RealRadius::euclidean_norm(components)?;
++    let ratio = RealRadius::from_unsigned_ratio(17, NonZeroU64::new(1000).unwrap())?;
++    let product = norm.clone() * ratio;
++    let source = RealRadius::from(source);
++    let controller = RealRadius::from(controller);
++    Ok(Some((source + controller + norm + product).into_real()))
++}
++
++#[test]
++fn ordered_composition_preserves_exact_values_and_serialized_definition() {
++    for (source, controller) in [(-1, -1), (0, -1), (0, 0), (1, 2)] {
++        for components in [
++            vec![],
++            vec![Real::from(3), Real::from(4)],
++            vec![Real::one(), Real::one()],
++        ] {
++            for _warm in [false, true] {
++                let old = legacy(
++                    Rational::from(source),
++                    Rational::from(controller),
++                    &components,
++                );
++                let new = shared(
++                    Rational::from(source),
++                    Rational::from(controller),
++                    &components,
++                );
++                assert_eq!(new, old);
++                #[cfg(feature = "serde")]
++                assert_eq!(
++                    serde_json::to_vec(&new.as_ref().unwrap()).unwrap(),
++                    serde_json::to_vec(&old.as_ref().unwrap()).unwrap()
++                );
++            }
++        }
++    }
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn radius_trace_child() {
++    let Ok(case) = std::env::var("HYPERINTERVAL_RADIUS_TRACE_CASE") else {
++        return;
++    };
++    let parts: Vec<_> = case.split(',').collect();
++    assert_eq!(parts.len(), 5);
++    let source: i32 = parts[1].parse().unwrap();
++    let controller: i32 = parts[2].parse().unwrap();
++    let coordinates: &[i32] = match parts[3] {
++        "0" => &[],
++        "1" => &[3, 4],
++        "2" => &[1, 1],
++        _ => panic!("invalid case"),
++    };
++    let components: Vec<_> = coordinates.iter().copied().map(Real::from).collect();
++    let operation = match parts[0] {
++        "legacy" => legacy,
++        "shared" => shared,
++        _ => panic!("invalid variant"),
++    };
++    if parts[4] == "true" {
++        operation(
++            Rational::from(source),
++            Rational::from(controller),
++            &components,
++        )
++        .unwrap();
++    }
++    hyperreal::dispatch_trace::reset();
++    hyperreal::dispatch_trace::reset_rational_stats();
++    let result = hyperreal::dispatch_trace::with_recording(|| {
++        operation(
++            Rational::from(source),
++            Rational::from(controller),
++            &components,
++        )
++    });
++    let trace = hyperreal::dispatch_trace::take_trace();
++    println!("RADIUS_RECEIPT {trace:?}");
++    println!("RADIUS_VALUE {result:?}");
++    #[cfg(feature = "serde")]
++    println!(
++        "RADIUS_SERIALIZED {}",
++        serde_json::to_string(result.as_ref().unwrap()).unwrap()
++    );
++}
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn ordered_composition_preserves_complete_scalar_dispatch_in_fresh_processes() {
++    // Small-integer interning can share retained arithmetic even between
++    // separately constructed values. Compare matched process-local histories,
++    // preserving the complete trace rather than removing cache-sensitive counts.
++    for (source, controller) in [(-1, -1), (0, -1), (0, 0), (1, 2)] {
++        for vector in 0..3 {
++            for warm in [false, true] {
++                let capture = |variant| {
++                    let output = std::process::Command::new(std::env::current_exe().unwrap())
++                        .args([
++                            "--exact",
++                            "radius_trace_child",
++                            "--nocapture",
++                            "--test-threads=1",
++                        ])
++                        .env(
++                            "HYPERINTERVAL_RADIUS_TRACE_CASE",
++                            format!("{variant},{source},{controller},{vector},{warm}"),
++                        )
++                        .output()
++                        .unwrap();
++                    assert!(
++                        output.status.success(),
++                        "{}",
++                        String::from_utf8_lossy(&output.stderr)
++                    );
++                    let output = String::from_utf8(output.stdout).unwrap();
++                    let receipts: Vec<_> = output
++                        .lines()
++                        .filter_map(|line| {
++                            line.split_once("RADIUS_")
++                                .map(|(_, receipt)| receipt.to_owned())
++                        })
++                        .collect();
++                    assert_eq!(receipts.len(), if cfg!(feature = "serde") { 3 } else { 2 });
++                    receipts
++                };
++                let expected = capture("legacy");
++                let actual = capture("shared");
++                assert_eq!(
++                    actual, expected,
++                    "source={source}, controller={controller}, vector={vector}, warm={warm}"
++                );
++            }
++        }
++    }
++}
