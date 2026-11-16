@@ -1,0 +1,189 @@
+[
+  {
+    "symbol": "expand_unit_interval",
+    "path": "crates/alumina-foc/src/angle.rs",
+    "line": 422,
+    "body": "fn expand_unit_interval(value: Q30Interval, maximum_delta: Q30) -> Result<Q30Interval, FocError> {\n    if maximum_delta < Q30::ZERO {\n        return Err(FocError::Phase);\n    }\n    let lower = (i64::from(value.lower().bits()) - i64::from(maximum_delta.bits()))\n        .max(i64::from(Q30::NEG_ONE.bits()));\n    let upper = (i64::from(value.upper().bits()) + i64::from(maximum_delta.bits()))\n        .min(i64::from(Q30::ONE.bits()));\n    Q30Interval::new(\n        Q30::from_bits(i32::try_from(lower).map_err(|_| FocError::Range)?),\n        Q30::from_bits(i32::try_from(upper).map_err(|_| FocError::Range)?),\n    )\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "pi_and_factorial_intervals_have_integer_certificates",
+    "path": "crates/alumina-foc/src/angle.rs",
+    "line": 498,
+    "body": "fn pi_and_factorial_intervals_have_integer_certificates() {\n        let scale = i128::from(Q30_SCALE);\n        for (interval, denominator) in [\n            (INV_2_FACTORIAL, 2_i128),\n            (INV_3_FACTORIAL, 6),\n            (INV_4_FACTORIAL, 24),\n            (INV_5_FACTORIAL, 120),\n            (INV_6_FACTORIAL, 720),\n            (INV_7_FACTORIAL, 5_040),\n            (INV_8_FACTORIAL, 40_320),\n            (INV_9_FACTORIAL, 362_880),\n            (INV_10_FACTORIAL, 3_628_800),\n            (INV_11_FACTORIAL, 39_916_800),\n            (INV_12_FACTORIAL, 479_001_600),\n        ] {\n            assert!(i128::from(interval.lower().bits()) * denominator <= scale);\n            assert!(scale <= i128::from(interval.upper().bits()) * denominator);\n            assert!(interval.width_ulps() <= 1);\n        }\n\n        let (atan_fifth_lower, atan_fifth_upper) = atan_reciprocal_bounds(5, 20);\n        let (atan_239_lower, atan_239_upper) = atan_reciprocal_bounds(239, 6);\n        let machin_lower = 4 * atan_fifth_lower - atan_239_upper;\n        let machin_upper = 4 * atan_fifth_upper - atan_239_lower;\n        let q30_to_certificate = 1_i128 << (96 - 30);\n        assert!(i128::from(PI_OVER_4.lower().bits()) * q30_to_certificate <= machin_lower);\n        assert!(machin_upper <= i128::from(PI_OVER_4.upper().bits()) * q30_to_certificate);\n        assert_eq!(PI_OVER_4.width_ulps(), 1);\n\n        let root_lower = i128::from(INV_SQRT_2.lower().bits());\n        let root_upper = i128::from(INV_SQRT_2.upper().bits());\n        assert!(2 * root_lower * root_lower <= scale * scale);\n        assert!(scale * scale <= 2 * root_upper * root_upper);\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "atan_reciprocal_bounds",
+    "path": "crates/alumina-foc/src/angle.rs",
+    "line": 752,
+    "body": "fn atan_reciprocal_bounds(divisor: i128, terms: usize) -> (i128, i128) {\n        let scale = 1_i128 << 96;\n        let square = divisor * divisor;\n        let mut power = divisor;\n        let mut lower = 0_i128;\n        let mut upper = 0_i128;\n        for index in 0..terms {\n            let denominator = (2 * index as i128 + 1) * power;\n            let term_lower = scale / denominator;\n            let term_upper = term_lower + i128::from(scale.rem_euclid(denominator) != 0);\n            if index.is_multiple_of(2) {\n                lower += term_lower;\n                upper += term_upper;\n            } else {\n                lower -= term_upper;\n                upper -= term_lower;\n            }\n            power *= square;\n        }\n        let next_denominator = (2 * terms as i128 + 1) * power;\n        let next_upper =\n            scale / next_denominator + i128::from(scale.rem_euclid(next_denominator) != 0);\n        if terms.is_multiple_of(2) {\n            upper += next_upper;\n        } else {\n            lower -= next_upper;\n        }\n        (lower, upper)\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "complete_actor_and_prepared_transition_have_fixed_small_bounds",
+    "path": "crates/alumina-foc/src/axis.rs",
+    "line": 1875,
+    "body": "fn complete_actor_and_prepared_transition_have_fixed_small_bounds() {\n        let actor = core::mem::size_of::<ServoFocAxisController>();\n        let activation = core::mem::size_of::<PreparedServoFocAxisActivation>();\n        let transition = core::mem::size_of::<PreparedServoFocAxisTransition>();\n        let update = core::mem::size_of::<ServoFocAxisPreparedUpdate>();\n        assert!(\n            actor <= MAX_SERVO_FOC_AXIS_CONTROLLER_BYTES,\n            \"actor bytes: {actor}\"\n        );\n        assert!(\n            activation <= MAX_PREPARED_SERVO_FOC_AXIS_ACTIVATION_BYTES,\n            \"activation bytes: {activation}\"\n        );\n        assert!(\n            transition <= MAX_PREPARED_SERVO_FOC_AXIS_TRANSITION_BYTES,\n            \"transition bytes: {transition}\"\n        );\n        assert!(\n            update <= MAX_SERVO_FOC_AXIS_PREPARED_UPDATE_BYTES,\n            \"update bytes: {update}\"\n        );\n        let two_axis_bank = core::mem::size_of::<ServoFocBank<2>>();\n        let four_axis_activation = ServoFocBank::<MAX_SERVO_FOC_BANK_AXES>::prepare_activation(\n            [profile(); MAX_SERVO_FOC_BANK_AXES],\n            core::array::from_fn(|axis| ACTIVATION + axis as u64),\n            [seed(); MAX_SERVO_FOC_BANK_AXES],\n            FIRST_BOUNDARY,\n        )\n        .unwrap();\n        assert_eq!(\n            four_axis_activation.initial_images().len(),\n            MAX_SERVO_FOC_BANK_AXES\n        );\n        let four_axis_activation = core::mem::size_of_val(&four_axis_activation);\n        let two_axis_transition = core::mem::size_of::<PreparedServoFocBankTransition<2>>();\n        assert!(\n            two_axis_bank <= 2 * MAX_SERVO_FOC_AXIS_CONTROLLER_BYTES + 128,\n            \"two-axis bank bytes: {two_axis_bank}\"\n        );\n        assert!(\n            two_axis_transition <= 2 * MAX_PREPARED_SERVO_FOC_AXIS_TRANSITION_BYTES + 32,\n            \"two-axis transition bytes: {two_axis_transition}\"\n        );\n        assert!(\n            four_axis_activation <= MAX_PREPARED_SERVO_FOC_BANK_ACTIVATION_BYTES,\n            \"four-axis activation bytes: {four_axis_activation}\"\n        );\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "widen_interval",
+    "path": "crates/alumina-foc/src/current.rs",
+    "line": 627,
+    "body": "fn widen_interval(value: Q30Interval, error: Q30) -> Result<Q30Interval, FocError> {\n    if error < Q30::ZERO {\n        return Err(FocError::CurrentCalibration);\n    }\n    Q30Interval::new(\n        value.lower().checked_sub(error)?,\n        value.upper().checked_add(error)?,\n    )\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "interval_within_limit",
+    "path": "crates/alumina-foc/src/current.rs",
+    "line": 637,
+    "body": "fn interval_within_limit(value: Q30Interval, limit: Q30) -> bool {\n    if limit < Q30::ZERO {\n        return false;\n    }\n    let Ok(negative_limit) = limit.checked_neg() else {\n        return false;\n    };\n    value.lower() >= negative_limit && value.upper() <= limit\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "position_interval",
+    "path": "crates/alumina-foc/src/encoder.rs",
+    "line": 611,
+    "body": "fn position_interval(\n    profile: ServoEncoderProfile,\n    unwrapped_count: i64,\n) -> Result<ServoPositionInterval, ServoEncoderError> {\n    let error_numerator = i128::from(profile.maximum_count_error.numerator());\n    let error_denominator = i128::from(profile.maximum_count_error.denominator());\n    let center = i128::from(unwrapped_count)\n        .checked_mul(error_denominator)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower_count = center\n        .checked_sub(error_numerator)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper_count = center\n        .checked_add(error_numerator)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let scale_numerator = i128::from(profile.scale.position_bits_per_turn_numerator);\n    let denominator = error_denominator\n        .checked_mul(i128::from(profile.counts_per_mechanical_turn))\n        .and_then(|value| {\n            value.checked_mul(i128::from(profile.scale.position_bits_per_turn_denominator))\n        })\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower_delta = lower_count\n        .checked_mul(scale_numerator)\n        .map(|value| div_floor(value, denominator))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper_delta = upper_count\n        .checked_mul(scale_numerator)\n        .map(|value| div_ceil(value, denominator))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let reference = i128::from(profile.position_at_reference.bits());\n    let lower = reference\n        .checked_add(lower_delta)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper = reference\n        .checked_add(upper_delta)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower = i64::try_from(lower).map_err(|_| ServoEncoderError::PositionRange)?;\n    let upper = i64::try_from(upper).map_err(|_| ServoEncoderError::PositionRange)?;\n    ServoPositionInterval::new(\n        ServoPosition::from_bits(lower),\n        ServoPosition::from_bits(upper),\n    )\n    .map_err(|_| ServoEncoderError::Arithmetic)\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "velocity_interval",
+    "path": "crates/alumina-foc/src/encoder.rs",
+    "line": 672,
+    "body": "fn velocity_interval(\n    profile: ServoEncoderProfile,\n    delta_counts: i64,\n) -> Result<Q30Interval, ServoEncoderError> {\n    let error_numerator = i128::from(profile.maximum_count_error.numerator());\n    let error_denominator = i128::from(profile.maximum_count_error.denominator());\n    let center = i128::from(delta_counts)\n        .checked_mul(error_denominator)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let complete_error = error_numerator\n        .checked_mul(2)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower_count = center\n        .checked_sub(complete_error)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper_count = center\n        .checked_add(complete_error)\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let numerator_scale = i128::from(profile.device_cycle_hz)\n        .checked_mul(i128::from(\n            profile.scale.counts_per_second_at_velocity_one_denominator,\n        ))\n        .and_then(|value| value.checked_mul(i128::from(Q30_SCALE)))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let denominator = error_denominator\n        .checked_mul(i128::from(profile.sample_period_cycles))\n        .and_then(|value| {\n            value.checked_mul(i128::from(\n                profile.scale.counts_per_second_at_velocity_one_numerator,\n            ))\n        })\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower_bits = lower_count\n        .checked_mul(numerator_scale)\n        .map(|value| div_floor(value, denominator))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper_bits = upper_count\n        .checked_mul(numerator_scale)\n        .map(|value| div_ceil(value, denominator))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let lower_bits = lower_bits\n        .checked_sub(i128::from(profile.maximum_velocity_estimation_error.bits()))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let upper_bits = upper_bits\n        .checked_add(i128::from(profile.maximum_velocity_estimation_error.bits()))\n        .ok_or(ServoEncoderError::Arithmetic)?;\n    let maximum = i128::from(profile.maximum_admitted_velocity.bits());\n    if lower_bits < -maximum || upper_bits > maximum {\n        return Err(ServoEncoderError::VelocityRange {\n            lower_bits,\n            upper_bits,\n            maximum_absolute_bits: profile.maximum_admitted_velocity.bits(),\n        });\n    }\n    let lower = i32::try_from(lower_bits).map_err(|_| ServoEncoderError::Arithmetic)?;\n    let upper = i32::try_from(upper_bits).map_err(|_| ServoEncoderError::Arithmetic)?;\n    Q30Interval::new(Q30::from_bits(lower), Q30::from_bits(upper))\n        .map_err(|_| ServoEncoderError::Arithmetic)\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "forward_wrap_produces_outward_position_and_velocity_intervals",
+    "path": "crates/alumina-foc/src/encoder.rs",
+    "line": 890,
+    "body": "fn forward_wrap_produces_outward_position_and_velocity_intervals() {\n        let mut estimator = estimator(4_094);\n        let estimate = estimator.observe(observation(2, 2_000)).unwrap();\n        assert_eq!(estimate.raw_count, 2);\n        assert_eq!(estimate.directed_count, 2);\n        assert_eq!(estimate.delta_counts, 4);\n        assert_eq!(estimate.unwrapped_count, 4_098);\n        assert_eq!(estimate.sample.sequence, 1);\n        assert_eq!(estimate.sample.sampled_at, DeviceCycle(2_000));\n        assert_eq!(\n            estimate.sample.position,\n            ServoPositionInterval::new(\n                ServoPosition::from_bits(\n                    4_098 * POSITION_BITS_PER_COUNT - POSITION_BITS_PER_COUNT / 2\n                ),\n                ServoPosition::from_bits(\n                    4_098 * POSITION_BITS_PER_COUNT + POSITION_BITS_PER_COUNT / 2\n                ),\n            )\n            .unwrap()\n        );\n        assert_eq!(\n            estimate.sample.velocity,\n            Q30Interval::new(\n                Q30::from_bits(3 * VELOCITY_BITS_PER_COUNT - VELOCITY_ESTIMATION_ERROR),\n                Q30::from_bits(5 * VELOCITY_BITS_PER_COUNT + VELOCITY_ESTIMATION_ERROR),\n            )\n            .unwrap()\n        );\n        assert_eq!(\n            estimate.sample.velocity.width_ulps(),\n            u64::from(VELOCITY_WIDTH)\n        );\n\n        let second = estimator.observe(observation(5, 3_000)).unwrap();\n        assert_eq!(second.delta_counts, 3);\n        assert_eq!(second.unwrapped_count, 4_101);\n        assert_eq!(second.sample.sequence, 2);\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "non_power_of_two_negative_position_and_velocity_bounds_are_outward",
+    "path": "crates/alumina-foc/src/encoder.rs",
+    "line": 964,
+    "body": "fn non_power_of_two_negative_position_and_velocity_bounds_are_outward() {\n        let position_numerator = 5_u64 * (1_u64 << 32);\n        let profile = ServoEncoderProfile {\n            configuration_digest: DIGEST,\n            counts_per_mechanical_turn: 12,\n            count_at_reference: 3,\n            direction: RotorCountDirection::Increasing,\n            maximum_count_error: CountUncertainty::new(1, 3).unwrap(),\n            position_at_reference: ServoPosition::from_bits(123),\n            scale: ServoEncoderScale::new(position_numerator, 3, 30, 1).unwrap(),\n            device_cycle_hz: 1_000,\n            sample_period_cycles: 100,\n            maximum_observation_latency_cycles: 10,\n            maximum_trackable_velocity: Q30::ONE,\n            maximum_admitted_velocity: Q30::ONE,\n            maximum_velocity_estimation_error: Q30::from_bits(7),\n            maximum_position_interval_width_ulps: u64::MAX,\n            maximum_velocity_interval_width_ulps: u32::MAX,\n        };\n        assert_eq!(profile.maximum_observed_delta_counts(), Ok(4));\n        let mut estimator = ServoEncoderEstimator::new(\n            profile,\n            ServoEncoderSeed {\n                observation: ServoEncoderObservation {\n                    configuration_digest: DIGEST,\n                    raw_count: 3,\n                    sampled_at: DeviceCycle(100),\n                    available_at: DeviceCycle(100),\n                },\n                turn_index: -1,\n            },\n        )\n        .unwrap();\n        let estimate = estimator\n            .observe(ServoEncoderObservation {\n                configuration_digest: DIGEST,\n                raw_count: 4,\n                sampled_at: DeviceCycle(200),\n                available_at: DeviceCycle(200),\n            })\n            .unwrap();\n        assert_eq!(estimate.unwrapped_count, -11);\n        assert_eq!(estimate.delta_counts, 1);\n\n        let position_denominator = 3_i128 * 12 * 3;\n        let reference = 123_i128 * position_denominator;\n        let lower_position_numerator =\n            reference + (-11_i128 * 3 - 1) * i128::from(position_numerator);\n        let upper_position_numerator =\n            reference + (-11_i128 * 3 + 1) * i128::from(position_numerator);\n        let lower_position = i128::from(estimate.sample.position.lower().bits());\n        let upper_position = i128::from(estimate.sample.position.upper().bits());\n        assert!(lower_position * position_denominator <= lower_position_numerator);\n        assert!((lower_position + 1) * position_denominator > lower_position_numerator);\n        assert!((upper_position - 1) * position_denominator < upper_position_numerator);\n        assert!(upper_position * position_denominator >= upper_position_numerator);\n\n        let velocity_denominator = 3_i128 * 100 * 30;\n        let lower_velocity_numerator = 1_000_i128 * i128::from(Q30_SCALE);\n        let upper_velocity_numerator = 5_000_i128 * i128::from(Q30_SCALE);\n        let lower_velocity = i128::from(estimate.sample.velocity.lower().bits()) + 7;\n        let upper_velocity = i128::from(estimate.sample.velocity.upper().bits()) - 7;\n        assert!(lower_velocity * velocity_denominator <= lower_velocity_numerator);\n        assert!((lower_velocity + 1) * velocity_denominator > lower_velocity_numerator);\n        assert!((upper_velocity - 1) * velocity_denominator < upper_velocity_numerator);\n        assert!(upper_velocity * velocity_denominator >= upper_velocity_numerator);\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "precision_and_range_policies_fail_before_state_advances",
+    "path": "crates/alumina-foc/src/encoder.rs",
+    "line": 1136,
+    "body": "fn precision_and_range_policies_fail_before_state_advances() {\n        let mut narrow_position = profile(RotorCountDirection::Increasing);\n        narrow_position.maximum_position_interval_width_ulps = POSITION_WIDTH - 1;\n        assert_eq!(\n            ServoEncoderEstimator::new(\n                narrow_position,\n                ServoEncoderSeed {\n                    observation: observation(0, 1_000),\n                    turn_index: 0,\n                }\n            ),\n            Err(ServoEncoderError::PositionPrecision {\n                width_ulps: POSITION_WIDTH,\n                maximum_width_ulps: POSITION_WIDTH - 1,\n            })\n        );\n\n        let mut narrow_velocity = profile(RotorCountDirection::Increasing);\n        narrow_velocity.maximum_velocity_interval_width_ulps = VELOCITY_WIDTH - 1;\n        let mut narrow_estimator = ServoEncoderEstimator::new(\n            narrow_velocity,\n            ServoEncoderSeed {\n                observation: observation(0, 1_000),\n                turn_index: 0,\n            },\n        )\n        .unwrap();\n        assert_eq!(\n            narrow_estimator.observe(observation(4, 2_000)),\n            Err(ServoEncoderError::VelocityPrecision {\n                width_ulps: u64::from(VELOCITY_WIDTH),\n                maximum_width_ulps: VELOCITY_WIDTH - 1,\n            })\n        );\n        assert_eq!(narrow_estimator.estimate_sequence(), 0);\n\n        let mut overspeed = estimator(0);\n        assert!(matches!(\n            overspeed.observe(observation(8, 2_000)),\n            Err(ServoEncoderError::VelocityRange { .. })\n        ));\n        assert_eq!(overspeed.last_unwrapped_count(), 0);\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "Q30Interval",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 166,
+    "body": "pub struct Q30Interval {\n    lower: Q30,\n    upper: Q30,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "DqInterval",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 370,
+    "body": "pub struct DqInterval {\n    pub d: Q30Interval,\n    pub q: Q30Interval,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "interval_max",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1073,
+    "body": "fn interval_max(left: Q30Interval, right: Q30Interval) -> Q30Interval {\n    Q30Interval {\n        lower: left.lower.max(right.lower),\n        upper: left.upper.max(right.upper),\n    }\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "interval_min",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1080,
+    "body": "fn interval_min(left: Q30Interval, right: Q30Interval) -> Q30Interval {\n    Q30Interval {\n        lower: left.lower.min(right.lower),\n        upper: left.upper.min(right.upper),\n    }\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "scale_wide_interval",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1120,
+    "body": "fn scale_wide_interval(\n    lower_bits: i64,\n    upper_bits: i64,\n    scale: Q30Interval,\n) -> Result<Q30Interval, FocError> {\n    // Clarke differences may exceed Q30's i32 endpoint range. Retain i64\n    // storage through the product and round once before narrowing to Q30.\n    let lower =\n        FixedInterval::<i64, Q30_FRACTION_BITS>::point(lower_bits).expect(\"scale 30 is valid\");\n    let upper =\n        FixedInterval::<i64, Q30_FRACTION_BITS>::point(upper_bits).expect(\"scale 30 is valid\");\n    // The generated difference's endpoints are ordered; their singleton hull\n    // is the same exact closed interval without a second ingress boundary.\n    let source = lower.hull(&upper);\n    let coefficient = FixedInterval::<i64, Q30_FRACTION_BITS>::new(\n        i64::from(scale.lower().bits()),\n        i64::from(scale.upper().bits()),\n    )\n    .expect(\"ordered Q30 coefficient\");\n    Q30Interval::from_fixed(\n        source\n            .checked_mul(&coefficient)\n            .and_then(|value| value.convert::<i32>()),\n    )\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "ratio_bounds",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "status": "absent"
+  },
+  {
+    "symbol": "clamp_i64_to_i32_bounds",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1205,
+    "body": "fn clamp_i64_to_i32_bounds(value: i64, lower: Q30, upper: Q30) -> i32 {\n    value.clamp(i64::from(lower.bits()), i64::from(upper.bits())) as i32\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "interval_arithmetic_is_outward_and_division_rejects_zero",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1222,
+    "body": "fn interval_arithmetic_is_outward_and_division_rejects_zero() {\n        let one_third = q(1, 3);\n        assert_eq!(one_third.width_ulps(), 1);\n        let product = one_third.checked_mul(q(3, 2)).unwrap();\n        assert!(product.contains(Q30::HALF));\n        assert_eq!(q(1, -2), Q30Interval::point(point(-1, 2)));\n        assert_eq!(q(-1, -2), Q30Interval::point(Q30::HALF));\n        assert_eq!(\n            Q30Interval::ONE.checked_div(Q30Interval::new(point(-1, 2), point(1, 2)).unwrap()),\n            Err(FocError::DivideByZero)\n        );\n        assert_eq!(Q30::from_bits(i32::MIN).checked_neg(), Err(FocError::Range));\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "transform_constant_intervals_have_integer_certificates",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1329,
+    "body": "fn transform_constant_intervals_have_integer_certificates() {\n        let scale = i128::from(Q30_SCALE);\n        assert!(3 * i128::from(TWO_THIRDS.lower().bits()) <= 2 * scale);\n        assert!(2 * scale <= 3 * i128::from(TWO_THIRDS.upper().bits()));\n\n        let inverse_lower = i128::from(INV_SQRT_3.lower().bits());\n        let inverse_upper = i128::from(INV_SQRT_3.upper().bits());\n        assert!(3 * inverse_lower * inverse_lower <= scale * scale);\n        assert!(scale * scale <= 3 * inverse_upper * inverse_upper);\n\n        let root_lower = i128::from(SQRT_3_OVER_2.lower().bits());\n        let root_upper = i128::from(SQRT_3_OVER_2.upper().bits());\n        assert!(4 * root_lower * root_lower <= 3 * scale * scale);\n        assert!(3 * scale * scale <= 4 * root_upper * root_upper);\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "min_max_modulation_contains_known_duties_and_rejects_overrange",
+    "path": "crates/alumina-foc/src/lib.rs",
+    "line": 1408,
+    "body": "fn min_max_modulation_contains_known_duties_and_rejects_overrange() {\n        let result = space_vector_modulate(\n            AlphaBeta {\n                alpha: q(1, 2),\n                beta: Q30Interval::ZERO,\n            },\n            Q30::ONE,\n        )\n        .unwrap();\n        assert!(result.duties.a.contains(point(11, 16)));\n        assert!(result.duties.b.contains(point(5, 16)));\n        assert!(result.duties.c.contains(point(5, 16)));\n        assert_eq!(\n            phase_to_duty(Q30Interval::point(Q30::NEG_ONE), Q30::ONE).unwrap(),\n            Q30Interval::ZERO\n        );\n        assert_eq!(\n            phase_to_duty(Q30Interval::ONE, Q30::ONE).unwrap(),\n            Q30Interval::ONE\n        );\n        assert_eq!(\n            space_vector_modulate(\n                AlphaBeta {\n                    alpha: q(3, 2),\n                    beta: Q30Interval::ZERO,\n                },\n                Q30::ONE,\n            ),\n            Err(FocError::ModulationRange)\n        );\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "range_pulse_and_quantization_policies_fail_closed",
+    "path": "crates/alumina-foc/src/pwm.rs",
+    "line": 887,
+    "body": "fn range_pulse_and_quantization_policies_fail_closed() {\n        let outside = Q30Interval::new(Q30::from_bits(-1), Q30::ZERO).unwrap();\n        assert_eq!(\n            contract(u32::MAX).lower(\n                &parameters(),\n                synchronization(),\n                1,\n                DeviceCycle(0),\n                duties(outside),\n            ),\n            Err(PwmCompareError::DutyRange)\n        );\n        assert_eq!(\n            contract(u32::MAX).lower(\n                &parameters(),\n                synchronization(),\n                1,\n                DeviceCycle(0),\n                duties(Q30Interval::ZERO),\n            ),\n            Err(PwmCompareError::PulseWidth)\n        );\n\n        let one_third = Q30Interval::from_ratio(1, 3).unwrap();\n        assert_eq!(\n            contract(1).lower(\n                &parameters(),\n                synchronization(),\n                1,\n                DeviceCycle(0),\n                duties(one_third),\n            ),\n            Err(PwmCompareError::Quantization)\n        );\n        assert_eq!(\n            contract(u32::MAX).lower(\n                &parameters(),\n                synchronization(),\n                0,\n                DeviceCycle(0),\n                duties(Q30Interval::HALF),\n            ),\n            Err(PwmCompareError::ZeroToken)\n        );\n    }",
+    "status": "present"
+  },
+  {
+    "symbol": "ServoPositionInterval",
+    "path": "crates/alumina-foc/src/servo.rs",
+    "line": 55,
+    "body": "pub struct ServoPositionInterval {\n    lower: ServoPosition,\n    upper: ServoPosition,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "ServoPositionIntervalError",
+    "path": "crates/alumina-foc/src/servo.rs",
+    "line": 119,
+    "body": "pub enum ServoPositionIntervalError {\n    /// The supplied upper endpoint preceded the lower endpoint.\n    Order,\n    /// A checked exact position operation overflowed Q31.32 storage.\n    Arithmetic,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "ServoPositionErrorInterval",
+    "path": "crates/alumina-foc/src/servo.rs",
+    "line": 131,
+    "body": "pub struct ServoPositionErrorInterval {\n    lower_bits: i128,\n    upper_bits: i128,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "ServoQ30ErrorInterval",
+    "path": "crates/alumina-foc/src/servo.rs",
+    "line": 167,
+    "body": "pub struct ServoQ30ErrorInterval {\n    lower_bits: i64,\n    upper_bits: i64,\n}",
+    "status": "present"
+  },
+  {
+    "symbol": "q31_32_intervals_preserve_extreme_width_and_midpoint",
+    "path": "crates/alumina-foc/src/servo.rs",
+    "line": 1067,
+    "body": "fn q31_32_intervals_preserve_extreme_width_and_midpoint() {\n        let interval = ServoPositionInterval::new(\n            ServoPosition::from_bits(i64::MIN),\n            ServoPosition::from_bits(i64::MAX),\n        )\n        .unwrap();\n        assert_eq!(interval.width_ulps(), u64::MAX);\n        assert_eq!(interval.midpoint(), ServoPosition::from_bits(-1));\n        assert_eq!(\n            ServoPositionInterval::new(ServoPosition::from_bits(1), ServoPosition::from_bits(0)),\n            Err(ServoPositionIntervalError::Order)\n        );\n        assert_eq!(\n            ServoPosition::from_bits(i64::MAX).checked_add_bits(1),\n            Err(ServoPositionIntervalError::Arithmetic)\n        );\n    }",
+    "status": "present"
+  }
+]
