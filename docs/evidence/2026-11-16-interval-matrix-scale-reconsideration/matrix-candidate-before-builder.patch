@@ -1,0 +1,334 @@
+diff --git a/crates/hyperlattice-interval/CHANGELOG.md b/crates/hyperlattice-interval/CHANGELOG.md
+index a82562c09..e7c80df65 100644
+--- a/crates/hyperlattice-interval/CHANGELOG.md
++++ b/crates/hyperlattice-interval/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## 0.1.0 (unreleased)
+ 
++- Add shared-context matrix scalar scaling with row-major arithmetic, outward
++  bounds, explicit empty/unit products and validated downstream replay. A shared
++  scalar's cross-entry correlation is not retained by the Cartesian result.
++
+ - Add exact closed dyadic box bisection and outward grid transport, preserving
+   empty/unit products, typed boundaries and shared scalar budgets.
+ 
+diff --git a/crates/hyperlattice-interval/README.md b/crates/hyperlattice-interval/README.md
+index 0db77aa89..0b00b26f3 100644
+--- a/crates/hyperlattice-interval/README.md
++++ b/crates/hyperlattice-interval/README.md
+@@ -33,7 +33,8 @@ including std and the same Rust 1.95 requirement.
+ `serde` validates scalar endpoints, dimensions and fixed scales on replay.
+ 
+ Implemented: canonical empty/unit products, component hull/intersection and
+-inclusion, sums/differences, dot products, matrix products, affine enclosures,
++inclusion, sums/differences, vector and matrix scalar scaling, dot products,
++matrix products, affine enclosures,
+ transpose and checked row/column projections. Vector and matrix one/infinity
+ norms include lower and upper bounds. Square matrices also supply logarithmic
+ one/infinity measures (with signed diagonals) and row/column diagonal-dominance
+diff --git a/crates/hyperlattice-interval/src/matrix.rs b/crates/hyperlattice-interval/src/matrix.rs
+index 3d926d6c3..12d811eb3 100644
+--- a/crates/hyperlattice-interval/src/matrix.rs
++++ b/crates/hyperlattice-interval/src/matrix.rs
+@@ -112,6 +112,26 @@ impl<I: IntervalArithmetic, const R: usize, const C: usize> IntervalMatrix<I, R,
+         self.zip(other, context, I::sub)
+     }
+ 
++    /// Encloses multiplication by a shared scalar. Correlations between entries
++    /// are forgotten in the Cartesian result. Empty operands remain empty,
++    /// including matrices with zero rows or columns. Uses row-major order and
++    /// one shared backend context.
++    pub fn scale(
++        &self,
++        scalar: &I,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        let Some(rows) = self.rows() else {
++            return Self::empty();
++        };
++        if scalar.is_empty() {
++            return Self::empty();
++        }
++        Self::new(array_result(|r| {
++            array_result(|c| rows[r][c].mul(scalar, context))
++        })?)
++    }
++
+     /// Matrix-vector product enclosure. Singleton coefficients or lanes support
+     /// point-matrix or point-vector products without a separate arithmetic path.
+     /// Rows are evaluated in order, each dot product from column zero upward.
+diff --git a/crates/hyperlattice-interval/tests/cartesian.rs b/crates/hyperlattice-interval/tests/cartesian.rs
+index 63fb81e3f..081267aa0 100644
+--- a/crates/hyperlattice-interval/tests/cartesian.rs
++++ b/crates/hyperlattice-interval/tests/cartesian.rs
+@@ -69,6 +69,20 @@ fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
+                     .into_lanes(),
+                 Some(expected.map(|(lo, hi)| scalar(lo, hi)))
+             );
++            let matrix = IntervalMatrix::new([vector.clone().into_lanes().unwrap()]).unwrap();
++            assert_eq!(
++                matrix
++                    .scale(&scalar(scale.0, scale.1), &mut context())
++                    .unwrap()
++                    .into_rows(),
++                Some([expected.map(|(lo, hi)| scalar(lo, hi))])
++            );
++            assert!(
++                matrix
++                    .scale(&I::empty().unwrap(), &mut context())
++                    .unwrap()
++                    .is_empty()
++            );
+             assert!(
+                 vector
+                     .scale(&I::empty().unwrap(), &mut context())
+@@ -84,6 +98,27 @@ fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
+             .unwrap()
+             .is_empty()
+     );
++    let unit = IntervalMatrix::<I, 0, 2>::new([]).unwrap();
++    assert_eq!(unit.scale(&scalar(-1, 1), &mut context()).unwrap(), unit);
++    assert!(
++        unit.scale(&I::empty().unwrap(), &mut context())
++            .unwrap()
++            .is_empty()
++    );
++    let unit = IntervalMatrix::<I, 2, 0>::new([[], []]).unwrap();
++    assert_eq!(unit.scale(&scalar(-1, 1), &mut context()).unwrap(), unit);
++    assert!(
++        unit.scale(&I::empty().unwrap(), &mut context())
++            .unwrap()
++            .is_empty()
++    );
++    let empty = IntervalMatrix::<I, 1, 2>::empty().unwrap();
++    assert!(
++        empty
++            .scale(&scalar(-1, 1), &mut context())
++            .unwrap()
++            .is_empty()
++    );
+     // Exhaust every two-lane dot product over this finite endpoint domain.
+     for a0 in ranges {
+         for a1 in ranges {
+@@ -505,6 +540,27 @@ fn rectangular_products_and_composition<I: IntervalArithmetic + core::fmt::Debug
+         .unwrap();
+         let actual = a.mul_matrix(&b, &mut context()).unwrap();
+         assert_eq!(actual, expected, "case {case}");
++        // Scale a generated product, then consume it in another matrix operation.
++        // Every expected entry comes from the independent integer corner oracle.
++        let scaled = actual.scale(&scalar(-2, 3), &mut context()).unwrap();
++        let scaled_bounds: [[(i32, i32); 2]; 2] = core::array::from_fn(|r| {
++            core::array::from_fn(|c| {
++                let product = dot_bounds(&aa[r], &bb.map(|row| row[c]));
++                dot_bounds(&[product], &[(-2, 3)])
++            })
++        });
++        assert_eq!(
++            scaled.rows(),
++            Some(&scaled_bounds.map(|row| row.map(|(lo, hi)| scalar(lo, hi))))
++        );
++        let ones = IntervalVector::new([scalar(1, 1), scalar(1, 1)]).unwrap();
++        assert_eq!(
++            scaled.mul_vector(&ones, &mut context()).unwrap().lanes(),
++            Some(&scaled_bounds.map(|row| {
++                let (lo, hi) = dot_bounds(&row, &[(1, 1), (1, 1)]);
++                scalar(lo, hi)
++            }))
++        );
+         let rebuilt = a.clone();
+         assert_eq!(rebuilt.mul_matrix(&b, &mut context()).unwrap(), actual);
+         for column in 0..2 {
+@@ -601,3 +657,113 @@ fn rectangular_dyadic_products() {
+         || DyadicBudget::new(1024, 10_000_000),
+     );
+ }
++
++#[cfg(feature = "dyadic")]
++#[test]
++fn matrix_scale_shares_budget_in_row_order_and_retries() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{DyadicBudget, DyadicInterval as I, IntervalError};
++    let i = |n: i32| I::point(n.into(), 0).unwrap();
++    let input = IntervalMatrix::new([[i(2), i(-3)], [i(5), i(7)]]).unwrap();
++    let scalar = I::new((-3).into(), 2.into(), -1).unwrap();
++    let mut measured = DyadicBudget::new(256, 1_000_000);
++    let expected = input.scale(&scalar, &mut measured).unwrap();
++    let work = 1_000_000 - measured.remaining_work();
++    let mut exact = DyadicBudget::new(256, work);
++    assert_eq!(input.scale(&scalar, &mut exact).unwrap(), expected);
++    assert_eq!(exact.remaining_work(), 0);
++    let mut manual = DyadicBudget::new(256, 1_000_000);
++    for (r, row) in input.rows().unwrap().iter().enumerate() {
++        for (c, value) in row.iter().enumerate() {
++            assert_eq!(
++                value.mul(&scalar, &mut manual).unwrap(),
++                expected.rows().unwrap()[r][c]
++            );
++        }
++    }
++    assert_eq!(manual.remaining_work(), measured.remaining_work());
++    // Check every work cut against the explicit left-to-right sequence. An
++    // exhausted matrix operation must consume exactly the same partial work,
++    // without publishing a partial matrix or poisoning a fresh retry.
++    for limit in 0..=work {
++        let mut actual_budget = DyadicBudget::new(256, limit);
++        let actual = input.scale(&scalar, &mut actual_budget);
++        let mut reference_budget = DyadicBudget::new(256, limit);
++        let reference = input
++            .rows()
++            .unwrap()
++            .iter()
++            .flatten()
++            .try_for_each(|value| value.mul(&scalar, &mut reference_budget).map(|_| ()));
++        assert_eq!(
++            actual.map(|_| ()),
++            reference.map_err(IntervalLatticeError::Scalar)
++        );
++        assert_eq!(
++            actual_budget.remaining_work(),
++            reference_budget.remaining_work()
++        );
++    }
++    assert_eq!(
++        input.scale(&scalar, &mut DyadicBudget::new(256, work - 1)),
++        Err(IntervalLatticeError::Scalar(IntervalError::WorkExhausted))
++    );
++    assert_eq!(
++        input.scale(&scalar, &mut DyadicBudget::new(1, 1_000_000)),
++        Err(IntervalLatticeError::Scalar(IntervalError::SizeExhausted))
++    );
++    assert_eq!(
++        input
++            .scale(&scalar, &mut DyadicBudget::new(256, 1_000_000))
++            .unwrap(),
++        expected
++    );
++    // Empty scalar/domain and zero-dimensional unit products require no arithmetic.
++    assert!(
++        input
++            .scale(&I::empty(), &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .is_empty()
++    );
++    let empty = IntervalMatrix::<I, 2, 2>::empty().unwrap();
++    assert!(
++        empty
++            .scale(&scalar, &mut DyadicBudget::new(0, 0))
++            .unwrap()
++            .is_empty()
++    );
++    let unit = IntervalMatrix::<I, 2, 0>::new([[], []]).unwrap();
++    assert_eq!(
++        unit.scale(&scalar, &mut DyadicBudget::new(0, 0)).unwrap(),
++        unit
++    );
++}
++
++#[cfg(feature = "fixed")]
++#[test]
++fn matrix_scale_keeps_rounding_overflow_and_cartesian_correlation_contracts() {
++    use hyperlattice_interval::IntervalLatticeError;
++    use hyperlattice_interval::hyperinterval::{FixedInterval as F, IntervalError};
++    type I = F<i32, 2>;
++    let i = |a, b| I::new(a, b).unwrap();
++    // [-1/4,1/2] * [-3/4,1/2] = [-3/8,1/4], rounded outward on a 1/4 grid.
++    let m = IntervalMatrix::new([[i(-1, 2)]]).unwrap();
++    assert_eq!(
++        m.scale(&i(-3, 2), &mut ()).unwrap().rows(),
++        Some(&[[i(-2, 1)]])
++    );
++    let huge = IntervalMatrix::new([[i(i32::MAX, i32::MAX)]]).unwrap();
++    assert_eq!(
++        huge.scale(&i(8, 8), &mut ()),
++        Err(IntervalLatticeError::Scalar(IntervalError::Overflow))
++    );
++    let ones = IntervalMatrix::new([[i(4, 4), i(4, 4)]]).unwrap();
++    let shared = ones.scale(&i(-4, 4), &mut ()).unwrap();
++    // The output is a Cartesian box. The shared-scalar relation is deliberately
++    // absent; evaluating its coordinate difference must not claim exact zero.
++    let difference = IntervalVector::new([i(4, 4), i(-4, -4)]).unwrap();
++    assert_eq!(
++        shared.mul_vector(&difference, &mut ()).unwrap().lanes(),
++        Some(&[i(-8, 8)])
++    );
++}
+diff --git a/crates/hyperlattice-interval/tests/no_alloc.rs b/crates/hyperlattice-interval/tests/no_alloc.rs
+index a02fa9f6d..5a465cfa4 100644
+--- a/crates/hyperlattice-interval/tests/no_alloc.rs
++++ b/crates/hyperlattice-interval/tests/no_alloc.rs
+@@ -17,6 +17,12 @@ fn primitive_construction_composition_and_errors_do_not_allocate() {
+             x.scale(&I::new(-(1 << 16), 1 << 16).unwrap(), &mut ())
+                 .unwrap(),
+         );
++        assert_eq!(m.scale(&p, &mut ()).unwrap(), m);
++        std::hint::black_box(
++            m.scale(&I::new(-(1 << 16), 1 << 16).unwrap(), &mut ())
++                .unwrap(),
++        );
++        assert!(m.scale(&I::empty().unwrap(), &mut ()).unwrap().is_empty());
+         let transposed = m.transpose(&mut ()).unwrap();
+         let squared = m.mul_matrix(&transposed, &mut ()).unwrap();
+         let row = squared.row(0, &mut ()).unwrap();
+diff --git a/crates/hyperlattice-interval/tests/replay.rs b/crates/hyperlattice-interval/tests/replay.rs
+index 53f093a6d..96f4759d8 100644
+--- a/crates/hyperlattice-interval/tests/replay.rs
++++ b/crates/hyperlattice-interval/tests/replay.rs
+@@ -77,3 +77,57 @@ fn unit_and_empty_products_have_distinct_replays() {
+     assert_eq!(serde_json::to_string(&unit).unwrap(), "[[],[]]");
+     assert_eq!(serde_json::to_string(&empty).unwrap(), "null");
+ }
++
++#[test]
++fn scaled_matrix_fresh_process_replay_remains_an_operand() {
++    const ENV: &str = "CSGRS_MATRIX_SCALE_REPLAY_DIR";
++    if let Some(path) = std::env::var_os(ENV) {
++        let path = std::path::PathBuf::from(path);
++        let matrix: IntervalMatrix<I, 2, 2> =
++            serde_json::from_slice(&std::fs::read(path.join("input.json")).unwrap()).unwrap();
++        let vector = IntervalVector::new([I::point(1).unwrap(), I::point(-1).unwrap()]).unwrap();
++        let image = matrix.mul_vector(&vector, &mut ()).unwrap();
++        std::fs::write(
++            path.join("output.json"),
++            serde_json::to_vec(&image).unwrap(),
++        )
++        .unwrap();
++        return;
++    }
++    let matrix = IntervalMatrix::new([
++        [I::new(-2, 3).unwrap(), I::point(4).unwrap()],
++        [I::point(-1).unwrap(), I::new(2, 5).unwrap()],
++    ])
++    .unwrap()
++    .scale(&I::new(-2, 3).unwrap(), &mut ())
++    .unwrap();
++    // Independent products: [-6,9],[-8,12]; [-3,2],[-10,15].
++    let expected =
++        IntervalVector::new([I::new(-18, 17).unwrap(), I::new(-18, 12).unwrap()]).unwrap();
++    let nonce = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_nanos();
++    let path = std::env::temp_dir().join(format!("matrix-scale-{}-{nonce}", std::process::id()));
++    std::fs::create_dir(&path).unwrap();
++    std::fs::write(
++        path.join("input.json"),
++        serde_json::to_vec(&matrix).unwrap(),
++    )
++    .unwrap();
++    let output = std::process::Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "scaled_matrix_fresh_process_replay_remains_an_operand",
++            "--nocapture",
++        ])
++        .env(ENV, &path)
++        .output()
++        .unwrap();
++    assert!(output.status.success(), "{output:?}");
++    let bytes = std::fs::read(path.join("output.json")).unwrap();
++    let actual: IntervalVector<I, 2> = serde_json::from_slice(&bytes).unwrap();
++    assert_eq!(actual, expected);
++    assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
++    std::fs::remove_dir_all(path).unwrap();
++}
