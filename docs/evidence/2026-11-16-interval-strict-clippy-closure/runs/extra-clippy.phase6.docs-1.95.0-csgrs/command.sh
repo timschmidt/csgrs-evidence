@@ -1,0 +1,1 @@
+cargo clippy --locked --all-targets -p csgrs --no-default-features --features attributed,curve,stl-io,dxf-io,obj-io,ply-io,amf-io,gltf-io,vrml-io,gerber-io,svg-io,image-io,metaballs,sdf,offset,truetype-text,hershey-text,wasm -- -D warnings

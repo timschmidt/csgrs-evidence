@@ -1,0 +1,493 @@
+use super::Aabb3;
+use super::scalar::{
+    AdapterError, AdapterResult, F32, F64, I128, RawReal, ScalarAdapter, real3_to_scalar,
+    scalar3_to_real,
+};
+use crate::solid::{self, SolidExt};
+use crate::{GeometryContext, GeometryOutcome};
+use hyperlattice::{Matrix4, Point3, Vector3};
+use hypermesh::{Triangle, TriangleMesh};
+use std::{
+    any::{Any, TypeId},
+    cell::RefCell,
+    marker::PhantomData,
+    sync::Arc,
+};
+
+pub type MeshVertex<S> = ([S; 3], [S; 3]);
+pub type IndexedMeshBuffers<S> = (Vec<[S; 3]>, Vec<[u32; 3]>);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphicsMesh<S> {
+    pub vertices: Arc<[MeshVertex<S>]>,
+    pub indices: Arc<[u32]>,
+}
+
+struct CachedGraphicsMesh {
+    positions: Arc<[Point3]>,
+    triangles: Arc<[Triangle]>,
+    adapter: TypeId,
+    graphics: Box<dyn Any>,
+}
+
+thread_local! {
+    static GRAPHICS_MESH_CACHE: RefCell<Vec<CachedGraphicsMesh>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub type RawTriangleMesh = ScalarMesh<RawReal>;
+pub type TriangleMeshF32 = ScalarMesh<F32>;
+pub type TriangleMeshF64 = ScalarMesh<F64>;
+pub type TriangleMeshI128 = ScalarMesh<I128>;
+
+/// Primitive-scalar boundary over native [`TriangleMesh`] geometry.
+///
+/// Boolean failures retain their native cause in [`AdapterError::Construction`]
+/// through [`crate::errors::ValidationError::Mesh`]. Inspect the validation
+/// error's [`kind`](crate::errors::ValidationError::kind) or follow
+/// [`std::error::Error::source`] to distinguish invalid input from an undecided
+/// predicate. This replaces text-only [`AdapterError::Validation`] failures.
+/// Polyhedron and graphics construction also retain native causes; graphics
+/// errors use [`crate::errors::ValidationError::Gpu`]. Point transforms retain
+/// scalar arithmetic failures through [`AdapterError::Hyperreal`].
+#[derive(Clone, Debug)]
+pub struct ScalarMesh<A>
+where
+    A: ScalarAdapter,
+{
+    inner: TriangleMesh,
+    _adapter: PhantomData<fn() -> A>,
+}
+
+impl<A> ScalarMesh<A>
+where
+    A: ScalarAdapter,
+{
+    pub fn from_native(inner: TriangleMesh) -> Self {
+        Self {
+            inner,
+            _adapter: PhantomData,
+        }
+    }
+
+    pub fn into_native(self) -> TriangleMesh {
+        self.inner
+    }
+
+    pub const fn native(&self) -> &TriangleMesh {
+        &self.inner
+    }
+
+    pub fn empty() -> Self {
+        Self::from_native(solid::empty())
+    }
+
+    pub fn cube(width: A::Scalar) -> AdapterResult<Self> {
+        Ok(Self::from_native(solid::cube(A::into_real(width)?)?))
+    }
+
+    pub fn cuboid(
+        width: A::Scalar,
+        length: A::Scalar,
+        height: A::Scalar,
+    ) -> AdapterResult<Self> {
+        Ok(Self::from_native(solid::cuboid(
+            A::into_real(width)?,
+            A::into_real(length)?,
+            A::into_real(height)?,
+        )?))
+    }
+
+    pub fn sphere(radius: A::Scalar, segments: usize, stacks: usize) -> AdapterResult<Self> {
+        Ok(Self::from_native(solid::sphere(
+            A::into_real(radius)?,
+            segments,
+            stacks,
+        )?))
+    }
+
+    pub fn cylinder(
+        radius: A::Scalar,
+        height: A::Scalar,
+        segments: usize,
+    ) -> AdapterResult<Self> {
+        Ok(Self::from_native(solid::cylinder(
+            A::into_real(radius)?,
+            A::into_real(height)?,
+            segments,
+        )?))
+    }
+
+    pub fn polyhedron(points: &[[A::Scalar; 3]], faces: &[&[usize]]) -> AdapterResult<Self> {
+        let points = points
+            .iter()
+            .cloned()
+            .map(scalar3_to_real::<A>)
+            .collect::<AdapterResult<Vec<_>>>()?;
+        solid::polyhedron(&points, faces)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn union(&self, other: &Self) -> AdapterResult<Self> {
+        self.inner
+            .try_union(&other.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn difference(&self, other: &Self) -> AdapterResult<Self> {
+        self.inner
+            .try_difference(&other.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn intersection(&self, other: &Self) -> AdapterResult<Self> {
+        self.inner
+            .try_intersection(&other.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn xor(&self, other: &Self) -> AdapterResult<Self> {
+        self.inner
+            .try_xor(&other.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    /// Computes the Boolean with the selected policy and aggregate certainty.
+    pub fn union_with_context(
+        &self,
+        other: &Self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        self.inner
+            .try_union_with_context(&other.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Computes the Boolean with the selected policy and aggregate certainty.
+    pub fn difference_with_context(
+        &self,
+        other: &Self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        self.inner
+            .try_difference_with_context(&other.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Computes the Boolean with the selected policy and aggregate certainty.
+    pub fn intersection_with_context(
+        &self,
+        other: &Self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        self.inner
+            .try_intersection_with_context(&other.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Computes the Boolean with the selected policy and aggregate certainty.
+    pub fn xor_with_context(
+        &self,
+        other: &Self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        self.inner
+            .try_xor_with_context(&other.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    pub fn transform(&self, matrix: &Matrix4) -> AdapterResult<Self> {
+        solid::transform(&self.inner, matrix)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn translate(&self, x: A::Scalar, y: A::Scalar, z: A::Scalar) -> AdapterResult<Self> {
+        Ok(Self::from_native(self.inner.translated(
+            A::into_real(x)?,
+            A::into_real(y)?,
+            A::into_real(z)?,
+        )?))
+    }
+
+    pub fn scale(&self, sx: A::Scalar, sy: A::Scalar, sz: A::Scalar) -> AdapterResult<Self> {
+        solid::scale(
+            &self.inner,
+            A::into_real(sx)?,
+            A::into_real(sy)?,
+            A::into_real(sz)?,
+        )
+        .map(Self::from_native)
+        .map_err(AdapterError::from)
+    }
+
+    pub fn rotate(
+        &self,
+        x_degrees: A::Scalar,
+        y_degrees: A::Scalar,
+        z_degrees: A::Scalar,
+    ) -> AdapterResult<Self> {
+        solid::rotate(
+            &self.inner,
+            A::into_real(x_degrees)?,
+            A::into_real(y_degrees)?,
+            A::into_real(z_degrees)?,
+        )
+        .map(Self::from_native)
+        .map_err(AdapterError::from)
+    }
+
+    pub fn inverse(&self) -> Self {
+        Self::from_native(self.inner.reversed_winding())
+    }
+
+    pub fn center(&self) -> AdapterResult<Self> {
+        solid::center(&self.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn float(&self) -> AdapterResult<Self> {
+        solid::float(&self.inner)
+            .map(Self::from_native)
+            .map_err(AdapterError::from)
+    }
+
+    pub fn bounding_box(&self) -> AdapterResult<Option<Aabb3<A::Scalar>>> {
+        solid::bounding_box(&self.inner)?
+            .map(super::convert_bounds::<A>)
+            .transpose()
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn transform_with_context(
+        &self,
+        matrix: &Matrix4,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::transform_with_context(&self.inner, matrix, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn translate_with_context(
+        &self,
+        x: A::Scalar,
+        y: A::Scalar,
+        z: A::Scalar,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::transform_with_context(
+            &self.inner,
+            &Matrix4::affine_translation([
+                A::into_real(x)?,
+                A::into_real(y)?,
+                A::into_real(z)?,
+            ]),
+            context,
+        )
+        .map(|outcome| outcome.map(Self::from_native))
+        .map_err(AdapterError::from)
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn scale_with_context(
+        &self,
+        x: A::Scalar,
+        y: A::Scalar,
+        z: A::Scalar,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::scale_with_context(
+            &self.inner,
+            A::into_real(x)?,
+            A::into_real(y)?,
+            A::into_real(z)?,
+            context,
+        )
+        .map(|outcome| outcome.map(Self::from_native))
+        .map_err(AdapterError::from)
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn rotate_with_context(
+        &self,
+        x: A::Scalar,
+        y: A::Scalar,
+        z: A::Scalar,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::rotate_with_context(
+            &self.inner,
+            A::into_real(x)?,
+            A::into_real(y)?,
+            A::into_real(z)?,
+            context,
+        )
+        .map(|outcome| outcome.map(Self::from_native))
+        .map_err(AdapterError::from)
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn center_with_context(
+        &self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::center_with_context(&self.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Applies the operation with the selected policy and aggregate certainty.
+    pub fn float_with_context(
+        &self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        solid::float_with_context(&self.inner, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    /// Computes bounds before scalar conversion, retaining predicate certainty.
+    pub fn bounding_box_with_context(
+        &self,
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Option<Aabb3<A::Scalar>>>> {
+        solid::bounding_box_with_context(&self.inner, context)?
+            .try_map(|bounds| bounds.map(super::convert_bounds::<A>).transpose())
+    }
+
+    /// Triangulates faces with the selected policy after promoting scalar coordinates.
+    pub fn polyhedron_with_context(
+        points: &[[A::Scalar; 3]],
+        faces: &[&[usize]],
+        context: GeometryContext,
+    ) -> AdapterResult<GeometryOutcome<Self>> {
+        let points = points
+            .iter()
+            .cloned()
+            .map(scalar3_to_real::<A>)
+            .collect::<AdapterResult<Vec<_>>>()?;
+        solid::polyhedron_with_context(&points, faces, context)
+            .map(|outcome| outcome.map(Self::from_native))
+            .map_err(AdapterError::from)
+    }
+
+    pub fn graphics_mesh(&self) -> AdapterResult<GraphicsMesh<A::Scalar>> {
+        if let Some(graphics) = GRAPHICS_MESH_CACHE.with_borrow(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|entry| {
+                    Arc::ptr_eq(&entry.positions, &self.inner.positions)
+                        && Arc::ptr_eq(&entry.triangles, &self.inner.triangles)
+                        && entry.adapter == TypeId::of::<A>()
+                })
+                .and_then(|entry| {
+                    entry
+                        .graphics
+                        .downcast_ref::<GraphicsMesh<A::Scalar>>()
+                        .cloned()
+                })
+        }) {
+            return Ok(graphics);
+        }
+        let mesh = self
+            .inner
+            .to_exact_gpu_mesh_buffers()
+            .map_err(AdapterError::from)?;
+        let vertices = mesh
+            .vertices
+            .iter()
+            .map(|(position, normal)| {
+                Ok((real3_to_scalar::<A>(position)?, real3_to_scalar::<A>(normal)?))
+            })
+            .collect::<AdapterResult<Vec<_>>>()?;
+
+        let graphics = GraphicsMesh {
+            vertices: vertices.into(),
+            indices: Arc::from(mesh.indices.as_slice()),
+        };
+        GRAPHICS_MESH_CACHE.with_borrow_mut(|entries| {
+            const CAPACITY: usize = 8;
+            if entries.len() == CAPACITY {
+                entries.remove(0);
+            }
+            entries.push(CachedGraphicsMesh {
+                positions: Arc::clone(&self.inner.positions),
+                triangles: Arc::clone(&self.inner.triangles),
+                adapter: TypeId::of::<A>(),
+                graphics: Box::new(graphics.clone()),
+            });
+        });
+        Ok(graphics)
+    }
+
+    pub fn vertices_and_indices(&self) -> AdapterResult<IndexedMeshBuffers<A::Scalar>> {
+        let vertices = self
+            .inner
+            .positions
+            .iter()
+            .map(point3_to_scalar::<A>)
+            .collect::<AdapterResult<Vec<_>>>()?;
+        let indices = self
+            .inner
+            .triangles
+            .iter()
+            .map(|triangle| {
+                let [a, b, c] = triangle.indices();
+                Ok([
+                    u32::try_from(a).map_err(index_error)?,
+                    u32::try_from(b).map_err(index_error)?,
+                    u32::try_from(c).map_err(index_error)?,
+                ])
+            })
+            .collect::<AdapterResult<Vec<_>>>()?;
+        Ok((vertices, indices))
+    }
+
+    pub fn transform_adapter_points(
+        points: &[[A::Scalar; 3]],
+        matrix: &Matrix4,
+    ) -> AdapterResult<Vec<[A::Scalar; 3]>> {
+        points
+            .iter()
+            .cloned()
+            .map(scalar3_to_real::<A>)
+            .map(|point| {
+                let [x, y, z] = point?;
+                let transformed = matrix
+                    .transform_point3(&Point3::new(x, y, z))
+                    .map_err(AdapterError::from)?;
+                point3_to_scalar::<A>(&transformed)
+            })
+            .collect()
+    }
+
+    pub fn vector_from_adapter(values: [A::Scalar; 3]) -> AdapterResult<Vector3> {
+        let [x, y, z] = scalar3_to_real::<A>(values)?;
+        Ok(Vector3::from_xyz(x, y, z))
+    }
+}
+
+fn index_error(error: std::num::TryFromIntError) -> AdapterError {
+    AdapterError::Validation(format!("native mesh index exceeds u32: {error}"))
+}
+
+fn point3_to_scalar<A: ScalarAdapter>(point: &Point3) -> AdapterResult<[A::Scalar; 3]> {
+    Ok([
+        A::from_real(&point.x)?,
+        A::from_real(&point.y)?,
+        A::from_real(&point.z)?,
+    ])
+}

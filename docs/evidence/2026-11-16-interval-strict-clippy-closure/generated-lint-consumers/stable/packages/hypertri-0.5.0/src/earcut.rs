@@ -1,0 +1,2527 @@
+//! Exact ear-clipping polygon triangulation.
+//!
+//! The implementation returns earcut-style flat triangle indices while routing
+//! numeric decisions through the crate's predicate evaluator. `earcutr` is
+//! used only as a development-time differential oracle.
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::context::{TriangulationContext, TriangulationOutcome};
+use crate::error::{Error, Result};
+use crate::polygon::{PolygonRings, RingRange, open_ring_indices, rings_from_hole_indices};
+use crate::predicate_evaluator::PredicateEvaluator;
+use crate::predicate_evaluator::map_hyperlimit_sign;
+use crate::predicates;
+use crate::types::Sign;
+use crate::types::{ExactPoint, Point2, TriangleIndices};
+
+/// Non-certifying diagnostics for the exact earcut hot loop.
+///
+/// These counters make candidate pressure visible before introducing optional
+/// z-order pruning, unsafe indexing, or additional 2D-specialized kernels.
+/// They are scheduling metadata only: exact predicates still certify topology.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EarcutDiagnostics {
+    /// Number of vertices tested as ear candidates.
+    pub ear_tests: usize,
+    /// Number of non-triangle vertices considered for candidate-ear containment.
+    pub containment_candidates: usize,
+    /// Number of containment candidates rejected because their local vertex is strictly convex.
+    pub containment_convex_rejects: usize,
+    /// Number of containment candidates classified through prepared local reflex facts.
+    pub containment_prepared_reflex_lookups: usize,
+    /// Number of full-ring prepared reflex/convex fact rebuilds.
+    pub prepared_reflex_rebuilds: usize,
+    /// Number of local prepared reflex/convex fact updates after clipping.
+    pub prepared_reflex_updates: usize,
+    /// Number of containment candidates rejected by an exact triangle AABB.
+    pub containment_bbox_rejects: usize,
+    /// Number of non-triangle vertices tested with exact triangle containment.
+    pub containment_tests: usize,
+    /// Number of triangles emitted by clipping, curing, or split fallback.
+    pub emitted_triangles: usize,
+    /// Number of accepted local-intersection cures.
+    pub local_intersection_cures: usize,
+    /// Number of split fallback attempts entered.
+    pub split_fallbacks: usize,
+}
+
+/// Triangle indices paired with hot-loop diagnostics.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarcutReport {
+    /// Flat earcut-compatible triangle index buffer.
+    pub triangles: TriangleIndices,
+    /// Non-certifying hot-loop counters.
+    pub diagnostics: EarcutDiagnostics,
+}
+
+/// A simple polygon's triangulation, oriented with its input boundary.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimpleRingTriangulation {
+    /// Flat indices into the original vertex slice, with the input winding.
+    pub triangles: TriangleIndices,
+    /// Nonzero signed-area orientation consumed during this operation.
+    pub winding: Sign,
+}
+
+/// Validate and triangulate one simple, nonzero-area polygon without holes.
+///
+/// The final point may repeat the first. Other repeated points, backtracking,
+/// self-touching and crossing edges are invalid input. Forward collinear
+/// boundary vertices remain represented in the output. Triangles have the
+/// input winding; the outcome aggregates validation and triangulation certainty.
+/// Edge-pair validation takes quadratic work. This API has no total-work,
+/// heap-byte or cancellation bound.
+pub fn triangulate_simple_ring(
+    context: &TriangulationContext,
+    vertices: &[ExactPoint],
+) -> Result<TriangulationOutcome<SimpleRingTriangulation>> {
+    let evaluator = PredicateEvaluator::new(context);
+    let (rings, ring, winding) = validated_simple_ring(&evaluator, vertices)?;
+    let triangles = triangulate_report_inner(&evaluator, vertices, &[])?.triangles;
+    let triangles =
+        oriented_simple_ring_triangles(&evaluator, vertices, &rings, &ring, triangles, winding)?;
+    Ok(evaluator.finish(SimpleRingTriangulation { triangles, winding }))
+}
+
+/// Validate and triangulate one simple ring like [`triangulate_simple_ring`],
+/// keeping as many triangles as possible at the ring vertex `apex`.
+///
+/// `apex` indexes `vertices` and must be a ring vertex. Ear clipping tries the
+/// two ears beside `apex` before any other and clips elsewhere only when
+/// neither is an ear, so every vertex that `apex` can still see is joined to
+/// it and only the pockets it cannot see are cut into other triangles. The
+/// triangulation depends only on the cyclic ring, its direction and `apex`,
+/// not on which vertex the ring starts at, and every triangle keeps the
+/// input winding. Callers that retriangulate parts of one surface can choose
+/// `apex` consistently, such as its oldest vertex, so long fan edges gather
+/// at one place instead of where the ring happens to start. Clipping takes cubic
+/// work in the ring length at worst; like [`triangulate_simple_ring`], this
+/// API has no total-work, heap-byte or cancellation bound.
+pub fn triangulate_simple_ring_around(
+    context: &TriangulationContext,
+    vertices: &[ExactPoint],
+    apex: usize,
+) -> Result<TriangulationOutcome<SimpleRingTriangulation>> {
+    let evaluator = PredicateEvaluator::new(context);
+    let (rings, ring, winding) = validated_simple_ring(&evaluator, vertices)?;
+    if !ring.contains(&apex) {
+        return Err(Error::InvalidInput {
+            reason: "ring triangulation apex is not a ring vertex",
+        });
+    }
+    let triangles = clip_ring_around_apex(&evaluator, vertices, ring.clone(), apex, winding)?;
+    let triangles =
+        oriented_simple_ring_triangles(&evaluator, vertices, &rings, &ring, triangles, winding)?;
+    Ok(evaluator.finish(SimpleRingTriangulation { triangles, winding }))
+}
+
+/// Ear clipping that prefers the ears beside `apex`; see
+/// [`triangulate_simple_ring_around`]. Every simple ring with more than three
+/// vertices has two ears that do not overlap, so at least one is not `apex`
+/// itself, and `apex` stays in the ring until its last triangle.
+fn clip_ring_around_apex(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    mut ring: Vec<usize>,
+    apex: usize,
+    winding: Sign,
+) -> Result<TriangleIndices> {
+    let mut diagnostics = EarcutDiagnostics::default();
+    let mut triangles = Vec::with_capacity(ring.len().saturating_sub(2) * 3);
+    let mut convex =
+        prepare_local_convexity(evaluator, vertices, &ring, winding, &mut diagnostics)?;
+    while ring.len() > 3 {
+        let len = ring.len();
+        let at = ring
+            .iter()
+            .position(|&vertex| vertex == apex)
+            .ok_or(Error::NoEarFound)?;
+        let mut clipped = None;
+        for offset in [1, len - 1].into_iter().chain(2..len - 1) {
+            let cursor = (at + offset) % len;
+            if is_ear(
+                evaluator,
+                vertices,
+                &ring,
+                &convex,
+                cursor,
+                winding,
+                &mut diagnostics,
+            )? {
+                clipped = Some(cursor);
+                break;
+            }
+        }
+        let cursor = clipped.ok_or(Error::NoEarFound)?;
+        push_triangle(
+            &mut triangles,
+            ring[(cursor + len - 1) % len],
+            ring[cursor],
+            ring[(cursor + 1) % len],
+            winding,
+        );
+        ring.remove(cursor);
+        convex.remove(cursor);
+        let cursor = if cursor == ring.len() { 0 } else { cursor };
+        update_prepared_convexity_after_clip(
+            evaluator,
+            vertices,
+            &ring,
+            &mut convex,
+            cursor,
+            winding,
+            &mut diagnostics,
+        )?;
+    }
+    push_triangle(&mut triangles, ring[0], ring[1], ring[2], winding);
+    Ok(triangles)
+}
+
+/// Check that `triangles`, emitted counterclockwise, tile the validated ring
+/// with its boundary edges, and give them the ring's own winding.
+fn oriented_simple_ring_triangles(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    rings: &PolygonRings,
+    ring: &[usize],
+    mut triangles: TriangleIndices,
+    winding: Sign,
+) -> Result<TriangleIndices> {
+    if triangles.len() / 3 != ring.len() - 2
+        || !triangles_match_input_boundary(evaluator, vertices, rings, &triangles)?
+    {
+        return Err(Error::NoEarFound);
+    }
+    // Triangles are emitted CCW. Retain the input orientation for consumers
+    // attaching these faces to an already oriented boundary.
+    if winding == Sign::Negative {
+        for triangle in triangles.as_chunks_mut::<3>().0 {
+            triangle.swap(1, 2);
+        }
+    }
+    Ok(triangles)
+}
+
+/// The open ring of a simple, nonzero-area polygon and its winding, or
+/// `InvalidInput` for repeated points, crossing, overlapping or touching
+/// edges and zero area.
+fn validated_simple_ring(
+    evaluator: &PredicateEvaluator,
+    vertices: &[ExactPoint],
+) -> Result<(PolygonRings, Vec<usize>, Sign)> {
+    let rings = rings_from_hole_indices(vertices, &[])?;
+    let ring = open_ring_indices(evaluator, vertices, rings.exterior())?;
+    if ring.len() < 3 {
+        return Err(Error::InvalidInput {
+            reason: "simple ring requires at least three distinct vertices",
+        });
+    }
+    for left in 0..ring.len() {
+        let next_left = (left + 1) % ring.len();
+        let a = &vertices[ring[left]];
+        let b = &vertices[ring[next_left]];
+        if points_equal(evaluator, a, b)? {
+            return Err(Error::InvalidInput {
+                reason: "simple ring has a zero-length edge",
+            });
+        }
+        for right in left + 1..ring.len() {
+            let next_right = (right + 1) % ring.len();
+            let intersection = predicates::segment_intersection(
+                evaluator,
+                a,
+                b,
+                &vertices[ring[right]],
+                &vertices[ring[next_right]],
+            )?;
+            let adjacent = next_left == right || next_right == left;
+            let valid = if adjacent {
+                intersection == predicates::SegmentIntersection::EndpointTouch
+            } else {
+                intersection.is_disjoint()
+            };
+            if !valid {
+                return Err(Error::InvalidInput {
+                    reason: "simple ring edges cross, overlap or touch away from adjacent endpoints",
+                });
+            }
+        }
+    }
+    let winding = ring_area_sign(evaluator, vertices, &ring)?;
+    if winding == Sign::Zero {
+        return Err(Error::InvalidInput {
+            reason: "simple ring has zero signed area",
+        });
+    }
+    Ok((rings, ring, winding))
+}
+
+/// Triangulate an exact polygon.
+pub fn triangulate(
+    context: &TriangulationContext,
+    vertices: &[ExactPoint],
+    hole_indices: &[usize],
+) -> Result<TriangulationOutcome<TriangleIndices>> {
+    triangulate_report(context, vertices, hole_indices)
+        .map(|outcome| outcome.map(|report| report.triangles))
+}
+
+/// Triangulate an exact polygon and return hot-loop diagnostics.
+pub fn triangulate_report(
+    context: &TriangulationContext,
+    vertices: &[ExactPoint],
+    hole_indices: &[usize],
+) -> Result<TriangulationOutcome<EarcutReport>> {
+    let evaluator = PredicateEvaluator::new(context);
+    let report = triangulate_report_inner(&evaluator, vertices, hole_indices)?;
+    Ok(evaluator.finish(report))
+}
+
+fn triangulate_report_inner(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    hole_indices: &[usize],
+) -> Result<EarcutReport> {
+    let rings = rings_from_hole_indices(vertices, hole_indices)?;
+    let mut diagnostics = EarcutDiagnostics::default();
+    // Structural-dispatch note: normalization discovers several facts that are
+    // currently consumed locally and then discarded. Preserving "simple",
+    // "convex", "monotone", exact-rational coordinate kind, and the count of
+    // removed duplicate/collinear vertices would let the public runtime choose
+    // fan, monotone partition, earcut, or CDT without re-scanning coordinates.
+    let mut ring = normalized_ring(evaluator, vertices, rings.exterior())?;
+    if ring.len() < 3 {
+        return Ok(EarcutReport {
+            triangles: Vec::new(),
+            diagnostics,
+        });
+    }
+
+    let winding = ring_area_sign(evaluator, vertices, &ring)?;
+    if winding == Sign::Zero {
+        return Ok(EarcutReport {
+            triangles: Vec::new(),
+            diagnostics,
+        });
+    }
+
+    let holes = normalized_holes(evaluator, vertices, rings.holes(), winding)?;
+    if holes.len() == 1
+        && let Some(triangles) =
+            triangulate_rectangular_annulus(evaluator, vertices, &ring, &holes[0], winding)?
+        && triangles_match_input_boundary(evaluator, vertices, &rings, &triangles)?
+    {
+        diagnostics.emitted_triangles = triangles.len() / 3;
+        return Ok(EarcutReport {
+            triangles,
+            diagnostics,
+        });
+    }
+    if !holes.is_empty() {
+        ring = bridge_holes(evaluator, vertices, ring, &holes)?;
+        ring = filter_ring(evaluator, vertices, ring)?;
+        if ring.len() < 3 {
+            return Ok(EarcutReport {
+                triangles: Vec::new(),
+                diagnostics,
+            });
+        }
+    }
+
+    let triangles = clip_ring(evaluator, vertices, ring, winding, &mut diagnostics)?;
+    // Normalization drops duplicate and collinear boundary vertices with or
+    // without holes. Every input vertex must remain a triangle vertex so the
+    // result conforms to adjacent geometry sharing the same boundary edges.
+    let triangles = ensure_input_conformity(evaluator, vertices, &rings, triangles)?;
+    Ok(EarcutReport {
+        triangles,
+        diagnostics,
+    })
+}
+
+#[cfg(any(feature = "cdt", feature = "runtime-select"))]
+pub(crate) fn triangulate_inner(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    hole_indices: &[usize],
+) -> Result<TriangleIndices> {
+    Ok(triangulate_report_inner(evaluator, vertices, hole_indices)?.triangles)
+}
+
+fn split_edges_at_input_vertices(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    triangles: TriangleIndices,
+) -> Result<TriangleIndices> {
+    if !triangles.len().is_multiple_of(3) {
+        return Err(Error::InvalidInput {
+            reason: "triangle index buffer length is not a multiple of three",
+        });
+    }
+    if triangles.iter().any(|&index| index >= vertices.len()) {
+        return Err(Error::InvalidInput {
+            reason: "triangle index is out of bounds",
+        });
+    }
+
+    let mut pending = triangles
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|triangle| [triangle[0], triangle[1], triangle[2]])
+        .collect::<Vec<_>>();
+    let mut conforming = Vec::with_capacity(triangles.len());
+
+    while let Some(triangle) = pending.pop() {
+        let mut split = None;
+        for (edge_start, edge_end, opposite) in [
+            (triangle[0], triangle[1], triangle[2]),
+            (triangle[1], triangle[2], triangle[0]),
+            (triangle[2], triangle[0], triangle[1]),
+        ] {
+            for candidate in 0..vertices.len() {
+                if candidate == edge_start
+                    || candidate == edge_end
+                    || candidate == opposite
+                    || points_equal(evaluator, &vertices[candidate], &vertices[edge_start])?
+                    || points_equal(evaluator, &vertices[candidate], &vertices[edge_end])?
+                {
+                    continue;
+                }
+                if predicates::point_on_segment(
+                    evaluator,
+                    &vertices[edge_start],
+                    &vertices[edge_end],
+                    &vertices[candidate],
+                )? {
+                    split = Some((edge_start, edge_end, opposite, candidate));
+                    break;
+                }
+            }
+            if split.is_some() {
+                break;
+            }
+        }
+
+        if let Some((edge_start, edge_end, opposite, candidate)) = split {
+            pending.push([candidate, edge_end, opposite]);
+            pending.push([edge_start, candidate, opposite]);
+        } else {
+            conforming.extend(triangle);
+        }
+    }
+
+    Ok(conforming)
+}
+
+fn ensure_input_conformity(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    rings: &PolygonRings,
+    triangles: TriangleIndices,
+) -> Result<TriangleIndices> {
+    if triangles_match_input_boundary(evaluator, vertices, rings, &triangles)? {
+        Ok(triangles)
+    } else {
+        split_edges_at_input_vertices(evaluator, vertices, triangles)
+    }
+}
+
+fn triangles_match_input_boundary(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    rings: &PolygonRings,
+    triangles: &[usize],
+) -> Result<bool> {
+    if !triangles.len().is_multiple_of(3) {
+        return Err(Error::InvalidInput {
+            reason: "triangle index buffer length is not a multiple of three",
+        });
+    }
+    if triangles.iter().any(|&index| index >= vertices.len()) {
+        return Err(Error::InvalidInput {
+            reason: "triangle index is out of bounds",
+        });
+    }
+
+    let mut boundary_edges = BTreeSet::new();
+    for range in std::iter::once(rings.exterior()).chain(rings.holes().iter().copied()) {
+        let ring = open_ring_indices(evaluator, vertices, range)?;
+        for position in 0..ring.len() {
+            let start = ring[position];
+            let end = ring[(position + 1) % ring.len()];
+            if !same_point(evaluator, vertices, start, end)? {
+                boundary_edges.insert(ordered_edge(start, end));
+            }
+        }
+    }
+
+    let mut edge_counts = BTreeMap::new();
+    for triangle in triangles.as_chunks::<3>().0 {
+        for edge in [
+            ordered_edge(triangle[0], triangle[1]),
+            ordered_edge(triangle[1], triangle[2]),
+            ordered_edge(triangle[2], triangle[0]),
+        ] {
+            *edge_counts.entry(edge).or_insert(0_usize) += 1;
+        }
+    }
+
+    Ok(boundary_edges
+        .iter()
+        .all(|edge| edge_counts.get(edge) == Some(&1))
+        && edge_counts
+            .iter()
+            .all(|(edge, &count)| count == if boundary_edges.contains(edge) { 1 } else { 2 }))
+}
+
+fn ordered_edge(first: usize, second: usize) -> (usize, usize) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn normalized_ring(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    range: RingRange,
+) -> Result<Vec<usize>> {
+    let ring = open_ring_indices(evaluator, vertices, range)?;
+    filter_ring(evaluator, vertices, ring)
+}
+
+fn normalized_holes(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ranges: &[RingRange],
+    exterior_winding: Sign,
+) -> Result<Vec<Vec<usize>>> {
+    let mut holes = Vec::with_capacity(ranges.len());
+    for &range in ranges {
+        let mut hole = normalized_ring(evaluator, vertices, range)?;
+        if hole.len() < 3 {
+            return Err(Error::InvalidInput {
+                reason: "hole ring is degenerate",
+            });
+        }
+
+        let hole_winding = ring_area_sign(evaluator, vertices, &hole)?;
+        if hole_winding == Sign::Zero {
+            return Err(Error::InvalidInput {
+                reason: "hole ring is degenerate",
+            });
+        }
+
+        if hole_winding == exterior_winding {
+            hole.reverse();
+        }
+
+        holes.push(hole);
+    }
+
+    Ok(holes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AxisAlignedRectangle {
+    lower_left: usize,
+    lower_right: usize,
+    upper_right: usize,
+    upper_left: usize,
+}
+
+fn triangulate_rectangular_annulus(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    exterior: &[usize],
+    hole: &[usize],
+    winding: Sign,
+) -> Result<Option<TriangleIndices>> {
+    let Some(exterior) = axis_aligned_rectangle(evaluator, vertices, exterior)? else {
+        return Ok(None);
+    };
+    let Some(hole) = axis_aligned_rectangle(evaluator, vertices, hole)? else {
+        return Ok(None);
+    };
+
+    let strictly_contains = compare_real_coordinates(
+        evaluator,
+        &vertices[exterior.lower_left].x,
+        &vertices[hole.lower_left].x,
+    )? == Ordering::Less
+        && compare_real_coordinates(
+            evaluator,
+            &vertices[exterior.lower_left].y,
+            &vertices[hole.lower_left].y,
+        )? == Ordering::Less
+        && compare_real_coordinates(
+            evaluator,
+            &vertices[hole.upper_right].x,
+            &vertices[exterior.upper_right].x,
+        )? == Ordering::Less
+        && compare_real_coordinates(
+            evaluator,
+            &vertices[hole.upper_right].y,
+            &vertices[exterior.upper_right].y,
+        )? == Ordering::Less;
+    if !strictly_contains {
+        return Ok(None);
+    }
+
+    let mut triangles = Vec::with_capacity(24);
+    for [a, b, c] in [
+        [exterior.lower_left, exterior.lower_right, hole.lower_right],
+        [exterior.lower_left, hole.lower_right, hole.lower_left],
+        [exterior.lower_right, exterior.upper_right, hole.upper_right],
+        [exterior.lower_right, hole.upper_right, hole.lower_right],
+        [exterior.upper_right, exterior.upper_left, hole.upper_left],
+        [exterior.upper_right, hole.upper_left, hole.upper_right],
+        [exterior.upper_left, exterior.lower_left, hole.lower_left],
+        [exterior.upper_left, hole.lower_left, hole.upper_left],
+    ] {
+        push_triangle(&mut triangles, a, b, c, winding);
+    }
+    Ok(Some(triangles))
+}
+
+fn axis_aligned_rectangle(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+) -> Result<Option<AxisAlignedRectangle>> {
+    if ring.len() != 4 {
+        return Ok(None);
+    }
+
+    let first = &vertices[ring[0]];
+    let mut other_x_index = None;
+    let mut other_y_index = None;
+    for &index in ring {
+        if other_x_index.is_none()
+            && !real_coordinates_equal(evaluator, &vertices[index].x, &first.x)?
+        {
+            other_x_index = Some(index);
+        }
+        if other_y_index.is_none()
+            && !real_coordinates_equal(evaluator, &vertices[index].y, &first.y)?
+        {
+            other_y_index = Some(index);
+        }
+    }
+    let Some(other_x_index) = other_x_index else {
+        return Ok(None);
+    };
+    let Some(other_y_index) = other_y_index else {
+        return Ok(None);
+    };
+    let other_x = &vertices[other_x_index].x;
+    let other_y = &vertices[other_y_index].y;
+
+    let x_order = compare_real_coordinates(evaluator, &first.x, other_x)?;
+    let y_order = compare_real_coordinates(evaluator, &first.y, other_y)?;
+    if x_order == Ordering::Equal || y_order == Ordering::Equal {
+        return Ok(None);
+    }
+
+    let mut corners = [None; 4];
+    for &index in ring {
+        let point = &vertices[index];
+        let x_slot = if real_coordinates_equal(evaluator, &point.x, &first.x)? {
+            0
+        } else if real_coordinates_equal(evaluator, &point.x, other_x)? {
+            1
+        } else {
+            return Ok(None);
+        };
+        let y_slot = if real_coordinates_equal(evaluator, &point.y, &first.y)? {
+            0
+        } else if real_coordinates_equal(evaluator, &point.y, other_y)? {
+            1
+        } else {
+            return Ok(None);
+        };
+        let low_x = (x_slot == 0) == (x_order == Ordering::Less);
+        let low_y = (y_slot == 0) == (y_order == Ordering::Less);
+        let corner = match (low_x, low_y) {
+            (true, true) => 0,
+            (false, true) => 1,
+            (false, false) => 2,
+            (true, false) => 3,
+        };
+        if corners[corner].replace(index).is_some() {
+            return Ok(None);
+        }
+    }
+
+    let [
+        Some(lower_left),
+        Some(lower_right),
+        Some(upper_right),
+        Some(upper_left),
+    ] = corners
+    else {
+        return Ok(None);
+    };
+    Ok(Some(AxisAlignedRectangle {
+        lower_left,
+        lower_right,
+        upper_right,
+        upper_left,
+    }))
+}
+
+fn compare_real_coordinates(
+    evaluator: &PredicateEvaluator,
+    left: &crate::types::Real,
+    right: &crate::types::Real,
+) -> Result<Ordering> {
+    evaluator.decide(
+        hyperlimit::compare_reals(left, right, evaluator.policy()),
+        "compare_reals",
+    )
+}
+
+fn real_coordinates_equal(
+    evaluator: &PredicateEvaluator,
+    left: &crate::types::Real,
+    right: &crate::types::Real,
+) -> Result<bool> {
+    Ok(compare_real_coordinates(evaluator, left, right)? == Ordering::Equal)
+}
+
+fn bridge_holes(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    mut boundary: Vec<usize>,
+    holes: &[Vec<usize>],
+) -> Result<Vec<usize>> {
+    for hole in holes {
+        // A visible diagonal from an exterior boundary to a hole converts a
+        // polygon-with-holes into one simple boundary walk without changing the
+        // represented region.
+        let bridge = find_visible_bridge(evaluator, vertices, &boundary, hole, holes)?;
+        boundary = splice_hole(boundary, hole, bridge.boundary_pos, bridge.hole_pos);
+    }
+
+    Ok(boundary)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Bridge {
+    boundary_pos: usize,
+    hole_pos: usize,
+}
+
+fn find_visible_bridge(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    boundary: &[usize],
+    hole: &[usize],
+    holes: &[Vec<usize>],
+) -> Result<Bridge> {
+    let hole_positions = prioritize_positions_by_xy(evaluator, vertices, hole)?;
+    // A failed visibility proof does not prove this candidate invisible. Try
+    // the remaining witnesses, retaining uncertainty if none can be proved.
+    let mut undecided = None;
+
+    for hole_pos in hole_positions {
+        let boundary_positions = prioritize_positions_by_distance_then_xy(
+            evaluator,
+            vertices,
+            boundary,
+            hole[hole_pos],
+        )?;
+        for &boundary_pos in &boundary_positions {
+            match bridge_is_visible(
+                evaluator,
+                vertices,
+                boundary,
+                hole,
+                holes,
+                boundary_pos,
+                hole_pos,
+            ) {
+                Ok(true) => {
+                    return Ok(Bridge {
+                        boundary_pos,
+                        hole_pos,
+                    });
+                }
+                Ok(false) => {}
+                Err(error @ Error::PredicateUndecided { .. }) => {
+                    undecided.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    Err(undecided.unwrap_or(Error::InvalidInput {
+        reason: "hole cannot be connected by a visible bridge",
+    }))
+}
+
+fn bridge_is_visible(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    boundary: &[usize],
+    hole: &[usize],
+    holes: &[Vec<usize>],
+    boundary_pos: usize,
+    hole_pos: usize,
+) -> Result<bool> {
+    let boundary_index = boundary[boundary_pos];
+    let hole_index = hole[hole_pos];
+    if points_equal(evaluator, &vertices[boundary_index], &vertices[hole_index])? {
+        return Ok(false);
+    }
+
+    let midpoint = PredicateEvaluator::midpoint(&vertices[boundary_index], &vertices[hole_index])?;
+    if !predicates::point_in_ring_even_odd(evaluator, vertices, boundary, &midpoint)? {
+        return Ok(false);
+    }
+
+    for other_hole in holes {
+        if predicates::point_in_ring_even_odd(evaluator, vertices, other_hole, &midpoint)? {
+            return Ok(false);
+        }
+    }
+
+    if !segment_is_clear_of_ring(evaluator, vertices, boundary_index, hole_index, boundary)? {
+        return Ok(false);
+    }
+
+    for other_hole in holes {
+        if !segment_is_clear_of_ring(evaluator, vertices, boundary_index, hole_index, other_hole)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn segment_is_clear_of_ring(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    from: usize,
+    to: usize,
+    ring: &[usize],
+) -> Result<bool> {
+    for i in 0..ring.len() {
+        let edge_from = ring[i];
+        let edge_to = ring[(i + 1) % ring.len()];
+        if points_equal(evaluator, &vertices[edge_from], &vertices[edge_to])? {
+            continue;
+        }
+
+        let intersection = predicates::segment_intersection(
+            evaluator,
+            &vertices[from],
+            &vertices[to],
+            &vertices[edge_from],
+            &vertices[edge_to],
+        )?;
+        if intersection.is_disjoint() {
+            continue;
+        }
+        if intersection.is_endpoint_touch() {
+            let touches_allowed_endpoint = same_point(evaluator, vertices, edge_from, from)?
+                || same_point(evaluator, vertices, edge_to, from)?
+                || same_point(evaluator, vertices, edge_from, to)?
+                || same_point(evaluator, vertices, edge_to, to)?;
+            if touches_allowed_endpoint {
+                continue;
+            }
+        }
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn splice_hole(
+    boundary: Vec<usize>,
+    hole: &[usize],
+    boundary_pos: usize,
+    hole_pos: usize,
+) -> Vec<usize> {
+    let boundary_index = boundary[boundary_pos];
+    let hole_index = hole[hole_pos];
+    let mut merged = Vec::with_capacity(boundary.len() + hole.len() + 2);
+
+    merged.extend_from_slice(&boundary[..=boundary_pos]);
+    for offset in 0..hole.len() {
+        merged.push(hole[(hole_pos + offset) % hole.len()]);
+    }
+    merged.push(hole_index);
+    merged.push(boundary_index);
+    merged.extend_from_slice(&boundary[boundary_pos + 1..]);
+
+    merged
+}
+
+fn prioritize_positions_by_xy(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+) -> Result<Vec<usize>> {
+    // This is only a deterministic search priority, not a topology witness.
+    // An unresolved comparison leaves the candidate available without claiming
+    // an ordering or equality. Every chosen bridge still passes all visibility
+    // predicates, and fully decided comparisons preserve the previous order.
+    let mut positions = Vec::with_capacity(ring.len());
+    for position in 0..ring.len() {
+        let mut insert_at = positions.len();
+        for (candidate_at, &candidate) in positions.iter().enumerate() {
+            match compare_ring_positions(evaluator, vertices, ring, position, candidate) {
+                Ok(Ordering::Less) => {
+                    insert_at = candidate_at;
+                    break;
+                }
+                Ok(_) | Err(Error::PredicateUndecided { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        positions.insert(insert_at, position);
+    }
+
+    Ok(positions)
+}
+
+// As with the hole priorities, unknown distances do not remove candidates or
+// establish a geometric relation. Visibility remains mandatory.
+fn prioritize_positions_by_distance_then_xy(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    from: usize,
+) -> Result<Vec<usize>> {
+    let mut positions = Vec::with_capacity(ring.len());
+    for position in 0..ring.len() {
+        let mut insert_at = positions.len();
+        for (candidate_at, &candidate) in positions.iter().enumerate() {
+            match compare_distance_then_xy(evaluator, vertices, from, ring, position, candidate) {
+                Ok(Ordering::Less) => {
+                    insert_at = candidate_at;
+                    break;
+                }
+                Ok(_) | Err(Error::PredicateUndecided { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        positions.insert(insert_at, position);
+    }
+
+    Ok(positions)
+}
+
+fn compare_distance_then_xy(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    from: usize,
+    ring: &[usize],
+    left_pos: usize,
+    right_pos: usize,
+) -> Result<Ordering> {
+    match evaluator.decide(
+        hyperlimit::compare_point2_distance_squared(
+            &vertices[from],
+            &vertices[ring[left_pos]],
+            &vertices[ring[right_pos]],
+            evaluator.policy(),
+        ),
+        "compare_point2_distance_squared",
+    )? {
+        Ordering::Equal => compare_ring_positions(evaluator, vertices, ring, left_pos, right_pos),
+        ordering => Ok(ordering),
+    }
+}
+
+fn compare_ring_positions(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    left_pos: usize,
+    right_pos: usize,
+) -> Result<Ordering> {
+    compare_point_indices(evaluator, vertices, ring[left_pos], ring[right_pos])
+}
+
+fn compare_point_indices(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    left: usize,
+    right: usize,
+) -> Result<Ordering> {
+    evaluator.decide(
+        hyperlimit::compare_point2_lexicographic(
+            &vertices[left],
+            &vertices[right],
+            evaluator.policy(),
+        ),
+        "compare_point2_lexicographic",
+    )
+}
+
+fn filter_ring(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    mut ring: Vec<usize>,
+) -> Result<Vec<usize>> {
+    if ring.len() < 3 {
+        return Ok(ring);
+    }
+
+    let mut changed = true;
+    while changed && ring.len() >= 3 {
+        changed = false;
+        let mut i = 0;
+        while i < ring.len() {
+            let len = ring.len();
+            let prev = ring[(i + len - 1) % len];
+            let curr = ring[i];
+            let next = ring[(i + 1) % len];
+
+            let duplicate = points_equal(evaluator, &vertices[curr], &vertices[next])?
+                || points_equal(evaluator, &vertices[prev], &vertices[curr])?;
+            // Collinearity only permits an optional simplification here.
+            // If it is unresolved, keep the vertex for certified ear search.
+            let certified_collinear = match predicates::orient2(
+                evaluator,
+                &vertices[prev],
+                &vertices[curr],
+                &vertices[next],
+            ) {
+                Ok(sign) => sign == Sign::Zero,
+                Err(Error::PredicateUndecided { .. }) => false,
+                Err(error) => return Err(error),
+            };
+
+            if duplicate || (certified_collinear && ring.len() > 3) {
+                ring.remove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if ring.len() == 3
+        && predicates::orient2(
+            evaluator,
+            &vertices[ring[0]],
+            &vertices[ring[1]],
+            &vertices[ring[2]],
+        )? == Sign::Zero
+    {
+        ring.clear();
+    }
+
+    Ok(ring)
+}
+
+fn clip_ring(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: Vec<usize>,
+    winding: Sign,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<TriangleIndices> {
+    clip_ring_with_splits(evaluator, vertices, ring, winding, 0, diagnostics)
+}
+
+fn clip_ring_with_splits(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    mut ring: Vec<usize>,
+    winding: Sign,
+    split_depth: usize,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<TriangleIndices> {
+    let mut triangles = Vec::with_capacity((ring.len().saturating_sub(2)) * 3);
+    let mut cursor = 0;
+    let mut misses = 0;
+    let mut undecided = None;
+    let mut guard = ring.len() * ring.len() * 4 + 1;
+    let mut prepared_convex =
+        prepare_local_convexity(evaluator, vertices, &ring, winding, diagnostics)?;
+
+    while ring.len() > 3 {
+        if guard == 0 {
+            let (cured_ring, mut cured_triangles, cured) =
+                cure_local_intersections(evaluator, vertices, ring, winding)?;
+            if cured {
+                triangles.append(&mut cured_triangles);
+                triangles.append(&mut clip_ring_with_splits(
+                    evaluator,
+                    vertices,
+                    cured_ring,
+                    winding,
+                    split_depth,
+                    diagnostics,
+                )?);
+                return Ok(triangles);
+            }
+            return split_or_fail(
+                evaluator,
+                vertices,
+                cured_ring,
+                winding,
+                split_depth,
+                diagnostics,
+            );
+        }
+        guard -= 1;
+
+        // Only a proved ear may be clipped. An unresolved candidate stays in
+        // the ring while we try the other ears, and remains a typed failure if
+        // a complete pass cannot make progress.
+        let ear = match is_ear(
+            evaluator,
+            vertices,
+            &ring,
+            &prepared_convex,
+            cursor,
+            winding,
+            diagnostics,
+        ) {
+            Ok(value) => value,
+            Err(error @ Error::PredicateUndecided { .. }) => {
+                undecided.get_or_insert(error);
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        if ear {
+            let len = ring.len();
+            let prev = ring[(cursor + len - 1) % len];
+            let curr = ring[cursor];
+            let next = ring[(cursor + 1) % len];
+            push_triangle(&mut triangles, prev, curr, next, winding);
+            diagnostics.emitted_triangles += 1;
+            ring.remove(cursor);
+            prepared_convex.remove(cursor);
+            if cursor == ring.len() {
+                cursor = 0;
+            }
+            update_prepared_convexity_after_clip(
+                evaluator,
+                vertices,
+                &ring,
+                &mut prepared_convex,
+                cursor,
+                winding,
+                diagnostics,
+            )?;
+            misses = 0;
+            // Changed neighbors may make a previously unresolved ear provable.
+            undecided = None;
+            continue;
+        }
+
+        cursor = (cursor + 1) % ring.len();
+        misses += 1;
+
+        if misses > ring.len() {
+            if let Some(error) = undecided.take() {
+                return Err(error);
+            }
+            let previous_len = ring.len();
+            ring = filter_ring(evaluator, vertices, ring)?;
+            if ring.len() < 3 {
+                return Ok(triangles);
+            }
+            prepared_convex =
+                prepare_local_convexity(evaluator, vertices, &ring, winding, diagnostics)?;
+            if ring.len() == previous_len {
+                let (cured_ring, mut cured_triangles, cured) =
+                    cure_local_intersections(evaluator, vertices, ring, winding)?;
+                triangles.append(&mut cured_triangles);
+                if cured {
+                    diagnostics.local_intersection_cures += 1;
+                    diagnostics.emitted_triangles += cured_triangles.len() / 3;
+                    ring = cured_ring;
+                    prepared_convex =
+                        prepare_local_convexity(evaluator, vertices, &ring, winding, diagnostics)?;
+                    cursor = 0;
+                    misses = 0;
+                    guard = ring.len() * ring.len() * 4 + 1;
+                    continue;
+                }
+
+                let mut split_triangles = split_or_fail(
+                    evaluator,
+                    vertices,
+                    cured_ring,
+                    winding,
+                    split_depth,
+                    diagnostics,
+                )?;
+                triangles.append(&mut split_triangles);
+                return Ok(triangles);
+            }
+            cursor %= ring.len();
+            misses = 0;
+        }
+    }
+
+    let sign = evaluator.orient2(&vertices[ring[0]], &vertices[ring[1]], &vertices[ring[2]])?;
+    if sign != Sign::Zero {
+        push_triangle(&mut triangles, ring[0], ring[1], ring[2], sign);
+        diagnostics.emitted_triangles += 1;
+    }
+
+    Ok(triangles)
+}
+
+fn cure_local_intersections(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: Vec<usize>,
+    _winding: Sign,
+) -> Result<(Vec<usize>, TriangleIndices, bool)> {
+    if ring.len() < 4 {
+        return Ok((ring, TriangleIndices::new(), false));
+    }
+
+    for cursor in 0..ring.len() {
+        let len = ring.len();
+        let a_pos = (cursor + len - 1) % len;
+        let p_pos = cursor;
+        let q_pos = (cursor + 1) % len;
+        let b_pos = (cursor + 2) % len;
+
+        if local_intersection_is_curable(evaluator, vertices, &ring, a_pos, p_pos, q_pos, b_pos)? {
+            let a = ring[a_pos];
+            let p = ring[p_pos];
+            let b = ring[b_pos];
+            let mut cured_ring = ring.clone();
+
+            // This is earcut's local-intersection cure: when two nearby
+            // boundary edges cross, emit the triangle that bridges around the
+            // twist and remove the two offending vertices. Exact segment and
+            // orientation tests replace earcutr's floating-point tests.
+            remove_adjacent_positions(&mut cured_ring, p_pos, q_pos);
+
+            let sign = predicates::orient2(evaluator, &vertices[a], &vertices[p], &vertices[b])?;
+            if sign == Sign::Zero {
+                return Ok((ring, TriangleIndices::new(), false));
+            }
+
+            let mut triangles = TriangleIndices::new();
+            push_triangle(&mut triangles, a, p, b, sign);
+            return Ok((cured_ring, triangles, true));
+        }
+    }
+
+    Ok((ring, TriangleIndices::new(), false))
+}
+
+fn local_intersection_is_curable(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    a_pos: usize,
+    p_pos: usize,
+    q_pos: usize,
+    b_pos: usize,
+) -> Result<bool> {
+    let a = ring[a_pos];
+    let p = ring[p_pos];
+    let q = ring[q_pos];
+    let b = ring[b_pos];
+
+    if same_point(evaluator, vertices, a, b)? || same_point(evaluator, vertices, p, q)? {
+        return Ok(false);
+    }
+
+    if !predicates::segment_intersection(
+        evaluator,
+        &vertices[a],
+        &vertices[p],
+        &vertices[q],
+        &vertices[b],
+    )?
+    .is_proper_crossing()
+    {
+        return Ok(false);
+    }
+
+    if predicates::orient2(evaluator, &vertices[a], &vertices[p], &vertices[b])? == Sign::Zero {
+        return Ok(false);
+    }
+
+    diagonal_clear_after_removing_local_pair(evaluator, vertices, ring, a, p, q, b)
+}
+
+fn diagonal_clear_after_removing_local_pair(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    from: usize,
+    removed_first: usize,
+    removed_second: usize,
+    to: usize,
+) -> Result<bool> {
+    for i in 0..ring.len() {
+        let edge_from = ring[i];
+        let edge_to = ring[(i + 1) % ring.len()];
+        if edge_from == removed_first
+            || edge_from == removed_second
+            || edge_to == removed_first
+            || edge_to == removed_second
+            || edge_from == from
+            || edge_to == from
+            || edge_from == to
+            || edge_to == to
+        {
+            continue;
+        }
+
+        if predicates::segment_intersection(
+            evaluator,
+            &vertices[from],
+            &vertices[to],
+            &vertices[edge_from],
+            &vertices[edge_to],
+        )?
+        .intersects()
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn remove_adjacent_positions(ring: &mut Vec<usize>, first: usize, second: usize) {
+    debug_assert!((first + 1) % ring.len() == second);
+    if second > first {
+        ring.remove(second);
+        ring.remove(first);
+    } else {
+        ring.remove(first);
+        ring.remove(second);
+    }
+}
+
+fn split_or_fail(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: Vec<usize>,
+    winding: Sign,
+    split_depth: usize,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<TriangleIndices> {
+    if split_depth > ring.len() {
+        return Err(Error::NoEarFound);
+    }
+    diagnostics.split_fallbacks += 1;
+
+    let Some((first, second)) = find_split_diagonal(evaluator, vertices, &ring)? else {
+        return Err(Error::NoEarFound);
+    };
+
+    // Earcut's final fallback splits a difficult polygon by a valid internal
+    // diagonal and resumes ear clipping on each side. The validity tests here
+    // are exact: the diagonal must not cross the boundary, and its midpoint
+    // must lie inside the represented region.
+    let (mut left, mut right) = split_ring(&ring, first, second);
+    left = filter_ring(evaluator, vertices, left)?;
+    right = filter_ring(evaluator, vertices, right)?;
+
+    let mut triangles = TriangleIndices::new();
+    if left.len() >= 3 {
+        triangles.append(&mut clip_ring_with_splits(
+            evaluator,
+            vertices,
+            left,
+            winding,
+            split_depth + 1,
+            diagnostics,
+        )?);
+    }
+    if right.len() >= 3 {
+        triangles.append(&mut clip_ring_with_splits(
+            evaluator,
+            vertices,
+            right,
+            winding,
+            split_depth + 1,
+            diagnostics,
+        )?);
+    }
+
+    Ok(triangles)
+}
+
+fn find_split_diagonal(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+) -> Result<Option<(usize, usize)>> {
+    for gap in 2..ring.len().saturating_sub(1) {
+        for first in 0..ring.len() {
+            let second = (first + gap) % ring.len();
+            if positions_are_adjacent(ring.len(), first, second) {
+                continue;
+            }
+            if diagonal_is_valid(evaluator, vertices, ring, first, second)? {
+                return Ok(Some(ordered_positions(first, second)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn diagonal_is_valid(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    first_pos: usize,
+    second_pos: usize,
+) -> Result<bool> {
+    let first = ring[first_pos];
+    let second = ring[second_pos];
+    if same_point(evaluator, vertices, first, second)? {
+        return Ok(false);
+    }
+
+    if !segment_is_clear_of_ring(evaluator, vertices, first, second, ring)? {
+        return Ok(false);
+    }
+
+    let midpoint = PredicateEvaluator::midpoint(&vertices[first], &vertices[second])?;
+    predicates::point_in_ring_even_odd(evaluator, vertices, ring, &midpoint)
+}
+
+fn split_ring(ring: &[usize], first: usize, second: usize) -> (Vec<usize>, Vec<usize>) {
+    debug_assert!(first < second);
+    let mut left = Vec::with_capacity(second - first + 1);
+    left.extend_from_slice(&ring[first..=second]);
+
+    let mut right = Vec::with_capacity(ring.len() - (second - first) + 1);
+    right.extend_from_slice(&ring[second..]);
+    right.extend_from_slice(&ring[..=first]);
+
+    (left, right)
+}
+
+fn positions_are_adjacent(len: usize, first: usize, second: usize) -> bool {
+    first == second || (first + 1) % len == second || (second + 1) % len == first
+}
+
+fn ordered_positions(first: usize, second: usize) -> (usize, usize) {
+    if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn is_ear(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    prepared_convex: &[LocalConvexity],
+    cursor: usize,
+    winding: Sign,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<bool> {
+    diagnostics.ear_tests += 1;
+    let len = ring.len();
+    let prev = ring[(cursor + len - 1) % len];
+    let curr = ring[cursor];
+    let next = ring[(cursor + 1) % len];
+
+    // Every simple polygon with more than three vertices has at least two ears.
+    // The exact predicate here is the convexity gate; containment below rejects
+    // ears that would cover another vertex.
+    //
+    // Structural-dispatch note: the loop uses two exact object facts before
+    // the full containment predicate: the local reflex/convex turn and the
+    // candidate triangle AABB. Both are certified facts rather than
+    // floating-point heuristics.
+    debug_assert_eq!(ring.len(), prepared_convex.len());
+    match prepared_convex[cursor] {
+        LocalConvexity::Convex => {}
+        LocalConvexity::NonConvex => return Ok(false),
+        LocalConvexity::Unresolved => {
+            // Preparation did not establish this turn. Demand its proof only
+            // when this vertex is an ear candidate; warming may now help.
+            if predicates::orient2(evaluator, &vertices[prev], &vertices[curr], &vertices[next])?
+                != winding
+            {
+                return Ok(false);
+            }
+        }
+    }
+
+    for (candidate_cursor, &candidate) in ring.iter().enumerate() {
+        if candidate == prev || candidate == curr || candidate == next {
+            continue;
+        }
+
+        diagnostics.containment_candidates += 1;
+        diagnostics.containment_prepared_reflex_lookups += 1;
+        if matches!(prepared_convex[candidate_cursor], LocalConvexity::Convex) {
+            diagnostics.containment_convex_rejects += 1;
+            continue;
+        }
+
+        if !point_may_be_in_triangle_bbox(
+            &vertices[prev],
+            &vertices[curr],
+            &vertices[next],
+            &vertices[candidate],
+        ) {
+            diagnostics.containment_bbox_rejects += 1;
+            continue;
+        }
+
+        diagnostics.containment_tests += 1;
+        if predicates::point_in_or_on_triangle(
+            evaluator,
+            &vertices[prev],
+            &vertices[curr],
+            &vertices[next],
+            &vertices[candidate],
+        )? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+// An unresolved local turn has no convexity certificate. It cannot authorize
+// clipping or the convex-vertex containment shortcut, but another ear may work.
+#[derive(Clone, Copy, Debug)]
+enum LocalConvexity {
+    Convex,
+    NonConvex,
+    Unresolved,
+}
+
+fn prepare_local_convexity(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    winding: Sign,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<Vec<LocalConvexity>> {
+    diagnostics.prepared_reflex_rebuilds += 1;
+    (0..ring.len())
+        .map(|cursor| local_vertex_convexity(evaluator, vertices, ring, cursor, winding))
+        .collect()
+}
+
+fn update_prepared_convexity_after_clip(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    prepared_convex: &mut [LocalConvexity],
+    cursor: usize,
+    winding: Sign,
+    diagnostics: &mut EarcutDiagnostics,
+) -> Result<()> {
+    if ring.len() < 3 {
+        return Ok(());
+    }
+    let next = cursor % ring.len();
+    let prev = (next + ring.len() - 1) % ring.len();
+    prepared_convex[prev] = local_vertex_convexity(evaluator, vertices, ring, prev, winding)?;
+    diagnostics.prepared_reflex_updates += 1;
+    if next != prev {
+        prepared_convex[next] = local_vertex_convexity(evaluator, vertices, ring, next, winding)?;
+        diagnostics.prepared_reflex_updates += 1;
+    }
+    Ok(())
+}
+
+fn local_vertex_convexity(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+    cursor: usize,
+    winding: Sign,
+) -> Result<LocalConvexity> {
+    // Prepare once per active ring, then update only changed neighborhoods.
+    // Only a decided convex turn can bypass containment in an ear candidate;
+    // collinear and unresolved turns still require containment predicates.
+    let len = ring.len();
+    let prev = ring[(cursor + len - 1) % len];
+    let curr = ring[cursor];
+    let next = ring[(cursor + 1) % len];
+    match predicates::orient2(evaluator, &vertices[prev], &vertices[curr], &vertices[next]) {
+        Ok(sign) => Ok(if sign == winding {
+            LocalConvexity::Convex
+        } else {
+            LocalConvexity::NonConvex
+        }),
+        Err(Error::PredicateUndecided { .. }) => Ok(LocalConvexity::Unresolved),
+        Err(error) => Err(error),
+    }
+}
+
+fn point_may_be_in_triangle_bbox(a: &Point2, b: &Point2, c: &Point2, point: &Point2) -> bool {
+    // This is only a rejection filter. Exact coordinate comparisons prove that
+    // a point outside the triangle's axis-aligned bounding box cannot be inside
+    // the triangle, while points inside the box still go through the exact
+    // orientation-based containment predicate. An unknown box also reaches that
+    // final predicate; it is not a failed topology decision. Do not consume an
+    // approximate filter when the final predicate may have a certified proof.
+    !matches!(
+        hyperlimit::point_in_triangle2_aabb(a, b, c, point, hyperlimit::PredicatePolicy::STRICT),
+        hyperlimit::PredicateOutcome::Decided { value: false, .. }
+    )
+}
+
+fn ring_area_sign(
+    evaluator: &PredicateEvaluator,
+    vertices: &[Point2],
+    ring: &[usize],
+) -> Result<Sign> {
+    evaluator
+        .decide(
+            hyperlimit::indexed_ring_area_sign(vertices, ring, evaluator.policy()),
+            "indexed_ring_area_sign",
+        )
+        .map(map_hyperlimit_sign)
+}
+
+fn push_triangle(triangles: &mut TriangleIndices, a: usize, b: usize, c: usize, winding: Sign) {
+    match winding {
+        Sign::Positive | Sign::Zero => triangles.extend_from_slice(&[a, b, c]),
+        Sign::Negative => triangles.extend_from_slice(&[c, b, a]),
+    }
+}
+
+fn points_equal(
+    evaluator: &PredicateEvaluator,
+    left: &ExactPoint,
+    right: &ExactPoint,
+) -> Result<bool> {
+    predicates::points_equal(evaluator, left, right)
+}
+
+fn same_point(
+    evaluator: &PredicateEvaluator,
+    vertices: &[ExactPoint],
+    left: usize,
+    right: usize,
+) -> Result<bool> {
+    points_equal(evaluator, &vertices[left], &vertices[right])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Real;
+
+    const APPROX: TriangulationContext =
+        TriangulationContext::new(hyperlimit::PredicatePolicy::APPROXIMATE_512);
+
+    fn evaluator() -> PredicateEvaluator {
+        PredicateEvaluator::new(&APPROX)
+    }
+
+    fn exact_point(x: i32, y: i32) -> ExactPoint {
+        Point2::new(Real::from(x), Real::from(y))
+    }
+
+    fn exact_fraction_point(xn: i64, xd: u64, yn: i64, yd: u64) -> ExactPoint {
+        Point2::new(
+            Real::from(crate::types::Rational::fraction(xn, xd).unwrap()),
+            Real::from(crate::types::Rational::fraction(yn, yd).unwrap()),
+        )
+    }
+
+    #[test]
+    fn unknown_box_reaches_certified_triangle_classification() {
+        let sine = Real::e().sin();
+        let cosine = Real::e().cos();
+        let a = Point2::new(
+            crate::test_uncertainty::terminal_zero(&sine * &sine + &cosine * &cosine - Real::one()),
+            Real::zero(),
+        );
+        let b = exact_point(0, 1);
+        let c = exact_point(1, 0);
+        let context = TriangulationContext::new(hyperlimit::PredicatePolicy::STRICT);
+        let evaluator = PredicateEvaluator::new(&context);
+        for (point, inside) in [
+            (exact_point(2, 2), false),
+            (exact_fraction_point(1, 4, 1, 4), true),
+        ] {
+            assert!(matches!(
+                hyperlimit::point_in_triangle2_aabb(&a, &b, &c, &point, context.predicate_policy()),
+                hyperlimit::PredicateOutcome::Unknown { .. }
+            ));
+            assert!(point_may_be_in_triangle_bbox(&a, &b, &c, &point));
+            assert_eq!(
+                predicates::point_in_or_on_triangle(&evaluator, &a, &b, &c, &point).unwrap(),
+                inside
+            );
+        }
+        assert_eq!(
+            evaluator.finish(()).certainty,
+            crate::TriangulationCertainty::Certified
+        );
+    }
+
+    #[test]
+    fn triangulates_exact_square() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(1, 0),
+            exact_point(1, 1),
+            exact_point(0, 1),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+
+        assert_eq!(triangles.len(), 6);
+    }
+
+    #[test]
+    fn triangulates_exact_concave_polygon() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(2, 2),
+            exact_point(1, 1),
+            exact_point(0, 2),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+
+        assert_eq!(triangles.len(), 9);
+    }
+
+    #[test]
+    fn triangulates_square_with_square_hole() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 4),
+            exact_point(0, 4),
+            exact_point(1, 1),
+            exact_point(3, 1),
+            exact_point(3, 3),
+            exact_point(1, 3),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[4]).unwrap().value;
+
+        assert_eq!(triangles.len(), 24);
+        assert!(triangles.iter().all(|&index| index < vertices.len()));
+    }
+
+    #[test]
+    fn unresolved_bridge_priority_preserves_exact_triangulation() {
+        let sine = Real::e().sin();
+        let cosine = Real::e().cos();
+        let zero =
+            crate::test_uncertainty::terminal_zero(&sine * &sine + &cosine * &cosine - Real::one());
+        let hole = [
+            Point2::new(zero.clone(), Real::zero()),
+            exact_point(0, 2),
+            exact_point(2, 0),
+        ];
+        let context = TriangulationContext::new(hyperlimit::PredicatePolicy::STRICT);
+        assert!(matches!(
+            hyperlimit::compare_point2_lexicographic(
+                &hole[0],
+                &hole[1],
+                context.predicate_policy()
+            ),
+            hyperlimit::PredicateOutcome::Unknown { .. }
+        ));
+        for shift in 0..3 {
+            for reversed in [false, true] {
+                let mut vertices = vec![
+                    exact_point(-10, -10),
+                    exact_point(10, -10),
+                    exact_point(0, 12),
+                ];
+                let mut ring = (0..3)
+                    .map(|i| hole[(i + shift) % 3].clone())
+                    .collect::<Vec<_>>();
+                if reversed {
+                    ring.reverse();
+                }
+                vertices.extend(ring);
+                for _ in 0..2 {
+                    let outcome = triangulate(&context, &vertices, &[3]).unwrap();
+                    assert_eq!(outcome.certainty, crate::TriangulationCertainty::Certified);
+                    let rings = rings_from_hole_indices(&vertices, &[3]).unwrap();
+                    assert!(
+                        triangles_match_input_boundary(
+                            &PredicateEvaluator::new(&context),
+                            &vertices,
+                            &rings,
+                            &outcome.value
+                        )
+                        .unwrap()
+                    );
+                    let twice_area =
+                        outcome
+                            .value
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .fold(Real::zero(), |area, tri| {
+                                let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| &vertices[i]);
+                                assert_eq!(
+                                    hyperlimit::orient2(a, b, c, context.predicate_policy())
+                                        .value(),
+                                    Some(hyperlimit::Sign::Positive)
+                                );
+                                area + Real::diff_of_products(
+                                    &(&b.x - &a.x),
+                                    &(&c.y - &a.y),
+                                    &(&b.y - &a.y),
+                                    &(&c.x - &a.x),
+                                )
+                            });
+                    // Outer twice-area is 440; the hole's is 4 - 2*zero.
+                    assert_eq!(
+                        hyperlimit::compare_reals(
+                            &twice_area,
+                            &(Real::from(436) + Real::from(2) * &zero),
+                            context.predicate_policy()
+                        )
+                        .value(),
+                        Some(Ordering::Equal)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rectangular_annulus_dispatch_handles_rotated_winding_and_preserves_authored_edges() {
+        let vertices = vec![
+            exact_point(8, 6),
+            exact_point(8, 0),
+            exact_point(0, 0),
+            exact_point(0, 6),
+            exact_point(2, 2),
+            exact_point(2, 4),
+            exact_point(6, 4),
+            exact_point(6, 2),
+        ];
+
+        let report = triangulate_report(&APPROX, &vertices, &[4]).unwrap().value;
+        let rings = rings_from_hole_indices(&vertices, &[4]).unwrap();
+
+        assert_eq!(report.triangles.len(), 24);
+        assert_eq!(report.diagnostics.emitted_triangles, 8);
+        assert_eq!(report.diagnostics.ear_tests, 0);
+        assert!(
+            triangles_match_input_boundary(&evaluator(), &vertices, &rings, &report.triangles)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn rectangular_annulus_dispatch_falls_back_for_authored_collinear_boundary() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(8, 0),
+            exact_point(8, 6),
+            exact_point(0, 6),
+            exact_point(2, 2),
+            exact_point(2, 4),
+            exact_point(6, 4),
+            exact_point(6, 2),
+        ];
+
+        let report = triangulate_report(&APPROX, &vertices, &[5]).unwrap().value;
+        let rings = rings_from_hole_indices(&vertices, &[5]).unwrap();
+
+        assert!(report.diagnostics.ear_tests > 0);
+        assert!(
+            triangles_match_input_boundary(&evaluator(), &vertices, &rings, &report.triangles)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn triangulates_multiple_holes_with_mixed_winding() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(12, 0),
+            exact_point(12, 8),
+            exact_point(0, 8),
+            exact_point(1, 1),
+            exact_point(3, 1),
+            exact_point(3, 3),
+            exact_point(1, 3),
+            exact_point(8, 5),
+            exact_point(10, 5),
+            exact_point(10, 7),
+            exact_point(8, 7),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[4, 8]).unwrap().value;
+
+        assert_eq!(triangles.len(), 42);
+        assert!(triangles.iter().all(|&index| index < vertices.len()));
+    }
+
+    #[test]
+    fn vertically_aligned_holes_have_conforming_internal_edges() {
+        let vertices = vec![
+            exact_point(-5, -5),
+            exact_point(5, -5),
+            exact_point(5, 5),
+            exact_point(-5, 5),
+            exact_point(-2, 1),
+            exact_point(2, 1),
+            exact_point(2, 2),
+            exact_point(-2, 2),
+            exact_point(-2, -2),
+            exact_point(2, -2),
+            exact_point(2, -1),
+            exact_point(-2, -1),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[4, 8]).unwrap().value;
+        let mut edge_counts = std::collections::BTreeMap::new();
+        for triangle in triangles.as_chunks::<3>().0 {
+            for edge in [
+                [triangle[0], triangle[1]],
+                [triangle[1], triangle[2]],
+                [triangle[2], triangle[0]],
+            ] {
+                let mut edge = edge;
+                edge.sort();
+                *edge_counts.entry(edge).or_insert(0_usize) += 1;
+            }
+        }
+        let boundary_edges = [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [0, 3],
+            [4, 5],
+            [5, 6],
+            [6, 7],
+            [4, 7],
+            [8, 9],
+            [9, 10],
+            [10, 11],
+            [8, 11],
+        ];
+        let unexpected = edge_counts
+            .into_iter()
+            .filter(|(edge, count)| *count != 2 && !boundary_edges.contains(edge))
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "non-conforming internal edges: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn conformity_pass_splits_a_diagonal_at_source_vertices() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(0, 1),
+            exact_point(0, 2),
+            exact_point(0, 3),
+            exact_point(2, 0),
+        ];
+        let evaluator = evaluator();
+        let triangles =
+            split_edges_at_input_vertices(&evaluator, &vertices, vec![0, 3, 4]).unwrap();
+        assert_eq!(triangles.len(), 9);
+        for triangle in triangles.as_chunks::<3>().0 {
+            for edge in [
+                [triangle[0], triangle[1]],
+                [triangle[1], triangle[2]],
+                [triangle[2], triangle[0]],
+            ] {
+                for candidate in 0..vertices.len() {
+                    if edge.contains(&candidate) {
+                        continue;
+                    }
+                    assert!(
+                        !predicates::point_on_segment(
+                            &evaluator,
+                            &vertices[edge[0]],
+                            &vertices[edge[1]],
+                            &vertices[candidate],
+                        )
+                        .unwrap(),
+                        "edge {edge:?} was not split at {candidate}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conformity_pass_rejects_malformed_triangle_indices() {
+        let vertices = vec![exact_point(0, 0), exact_point(1, 0), exact_point(0, 1)];
+
+        assert!(matches!(
+            split_edges_at_input_vertices(&evaluator(), &vertices, vec![0, 1]),
+            Err(Error::InvalidInput {
+                reason: "triangle index buffer length is not a multiple of three"
+            })
+        ));
+        assert!(matches!(
+            split_edges_at_input_vertices(&evaluator(), &vertices, vec![0, 1, 3]),
+            Err(Error::InvalidInput {
+                reason: "triangle index is out of bounds"
+            })
+        ));
+        let rings = rings_from_hole_indices(&vertices, &[]).unwrap();
+        assert!(matches!(
+            triangles_match_input_boundary(&evaluator(), &vertices, &rings, &[0, 1, 3]),
+            Err(Error::InvalidInput {
+                reason: "triangle index is out of bounds"
+            })
+        ));
+    }
+
+    #[test]
+    fn conformity_certificate_accepts_complete_mesh_and_repairs_skipped_boundary_vertices() {
+        let square = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 4),
+            exact_point(0, 4),
+        ];
+        let square_rings = rings_from_hole_indices(&square, &[]).unwrap();
+        let square_triangles = vec![0, 1, 2, 0, 2, 3];
+        assert_eq!(
+            ensure_input_conformity(
+                &evaluator(),
+                &square,
+                &square_rings,
+                square_triangles.clone(),
+            )
+            .unwrap(),
+            square_triangles
+        );
+
+        let collinear = vec![
+            exact_point(0, 0),
+            exact_point(0, 1),
+            exact_point(0, 2),
+            exact_point(0, 3),
+            exact_point(2, 0),
+        ];
+        let collinear_rings = rings_from_hole_indices(&collinear, &[]).unwrap();
+        let repaired =
+            ensure_input_conformity(&evaluator(), &collinear, &collinear_rings, vec![0, 3, 4])
+                .unwrap();
+        assert_eq!(repaired.len(), 9);
+        assert!(
+            triangles_match_input_boundary(&evaluator(), &collinear, &collinear_rings, &repaired)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn triangulates_hole_with_duplicate_closing_vertex() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(5, 0),
+            exact_point(5, 5),
+            exact_point(0, 5),
+            exact_point(1, 1),
+            exact_point(3, 1),
+            exact_point(3, 3),
+            exact_point(1, 3),
+            exact_point(1, 1),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[4]).unwrap().value;
+
+        assert_eq!(triangles.len(), 24);
+        assert!(triangles.iter().all(|&index| index < 8));
+    }
+
+    #[test]
+    fn duplicate_closing_vertex_uses_numeric_equality() {
+        let left = Real::pi() + Real::e();
+        let equivalent_left = Real::e() + Real::pi();
+        assert_ne!(left, equivalent_left);
+        let right = &left + Real::one();
+
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(10, 0),
+            exact_point(10, 10),
+            exact_point(0, 10),
+            Point2::new(left.clone(), Real::from(2)),
+            Point2::new(right.clone(), Real::from(2)),
+            Point2::new(right, Real::from(3)),
+            Point2::new(left, Real::from(3)),
+            Point2::new(equivalent_left, Real::from(2)),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[4]).unwrap().value;
+
+        assert_eq!(triangles.len(), 24);
+        assert!(triangles.iter().all(|&index| index < 8));
+    }
+
+    #[test]
+    fn empty_zero_area_and_degenerate_hole_inputs_take_defined_paths() {
+        assert!(
+            triangulate_report(&APPROX, &[], &[])
+                .unwrap()
+                .value
+                .triangles
+                .is_empty()
+        );
+
+        let zero_area_bowtie = vec![
+            exact_point(0, 0),
+            exact_point(2, 2),
+            exact_point(0, 2),
+            exact_point(2, 0),
+        ];
+        assert!(
+            triangulate_report(&APPROX, &zero_area_bowtie, &[])
+                .unwrap()
+                .value
+                .triangles
+                .is_empty()
+        );
+
+        let collapsed_hole = vec![
+            exact_point(0, 0),
+            exact_point(6, 0),
+            exact_point(6, 6),
+            exact_point(0, 6),
+            exact_point(2, 2),
+            exact_point(2, 2),
+            exact_point(2, 2),
+        ];
+        assert_eq!(
+            triangulate(&APPROX, &collapsed_hole, &[4]),
+            Err(Error::InvalidInput {
+                reason: "hole ring is degenerate"
+            })
+        );
+
+        let zero_area_hole = vec![
+            exact_point(0, 0),
+            exact_point(8, 0),
+            exact_point(8, 8),
+            exact_point(0, 8),
+            exact_point(2, 2),
+            exact_point(4, 4),
+            exact_point(2, 4),
+            exact_point(4, 2),
+        ];
+        assert_eq!(
+            triangulate(&APPROX, &zero_area_hole, &[4]),
+            Err(Error::InvalidInput {
+                reason: "hole ring is degenerate"
+            })
+        );
+    }
+
+    #[test]
+    fn rectangle_classifier_rejects_every_non_rectangle_shape_class() {
+        let evaluator = evaluator();
+        let triangle = vec![exact_point(0, 0), exact_point(2, 0), exact_point(0, 2)];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &triangle, &[0, 1, 2]).unwrap(),
+            None
+        );
+
+        let vertical = vec![
+            exact_point(0, 0),
+            exact_point(0, 1),
+            exact_point(0, 2),
+            exact_point(0, 3),
+        ];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &vertical, &[0, 1, 2, 3]).unwrap(),
+            None
+        );
+        let horizontal = vec![
+            exact_point(0, 0),
+            exact_point(1, 0),
+            exact_point(2, 0),
+            exact_point(3, 0),
+        ];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &horizontal, &[0, 1, 2, 3]).unwrap(),
+            None
+        );
+
+        let third_x = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(3, 2),
+            exact_point(0, 2),
+        ];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &third_x, &[0, 1, 2, 3]).unwrap(),
+            None
+        );
+        let third_y = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(2, 3),
+            exact_point(0, 2),
+        ];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &third_y, &[0, 1, 2, 3]).unwrap(),
+            None
+        );
+        let repeated_corner = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(2, 0),
+            exact_point(0, 2),
+        ];
+        assert_eq!(
+            axis_aligned_rectangle(&evaluator, &repeated_corner, &[0, 1, 2, 3]).unwrap(),
+            None
+        );
+
+        let touching = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 4),
+            exact_point(0, 4),
+            exact_point(0, 1),
+            exact_point(2, 1),
+            exact_point(2, 2),
+            exact_point(0, 2),
+        ];
+        assert_eq!(
+            triangulate_rectangular_annulus(
+                &evaluator,
+                &touching,
+                &[0, 1, 2, 3],
+                &[4, 5, 6, 7],
+                Sign::Positive,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn bridge_visibility_rejects_coincident_outside_blocked_and_crossing_segments() {
+        let evaluator = evaluator();
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 4),
+            exact_point(0, 4),
+            exact_point(0, 0),
+            exact_point(6, 2),
+            exact_point(8, 1),
+            exact_point(8, 3),
+            exact_point(-1, 1),
+            exact_point(1, -1),
+            exact_point(2, 1),
+            exact_point(3, 1),
+            exact_point(3, 3),
+            exact_point(2, 3),
+        ];
+        let boundary = [0, 1, 2, 3];
+        assert!(
+            !bridge_is_visible(&evaluator, &vertices, &boundary, &[4, 5, 6], &[], 0, 0,).unwrap()
+        );
+        assert!(
+            !bridge_is_visible(&evaluator, &vertices, &boundary, &[5, 6, 7], &[], 1, 0,).unwrap()
+        );
+        assert!(!segment_is_clear_of_ring(&evaluator, &vertices, 8, 9, &boundary,).unwrap());
+
+        // The candidate midpoint is inside both the exterior and this blocker.
+        assert!(
+            !bridge_is_visible(
+                &evaluator,
+                &vertices,
+                &boundary,
+                &[10, 11, 12, 13],
+                &[vec![10, 11, 12, 13]],
+                0,
+                2,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            find_visible_bridge(
+                &evaluator,
+                &vertices,
+                &boundary,
+                &[5, 6, 7],
+                &[vec![5, 6, 7]],
+            ),
+            Err(Error::InvalidInput {
+                reason: "hole cannot be connected by a visible bridge"
+            })
+        );
+    }
+
+    #[test]
+    fn private_fallback_helpers_cover_short_malformed_and_wraparound_inputs() {
+        let evaluator = evaluator();
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(2, 2),
+            exact_point(0, 2),
+            exact_point(0, 0),
+        ];
+        assert_eq!(
+            filter_ring(&evaluator, &vertices, vec![0, 1]).unwrap(),
+            vec![0, 1]
+        );
+        assert!(
+            !cure_local_intersections(&evaluator, &vertices, vec![0, 1, 2], Sign::Positive)
+                .unwrap()
+                .2
+        );
+        assert!(
+            !cure_local_intersections(&evaluator, &vertices, vec![0, 1, 2, 3], Sign::Positive,)
+                .unwrap()
+                .2
+        );
+
+        let mut wrapped = vec![0, 1, 2, 3];
+        remove_adjacent_positions(&mut wrapped, 3, 0);
+        assert_eq!(wrapped, vec![1, 2]);
+
+        let mut diagnostics = EarcutDiagnostics::default();
+        assert_eq!(
+            split_or_fail(
+                &evaluator,
+                &vertices,
+                vec![0, 1, 2],
+                Sign::Positive,
+                4,
+                &mut diagnostics,
+            ),
+            Err(Error::NoEarFound)
+        );
+        assert_eq!(
+            split_or_fail(
+                &evaluator,
+                &vertices,
+                vec![0, 1, 2],
+                Sign::Positive,
+                0,
+                &mut diagnostics,
+            ),
+            Err(Error::NoEarFound)
+        );
+        assert_eq!(
+            find_split_diagonal(&evaluator, &vertices, &[0, 1, 2]).unwrap(),
+            None
+        );
+        assert!(!diagonal_is_valid(&evaluator, &vertices, &[0, 1, 2, 4], 0, 3).unwrap());
+        assert_eq!(ordered_positions(3, 1), (1, 3));
+        assert!(positions_are_adjacent(4, 3, 0));
+
+        let mut triangles = Vec::new();
+        push_triangle(&mut triangles, 0, 1, 2, Sign::Zero);
+        assert_eq!(triangles, vec![0, 1, 2]);
+        assert_eq!(map_hyperlimit_sign(hyperlimit::Sign::Zero), Sign::Zero);
+
+        assert_eq!(
+            triangles_match_input_boundary(
+                &evaluator,
+                &vertices[..3],
+                &rings_from_hole_indices(&vertices[..3], &[]).unwrap(),
+                &[0, 1],
+            ),
+            Err(Error::InvalidInput {
+                reason: "triangle index buffer length is not a multiple of three"
+            })
+        );
+    }
+
+    #[test]
+    fn earcut_report_matches_plain_triangulation_and_counts_hot_loop() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 3),
+            exact_point(2, 1),
+            exact_point(0, 3),
+        ];
+
+        let plain = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+        let report = triangulate_report(&APPROX, &vertices, &[]).unwrap().value;
+
+        assert_eq!(report.triangles, plain);
+        assert_eq!(report.diagnostics.emitted_triangles * 3, plain.len());
+        assert!(report.diagnostics.ear_tests > 0);
+        assert!(report.diagnostics.containment_candidates > 0);
+        assert!(
+            report.diagnostics.prepared_reflex_rebuilds > 0,
+            "earcut should prepare exact local convexity facts before scanning ears"
+        );
+        assert!(
+            report.diagnostics.prepared_reflex_updates > 0,
+            "ear clipping should update the prepared local convexity facts after removing vertices"
+        );
+        assert_eq!(
+            report.diagnostics.containment_prepared_reflex_lookups,
+            report.diagnostics.containment_candidates,
+            "every containment candidate should route through the prepared reflex/convex fact table"
+        );
+        assert!(
+            report.diagnostics.containment_convex_rejects > 0,
+            "exact reflex filter should reject at least one strictly convex candidate"
+        );
+        assert!(
+            report.diagnostics.containment_convex_rejects
+                + report.diagnostics.containment_bbox_rejects
+                > 0,
+            "at least one exact containment prefilter should reject a candidate"
+        );
+        assert!(
+            report.diagnostics.containment_tests
+                <= report.diagnostics.containment_candidates
+                    - report.diagnostics.containment_convex_rejects
+                    - report.diagnostics.containment_bbox_rejects
+        );
+    }
+
+    #[test]
+    fn split_fallback_triangulates_forced_valid_diagonal() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(2, 0),
+            exact_point(3, 1),
+            exact_point(2, 2),
+            exact_point(0, 2),
+            exact_point(-1, 1),
+        ];
+        let ring = vec![0, 1, 2, 3, 4, 5];
+
+        let mut diagnostics = EarcutDiagnostics::default();
+        let triangles = split_or_fail(
+            &evaluator(),
+            &vertices,
+            ring,
+            Sign::Positive,
+            0,
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(triangles.len(), 12);
+        assert_eq!(diagnostics.split_fallbacks, 1);
+        assert!(triangles.iter().all(|&index| index < vertices.len()));
+    }
+
+    #[test]
+    fn local_intersection_cure_removes_twisted_pair() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(3, 3),
+            exact_point(0, 3),
+            exact_point(3, 0),
+            exact_point(4, 4),
+            exact_point(-1, 4),
+        ];
+        let ring = vec![0, 1, 2, 3, 4, 5];
+
+        let (cured_ring, triangles, cured) =
+            cure_local_intersections(&evaluator(), &vertices, ring, Sign::Positive).unwrap();
+
+        assert!(cured);
+        assert_eq!(cured_ring, vec![0, 3, 4, 5]);
+        assert_eq!(triangles.len(), 3);
+        assert!(triangles.iter().all(|&index| index < vertices.len()));
+    }
+
+    #[test]
+    fn drops_duplicate_closing_vertex() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(1, 0),
+            exact_point(1, 1),
+            exact_point(0, 1),
+            exact_point(0, 0),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+
+        assert_eq!(triangles.len(), 6);
+        assert!(triangles.iter().all(|&index| index < 4));
+    }
+
+    #[test]
+    fn collinear_chain_vertices_remain_triangle_vertices() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(1, 0),
+            exact_point(2, 0),
+            exact_point(2, 1),
+            exact_point(0, 1),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+
+        // Ear clipping skips the collinear vertex; conformity reinserts it so
+        // an extruded side wall split there shares every cap edge.
+        assert_eq!(triangles.len(), 9);
+        assert!((0..vertices.len()).all(|vertex| triangles.contains(&vertex)));
+    }
+
+    #[test]
+    fn handles_near_collinear_exact_rational_not_epsilon_collapsed() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_fraction_point(1, 1_000_000_000, 1, 1_000_000_000_000),
+            exact_point(2, 0),
+            exact_point(2, 1),
+            exact_point(0, 1),
+        ];
+
+        let triangles = triangulate(&APPROX, &vertices, &[]).unwrap().value;
+
+        assert_eq!(triangles.len(), 9);
+    }
+
+    #[test]
+    fn rejects_unsorted_hole_indices_before_algorithm_dispatch() {
+        let vertices = vec![
+            exact_point(0, 0),
+            exact_point(4, 0),
+            exact_point(4, 4),
+            exact_point(0, 4),
+            exact_point(1, 1),
+            exact_point(3, 1),
+            exact_point(3, 3),
+            exact_point(1, 3),
+        ];
+
+        let error = triangulate(&APPROX, &vertices, &[5, 4]).unwrap_err();
+
+        assert_eq!(
+            error,
+            Error::InvalidInput {
+                reason: "hole indices must be strictly increasing interior starts"
+            }
+        );
+    }
+}

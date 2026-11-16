@@ -1,0 +1,346 @@
+//! Immutable operation policy and aggregate predicate certainty.
+
+use std::cell::Cell;
+
+use hyperlimit::{Certainty, PredicateOutcome, PredicatePolicy};
+use hypermesh::{MeshCertainty, MeshContext, MeshOutcome};
+use hypertri::{TriangulationCertainty, TriangulationContext, TriangulationOutcome};
+
+use crate::errors::ValidationError;
+
+/// Immutable predicate policy selected for one CSG operation.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GeometryContext {
+    predicates: PredicatePolicy,
+}
+
+impl GeometryContext {
+    /// Strict certified topology.
+    pub const STRICT: Self = Self::new(PredicatePolicy::STRICT);
+
+    /// Certified topology with Hyperlimit's terminal 512-bit interpretation.
+    pub const APPROXIMATE_512: Self = Self::new(PredicatePolicy::APPROXIMATE_512);
+
+    /// Construct a context with the selected Hyperlimit predicate policy.
+    pub const fn new(predicates: PredicatePolicy) -> Self {
+        Self { predicates }
+    }
+
+    /// Return the selected predicate policy.
+    pub const fn predicate_policy(self) -> PredicatePolicy {
+        self.predicates
+    }
+
+    /// Derive the matching Hypermesh context.
+    pub const fn mesh_context(self) -> MeshContext {
+        MeshContext::new(self.predicates)
+    }
+
+    /// Derive the matching Hypertri context.
+    pub const fn triangulation_context(self) -> TriangulationContext {
+        TriangulationContext::new(self.predicates)
+    }
+}
+
+/// Weakest predicate certainty consumed by a completed CSG operation.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GeometryCertainty {
+    /// Every consumed topology decision was certified.
+    Certified,
+    /// At least one decision used Hyperlimit's terminal 512-bit interpretation.
+    Approximate512Consumed,
+}
+
+impl GeometryCertainty {
+    /// The certainty of a claim that depends on both receipts: approximate if
+    /// either consumed the terminal.
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Certified, Self::Certified) => Self::Certified,
+            _ => Self::Approximate512Consumed,
+        }
+    }
+}
+
+/// Completed CSG value paired with operation-local predicate certainty.
+///
+/// The receipt covers the decisions of the operation that produced `value`.
+/// For meshes, inherited construction qualifications are separately queryable
+/// through [`hypermesh::TriangleMesh::construction_evidence`]. A certified local
+/// receipt does not clear an earlier approximate construction or missing history.
+/// Curve regions and query values carry no inherited qualification, so a
+/// caller that needs the certainty of a whole chain keeps it with
+/// [`Self::and_then`] or [`GeometryCertainty::combine`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeometryOutcome<T> {
+    /// Completed value.
+    pub value: T,
+    /// Weakest certainty consumed while producing `value`.
+    pub certainty: GeometryCertainty,
+}
+
+impl<T> GeometryOutcome<T> {
+    const fn new(value: T, certainty: GeometryCertainty) -> Self {
+        Self { value, certainty }
+    }
+
+    /// Transform the value without changing aggregate certainty.
+    ///
+    /// The closure's own predicate decisions are not recorded. Use
+    /// [`Self::and_then`] for an operation that returns its own outcome.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> GeometryOutcome<U> {
+        GeometryOutcome::new(map(self.value), self.certainty)
+    }
+
+    /// Fallibly transform the value without changing aggregate certainty.
+    ///
+    /// As with [`Self::map`], the closure's own decisions are not recorded.
+    pub fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<GeometryOutcome<U>, E> {
+        map(self.value).map(|value| GeometryOutcome::new(value, self.certainty))
+    }
+
+    /// Run a dependent operation on the value and combine both receipts.
+    ///
+    /// The result is approximate if either this outcome or the dependent
+    /// operation consumed the terminal; a certified later step cannot certify
+    /// an earlier approximate one. A failed dependent operation returns its
+    /// error.
+    pub fn and_then<U, E>(
+        self,
+        operation: impl FnOnce(T) -> Result<GeometryOutcome<U>, E>,
+    ) -> Result<GeometryOutcome<U>, E> {
+        let certainty = self.certainty;
+        operation(self.value).map(|outcome| {
+            GeometryOutcome::new(outcome.value, certainty.combine(outcome.certainty))
+        })
+    }
+
+    /// Consume the outcome and return its value.
+    pub fn into_value(self) -> T {
+        self.value
+    }
+}
+
+// Feature-minimal builds retain the public context and mesh accumulator while
+// curve/predicate consumers are compiled out.
+#[allow(dead_code)]
+pub(crate) struct GeometryDecisions {
+    context: GeometryContext,
+    mesh_context: MeshContext,
+    certainty: Cell<GeometryCertainty>,
+    construction: Cell<hypermesh::ConstructionEvidence>,
+}
+
+#[allow(dead_code)]
+impl GeometryDecisions {
+    pub(crate) const fn new(context: GeometryContext) -> Self {
+        Self {
+            context,
+            mesh_context: context.mesh_context(),
+            certainty: Cell::new(GeometryCertainty::Certified),
+            construction: Cell::new(hypermesh::ConstructionEvidence::DECLARED_COORDINATES),
+        }
+    }
+
+    pub(crate) const fn predicate_policy(&self) -> PredicatePolicy {
+        self.context.predicate_policy()
+    }
+
+    pub(crate) const fn mesh_context(&self) -> &MeshContext {
+        &self.mesh_context
+    }
+
+    pub(crate) const fn triangulation_context(&self) -> TriangulationContext {
+        self.context.triangulation_context()
+    }
+
+    pub(crate) const fn finish<T>(&self, value: T) -> GeometryOutcome<T> {
+        GeometryOutcome::new(value, self.certainty.get())
+    }
+
+    pub(crate) fn record_construction(&self, evidence: hypermesh::ConstructionEvidence) {
+        self.construction
+            .set(self.construction.get().combine(evidence));
+    }
+
+    pub(crate) fn qualify_mesh(
+        &self,
+        mesh: hypermesh::TriangleMesh,
+    ) -> hypermesh::TriangleMesh {
+        let certainty = match self.certainty.get() {
+            GeometryCertainty::Certified => MeshCertainty::Certified,
+            GeometryCertainty::Approximate512Consumed => MeshCertainty::Approximate512Consumed,
+        };
+        mesh.with_inherited_construction(
+            self.construction.get().with_predicate_certainty(certainty),
+        )
+    }
+
+    pub(crate) fn finish_mesh(
+        &self,
+        mesh: hypermesh::TriangleMesh,
+    ) -> GeometryOutcome<hypermesh::TriangleMesh> {
+        self.finish(self.qualify_mesh(mesh))
+    }
+
+    /// Folds a nested operation's receipt into this operation and returns
+    /// its value.
+    pub(crate) fn record<T>(&self, outcome: GeometryOutcome<T>) -> T {
+        self.observe(outcome.certainty);
+        outcome.value
+    }
+
+    pub(crate) fn observe(&self, certainty: GeometryCertainty) {
+        if certainty == GeometryCertainty::Approximate512Consumed {
+            self.certainty.set(certainty);
+        }
+    }
+
+    /// Runs principal exact Hypercurve operations under this context's
+    /// predicate policy through [`hypercurve::evaluate_under`], recording any
+    /// approximate terminal they consumed.
+    pub(crate) fn exact_curve<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let provisional = hypercurve::evaluate_under(self.predicate_policy(), operation);
+        if !provisional.is_certified() {
+            self.observe(GeometryCertainty::Approximate512Consumed);
+        }
+        provisional.into_unverified()
+    }
+
+    pub(crate) fn consume_mesh<T>(&self, outcome: MeshOutcome<T>) -> T {
+        if outcome.certainty == MeshCertainty::Approximate512Consumed {
+            self.observe(GeometryCertainty::Approximate512Consumed);
+        }
+        outcome.value
+    }
+
+    pub(crate) fn consume_geometry<T>(&self, outcome: GeometryOutcome<T>) -> T {
+        self.observe(outcome.certainty);
+        outcome.value
+    }
+
+    pub(crate) fn consume_triangulation<T>(&self, outcome: TriangulationOutcome<T>) -> T {
+        if outcome.certainty == TriangulationCertainty::Approximate512Consumed {
+            self.observe(GeometryCertainty::Approximate512Consumed);
+        }
+        outcome.value
+    }
+
+    pub(crate) fn sign(
+        &self,
+        value: &hyperreal::Real,
+        predicate: &'static str,
+    ) -> Result<hyperreal::RealSign, ValidationError> {
+        self.decide(
+            hyperlimit::classify_real_sign(value, self.predicate_policy()),
+            predicate,
+        )
+        .map(|sign| match sign {
+            hyperlimit::Sign::Negative => hyperreal::RealSign::Negative,
+            hyperlimit::Sign::Zero => hyperreal::RealSign::Zero,
+            hyperlimit::Sign::Positive => hyperreal::RealSign::Positive,
+        })
+    }
+
+    pub(crate) fn points_equal(
+        &self,
+        left: &hyperlattice::Point3,
+        right: &hyperlattice::Point3,
+    ) -> Result<bool, ValidationError> {
+        let left = hyperlimit::Point3::new(left.x.clone(), left.y.clone(), left.z.clone());
+        let right = hyperlimit::Point3::new(right.x.clone(), right.y.clone(), right.z.clone());
+        self.decide(
+            hyperlimit::point3_equal(&left, &right, self.predicate_policy()),
+            "point equality",
+        )
+    }
+
+    pub(crate) fn decide<T>(
+        &self,
+        outcome: PredicateOutcome<T>,
+        predicate: &'static str,
+    ) -> Result<T, ValidationError> {
+        match outcome {
+            PredicateOutcome::Decided {
+                value, certainty, ..
+            } => {
+                if certainty == Certainty::Approximate {
+                    self.observe(GeometryCertainty::Approximate512Consumed);
+                }
+                Ok(value)
+            },
+            PredicateOutcome::Unknown { .. } => Err(ValidationError::PredicateUndecided {
+                predicate,
+                policy: self.context.predicate_policy(),
+            }),
+        }
+    }
+
+    pub(crate) fn probe<T>(&self, outcome: PredicateOutcome<T>) -> Option<T> {
+        self.decide(outcome, "optional geometry predicate").ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contexts_and_certainty_remain_one_byte() {
+        assert_eq!(core::mem::size_of::<GeometryContext>(), 1);
+        assert_eq!(core::mem::size_of::<GeometryCertainty>(), 1);
+    }
+
+    #[test]
+    fn dependent_receipts_combine_to_the_weakest_certainty() {
+        use GeometryCertainty::{Approximate512Consumed as Approximate, Certified};
+        for (first, second, combined) in [
+            (Certified, Certified, Certified),
+            (Certified, Approximate, Approximate),
+            (Approximate, Certified, Approximate),
+            (Approximate, Approximate, Approximate),
+        ] {
+            assert_eq!(first.combine(second), combined);
+            let chained = GeometryOutcome::new(1, first)
+                .and_then(|value| Ok::<_, ()>(GeometryOutcome::new(value + 1, second)))
+                .unwrap();
+            assert_eq!(chained, GeometryOutcome::new(2, combined));
+            assert_eq!(
+                GeometryOutcome::new(1, first)
+                    .map(|value| value + 1)
+                    .certainty,
+                first
+            );
+        }
+        assert_eq!(
+            GeometryOutcome::new(1, Approximate)
+                .and_then(|_| Err::<GeometryOutcome<i32>, _>("failed")),
+            Err("failed")
+        );
+    }
+
+    #[test]
+    fn one_context_derives_matching_kernel_policies() {
+        assert_eq!(
+            GeometryContext::STRICT.mesh_context().predicate_policy(),
+            PredicatePolicy::STRICT
+        );
+        assert_eq!(
+            GeometryContext::APPROXIMATE_512
+                .mesh_context()
+                .predicate_policy(),
+            PredicatePolicy::APPROXIMATE_512
+        );
+        for context in [GeometryContext::STRICT, GeometryContext::APPROXIMATE_512] {
+            assert_eq!(
+                context.triangulation_context().predicate_policy(),
+                context.predicate_policy()
+            );
+        }
+    }
+}
