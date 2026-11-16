@@ -1,0 +1,73 @@
+diff --git a/crates/hyperdynamics/src/field.rs b/crates/hyperdynamics/src/field.rs
+index e3be27b4c..66ce3543c 100644
+--- a/crates/hyperdynamics/src/field.rs
++++ b/crates/hyperdynamics/src/field.rs
+@@ -7,6 +7,8 @@ pub mod clock;
+ pub mod evolution;
+ /// Source-bound Picard self-map and contraction verification for dyadic steps.
+ pub mod picard;
++/// Certified initial-state sensitivity of native Picard evolutions.
++pub mod sensitivity;
+ use std::{collections::BTreeSet, fmt, sync::Arc};
+ 
+ use hyperinterval::{DyadicBudget, DyadicInterval, IntervalError};
+diff --git a/crates/hyperlattice-interval/src/matrix.rs b/crates/hyperlattice-interval/src/matrix.rs
+index 3d926d6c3..12d811eb3 100644
+--- a/crates/hyperlattice-interval/src/matrix.rs
++++ b/crates/hyperlattice-interval/src/matrix.rs
+@@ -112,6 +112,26 @@ impl<I: IntervalArithmetic, const R: usize, const C: usize> IntervalMatrix<I, R,
+         self.zip(other, context, I::sub)
+     }
+ 
++    /// Encloses multiplication by a shared scalar. Correlations between entries
++    /// are forgotten in the Cartesian result. Empty operands remain empty,
++    /// including matrices with zero rows or columns. Uses row-major order and
++    /// one shared backend context.
++    pub fn scale(
++        &self,
++        scalar: &I,
++        context: &mut I::Context,
++    ) -> Result<Self, IntervalLatticeError> {
++        let Some(rows) = self.rows() else {
++            return Self::empty();
++        };
++        if scalar.is_empty() {
++            return Self::empty();
++        }
++        Self::new(array_result(|r| {
++            array_result(|c| rows[r][c].mul(scalar, context))
++        })?)
++    }
++
+     /// Matrix-vector product enclosure. Singleton coefficients or lanes support
+     /// point-matrix or point-vector products without a separate arithmetic path.
+     /// Rows are evaluated in order, each dot product from column zero upward.
+diff --git a/crates/hyperlattice-interval/tests/cartesian.rs b/crates/hyperlattice-interval/tests/cartesian.rs
+index 63fb81e3f..e2dd9fea4 100644
+--- a/crates/hyperlattice-interval/tests/cartesian.rs
++++ b/crates/hyperlattice-interval/tests/cartesian.rs
+@@ -69,6 +69,12 @@ fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
+                     .into_lanes(),
+                 Some(expected.map(|(lo, hi)| scalar(lo, hi)))
+             );
++            let matrix = IntervalMatrix::new([vector.clone().into_lanes().unwrap()]).unwrap();
++            assert_eq!(
++                matrix.scale(&scalar(scale.0, scale.1), &mut context()).unwrap().into_rows(),
++                Some([expected.map(|(lo, hi)| scalar(lo, hi))])
++            );
++            assert!(matrix.scale(&I::empty().unwrap(), &mut context()).unwrap().is_empty());
+             assert!(
+                 vector
+                     .scale(&I::empty().unwrap(), &mut context())
+@@ -84,6 +90,11 @@ fn exact_products<I: IntervalArithmetic + core::fmt::Debug + PartialEq>(
+             .unwrap()
+             .is_empty()
+     );
++    let unit = IntervalMatrix::<I, 0, 2>::new([]).unwrap();
++    assert_eq!(unit.scale(&scalar(-1, 1), &mut context()).unwrap(), unit);
++    assert!(unit.scale(&I::empty().unwrap(), &mut context()).unwrap().is_empty());
++    let empty = IntervalMatrix::<I, 1, 2>::empty().unwrap();
++    assert!(empty.scale(&scalar(-1, 1), &mut context()).unwrap().is_empty());
+     // Exhaust every two-lane dot product over this finite endpoint domain.
+     for a0 in ranges {
+         for a1 in ranges {
