@@ -1,0 +1,294 @@
+commit e139885a6e44b553a031fd114ff0615c0c1d4c52
+Author:     Timothy Schmidt <tim@ai.replimat.org>
+AuthorDate: Sun Nov 15 23:15:24 2026 -0500
+Commit:     Timothy Schmidt <tim@ai.replimat.org>
+CommitDate: Sun Nov 15 23:15:24 2026 -0500
+
+    test(dynamics): qualify continuous two-rate noise propagation
+
+diff --git a/crates/hyperdynamics/tests/adaptive_taylor.rs b/crates/hyperdynamics/tests/adaptive_taylor.rs
+index a2cbfec12..760356c46 100644
+--- a/crates/hyperdynamics/tests/adaptive_taylor.rs
++++ b/crates/hyperdynamics/tests/adaptive_taylor.rs
+@@ -16,6 +16,11 @@ use hypersolve::{
+     Expr, SymbolId,
+     expression_program::{ExpressionBudget, ExpressionProgram},
+ };
++
++#[path = "support/exponential_oracle.rs"]
++mod exponential_oracle;
++use exponential_oracle::exp_bounds;
++
+ const T: SymbolId = SymbolId(10);
+ const X: SymbolId = SymbolId(20);
+ fn d(l: i64, u: i64, e: i32) -> DyadicInterval {
+@@ -169,16 +174,6 @@ fn quality_halves_at_last_order_then_regrows_and_caps_exact_horizon() {
+         );
+     }
+ }
+-fn exp_bounds(t: Q) -> (Q, Q) {
+-    let mut term = Q::from(1);
+-    let mut lower = term.clone();
+-    for k in 1..=12 {
+-        term = &term * &t / Q::from(k);
+-        lower = lower + &term;
+-    }
+-    let upper = &lower + (&term * &t / Q::from(13)) / (Q::from(1) - &t / Q::from(14));
+-    (lower, upper)
+-}
+ #[test]
+ fn exponential_uncertainty_and_generated_endpoint_have_independent_bounds() {
+     let f = field::<1>(&[Expr::anonymous_symbol(X)], &[X]);
+diff --git a/crates/hyperdynamics/tests/flow_noise_witness.rs b/crates/hyperdynamics/tests/flow_noise_witness.rs
+index 1aadf75d9..efccc1c4a 100644
+--- a/crates/hyperdynamics/tests/flow_noise_witness.rs
++++ b/crates/hyperdynamics/tests/flow_noise_witness.rs
+@@ -847,3 +847,183 @@ mod closure {
+         std::fs::remove_dir_all(path).unwrap();
+     }
+ }
++
++#[cfg(all(feature = "flow-noise", feature = "taylor-evolution"))]
++mod two_rate {
++    use super::*;
++    use hyperdynamics::field::{
++        evolution::{EvolutionOptions, EvolutionRequest},
++        taylor_flow::{
++            evolution::FlowTaylorEvolutionStatus,
++            noise::{FlowNoiseInput, FlowNoiseRequest, FlowNoiseState, FlowNoiseStatus},
++        },
++    };
++    use hyperinterval::DyadicBudget;
++    use hyperreal::Rational as Q;
++    use std::sync::Arc;
++
++    fn arithmetic() -> DyadicBudget {
++        DyadicBudget::new(16384, 1_000_000_000)
++    }
++
++    fn bounds(time: i64, rate: i64, radius: i64) -> (Q, Q) {
++        let (lo, hi) = crate::exponential_oracle::exp_bounds(Q::from(time * rate) / Q::from(64));
++        // Reciprocation reverses the positive exp bounds. Scaling by the
++        // positive initial interval gives exact independent solution bounds.
++        (
++            Q::from(1024 - radius) / Q::from(1024) / hi,
++            Q::from(1024 + radius) / Q::from(1024) / lo,
++        )
++    }
++
++    fn contains(value: &DyadicInterval, lo: &Q, hi: &Q) {
++        let range = value.to_rational(&mut arithmetic()).unwrap();
++        assert!(
++            range.contains_point(lo),
++            "missing lower extremum {lo:?} from {range:?}"
++        );
++        assert!(
++            range.contains_point(hi),
++            "missing upper extremum {hi:?} from {range:?}"
++        );
++    }
++
++    #[test]
++    fn full_two_rate_noise_chains_enclose_continuous_point_and_box_flows() {
++        let (time, x, y) = (SymbolId(0), SymbolId(1), SymbolId(2));
++        let source = ExpressionProgram::compile(
++            &[
++                -Expr::anonymous_symbol(x),
++                Expr::int(-8) * Expr::anonymous_symbol(y),
++            ],
++            &[time, x, y],
++            &mut ExpressionBudget::new(1_000_000, 100_000_000),
++        )
++        .unwrap();
++        let mut preparation = EnclosureBudget::new(EnclosurePolicy::default());
++        let program = ExpressionField::<2>::from_definition(
++            FieldDefinition {
++                source: source.definition().clone(),
++                time,
++                state: vec![x, y],
++            },
++            &mut preparation,
++        )
++        .unwrap()
++        .flow_taylor(3, &mut preparation)
++        .unwrap();
++        for radius in [0, 1] {
++            let initial = BoxN::new([
++                interval(1024 - radius, 1024 + radius, -10),
++                interval(1024 - radius, 1024 + radius, -10),
++            ])
++            .unwrap();
++            let mut proposal_budget = EnclosureBudget::new(EnclosurePolicy::default());
++            let proposals = program.integrate(
++                EvolutionRequest {
++                    start: interval(0, 0, 0),
++                    end: interval(1, 1, -2),
++                    initial: initial.clone(),
++                },
++                EvolutionOptions {
++                    maximum_step: Some(interval(1, 1, -6)),
++                    ..Default::default()
++                },
++                &mut proposal_budget,
++            );
++            assert!(matches!(
++                proposals.status(),
++                FlowTaylorEvolutionStatus::Completed
++            ));
++            assert_eq!(proposals.segments().len(), 16);
++            let mut budget = EnclosureBudget::new(EnclosurePolicy::default());
++            let mut state = Arc::new(
++                FlowNoiseState::new(interval(0, 0, 0), initial.clone(), &mut budget).unwrap(),
++            );
++            let mut tube = initial.lanes().unwrap().clone();
++            for (index, proposal) in proposals.segments().enumerate() {
++                let previous = state.clone();
++                let request = proposal.picard().proposal();
++                assert_eq!(request.start, interval(index as i64, index as i64, -6));
++                assert_eq!(
++                    request.end,
++                    interval(index as i64 + 1, index as i64 + 1, -6)
++                );
++                let report = program.certify_noise_step(
++                    state,
++                    FlowNoiseRequest {
++                        end: request.end.clone(),
++                        candidate: request.candidate.clone(),
++                        maximum_noise: 2,
++                    },
++                    &mut budget,
++                );
++                assert!(
++                    matches!(report.status(), FlowNoiseStatus::Certified),
++                    "{:?}",
++                    report.status()
++                );
++                let evidence = report.evidence();
++                assert!(Arc::ptr_eq(evidence.initial(), &previous));
++                let flow = evidence.flow().unwrap();
++                assert!(matches!(flow.status(), FlowTaylorStatus::Certified));
++                assert_eq!(&flow.picard().proposal().initial, previous.enclosure());
++                assert_eq!(&flow.picard().proposal().start, previous.time());
++                if index > 0 {
++                    assert!(evidence.inputs().contains(&FlowNoiseInput::Residual(0)));
++                    assert!(evidence.inputs().contains(&FlowNoiseInput::Residual(1)));
++                }
++                state = report.end_state().unwrap().clone();
++                assert!(Arc::ptr_eq(state.evidence().unwrap(), evidence));
++                assert_eq!(state.time(), &request.end);
++                assert!(state.columns().unwrap().len() <= 2);
++                for (lane, rate) in [1, 8].into_iter().enumerate() {
++                    let (end_lo, end_hi) = bounds(index as i64 + 1, rate, radius);
++                    let (_, start_hi) = bounds(index as i64, rate, radius);
++                    contains(&state.enclosure().lanes().unwrap()[lane], &end_lo, &end_hi);
++                    let piece = &flow.tube().unwrap().lanes().unwrap()[lane];
++                    // Positive decays are monotone throughout each whole step.
++                    contains(piece, &end_lo, &start_hi);
++                    tube[lane] = tube[lane].hull(piece, &mut arithmetic()).unwrap();
++                    assert_ne!(state.residual().unwrap()[lane], interval(0, 0, 0));
++                }
++            }
++            assert_eq!(state.time(), &interval(1, 1, -2));
++            for (lane, rate) in [1, 8].into_iter().enumerate() {
++                let (end_lo, _) = bounds(16, rate, radius);
++                let (_, start_hi) = bounds(0, rate, radius);
++                contains(&tube[lane], &end_lo, &start_hi);
++                assert!(
++                    tube[lane]
++                        .width(&mut arithmetic())
++                        .unwrap()
++                        .subset_of(&interval(0, 1, 0), &mut arithmetic())
++                        .unwrap()
++                );
++                let width = state.enclosure().lanes().unwrap()[lane]
++                    .width(&mut arithmetic())
++                    .unwrap();
++                let exponent = if radius == 0 {
++                    [-29, -17][lane]
++                } else {
++                    [-9, -11][lane]
++                };
++                assert!(
++                    width
++                        .subset_of(&interval(0, 1, exponent), &mut arithmetic())
++                        .unwrap()
++                );
++            }
++            println!(
++                "two_rate radius={radius}; end={:?}; tube={tube:?}; graph_work={}; scalar_work={}",
++                state.enclosure(),
++                budget.policy().graph_work - budget.remaining_graph_work(),
++                budget.policy().scalar_work - budget.remaining_scalar_work()
++            );
++        }
++    }
++}
++
++#[cfg(all(feature = "flow-noise", feature = "taylor-evolution"))]
++#[path = "support/exponential_oracle.rs"]
++mod exponential_oracle;
+diff --git a/crates/hyperdynamics/tests/support/exponential_oracle.rs b/crates/hyperdynamics/tests/support/exponential_oracle.rs
+new file mode 100644
+index 000000000..87ff7e2d6
+--- /dev/null
++++ b/crates/hyperdynamics/tests/support/exponential_oracle.rs
+@@ -0,0 +1,15 @@
++use hyperreal::Rational as Q;
++
++// Positive exponential series through degree twelve. For 0 <= t < 14,
++// every ratio in the omitted tail after its first term is at most t/14.
++pub fn exp_bounds(t: Q) -> (Q, Q) {
++    assert!(t >= Q::zero() && t < Q::from(14));
++    let mut term = Q::from(1);
++    let mut lower = term.clone();
++    for k in 1..=12 {
++        term = &term * &t / Q::from(k);
++        lower = lower + &term;
++    }
++    let upper = &lower + (&term * &t / Q::from(13)) / (Q::from(1) - &t / Q::from(14));
++    (lower, upper)
++}
+diff --git a/docs/research/validated-dynamics-comparison.md b/docs/research/validated-dynamics-comparison.md
+index c07d265c8..ac06a4345 100644
+--- a/docs/research/validated-dynamics-comparison.md
++++ b/docs/research/validated-dynamics-comparison.md
+@@ -204,3 +204,39 @@ remain present. The archive row `2026-11-15-interval-external-dynamics-extended`
+ in `docs/evidence-archive.tsv` binds the sources, commands, checks and raw results.
+ Full-stack, hosted/HIL and the remaining plan qualification are not established
+ by this benchmark extension.
++
++## Manual affine-noise wrapping qualification
++
++The existing `FlowNoiseState` / `certify_noise_step` path also completes the
++point and box two-rate cases at order 3, with sixteen steps of `1/64` and two
++retained noise columns. The Cartesian integrator supplies candidate boxes only;
++each noise step independently re-certifies its actual incoming affine outer
++state. The original initial data, horizon and common width limits above remain
++unchanged. This is an existing manual composition capability, not an automatic
++noise-controller implementation.
++
++| Input | Coordinate | Cartesian endpoint width | Noise endpoint width |
++| --- | --- | ---: | ---: |
++| point | x | 6.37146198e-10 | 4.98832206e-10 |
++| point | y | 4.13989040e-5 | 3.51031049e-6 |
++| box | x | 0.00250786278 | 0.00152109578 |
++| box | y | 0.01447350104 | 0.000267950531 |
++
++The maintained `flow_noise_witness` test checks every generated endpoint and
++continuous segment against independent rational exponential bounds. Both
++coordinates decrease from positive initial intervals, so the bounds cover all
++times between the segment endpoints. It materializes the hull of all sixteen
++tubes, checks the full-horizon width limit, and requires stricter noise endpoint
++widths: `(2^-29, 2^-17)` for the point input and `(2^-9, 2^-11)` for the box.
++Source/proof identity, nonzero residuals, fresh residual inputs and subsequent
++step consumption remain explicit. The rational series oracle is shared with
++the existing adaptive-Taylor tests; their original assertions remain intact.
++
++The noise chain consumes 625,855 graph-work units / 658,480,044 scalar-work units
++for the point input and 625,821 / 734,947,748 for the box. Those counters cover
++one shared noise-chain budget; preparation, Cartesian proposal generation and
++tube publication have separate budgets. They are not a total CPU or heap bound.
++An exploratory profile motivates further preparation/arithmetic work, but this
++qualification does not supply a matched wall-clock comparison with the tables
++above. Automatic noise orchestration, global sensitivity and wider workload
++qualification remain open.
