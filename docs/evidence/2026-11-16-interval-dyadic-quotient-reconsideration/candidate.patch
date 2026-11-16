@@ -1,0 +1,29 @@
+diff --git a/crates/hyperinterval/src/dyadic.rs b/crates/hyperinterval/src/dyadic.rs
+index 291330bd2..41ee29890 100644
+--- a/crates/hyperinterval/src/dyadic.rs
++++ b/crates/hyperinterval/src/dyadic.rs
+@@ -831,7 +831,23 @@ pub(crate) fn scaled_quotient(
+     } else {
+         (n.clone(), d << amount)
+     };
+-    Ok((n.div_floor(&d), n.div_ceil(&d)))
++    // Share the unsigned division used by floor and ceiling, assigning signs
++    // only to the retained bounds. The remainder is needed only for exactness.
++    let (quotient, remainder) = n.magnitude().div_rem(d.magnitude());
++    let exact = remainder.is_zero();
++    let quotient = BigInt::from(quotient);
++    if n.sign() == d.sign() {
++        let upper = if exact {
++            quotient.clone()
++        } else {
++            &quotient + 1u32
++        };
++        Ok((quotient, upper))
++    } else {
++        let upper = -quotient;
++        let lower = if exact { upper.clone() } else { &upper - 1u32 };
++        Ok((lower, upper))
++    }
+ }
+ 
+ #[cfg(feature = "rational")]
