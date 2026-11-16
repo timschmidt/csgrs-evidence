@@ -1,0 +1,494 @@
+diff --git a/crates/hyperinterval/src/lib.rs b/crates/hyperinterval/src/lib.rs
+index 1296048ff..f49109150 100644
+--- a/crates/hyperinterval/src/lib.rs
++++ b/crates/hyperinterval/src/lib.rs
+@@ -83,7 +83,7 @@ pub use integer_quotient::integer_quotient_bounds;
+ #[cfg(feature = "float-proposal")]
+ pub use proposal::{F32ProposalInterval, F64ProposalInterval};
+ #[cfg(feature = "rational")]
+-pub use rational::RationalInterval;
++pub use rational::{NonEmptyRationalInterval, NonEmptyRationalIntervalRef, RationalInterval};
+ #[cfg(all(feature = "rational", feature = "dyadic"))]
+ pub use rational_admission::RationalArithmetic;
+ #[cfg(feature = "real-ball")]
+diff --git a/crates/hyperinterval/src/rational.rs b/crates/hyperinterval/src/rational.rs
+index 03bb89ea3..68ba6bab3 100644
+--- a/crates/hyperinterval/src/rational.rs
++++ b/crates/hyperinterval/src/rational.rs
+@@ -12,6 +12,128 @@ pub struct RationalInterval {
+     bounds: Option<Bounds<Rational>>,
+ }
+ 
++/// Validated nonempty working form of [`RationalInterval`].
++///
++/// This is the same exact rational family, with nonemptiness retained in the
++/// type through products and translations. It introduces no second product
++/// kernel or unchecked endpoint constructor. Convert to the general carrier
++/// for operations whose result may be empty, such as intersection.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct NonEmptyRationalInterval {
++    bounds: Bounds<Rational>,
++}
++
++/// Borrowed validated nonempty rational bounds.
++///
++/// Borrowing preserves the endpoint lifetime and exact order without cloning
++/// their shared scalar storage. It carries the same invariant as the owned
++/// working form; its constructor still checks order.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct NonEmptyRationalIntervalRef<'a> {
++    bounds: Bounds<&'a Rational>,
++}
++
++impl<'a> NonEmptyRationalIntervalRef<'a> {
++    /// Checks the order of borrowed endpoints exactly once.
++    #[inline]
++    pub fn new(lower: &'a Rational, upper: &'a Rational) -> Result<Self, IntervalError> {
++        Ok(Self {
++            bounds: Bounds::new(lower, upper)?,
++        })
++    }
++
++    /// Exact borrowed endpoint pair.
++    #[inline]
++    pub fn bounds(self) -> (&'a Rational, &'a Rational) {
++        self.bounds.endpoints()
++    }
++
++    /// Retains owned endpoint storage without a new order comparison.
++    #[inline]
++    pub fn to_owned(self) -> NonEmptyRationalInterval {
++        NonEmptyRationalInterval {
++            bounds: self.bounds.cloned(),
++        }
++    }
++
++    /// Exact product hull through the shared sign-specialized kernel.
++    #[inline]
++    pub fn mul(&self, other: &Self) -> NonEmptyRationalInterval {
++        let (a, b) = self.bounds();
++        let (c, d) = other.bounds();
++        let (lower, upper) = product_hull(a, b, c, d);
++        NonEmptyRationalInterval {
++            bounds: Bounds::ordered(lower, upper),
++        }
++    }
++}
++
++impl NonEmptyRationalInterval {
++    /// Checks the order of finite exact endpoints once.
++    #[inline]
++    pub fn new(lower: Rational, upper: Rational) -> Result<Self, IntervalError> {
++        Ok(Self {
++            bounds: Bounds::new(lower, upper)?,
++        })
++    }
++
++    /// A singleton, with nonemptiness known by construction.
++    #[inline]
++    pub fn point(value: Rational) -> Self {
++        Self {
++            bounds: Bounds::point(value),
++        }
++    }
++
++    /// Borrowed exact endpoints.
++    #[inline]
++    pub fn bounds(&self) -> (&Rational, &Rational) {
++        self.bounds.as_refs().endpoints()
++    }
++
++    /// Borrows this already validated working form without comparisons.
++    #[inline]
++    pub fn borrowed(&self) -> NonEmptyRationalIntervalRef<'_> {
++        NonEmptyRationalIntervalRef {
++            bounds: self.bounds.as_refs(),
++        }
++    }
++
++    /// Consumes the working form without cloning either endpoint.
++    #[inline]
++    pub fn into_bounds(self) -> (Rational, Rational) {
++        self.bounds.endpoints()
++    }
++
++    /// Lossless conversion to the general carrier, without comparison.
++    #[inline]
++    pub fn into_interval(self) -> RationalInterval {
++        RationalInterval {
++            bounds: Some(self.bounds),
++        }
++    }
++
++    /// Exact product hull, using the same sign-specialized rational kernel.
++    #[inline]
++    pub fn mul(&self, other: &Self) -> Self {
++        self.borrowed().mul(&other.borrowed())
++    }
++
++    /// Exact translation by a rational scalar, preserving nonemptiness.
++    #[inline]
++    pub fn translate(&self, offset: &Rational) -> Self {
++        let (a, b) = self.bounds();
++        Self {
++            bounds: translated_bounds(a, b, offset),
++        }
++    }
++}
++
++#[inline]
++fn translated_bounds(lower: &Rational, upper: &Rational, offset: &Rational) -> Bounds<Rational> {
++    Bounds::ordered(lower + offset, upper + offset)
++}
++
+ impl RationalInterval {
+     /// Checks endpoint order without changing either endpoint.
+     pub fn new(lower: Rational, upper: Rational) -> Result<Self, IntervalError> {
+@@ -76,6 +198,13 @@ impl RationalInterval {
+         self.bounds.map(Bounds::endpoints)
+     }
+ 
++    /// Extracts a validated nonempty working form without comparing or cloning.
++    #[inline]
++    pub fn into_nonempty(self) -> Option<NonEmptyRationalInterval> {
++        self.bounds
++            .map(|bounds| NonEmptyRationalInterval { bounds })
++    }
++
+     /// Exact lower endpoint, or `None` for empty.
+     pub fn lower(&self) -> Option<&Rational> {
+         self.bounds().map(|b| b.0)
+@@ -227,6 +356,14 @@ impl RationalInterval {
+         }
+     }
+ 
++    /// Exact translation by a scalar; empty stays empty.
++    #[inline]
++    pub fn translate(&self, offset: &Rational) -> Self {
++        Self {
++            bounds: self.bounds().map(|(a, b)| translated_bounds(a, b, offset)),
++        }
++    }
++
+     /// Exact Minkowski difference; repeated operands are independent sets.
+     pub fn sub(&self, other: &Self) -> Self {
+         match (self.bounds(), other.bounds()) {
+@@ -460,3 +597,18 @@ impl<'de> serde::Deserialize<'de> for RationalInterval {
+         .map_err(serde::de::Error::custom)
+     }
+ }
++
++#[cfg(feature = "serde")]
++impl serde::Serialize for NonEmptyRationalInterval {
++    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.bounds().serialize(serializer)
++    }
++}
++
++#[cfg(feature = "serde")]
++impl<'de> serde::Deserialize<'de> for NonEmptyRationalInterval {
++    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
++        let (lower, upper) = <(Rational, Rational)>::deserialize(deserializer)?;
++        Self::new(lower, upper).map_err(serde::de::Error::custom)
++    }
++}
+diff --git a/crates/hyperinterval/tests/rational.rs b/crates/hyperinterval/tests/rational.rs
+index 0d27109ec..e981dd7de 100644
+--- a/crates/hyperinterval/tests/rational.rs
++++ b/crates/hyperinterval/tests/rational.rs
+@@ -1,6 +1,6 @@
+ #![cfg(feature = "rational")]
+ 
+-use hyperinterval::{IntervalError, RationalInterval, SignSet};
++use hyperinterval::{IntervalError, NonEmptyRationalInterval, RationalInterval, SignSet};
+ use hyperreal::Rational;
+ 
+ #[path = "support/legacy_rational_product.rs"]
+@@ -102,7 +102,7 @@ fn product_dispatch_and_reducer_counts_match_baseline() {
+     use hyperreal::dispatch_trace;
+     const KEY: &str = "HYPERINTERVAL_TRACE_BACKEND";
+     if let Ok(backend) = std::env::var(KEY) {
+-        assert!(backend == "legacy" || backend == "shared");
++        assert!(backend == "legacy" || backend == "shared" || backend == "nonempty");
+         let large: Rational = "123456789012345678901234567890123456789/9876543210987654321"
+             .parse()
+             .unwrap();
+@@ -113,12 +113,16 @@ fn product_dispatch_and_reducer_counts_match_baseline() {
+                     for d in &values[j..] {
+                         let left = RationalInterval::new(a.clone(), b.clone()).unwrap();
+                         let right = RationalInterval::new(c.clone(), d.clone()).unwrap();
++                        let nonempty_left = left.clone().into_nonempty().unwrap();
++                        let nonempty_right = right.clone().into_nonempty().unwrap();
+                         for _ in 0..2 {
+                             dispatch_trace::reset();
+                             dispatch_trace::reset_rational_stats();
+                             let result = dispatch_trace::with_recording(|| {
+                                 if backend == "legacy" {
+                                     legacy::rational_interval_product(a, b, c, d)
++                                } else if backend == "nonempty" {
++                                    nonempty_left.mul(&nonempty_right).into_bounds()
+                                 } else {
+                                     let product = left.mul(&right);
+                                     let (lo, hi) = product.bounds().unwrap();
+@@ -162,6 +166,7 @@ fn product_dispatch_and_reducer_counts_match_baseline() {
+     let new = run("shared");
+     assert_eq!(old.len(), 450);
+     assert_eq!(new, old);
++    assert_eq!(run("nonempty"), old);
+ }
+ 
+ #[test]
+@@ -267,3 +272,47 @@ fn rational_replay_validates_order_and_preserves_sets() {
+     let reversed = serde_json::to_vec(&Some((r(1, 1), r(-1, 1)))).unwrap();
+     assert!(serde_json::from_slice::<RationalInterval>(&reversed).is_err());
+ }
++
++#[test]
++fn nonempty_working_form_preserves_endpoint_authority_and_composition() {
++    assert_eq!(
++        NonEmptyRationalInterval::new(r(2, 1), r(1, 1)),
++        Err(IntervalError::ReversedEndpoints)
++    );
++    assert!(RationalInterval::empty().into_nonempty().is_none());
++    assert!(RationalInterval::empty().translate(&r(1, 1)).is_empty());
++    let x = NonEmptyRationalInterval::new(r(-2, 3), r(5, 7)).unwrap();
++    assert_eq!(x.clone().into_interval().into_nonempty().unwrap(), x);
++    let y = NonEmptyRationalInterval::point(r(-3, 5));
++    let product = x.mul(&y);
++    assert_eq!(product.bounds(), (&r(-3, 7), &r(2, 5)));
++    let translated = product.translate(&r(4, 9));
++    assert_eq!(translated.bounds(), (&r(1, 63), &r(38, 45)));
++    assert_eq!(
++        product.into_interval().translate(&r(4, 9)),
++        translated.clone().into_interval()
++    );
++    assert_eq!(translated.into_bounds(), (r(1, 63), r(38, 45)));
++    assert_eq!(
++        core::mem::size_of::<NonEmptyRationalInterval>(),
++        2 * core::mem::size_of::<Rational>()
++    );
++}
++
++#[cfg(feature = "serde")]
++#[test]
++fn nonempty_replay_rejects_empty_and_reversed_inputs() {
++    let x = NonEmptyRationalInterval::new(r(-3, 7), r(5, 11)).unwrap();
++    let bytes = serde_json::to_vec(&x).unwrap();
++    assert_eq!(
++        bytes,
++        serde_json::to_vec(&x.clone().into_interval()).unwrap()
++    );
++    assert_eq!(
++        serde_json::from_slice::<NonEmptyRationalInterval>(&bytes).unwrap(),
++        x
++    );
++    assert!(serde_json::from_str::<NonEmptyRationalInterval>("null").is_err());
++    let reversed = serde_json::to_vec(&(r(2, 1), r(1, 1))).unwrap();
++    assert!(serde_json::from_slice::<NonEmptyRationalInterval>(&reversed).is_err());
++}
+diff --git a/crates/hypersolve/Cargo.toml b/crates/hypersolve/Cargo.toml
+index 8deaf5bce..6746d6949 100644
+--- a/crates/hypersolve/Cargo.toml
++++ b/crates/hypersolve/Cargo.toml
+@@ -25,10 +25,8 @@ hyperlattice = { version = "0.7.0", path = "../hyperlattice", default-features =
+ hyperlimit = { version = "0.5.0", path = "../hyperlimit", default-features = false }
+ num = { version = "0.4.3", features = ["num-bigint"] }
+ serde = { version = "1.0", features = ["derive"], optional = true }
+-hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, optional = true }
+-[dev-dependencies]
+-# Test-only interval migration candidates; production remains gated by cost.
+ hyperinterval = { version = "0.1.0", path = "../hyperinterval", default-features = false, features = ["rational"] }
++[dev-dependencies]
+ # Fresh-process selected-field replay exercises validated exact scalar interchange.
+ hyperreal = { version = "0.14.0", path = "../hyperreal", default-features = false, features = ["serde"] }
+ criterion = "0.5"
+@@ -52,10 +50,11 @@ taylor-noise = ["taylor-affine"]
+ taylor-polynomial = ["taylor-affine"]
+ taylor-composition = ["taylor-polynomial"]
+ float-proposal-program = ["expression-program"]
+-interval-program = ["expression-program", "dep:hyperinterval", "hyperinterval/hyperreal"]
++interval-program = ["expression-program", "hyperinterval/hyperreal"]
+ interval-lattice = ["interval-program", "hyperlattice/interval-dyadic"]
+-serde = ["dep:serde", "hyperreal/serde", "hyperinterval?/serde"]
++serde = ["dep:serde", "hyperreal/serde", "hyperinterval/serde"]
+ dispatch-trace = [
++    "hyperinterval/dispatch-trace",
+     "hyperreal/dispatch-trace",
+     "hyperlattice/hyperreal-dispatch-trace",
+     "hyperlimit/dispatch-trace",
+diff --git a/crates/hypersolve/src/algebraic.rs b/crates/hypersolve/src/algebraic.rs
+index 88d7c7825..216450c06 100644
+--- a/crates/hypersolve/src/algebraic.rs
++++ b/crates/hypersolve/src/algebraic.rs
+@@ -3541,19 +3541,16 @@ fn evaluate_rational_polynomial_interval(
+ ) -> Option<AlgebraicPolynomialValueInterval> {
+     let point_lower = point.lower.exact_rational_ref()?;
+     let point_upper = point.upper.exact_rational_ref()?;
+-    if point_lower > point_upper {
+-        return None;
+-    }
++    let point = hyperinterval::NonEmptyRationalIntervalRef::new(point_lower, point_upper).ok()?;
+     let mut coefficients = polynomial.iter().rev();
+     let leading = coefficients.next()?.exact_rational_ref()?;
+-    let mut lower = leading.clone();
+-    let mut upper = leading.clone();
++    let mut value = hyperinterval::NonEmptyRationalInterval::point(leading.clone());
+     for coefficient in coefficients {
+         let coefficient = coefficient.exact_rational_ref()?;
+-        (lower, upper) = rational_interval_product(&lower, &upper, point_lower, point_upper);
+-        lower = lower + coefficient;
+-        upper = upper + coefficient;
++        value = value.borrowed().mul(&point);
++        value = value.translate(coefficient);
+     }
++    let (lower, upper) = value.into_bounds();
+     Some(AlgebraicPolynomialValueInterval {
+         lower: Real::from(lower),
+         upper: Real::from(upper),
+diff --git a/crates/hypersolve/src/interval_migration/algebraic.rs b/crates/hypersolve/src/interval_migration/algebraic.rs
+index 86c4ba01b..82e10193a 100644
+--- a/crates/hypersolve/src/interval_migration/algebraic.rs
++++ b/crates/hypersolve/src/interval_migration/algebraic.rs
+@@ -103,3 +103,34 @@ fn candidate_evaluate_rational_polynomial_interval(
+         upper: Real::from(upper),
+     })
+ }
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn rational_horner_production_dispatch_differential() {
++    let count = crate::test_support::rational_horner_cases().len() * 2;
++    crate::test_support::compare_horner_processes(
++        "algebraic::interval_migration::rational_horner_production_dispatch_differential",
++        count,
++        |legacy| {
++            for (polynomial, lower, upper) in crate::test_support::rational_horner_cases() {
++                let point = AlgebraicPolynomialValueInterval { lower, upper };
++                for _ in 0..2 {
++                    hyperreal::dispatch_trace::reset();
++                    hyperreal::dispatch_trace::reset_rational_stats();
++                    let result = hyperreal::dispatch_trace::with_recording(|| {
++                        if legacy {
++                            legacy_evaluate_rational_polynomial_interval(&polynomial, &point)
++                        } else {
++                            super::evaluate_rational_polynomial_interval(&polynomial, &point)
++                        }
++                    });
++                    let trace = hyperreal::dispatch_trace::take_trace();
++                    println!(
++                        "HORNER {trace:?} {:?} {result:?}",
++                        hyperreal::dispatch_trace::take_rational_stats()
++                    );
++                }
++            }
++        },
++    );
++}
+diff --git a/crates/hypersolve/src/interval_migration/root_isolation.rs b/crates/hypersolve/src/interval_migration/root_isolation.rs
+index 2f9b76947..247cd05df 100644
+--- a/crates/hypersolve/src/interval_migration/root_isolation.rs
++++ b/crates/hypersolve/src/interval_migration/root_isolation.rs
+@@ -173,3 +173,36 @@ fn candidate_exact_rational_polynomial_derivative_interval_excludes_zero(
+     let (range_lower, range_upper) = range.bounds()?;
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn rational_horner_exclusion_production_dispatch_differential() {
++    let count = crate::test_support::rational_horner_cases().len() * 4;
++    crate::test_support::compare_horner_processes(
++        "root_isolation::interval_migration::rational_horner_exclusion_production_dispatch_differential",
++        count,
++        |legacy| {
++            for (polynomial, lower, upper) in crate::test_support::rational_horner_cases() {
++                for _ in 0..2 {
++                    for derivative in [false, true] {
++                        hyperreal::dispatch_trace::reset();
++                        hyperreal::dispatch_trace::reset_rational_stats();
++                        let result = hyperreal::dispatch_trace::with_recording(|| {
++                            match (legacy,derivative) {
++                        (true,false)=>legacy_exact_rational_polynomial_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (true,true)=>legacy_exact_rational_polynomial_derivative_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (false,false)=>super::exact_rational_polynomial_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (false,true)=>super::exact_rational_polynomial_derivative_interval_excludes_zero(&polynomial,&lower,&upper),
++                    }
++                        });
++                        println!(
++                            "HORNER {:?} {:?} {result:?}",
++                            hyperreal::dispatch_trace::take_trace(),
++                            hyperreal::dispatch_trace::take_rational_stats()
++                        );
++                    }
++                }
++            }
++        },
++    );
++}
+diff --git a/crates/hypersolve/src/root_isolation.rs b/crates/hypersolve/src/root_isolation.rs
+index 684f76981..577242ca3 100644
+--- a/crates/hypersolve/src/root_isolation.rs
++++ b/crates/hypersolve/src/root_isolation.rs
+@@ -25,7 +25,6 @@ use crate::integer_interpolation::{
+     primitive_integer_polynomial, primitive_integer_polynomial_gcd,
+     primitive_integer_sturm_sequence, rational_polynomial_exact_quotient,
+ };
+-use crate::interval::rational_interval_product;
+ use crate::model::{ConstraintKind, Problem};
+ use crate::symbolic::{Expr, SymbolId};
+ 
+@@ -2602,20 +2601,16 @@ fn exact_rational_polynomial_interval_excludes_zero(
+ ) -> Option<bool> {
+     let lower = lower.exact_rational_ref()?;
+     let upper = upper.exact_rational_ref()?;
+-    if lower > upper {
+-        return None;
+-    }
++    let point = hyperinterval::NonEmptyRationalIntervalRef::new(lower, upper).ok()?;
+     let mut coefficients = polynomial.iter().rev();
+     let leading = coefficients.next()?.exact_rational_ref()?;
+-    let mut range_lower = leading.clone();
+-    let mut range_upper = leading.clone();
++    let mut range = hyperinterval::NonEmptyRationalInterval::point(leading.clone());
+     for coefficient in coefficients {
+         let coefficient = coefficient.exact_rational_ref()?;
+-        let (product_lower, product_upper) =
+-            rational_interval_product(&range_lower, &range_upper, lower, upper);
+-        range_lower = product_lower + coefficient;
+-        range_upper = product_upper + coefficient;
++        range = range.borrowed().mul(&point);
++        range = range.translate(coefficient);
+     }
++    let (range_lower, range_upper) = range.bounds();
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
+ 
+@@ -2626,23 +2621,19 @@ fn exact_rational_polynomial_derivative_interval_excludes_zero(
+ ) -> Option<bool> {
+     let lower = lower.exact_rational_ref()?;
+     let upper = upper.exact_rational_ref()?;
+-    if lower > upper {
+-        return None;
+-    }
++    let point = hyperinterval::NonEmptyRationalIntervalRef::new(lower, upper).ok()?;
+     let mut coefficients = polynomial.iter().enumerate().skip(1).rev();
+     let (degree, leading) = coefficients.next()?;
+     let degree = HyperRational::new(i64::try_from(degree).ok()?);
+     let leading = leading.exact_rational_ref()? * &degree;
+-    let mut range_lower = leading.clone();
+-    let mut range_upper = leading;
++    let mut range = hyperinterval::NonEmptyRationalInterval::point(leading);
+     for (degree, coefficient) in coefficients {
+-        let (product_lower, product_upper) =
+-            rational_interval_product(&range_lower, &range_upper, lower, upper);
++        range = range.borrowed().mul(&point);
+         let degree = HyperRational::new(i64::try_from(degree).ok()?);
+         let coefficient = coefficient.exact_rational_ref()? * degree;
+-        range_lower = product_lower + &coefficient;
+-        range_upper = product_upper + coefficient;
++        range = range.translate(&coefficient);
+     }
++    let (range_lower, range_upper) = range.bounds();
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
+ 

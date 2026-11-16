@@ -1,0 +1,77 @@
+diff --git a/crates/hypersolve/src/interval_migration/algebraic.rs b/crates/hypersolve/src/interval_migration/algebraic.rs
+index 86c4ba01b..c08912909 100644
+--- a/crates/hypersolve/src/interval_migration/algebraic.rs
++++ b/crates/hypersolve/src/interval_migration/algebraic.rs
+@@ -103,3 +103,31 @@ fn candidate_evaluate_rational_polynomial_interval(
+         upper: Real::from(upper),
+     })
+ }
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn rational_horner_production_dispatch_differential() {
++    let count = crate::test_support::rational_horner_cases().len() * 2;
++    crate::test_support::compare_horner_processes(
++        "algebraic::interval_migration::rational_horner_production_dispatch_differential",
++        count,
++        |legacy| {
++            for (polynomial, lower, upper) in crate::test_support::rational_horner_cases() {
++                let point = AlgebraicPolynomialValueInterval { lower, upper };
++                for _ in 0..2 {
++                    hyperreal::dispatch_trace::reset();
++                    hyperreal::dispatch_trace::reset_rational_stats();
++                    let result = hyperreal::dispatch_trace::with_recording(|| {
++                        if legacy {
++                            legacy_evaluate_rational_polynomial_interval(&polynomial, &point)
++                        } else {
++                            super::evaluate_rational_polynomial_interval(&polynomial, &point)
++                        }
++                    });
++                    let trace = hyperreal::dispatch_trace::take_trace();
++                    println!("HORNER {trace:?} {:?} {result:?}", hyperreal::dispatch_trace::take_rational_stats());
++                }
++            }
++        },
++    );
++}
+diff --git a/crates/hypersolve/src/interval_migration/root_isolation.rs b/crates/hypersolve/src/interval_migration/root_isolation.rs
+index 2f9b76947..247cd05df 100644
+--- a/crates/hypersolve/src/interval_migration/root_isolation.rs
++++ b/crates/hypersolve/src/interval_migration/root_isolation.rs
+@@ -173,3 +173,36 @@ fn candidate_exact_rational_polynomial_derivative_interval_excludes_zero(
+     let (range_lower, range_upper) = range.bounds()?;
+     Some(range_lower.is_positive() || range_upper.is_negative())
+ }
++
++#[cfg(feature = "dispatch-trace")]
++#[test]
++fn rational_horner_exclusion_production_dispatch_differential() {
++    let count = crate::test_support::rational_horner_cases().len() * 4;
++    crate::test_support::compare_horner_processes(
++        "root_isolation::interval_migration::rational_horner_exclusion_production_dispatch_differential",
++        count,
++        |legacy| {
++            for (polynomial, lower, upper) in crate::test_support::rational_horner_cases() {
++                for _ in 0..2 {
++                    for derivative in [false, true] {
++                        hyperreal::dispatch_trace::reset();
++                        hyperreal::dispatch_trace::reset_rational_stats();
++                        let result = hyperreal::dispatch_trace::with_recording(|| {
++                            match (legacy,derivative) {
++                        (true,false)=>legacy_exact_rational_polynomial_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (true,true)=>legacy_exact_rational_polynomial_derivative_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (false,false)=>super::exact_rational_polynomial_interval_excludes_zero(&polynomial,&lower,&upper),
++                        (false,true)=>super::exact_rational_polynomial_derivative_interval_excludes_zero(&polynomial,&lower,&upper),
++                    }
++                        });
++                        println!(
++                            "HORNER {:?} {:?} {result:?}",
++                            hyperreal::dispatch_trace::take_trace(),
++                            hyperreal::dispatch_trace::take_rational_stats()
++                        );
++                    }
++                }
++            }
++        },
++    );
++}
