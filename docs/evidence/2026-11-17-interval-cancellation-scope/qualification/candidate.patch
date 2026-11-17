@@ -1,0 +1,54 @@
+diff --git a/crates/hypersolve/src/work_budget.rs b/crates/hypersolve/src/work_budget.rs
+index 8c2380c3d..1a2d3ad3f 100644
+--- a/crates/hypersolve/src/work_budget.rs
++++ b/crates/hypersolve/src/work_budget.rs
+@@ -379,7 +379,7 @@ pub fn consume(kind: WorkKind, amount: usize) -> Result<(), BudgetExceeded> {
+ /// return type. Panic unwinding restores the enclosing scope without refunding
+ /// work already admitted by that scope.
+ pub fn with_budget<T>(budget: WorkBudget, operation: impl FnOnce() -> T) -> BudgetOutcome<T> {
+-    enter(budget, None, None, operation)
++    enter::<false, T>(budget, None, None, operation)
+ }
+ 
+ /// Evaluate one synchronous operation with a work budget and a cancellation token.
+@@ -400,11 +400,7 @@ pub fn with_cancellable_budget<T>(
+     cancellation: &CancellationToken,
+     operation: impl FnOnce() -> T,
+ ) -> BudgetOutcome<T> {
+-    enter(budget, Some(cancellation.clone()), None, || {
+-        let value = operation();
+-        let _ = exhaustion();
+-        value
+-    })
++    enter::<true, T>(budget, Some(cancellation.clone()), None, operation)
+ }
+ 
+ /// Evaluate one synchronous operation whose instrumented exact coefficients
+@@ -416,7 +412,7 @@ pub fn with_cancellable_budget<T>(
+ /// is published. A nested limit that fails leaves its parent running. See the
+ /// [module documentation](self) for the constructions that report sizes.
+ pub fn with_coefficient_bit_limit<T>(bits: u64, operation: impl FnOnce() -> T) -> BudgetOutcome<T> {
+-    enter(WorkBudget::UNLIMITED, None, Some(bits), operation)
++    enter::<false, T>(WorkBudget::UNLIMITED, None, Some(bits), operation)
+ }
+ 
+ /// Report the bit length of an exact coefficient that an instrumented
+@@ -461,7 +457,7 @@ pub fn observe_coefficient_bits(bits: u64) -> Result<(), BudgetExceeded> {
+     })
+ }
+ 
+-fn enter<T>(
++fn enter<const CHECK_CANCELLATION: bool, T>(
+     budget: WorkBudget,
+     cancellation: Option<CancellationToken>,
+     max_coefficient_bits: Option<u64>,
+@@ -504,6 +500,9 @@ fn enter<T>(
+     });
+     let scope = Scope(true);
+     let value = operation();
++    if CHECK_CANCELLATION {
++        let _ = exhaustion();
++    }
+     let frame = scope.finish();
+     BudgetOutcome {
+         result: match frame.exhausted {
