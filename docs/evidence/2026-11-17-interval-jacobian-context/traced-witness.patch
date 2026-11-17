@@ -1,0 +1,37 @@
+diff --git a/crates/hypersolve/src/jacobian.rs b/crates/hypersolve/src/jacobian.rs
+index 4fbd71751..3012e0eca 100644
+--- a/crates/hypersolve/src/jacobian.rs
++++ b/crates/hypersolve/src/jacobian.rs
+@@ -17,6 +17,11 @@ impl Default for FiniteDifferenceConfig {
+     }
+ }
+ 
++/// Propose a forward-difference Jacobian at the supplied context bindings.
++///
++/// Fixed columns remain zero. An unused, unbound variable retains its model
++/// value for perturbation; a used unbound symbol fails during baseline replay.
++/// The returned primitive-float estimates are not derivative certificates.
+ pub fn finite_difference_jacobian(
+     problem: &Problem,
+     context: &EvaluationContext,
+@@ -40,7 +45,11 @@ pub fn finite_difference_jacobian(
+             continue;
+         }
+         let mut perturbed = context.clone();
+-        let shifted = variable.value.clone() + config.step.clone();
++        let center = context
++            .bindings()
++            .get(&variable.symbol)
++            .unwrap_or(&variable.value);
++        let shifted = center.clone() + config.step.clone();
+         perturbed.bind(variable.symbol, shifted);
+         let next = crate::eval::evaluate_residuals(problem, &perturbed)?
+             .into_iter()
+@@ -134,3 +143,7 @@ fn symbolic_jacobian_with_sparsity(
+     }
+     Ok(rows)
+ }
++
++#[cfg(test)]
++#[path = "jacobian_tests.rs"]
++mod tests;

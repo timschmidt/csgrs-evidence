@@ -1,0 +1,66 @@
+diff --git a/crates/hypersolve/src/eval.rs b/crates/hypersolve/src/eval.rs
+index 1e7690584..12fdf34bd 100644
+--- a/crates/hypersolve/src/eval.rs
++++ b/crates/hypersolve/src/eval.rs
+@@ -17,15 +17,17 @@ impl EvaluationContext {
+         self.generation += 1;
+     }
+ 
+-    /// Shift an existing binding, using the model value only when it is absent.
++    /// Clone with one shifted binding, using the model value only when absent.
+     /// Finite differences use one map lookup for the read and replacement.
+-    pub(crate) fn shift_binding(&mut self, symbol: SymbolId, model_value: &Real, step: &Real) {
+-        let value = self
++    pub(crate) fn shifted_binding(&self, symbol: SymbolId, model_value: &Real, step: &Real) -> Self {
++        let mut shifted = self.clone();
++        let value = shifted
+             .bindings
+             .entry(symbol)
+             .or_insert_with(|| model_value.clone());
+         *value = value.clone() + step.clone();
+-        self.generation += 1;
++        shifted.generation += 1;
++        shifted
+     }
+ 
+     pub fn generation(&self) -> u64 {
+diff --git a/crates/hypersolve/src/jacobian.rs b/crates/hypersolve/src/jacobian.rs
+index 9fd765a8b..b52f2d375 100644
+--- a/crates/hypersolve/src/jacobian.rs
++++ b/crates/hypersolve/src/jacobian.rs
+@@ -44,8 +44,7 @@ pub fn finite_difference_jacobian(
+         if variable.fixed {
+             continue;
+         }
+-        let mut perturbed = context.clone();
+-        perturbed.shift_binding(variable.symbol, &variable.value, &config.step);
++        let perturbed = context.shifted_binding(variable.symbol, &variable.value, &config.step);
+         let next = crate::eval::evaluate_residuals(problem, &perturbed)?
+             .into_iter()
+             .filter_map(|row| row.weighted_dense_solver_estimate)
+diff --git a/crates/hypersolve/src/jacobian_tests.rs b/crates/hypersolve/src/jacobian_tests.rs
+index d067c7a41..49ce1523c 100644
+--- a/crates/hypersolve/src/jacobian_tests.rs
++++ b/crates/hypersolve/src/jacobian_tests.rs
+@@ -115,11 +115,14 @@ fn binding_shifts_preserve_generation_and_model_fallback() {
+     let mut context = EvaluationContext::default();
+     context.bind(SymbolId(0), Real::from(3));
+     let generation = context.generation();
+-    context.shift_binding(SymbolId(0), &Real::one(), &Real::from(2));
+-    assert_eq!(context.bindings()[&SymbolId(0)], Real::from(5));
+-    assert_eq!(context.generation(), generation + 1);
+-    context.shift_binding(SymbolId(1), &Real::from(7), &Real::from(-2));
+-    assert_eq!(context.bindings()[&SymbolId(1)], Real::from(5));
+-    assert_eq!(context.generation(), generation + 2);
+-    assert_eq!(context.bindings().len(), 2);
++    let shifted = context.shifted_binding(SymbolId(0), &Real::one(), &Real::from(2));
++    assert_eq!(shifted.bindings()[&SymbolId(0)], Real::from(5));
++    assert_eq!(shifted.generation(), generation + 1);
++    let shifted = shifted.shifted_binding(SymbolId(1), &Real::from(7), &Real::from(-2));
++    assert_eq!(shifted.bindings()[&SymbolId(1)], Real::from(5));
++    assert_eq!(shifted.generation(), generation + 2);
++    assert_eq!(shifted.bindings().len(), 2);
++    assert_eq!(context.bindings()[&SymbolId(0)], Real::from(3));
++    assert_eq!(context.generation(), generation);
++    assert_eq!(context.bindings().len(), 1);
+ }
