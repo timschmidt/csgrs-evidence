@@ -1,0 +1,326 @@
+diff --git a/crates/hypercurve/src/policy.rs b/crates/hypercurve/src/policy.rs
+index 414f3edcc..831afaadd 100644
+--- a/crates/hypercurve/src/policy.rs
++++ b/crates/hypercurve/src/policy.rs
+@@ -206,9 +206,11 @@ pub fn evaluate_with_budget<T>(
+ /// another thread may cancel. A cancelled evaluation reports
+ /// [`crate::WorkKind::Cancellation`] in the outer result and publishes no
+ /// value; it is never an approximate or partial success. Cancellation is
+-/// observed at instrumented work units, so it is not a wall-clock deadline.
+-/// A retry needs a new token. Pass [`crate::WorkBudget::UNLIMITED`] to limit
+-/// the evaluation by cancellation alone.
++/// observed at instrumented work units and once more before publication, so
++/// it is not a wall-clock deadline. The final check does not preempt the callback
++/// or undo its side effects; a request arriving afterward may race with success.
++/// A retry needs a new token. Pass [`crate::WorkBudget::UNLIMITED`] to select
++/// cancellation without unit limits; no time or memory bound follows.
+ ///
+ /// ```
+ /// use hypercurve::{
+diff --git a/crates/hypercurve/tests/work_budget.rs b/crates/hypercurve/tests/work_budget.rs
+index 83ec59787..d1bd1fe63 100644
+--- a/crates/hypercurve/tests/work_budget.rs
++++ b/crates/hypercurve/tests/work_budget.rs
+@@ -288,3 +288,37 @@ fn concurrent_cancellation_never_publishes_a_partial_intersection() {
+     }
+     assert_eq!(outcomes.iter().sum::<usize>(), 4);
+ }
++
++#[test]
++fn cancellation_at_publication_cannot_escape_as_a_provisional_value() {
++    use std::sync::Arc;
++    for policy in [
++        PredicatePolicy::STRICT,
++        PredicatePolicy::APPROXIMATE_512,
++        PredicatePolicy::STRICT,
++    ] {
++        let retained = Arc::new(Point2::new(Real::from(3), Real::from(4)));
++        let token = CancellationToken::new();
++        let cancelled =
++            evaluate_with_cancellable_budget(policy, WorkBudget::UNLIMITED, &token, || {
++                token.cancel();
++                Arc::clone(&retained)
++            });
++        assert_eq!(cancelled.result.unwrap_err().kind, WorkKind::Cancellation);
++        assert_eq!(cancelled.usage, WorkUsage::default());
++        assert_eq!(Arc::strong_count(&retained), 1);
++        assert!(!hypersolve::work_budget::is_active());
++
++        let fresh = CancellationToken::new();
++        let retry = evaluate_with_cancellable_budget(policy, WorkBudget::ZERO, &fresh, || {
++            Arc::clone(&retained)
++        });
++        assert_eq!(retry.usage, WorkUsage::default());
++        let value = retry.result.unwrap().certified().unwrap();
++        assert_eq!(value.as_ref(), retained.as_ref());
++        assert_eq!(Arc::strong_count(&retained), 2);
++        drop(value);
++        assert_eq!(Arc::strong_count(&retained), 1);
++        assert!(!hypersolve::work_budget::is_active());
++    }
++}
+diff --git a/crates/hypersolve/src/work_budget.rs b/crates/hypersolve/src/work_budget.rs
+index 5a15a99fb..8c2380c3d 100644
+--- a/crates/hypersolve/src/work_budget.rs
++++ b/crates/hypersolve/src/work_budget.rs
+@@ -90,7 +90,8 @@
+ //!
+ //! A scope can also carry a [`CancellationToken`]. Cancellation is cooperative:
+ //! the computing thread observes it at its next admitted unit or exhaustion
+-//! check, never inside one exact arithmetic step, so the delay before an
++//! check, including a final check before a cancellable scope publishes its
++//! result. It never interrupts one exact arithmetic step, so the delay before an
+ //! instrumented operation stops is bounded by its longest uninstrumented
+ //! stretch, not by a time limit. A cancelled scope then behaves as an exhausted
+ //! one with [`WorkKind::Cancellation`]: it publishes no value and its callers
+@@ -386,15 +387,24 @@ pub fn with_budget<T>(budget: WorkBudget, operation: impl FnOnce() -> T) -> Budg
+ /// This is [`with_budget`] with cooperative cancellation: once `cancellation`
+ /// is cancelled, from any thread, the operation's next admitted unit or
+ /// exhaustion check fails with [`WorkKind::Cancellation`] and no value is
+-/// published. A value completed before any check observed the request is
+-/// returned normally. Use [`WorkBudget::UNLIMITED`] to bound the operation by
+-/// cancellation alone.
++/// published. A final check after the callback returns also observes requests
++/// made during work that did not reach an instrumented unit. An earlier resource
++/// failure keeps precedence over a later cancellation request.
++///
++/// This check does not preempt the callback or undo its side effects. A request
++/// arriving after the final check may race with successful publication. Use
++/// [`WorkBudget::UNLIMITED`] to select cancellation without unit limits; it does
++/// not impose a time or memory bound.
+ pub fn with_cancellable_budget<T>(
+     budget: WorkBudget,
+     cancellation: &CancellationToken,
+     operation: impl FnOnce() -> T,
+ ) -> BudgetOutcome<T> {
+-    enter(budget, Some(cancellation.clone()), None, operation)
++    enter(budget, Some(cancellation.clone()), None, || {
++        let value = operation();
++        let _ = exhaustion();
++        value
++    })
+ }
+ 
+ /// Evaluate one synchronous operation whose instrumented exact coefficients
+diff --git a/crates/hypersolve/src/work_budget/tests.rs b/crates/hypersolve/src/work_budget/tests.rs
+index 8c7debcfb..ec1350265 100644
+--- a/crates/hypersolve/src/work_budget/tests.rs
++++ b/crates/hypersolve/src/work_budget/tests.rs
+@@ -449,3 +449,186 @@ fn coefficient_bit_limits_nest_like_budgets() {
+     assert_eq!(outcome.result.unwrap_err().limit, 100);
+     assert!(!is_active());
+ }
++
++#[test]
++fn cancellation_publication_drops_unpolled_result_and_allows_fresh_retry() {
++    let token = CancellationToken::new();
++    let retained = std::sync::Arc::new(17_u32);
++    let outcome = with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++        token.cancel();
++        std::sync::Arc::clone(&retained)
++    });
++    assert_eq!(
++        outcome.result.unwrap_err(),
++        BudgetExceeded {
++            kind: WorkKind::Cancellation,
++            limit: 0,
++            used: 0,
++            requested: 0,
++        }
++    );
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert_eq!(std::sync::Arc::strong_count(&retained), 1);
++    assert!(!is_active());
++    assert_eq!(exhaustion(), None);
++
++    let fresh = CancellationToken::new();
++    let retry = with_cancellable_budget(WorkBudget::ZERO, &fresh, || {
++        std::sync::Arc::clone(&retained)
++    });
++    assert_eq!(**retry.result.as_ref().unwrap(), 17);
++    assert_eq!(retry.usage, WorkUsage::default());
++    assert_eq!(std::sync::Arc::strong_count(&retained), 2);
++    drop(retry);
++    assert_eq!(std::sync::Arc::strong_count(&retained), 1);
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_observes_precancelled_token_after_callback() {
++    let token = CancellationToken::new();
++    token.cancel();
++    let invoked = std::cell::Cell::new(false);
++    let outcome = with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++        invoked.set(true);
++        23
++    });
++    assert!(
++        invoked.get(),
++        "the boundary check does not preempt the callback"
++    );
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_observes_cross_thread_request() {
++    use std::sync::{Arc, Barrier};
++    let token = CancellationToken::new();
++    let ready = Barrier::new(2);
++    let finish = Barrier::new(2);
++    let retained = Arc::new(31_u32);
++    let outcome = std::thread::scope(|scope| {
++        let worker = scope.spawn(|| {
++            with_cancellable_budget(WorkBudget::UNLIMITED, &token, || {
++                let value = Arc::clone(&retained);
++                ready.wait();
++                finish.wait();
++                value
++            })
++        });
++        ready.wait();
++        token.cancel();
++        finish.wait();
++        worker.join().unwrap()
++    });
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert_eq!(Arc::strong_count(&retained), 1);
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_propagates_unpolled_parent_request() {
++    let parent = CancellationToken::new();
++    let child = CancellationToken::new();
++    let outcome = with_cancellable_budget(WorkBudget::UNLIMITED, &parent, || {
++        let inner = with_cancellable_budget(WorkBudget::UNLIMITED, &child, || {
++            parent.cancel();
++            13
++        });
++        assert_eq!(inner.result.unwrap_err().kind, WorkKind::Cancellation);
++        assert_eq!(inner.usage, WorkUsage::default());
++        37
++    });
++    assert_eq!(outcome.result.unwrap_err().kind, WorkKind::Cancellation);
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_keeps_inner_request_local() {
++    let child = CancellationToken::new();
++    let outcome = with_budget(
++        WorkBudget {
++            refinements: 2,
++            promotions: 0,
++        },
++        || {
++            consume(WorkKind::RootRefinement, 1).unwrap();
++            let inner = with_cancellable_budget(WorkBudget::UNLIMITED, &child, || {
++                child.cancel();
++                13
++            });
++            assert_eq!(inner.result.unwrap_err().kind, WorkKind::Cancellation);
++            assert_eq!(exhaustion(), None);
++            consume(WorkKind::RootRefinement, 1).unwrap();
++            37
++        },
++    );
++    assert_eq!(outcome.result, Ok(37));
++    assert_eq!(outcome.usage.refinements, 2);
++    assert_eq!(outcome.usage.promotions, 0);
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_preserves_first_failure() {
++    let token = CancellationToken::new();
++    let expected = BudgetExceeded {
++        kind: WorkKind::RootRefinement,
++        limit: 0,
++        used: 0,
++        requested: 1,
++    };
++    let outcome = with_cancellable_budget(WorkBudget::ZERO, &token, || {
++        assert_eq!(consume(WorkKind::RootRefinement, 1), Err(expected));
++        token.cancel();
++        41
++    });
++    assert_eq!(outcome.result, Err(expected));
++    assert_eq!(outcome.usage, WorkUsage::default());
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_unwinding_restores_parent() {
++    let child = CancellationToken::new();
++    let outcome = with_budget(
++        WorkBudget {
++            refinements: 2,
++            promotions: 0,
++        },
++        || {
++            let unwound = std::panic::catch_unwind(|| {
++                with_cancellable_budget(WorkBudget::UNLIMITED, &child, || {
++                    consume(WorkKind::RootRefinement, 1).unwrap();
++                    child.cancel();
++                    panic!("exercise cancellation-boundary unwinding");
++                })
++            });
++            assert!(unwound.is_err());
++            assert_eq!(exhaustion(), None);
++            consume(WorkKind::RootRefinement, 1).unwrap();
++            43
++        },
++    );
++    assert_eq!(outcome.result, Ok(43));
++    assert_eq!(outcome.usage.refinements, 2);
++    assert_eq!(outcome.usage.promotions, 0);
++    assert!(!is_active());
++}
++
++#[test]
++fn cancellation_publication_ordinary_budget_and_uncancelled_scope_keep_values() {
++    let plain = with_budget(WorkBudget::ZERO, || 47);
++    assert_eq!(plain.result, Ok(47));
++    assert_eq!(plain.usage, WorkUsage::default());
++    let token = CancellationToken::new();
++    let cancellable = with_cancellable_budget(WorkBudget::ZERO, &token, || 53);
++    assert_eq!(cancellable.result, Ok(53));
++    assert_eq!(cancellable.usage, WorkUsage::default());
++    assert!(!token.is_cancelled());
++    assert!(!is_active());
++}
+diff --git a/docs/MIGRATIONS.md b/docs/MIGRATIONS.md
+index 3cb4fa9c6..b2afa9d01 100644
+--- a/docs/MIGRATIONS.md
++++ b/docs/MIGRATIONS.md
+@@ -1,5 +1,26 @@
+ # Migrations
+ 
++## Cancellable budget publication check (admission candidate, 2026-11-17)
++
++This isolated extension is not yet retained or published.
++
++`hypersolve::work_budget::with_cancellable_budget` now checks cancellation once
++more after its callback returns, before publishing the result. Previously, a
++callback that cancelled its token without reaching another instrumented unit
++or exhaustion check could return `Ok(value)`. It now returns
++`BudgetExceeded { kind: WorkKind::Cancellation, limit: 0, used: 0, requested: 0 }`
++when the final check first observes that request. An earlier resource failure
++retains its original reason and counters.
++
++Callers must handle the outer resource result before consuming the callback's
++value and use a fresh token for retry. The callback still runs when its token
++was cancelled before entry; cancellation remains cooperative. This change does
++not preempt uninstrumented work, undo callback side effects or establish a time,
++heap or total-work bound. Cancellation after the final check may still race
++with successful publication. Ordinary `with_budget` behavior is unchanged.
++The same final check governs Hypercurve's `evaluate_with_cancellable_budget`,
++so a cancelled value cannot escape that boundary as a successful `Provisional`.
++
+ ## Hypersolve composed solver repairs (admission candidate, 2026-11-17)
+ 
+ This isolated composition is not yet retained or published. It combines the
