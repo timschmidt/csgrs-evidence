@@ -1,0 +1,90 @@
+diff --git a/crates/hyperreal/src/dispatch_trace.rs b/crates/hyperreal/src/dispatch_trace.rs
+index bae76df37..a18247cb3 100644
+--- a/crates/hyperreal/src/dispatch_trace.rs
++++ b/crates/hyperreal/src/dispatch_trace.rs
+@@ -423,20 +423,10 @@ pub struct RationalTraceStats {
+     pub peak_operand_bits: u64,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+-struct DispatchKey {
+-    layer: &'static str,
+-    operation: &'static str,
+-    path: &'static str,
+-}
+-
+-/// Hot-path identity for compile-time trace labels.
++/// Content-keyed live trace labels.
+ ///
+-/// Trace labels are required to be static, so a call site presents the same
+-/// string addresses on every invocation. Keying the live counter table by
+-/// those addresses avoids repeatedly comparing label contents inside exact
+-/// arithmetic loops. Snapshots merge identity-distinct labels with equal text
+-/// back into the public content-keyed representation.
++/// Equal text shares a counter even when its static storage differs. Pointer
++/// equality accelerates the common call-site match; it does not define equality.
+ #[derive(Clone, Copy)]
+ struct ActiveDispatchKey {
+     layer: &'static str,
+@@ -446,9 +436,12 @@ struct ActiveDispatchKey {
+ 
+ impl PartialEq for ActiveDispatchKey {
+     fn eq(&self, other: &Self) -> bool {
+-        std::ptr::eq(self.layer, other.layer)
++        (std::ptr::eq(self.layer, other.layer)
+             && std::ptr::eq(self.operation, other.operation)
+-            && std::ptr::eq(self.path, other.path)
++            && std::ptr::eq(self.path, other.path))
++            || (self.layer == other.layer
++                && self.operation == other.operation
++                && self.path == other.path)
+     }
+ }
+ 
+@@ -456,12 +449,9 @@ impl Eq for ActiveDispatchKey {}
+ 
+ impl Hash for ActiveDispatchKey {
+     fn hash<H: Hasher>(&self, state: &mut H) {
+-        state.write_usize(self.layer.as_ptr() as usize);
+-        state.write_usize(self.layer.len());
+-        state.write_usize(self.operation.as_ptr() as usize);
+-        state.write_usize(self.operation.len());
+-        state.write_usize(self.path.as_ptr() as usize);
+-        state.write_usize(self.path.len());
++        self.layer.hash(state);
++        self.operation.hash(state);
++        self.path.hash(state);
+     }
+ }
+ 
+@@ -677,17 +667,8 @@ pub fn take_rational_stats() -> RationalTraceStats {
+ fn collect_dispatch_counts(
+     counts: impl IntoIterator<Item = (ActiveDispatchKey, u64)>,
+ ) -> Vec<DispatchCount> {
+-    let mut grouped = BTreeMap::<DispatchKey, u64>::new();
+-    for (key, count) in counts {
+-        *grouped
+-            .entry(DispatchKey {
+-                layer: key.layer,
+-                operation: key.operation,
+-                path: key.path,
+-            })
+-            .or_insert(0) += count;
+-    }
+-    grouped
++    // Both callers traverse the content-keyed live table, so each key is unique.
++    let mut grouped: Vec<_> = counts
+         .into_iter()
+         .map(|(key, count)| DispatchCount {
+             layer: key.layer,
+@@ -695,7 +676,9 @@ fn collect_dispatch_counts(
+             path: key.path,
+             count,
+         })
+-        .collect()
++        .collect();
++    grouped.sort_unstable_by_key(|entry| (entry.layer, entry.operation, entry.path));
++    grouped
+ }
+ 
+ pub fn snapshot() -> Vec<DispatchCount> {

@@ -1,0 +1,108 @@
+diff --git a/crates/hyperreal/src/dispatch_trace.rs b/crates/hyperreal/src/dispatch_trace.rs
+index bae76df37..af0470683 100644
+--- a/crates/hyperreal/src/dispatch_trace.rs
++++ b/crates/hyperreal/src/dispatch_trace.rs
+@@ -423,13 +423,34 @@ pub struct RationalTraceStats {
+     pub peak_operand_bits: u64,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+-struct DispatchKey {
+-    layer: &'static str,
+-    operation: &'static str,
+-    path: &'static str,
++/// Content ordering for report aggregation, borrowing the live identity key.
++#[derive(Clone, Copy)]
++struct DispatchKey<'a>(&'a ActiveDispatchKey);
++
++impl Ord for DispatchKey<'_> {
++    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
++        (self.0.layer, self.0.operation, self.0.path).cmp(&(
++            other.0.layer,
++            other.0.operation,
++            other.0.path,
++        ))
++    }
++}
++
++impl PartialOrd for DispatchKey<'_> {
++    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
++        Some(self.cmp(other))
++    }
++}
++
++impl PartialEq for DispatchKey<'_> {
++    fn eq(&self, other: &Self) -> bool {
++        self.cmp(other).is_eq()
++    }
+ }
+ 
++impl Eq for DispatchKey<'_> {}
++
+ /// Hot-path identity for compile-time trace labels.
+ ///
+ /// Trace labels are required to be static, so a call site presents the same
+@@ -674,46 +695,40 @@ pub fn take_rational_stats() -> RationalTraceStats {
+     })
+ }
+ 
+-fn collect_dispatch_counts(
+-    counts: impl IntoIterator<Item = (ActiveDispatchKey, u64)>,
+-) -> Vec<DispatchCount> {
+-    let mut grouped = BTreeMap::<DispatchKey, u64>::new();
++fn collect_dispatch_counts(counts: &ActiveCounts) -> Vec<DispatchCount> {
++    let mut grouped = BTreeMap::<DispatchKey<'_>, u64>::new();
+     for (key, count) in counts {
+-        *grouped
+-            .entry(DispatchKey {
+-                layer: key.layer,
+-                operation: key.operation,
+-                path: key.path,
+-            })
+-            .or_insert(0) += count;
++        *grouped.entry(DispatchKey(key)).or_insert(0) += *count;
+     }
+     grouped
+         .into_iter()
+         .map(|(key, count)| DispatchCount {
+-            layer: key.layer,
+-            operation: key.operation,
+-            path: key.path,
++            layer: key.0.layer,
++            operation: key.0.operation,
++            path: key.0.path,
+             count,
+         })
+         .collect()
+ }
+ 
+ pub fn snapshot() -> Vec<DispatchCount> {
+-    TRACE_STATE.with(|state| {
+-        collect_dispatch_counts(
+-            state
+-                .borrow()
+-                .counts
+-                .iter()
+-                .map(|(key, count)| (*key, *count)),
+-        )
+-    })
++    TRACE_STATE.with(|state| collect_dispatch_counts(&state.borrow().counts))
+ }
+ 
+ pub fn take() -> Vec<DispatchCount> {
++    // As with HashMap::drain, clear on unwinding as well as normal return.
++    struct ClearCounts<'a>(&'a mut ActiveCounts);
++
++    impl Drop for ClearCounts<'_> {
++        fn drop(&mut self) {
++            self.0.clear();
++        }
++    }
++
+     TRACE_STATE.with(|state| {
+         let mut state = state.borrow_mut();
+-        collect_dispatch_counts(state.counts.drain())
++        let counts = ClearCounts(&mut state.counts);
++        collect_dispatch_counts(counts.0)
+     })
+ }
