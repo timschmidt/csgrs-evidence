@@ -1,0 +1,59 @@
+diff --git a/crates/hyperreal/src/dispatch_trace.rs b/crates/hyperreal/src/dispatch_trace.rs
+index bae76df37..ac42481e6 100644
+--- a/crates/hyperreal/src/dispatch_trace.rs
++++ b/crates/hyperreal/src/dispatch_trace.rs
+@@ -423,13 +423,6 @@ pub struct RationalTraceStats {
+     pub peak_operand_bits: u64,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+-struct DispatchKey {
+-    layer: &'static str,
+-    operation: &'static str,
+-    path: &'static str,
+-}
+-
+ /// Hot-path identity for compile-time trace labels.
+ ///
+ /// Trace labels are required to be static, so a call site presents the same
+@@ -677,17 +670,7 @@ pub fn take_rational_stats() -> RationalTraceStats {
+ fn collect_dispatch_counts(
+     counts: impl IntoIterator<Item = (ActiveDispatchKey, u64)>,
+ ) -> Vec<DispatchCount> {
+-    let mut grouped = BTreeMap::<DispatchKey, u64>::new();
+-    for (key, count) in counts {
+-        *grouped
+-            .entry(DispatchKey {
+-                layer: key.layer,
+-                operation: key.operation,
+-                path: key.path,
+-            })
+-            .or_insert(0) += count;
+-    }
+-    grouped
++    let mut grouped: Vec<_> = counts
+         .into_iter()
+         .map(|(key, count)| DispatchCount {
+             layer: key.layer,
+@@ -695,7 +678,20 @@ fn collect_dispatch_counts(
+             path: key.path,
+             count,
+         })
+-        .collect()
++        .collect();
++    grouped.sort_unstable_by_key(|entry| (entry.layer, entry.operation, entry.path));
++    grouped.dedup_by(|next, previous| {
++        if (next.layer, next.operation, next.path)
++            == (previous.layer, previous.operation, previous.path)
++        {
++            previous.count += next.count;
++            true
++        } else {
++            false
++        }
++    });
++    grouped.shrink_to_fit();
++    grouped
+ }
+ 
+ pub fn snapshot() -> Vec<DispatchCount> {

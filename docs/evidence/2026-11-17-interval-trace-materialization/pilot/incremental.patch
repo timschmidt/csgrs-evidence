@@ -1,0 +1,60 @@
+diff --git a/crates/hyperreal/src/dispatch_trace.rs b/crates/hyperreal/src/dispatch_trace.rs
+index bae76df37..8bb78c837 100644
+--- a/crates/hyperreal/src/dispatch_trace.rs
++++ b/crates/hyperreal/src/dispatch_trace.rs
+@@ -423,13 +423,6 @@ pub struct RationalTraceStats {
+     pub peak_operand_bits: u64,
+ }
+ 
+-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+-struct DispatchKey {
+-    layer: &'static str,
+-    operation: &'static str,
+-    path: &'static str,
+-}
+-
+ /// Hot-path identity for compile-time trace labels.
+ ///
+ /// Trace labels are required to be static, so a call site presents the same
+@@ -677,25 +670,25 @@ pub fn take_rational_stats() -> RationalTraceStats {
+ fn collect_dispatch_counts(
+     counts: impl IntoIterator<Item = (ActiveDispatchKey, u64)>,
+ ) -> Vec<DispatchCount> {
+-    let mut grouped = BTreeMap::<DispatchKey, u64>::new();
++    let mut grouped: Vec<DispatchCount> = Vec::new();
+     for (key, count) in counts {
+-        *grouped
+-            .entry(DispatchKey {
+-                layer: key.layer,
+-                operation: key.operation,
+-                path: key.path,
+-            })
+-            .or_insert(0) += count;
++        match grouped.binary_search_by_key(&(key.layer, key.operation, key.path), |entry| {
++            (entry.layer, entry.operation, entry.path)
++        }) {
++            Ok(index) => grouped[index].count += count,
++            Err(index) => grouped.insert(
++                index,
++                DispatchCount {
++                    layer: key.layer,
++                    operation: key.operation,
++                    path: key.path,
++                    count,
++                },
++            ),
++        }
+     }
++    grouped.shrink_to_fit();
+     grouped
+-        .into_iter()
+-        .map(|(key, count)| DispatchCount {
+-            layer: key.layer,
+-            operation: key.operation,
+-            path: key.path,
+-            count,
+-        })
+-        .collect()
+ }
+ 
+ pub fn snapshot() -> Vec<DispatchCount> {
